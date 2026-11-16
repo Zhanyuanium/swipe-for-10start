@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.10.0
+// @version         0.11.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -65,8 +65,8 @@ What it does:
   axis travel and keeps the axis travel below 60 DIP is a scroll, not a
   dismiss: it restores `Progress = 1` without animation.
 - Release commits when the axis travel exceeds 20% of `Distance` or the average
-  velocity exceeds 0.45 DIP/ms. A commit retracts `Progress` to 0 and then asks
-  the explorer-side bridge for the shell's own `Hide`; a cancel animates back to
+  velocity exceeds 0.45 DIP/ms. A commit retracts `Progress` to 0 and taps the
+  Windows key at once; a cancel animates back to
   1 over 120 ms on `cubic-bezier(0.45, 0, 0.55, 1)`. Every Progress animation
   places the easing on the keyframe at t=1 and inserts the target as the base
   value before `StartAnimation`.
@@ -98,14 +98,16 @@ What it does:
   with `timeEndPeriod` for the time a contact is down). Without the waitable
   timer the release measured `relms=31`; the 1 ms request alone left it at 32.
 - A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
-  the legacy menu ignores an injected `VK_ESCAPE`. Both closes end in
-  `CStartExperienceManager::Hide` now: a gesture close retracts the panel and
-  writes `hide-now.txt`, and the explorer-side bridge calls the same `Hide` a
-  Windows key makes the shell call. The lone `VK_LWIN` tap (down, 60 ms, up)
-  survives in this mod only as the fallback for a write that fails. The shell
-  keeps its Start toggle in the key handler, not in `Hide`, so the bridge sends
-  one more Windows tap 120 ms after the hide it performed; that tap is invisible
-  and is what keeps the next Windows press opening the menu.
+  the legacy menu ignores an injected `VK_ESCAPE`. Both closes are one Windows
+  tap. A keyboard close already is one; a gesture close taps `VK_LWIN` at the
+  end of its retract, after the panel has left the screen. That tap is the
+  shell's own Start toggle: the key handler performs
+  `CStartExperienceManager::Hide` and leaves the toggle ready for the next
+  Windows press, so no re-arm tap and no explorer-side hide request exist. The
+  transfer is one key press, down 60 ms and up, on whichever window has the
+  foreground. A Win press during the retract hides the menu early (the stamp is
+  already fresh), and the armed tap is then skipped; no press desyncs the
+  toggle.
 - A down that arrives while the previous commit is still settling is ignored.
   The menu reuses one XAML root, so a commit sets a flag that makes the next
   down stop the animation and restore `Progress = 1` before the drag starts.
@@ -130,19 +132,20 @@ What it does:
   220 ms on the ease-in-out curve and keeps the menu. Anything else is a cancel:
   `Progress` retracts to 0 with the same planned duration and curve as the
   committed dismiss, so both close paths read the same from any finger
-  position. The hide request that closes the menu follows the retract on the
-  input timer, `duration + 30 ms` after the release. `Progress` stays 0; a later
+  position. The Windows tap that closes the menu is armed for the end of the
+  retract, so the panel is already off screen when the shell hides it. `Progress`
+  stays 0; a later
   open restores it, unless an edge contact is already driving that open. Pulling
   out and pushing back therefore cancels, as it does inside the open menu. The
   line `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`
-  is written once per reveal; the cancel adds `close hide requested kind=reveal`
-  when the deferred request runs, or `close request dropped kind=reveal` when a
-  new pull takes the panel over before it does.
-- Every close the mod starts suppresses the reopen restore for 600 ms, from the
-  moment its retract starts and again in the deferred request. The
+  is written once per reveal; the cancel adds `close tap kind=reveal delay=0`,
+  or `close tap dropped kind=reveal` when a new pull is already there at the tap.
+- Every close the mod starts suppresses the reopen restore from the moment its
+  retract starts until the shell reports the window cloaked (`win close
+  observed`), at most 600 ms. The
   reused root reports itself open until the shell has run the hide behind the
-  request, and restoring `Progress = 1` in that gap flashed the fully open panel
-  while the close was in flight. For the same 600 ms a contact on the edge counts
+  tap, and restoring `Progress = 1` in that gap flashed the fully open panel
+  while the close was in flight. For the same window a contact on the edge counts
   as a new reveal attempt even while the window still reports open: otherwise the
   down was read as a drag of the retracting panel, which stopped the retract and
   restored `Progress = 1` on the first sample.
@@ -161,24 +164,21 @@ What it does:
   `CStartExperienceManager::Hide` by 350 ms and writes `retract=1` to
   `debug.txt`, so the mod retracts `Progress` to 0 in 260 ms while the shell
   waits and the panel slides out instead of vanishing. One line per transition.
-- The mod starts its own gesture close through one file. Both close paths put
-  their request on one deferred slot, and both stamp `close-mode.txt` when the
-  retract starts. At the end of the retract the slot writes `1` to
-  `hide-now.txt`; the bridge calls `Hide` for it, and a fresh `close-mode.txt`
-  stamp keeps a shell hide that races the close from asking for a second
-  retract. One place retracts, one place writes, one place hides.
-- A new edge pull during that retract cancels the close by keeping the request
-  away from the bridge. The deferred request re-reads the pull generation and
-  logs `close request dropped kind=dismiss` (or `kind=reveal`) instead of
-  writing, so no `Hide` is issued for that cycle and the shell's Start toggle
-  stays in step. The earlier design returned `S_OK` from the bridge's `Hide`
-  instead; measured, one such abort left the Windows key and the taskbar Start
-  button dead until `StartMenuExperienceHost.exe` restarted.
+- Every gesture close stamps `close-mode.txt` at the release with
+  `gesture=0`. The tap comes at the end of the retract, so the Hide it causes
+  needs no wait; the stamp tells the bridge that this Hide is that tap's and not
+  a keyboard close. A stamp older than the bridge's 800 ms window means a
+  keyboard close and gets the fixed 350 ms lead instead.
+- A new edge pull during the retract cancels the close before the shell is
+  touched: the tap is dropped and the pull keeps driving the panel, so no Hide
+  runs and the toggle is never advanced. The pull generation is sampled at the
+  release and checked once when the tap would run; the drop overwrites the stamp
+  with `cancelled`, so a later keyboard close uses its own lead.
 
 What it does not do:
 
 - It does not use the explorer-side bridge's shared memory; the bridge reaches
-  it only through the `retract` line and the two marker files.
+  it only through the `retract` line and the `close-mode.txt` stamp.
 - It does not attach XAML pointer handlers and has no DirectManipulation
   hook.
 - It does not remove the shell's open storyboard. Measured with `anim=0`:
@@ -210,18 +210,13 @@ Debug channel (kept in the build):
   mechanisms without a gesture; it does nothing before the first
   `attached root=...` line.
 - `close-mode.txt` in the same directory is not a command file. A gesture close
-  writes `gesture=1` to it when its retract starts; the bridge reads only its
-  last-write time and treats a hide that lands inside 800 ms of it as the tail of
-  an animation that already ran, so that it does not wait for a second retract.
-  `CREATE_ALWAYS` creates and overwrites it, so no other setup is needed. A
-  Windows-key close writes nothing, which is how the bridge tells it apart.
-- `hide-now.txt` in the same directory is the close request. At the end of a
-  gesture close's retract the mod writes `1` to it (`CREATE_ALWAYS`, so the
-  last-write time is the whole signal), and the explorer-side bridge answers
-  with `CStartExperienceManager::Hide(manager, 1)` — the same call a Windows-key
-  close makes. The bridge records the stamp that exists when its worker starts,
-  so a request left over from an earlier session is not replayed. The file's
-  content is never read.
+  writes `gesture=0` at its release. The tap comes after the retract and causes
+  a Hide that needs no wait; the stamp is what tells the bridge that Hide is not
+  a keyboard close. A dropped close writes `cancelled`, which the bridge cannot
+  parse and treats as a keyboard close. Only a file younger than 800 ms is read;
+  a missing or older stamp means a keyboard close and the bridge uses its fixed
+  350 ms lead. `CREATE_ALWAYS` creates and overwrites it, so no other setup is
+  needed.
 
 Diagnostics:
 
@@ -231,10 +226,10 @@ Diagnostics:
   n=... relms=...`,
   `retract vel=... dur=...`,
   `win open`, `win close observed`,
-  `close hide requested kind=dismiss|reveal`,
-  `close request dropped kind=dismiss|reveal`,
-  `close hide request failed kind=... win tap fallback`,
-  `close mode write failed`,
+  `close tap kind=dismiss|reveal delay=...`,
+  `close tap dropped kind=dismiss|reveal`,
+  `close tap skipped kind=... (already closed)`,
+  `close mode write failed kind=...`, `close mode cancel write failed`,
   `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
   `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`),
   `hid decodefail dev=... err=...`,
@@ -284,35 +279,28 @@ Known risks:
   completion arrives on the compositor's dispatcher; if it never arrives,
   `Progress` stays at 0 and every later down is ignored until that batch
   completes.
-- A committed dismiss asks the explorer-side bridge for `Hide`. With the bridge
-  disabled or its hooks refused, the request reaches nothing and the close
-  silently does nothing; only a failed *write* falls back to the `VK_LWIN` tap.
-  The fallback tap is global: it lands on whichever window has the foreground,
-  and a lone Windows tap opens Start if the menu is already gone.
-- The shell's Start toggle is not part of `Hide`. It is re-armed by the bridge's
-  one Windows tap after the hide, so a gesture close and a keyboard close leave
-  the same state only while the bridge runs; without it, the first Windows press
-  after a gesture close is spent hiding an already hidden menu.
-- The suppression window is time based, not tied to the shell's own signal. If a
-  reopen without an edge contact, such as the Windows key, lands inside the
-  600 ms after a close, that open is not animated; `Progress` stays 0 and the
-  panel is invisible until the next open, which slides it back in.
-- The deferred close request runs on the input thread's 5 ms idle tick, behind
-  the report queue: a report flood on the same thread delays the request by that
-  much, for a dismiss and a cancelled reveal alike, and the bridge adds up to
-  20 ms of poll plus the dispatch to the UI thread. The panel stays retracted
-  until the hide runs.
-- The gesture close depends on the explorer-side bridge: without it nothing
-  calls `Hide`, and a menu opened without keyboard focus cannot be closed by the
-  mod at all. A new edge pull inside the retract drops the request, so the shell
-  never receives the close and no `Hide` runs; the pull's own follow then drives
-  the still-visible panel. The dropped request is the only cancel: returning
-  `S_OK` from `Hide` without hiding desynced the shell's Start toggle instead and
-  left the Windows key and the Start button dead until the host process
-  restarted.
-- `close-mode.txt` is a timestamp with an 800 ms window, so a Windows-key close
-  that lands that soon after a gesture close is passed through without a
-  slide-out: the bridge cannot tell the two apart and prefers a clean hide.
+- A committed dismiss taps the Windows key at the end of its retract. That tap is
+  the close: with the explorer-side bridge disabled or its hooks refused, the
+  menu still hides, and the panel has already slid out. The tap is global: it
+  lands on whichever window has the foreground, and a lone Windows tap opens
+  Start if the menu is already gone.
+- A pull that starts during the retract cancels the tap before it is sent, so
+  the shell is never touched and the menu stays open. That check runs once, when
+  the tap would run; a pull after the tap is a normal open of a closed menu.
+- A Win press during the retract hides the menu early (the close stamp is
+  already fresh), and the armed tap is skipped because the window is closed.
+  A press just after that hide lands in the shell's own settle and is ignored;
+  the toggle is not advanced, and the next press opens the menu.
+- The suppression window is time based until `win close observed` clears it. A
+  reopen that lands before the shell reports the close is not animated; the
+  panel stays at 0 until the observed close clears the window and the next open
+  animates it. In practice the window is the hide delay, not the full 600 ms.
+- The tap holds the input thread for 60 ms. It runs after the retract, on the
+  input thread, and is global; a new contact's reports queue behind it.
+- `close-mode.txt` is read only inside its 800 ms window. A gesture close stamps
+  `gesture=0` at its release; the tap's Hide arrives about 260 ms later and runs
+  at once. A dropped close stamps `cancelled`, which the bridge treats as a
+  keyboard close, so a Win press within the window still gets the 350 ms lead.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -341,18 +329,16 @@ Known risks:
  *   VisualTreeHelper and TransformToVisual
  *   from Windows.UI.Xaml.Media to map the panel trail; on `debug.txt` in the
  *   mod storage directory, read by the debug channel; on the fixed
- *   `close-mode.txt` and `hide-now.txt` paths in the same directory: the first
- *   is stamped when a gesture close starts so the bridge can tell it from a
- *   Windows-key close, the second is the hide request every gesture close ends
- *   in.
+ *   `close-mode.txt` path in the same directory: each gesture close stamps
+ *   `gesture=0` at its release, or `cancelled` when a pull drops its tap, and the
+ *   bridge uses the stamp to tell the tap's Hide from a keyboard close.
  * [OUTPUT]: one message-only window and one worker thread per process; the
  *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
- *   published for the reveal follow; one `hide-now.txt` write per committed
- *   dismiss or short reveal, both deferred on the input timer until their
- *   retract animation has run, both dropped when a new pull starts first and
- *   both backed by the one global Windows-key tap when the write fails, so both
- *   closes end in the shell's own Hide;
- *   one retract planner and one easing for both
+ *   published for the reveal follow; one `VK_LWIN` tap armed for the end of every
+ *   committed dismiss or short reveal, the shell's own Start toggle that performs
+ *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
+ *   generation exists when it would run, and no request file or re-arm tap
+ *   exists; one retract planner and one easing for both
  *   close paths (260 ms at rest, shortened by the release speed to a 117 ms
  *   floor); a linear coast of `Progress` at the finger's smoothed speed while
  *   no report arrives, ended by the next report or by the release, which then
@@ -361,11 +347,10 @@ Known risks:
  *   owns, plus a `win close observed` line when the shell hides the window by
  *   itself; a 1 ms timer period (timeBeginPeriod/timeEndPeriod) held exactly
  *   while a contact is down and one 5 ms high-resolution idle tick that detects
- *   the release; a 600 ms window after either request in which a
- *   closed-to-open report does not restore `Progress` and an edge contact starts
- *   a new reveal rather than a drag of the retracting panel; one
- *   `gesture=1` stamp in `close-mode.txt` at the start of every gesture close,
- *   so a shell hide that races it does not ask for a second retract; an optional
+ *   the release; a suppression window, at most 600 ms, after either close in
+ *   which a closed-to-open report does not restore `Progress` and an edge
+ *   contact starts a new reveal rather than a drag of the retracting panel; the
+ *   window ends as soon as the shell reports the window cloaked; an optional
  *   suppressed open animation request
  *   (type 0, off by default because dropping it leaves the pane undrawn) while
  *   the close request (type 1) always passes through; five file-driven debug
@@ -377,10 +362,11 @@ Known risks:
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
  *   takes the menu's own open over from the taskbar edge and pins the panel's
  *   trailing edge to the finger) and carries the switch that can drop the
- *   shell's open storyboard for experiments. It also decides when a gesture
- *   close happens: the request is deferred until the retract ends and a pull
- *   that starts during the retract drops it, so the explorer-side bridge hides
- *   the menu only for a close the user actually made.
+ *   shell's open storyboard for experiments. It also owns the close decision:
+ *   the retract runs first, then the tap at its end; a pull generation checked
+ *   at the tap drops it, so a re-pull never touches the shell. The explorer-side
+ *   bridge still calls the original Hide; it only skips its keyboard lead when
+ *   the stamp names the tap.
  *   The composition helpers below it are shared with the root hook above it.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
@@ -524,25 +510,24 @@ constexpr std::chrono::milliseconds kOpenSlideDuration{260};
 constexpr std::chrono::milliseconds kDismissCancelDuration{120};
 constexpr std::chrono::milliseconds kRevealCommitDuration{220};
 
-// Both close paths request the hide only after the panel has retracted out of
-// the screen edge: the planned retract duration plus 30 ms, about six 5 ms idle
-// ticks. A hide inside the animation froze the panel mid-retract and took the
-// window away at that position.
-constexpr uint64_t kHideRequestMarginMs = 30;
+// Every gesture close ends in one Windows tap at the end of its retract. The tap
+// is the shell's own Start toggle: the key handler performs Hide, so no
+// explorer-side request and no re-arm tap exist. The retract runs first, so the
+// panel is already off screen when the window hides; close-mode.txt tells the
+// bridge that the Hide belongs to this tap and needs no further delay.
+constexpr uint64_t kCloseTapDelayMs = 0;
 
 // A close this mod started hides the menu a moment later. Until then the shell
 // still reports the window open, so the reopen poll must not read that as a
 // fresh open and restore Progress while the close is in flight.
 constexpr uint64_t kRestoreSuppressMs = 600;
 
-// The deferred close request has to run inside that window, or the poll reads
-// the still-open window as a fresh open and restores Progress while the close is
-// in flight. The slowest retract is the unscaled kRetractDuration, so the
-// request lands at 290 ms, well inside the window.
-static_assert(static_cast<uint64_t>(kRetractDuration.count()) +
-                      kHideRequestMarginMs <=
+// The tap has to run inside that window, or the poll reads the still-open window
+// as a fresh open and restores Progress while the close is in flight. The
+// slowest retract is the unscaled kRetractDuration, so the tap lands at 260 ms.
+static_assert(static_cast<uint64_t>(kRetractDuration.count()) <=
                   kRestoreSuppressMs,
-              "the close request must run inside the restore suppression");
+              "the close tap must run inside the restore suppression");
 
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
 constexpr float kCommitDistanceFraction = 0.20f;
@@ -836,21 +821,18 @@ std::atomic<uint32_t> g_dismissSerial{0};
 std::atomic<uint64_t> g_suppressRestoreUntil{0};
 
 // ---------------------------------------------------------------------------
-// The deferred close request
+// The gesture close
 //
-// Both close paths end in the same place: after the retract animation the mod
-// writes hide-now.txt, and the explorer-side bridge calls the shell's own
-// CStartExperienceManager::Hide for it. A keyboard close is that same Hide, so
-// the two closes are one mechanism and no Windows key is involved. The old tap
-// decided whether the shell ever saw the close at all, and it raced any press of
-// the user in the ~300 ms it was pending, so the key read as dead; it survives
-// only as the fallback for a request that cannot be written.
+// Both close paths end in the same place: one Windows tap at the end of the
+// retract. The tap is the shell's own Start toggle, so the key handler runs
+// CStartExperienceManager::Hide exactly as it does for a keyboard close, and the
+// next Windows press opens the menu. The retract runs first, so the panel is off
+// screen when the window hides.
 //
-// The request waits for the retract animation on the input thread, and it
-// re-checks whether a new pull has taken the menu over in the meantime. If one
-// has, the request is dropped: no close reaches the shell, no `Hide` runs, and
-// the follow keeps driving the panel. One request slot is enough because a close
-// cannot start while another request is still waiting.
+// A new pull that starts during the retract cancels the close: the tap is
+// dropped before the shell is touched, so no Hide runs and the menu stays open.
+// The pull generation is sampled at the release and checked once when the tap
+// would run. This is one scheduled tap, not a request file.
 // ---------------------------------------------------------------------------
 enum class CloseKind {
     None,
@@ -858,21 +840,23 @@ enum class CloseKind {
     RevealCancel,
 };
 
-uint64_t g_pendingCloseTick = 0;  // input thread only, 0 = none pending
-CloseKind g_pendingCloseKind = CloseKind::None;
-uint32_t g_pendingClosePull = 0;  // g_pullSerial at schedule time
-
 // A pull is a contact that starts in the taskbar edge band and becomes a reveal
 // candidate (BeginEdgeCandidate). The counter names the pull generation: a close
-// scheduled under one generation is cancelled by any later pull, however far the
-// pull has got when the request would run.
+// released under one generation is dropped when a later pull exists by the time
+// its tap would run.
 uint32_t g_pullSerial = 0;  // input thread only
 
-// Arms the one request slot for a close that has just started its retract.
-void ScheduleClose(uint64_t atTickMs, CloseKind kind) {
-    g_pendingCloseTick = atTickMs;
-    g_pendingCloseKind = kind;
-    g_pendingClosePull = g_pullSerial;
+// The one tap slot. A close cannot start while another tap is still waiting.
+uint64_t g_pendingTapTick = 0;  // input thread only, 0 = none
+CloseKind g_pendingTapKind = CloseKind::None;
+uint32_t g_pendingTapPull = 0;
+
+// Arms the tap for a close that has just started its retract. The deadline is
+// the end of that retract.
+void ScheduleCloseTap(CloseKind kind, uint64_t delayMs) {
+    g_pendingTapTick = GetTickCount64() + delayMs;
+    g_pendingTapKind = kind;
+    g_pendingTapPull = g_pullSerial;
 }
 
 std::atomic<HWND> g_coreHwnd{nullptr};
@@ -923,11 +907,14 @@ HWND FindStartCoreWindow();
 // `Progress`, and the next open restores it anyway.
 extern bool g_commitNeedsProgressReset;
 
-// Defined with the file paths below. A close stamps the close mode there before
-// it arms its request, and the request itself is the hide-now file, so both
-// writers are declared here.
-bool WriteCloseMode();
-bool WriteHideNowRequest();
+// Defined with the file paths below. A close stamps its retract delay there
+// immediately before the Windows tap, so the bridge can hold the shell's Hide
+// for exactly that long.
+bool WriteCloseMode(uint64_t delayMs);
+
+// Defined with the input-thread gesture state below; the close tap needs the
+// kind for its log line.
+const wchar_t* CloseKindName(CloseKind kind);
 
 // ---------------------------------------------------------------------------
 // Composition helpers
@@ -1169,12 +1156,12 @@ void LogRetract(std::chrono::milliseconds duration, float velocity) {
             static_cast<unsigned long long>(duration.count()));
 }
 
-// The fallback, used only when the hide request cannot be written: with no
-// explorer-side bridge to call `Hide`, the lone Windows-key tap is the only
-// dismissal that works, even when the menu was opened without keyboard focus and
-// an injected VK_ESCAPE never reaches it. The 60 ms hold is the same one the
-// dismiss path always used. Only RunPendingClose calls it, on the input thread,
-// and it is a global tap: it lands on whichever window has the foreground.
+// The one dismissal every close uses. The tap is the shell's own Start toggle:
+// the key handler decides Hide exactly as it does for a keyboard close, so a
+// menu opened without keyboard focus closes too, where an injected VK_ESCAPE is
+// ignored. The 60 ms hold is the press the dismiss path always used; measured, a
+// 20 ms hold was missed intermittently and the menu stayed open. It runs on the
+// input thread and is global: it lands on whichever window has the foreground.
 void TapWindowsKey() {
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(60);
@@ -1185,8 +1172,12 @@ const wchar_t* CloseKindName(CloseKind kind) {
     return kind == CloseKind::Dismiss ? L"dismiss" : L"reveal";
 }
 
-// Committed dismiss: retract on the shared plan, then ask the bridge for the
-// shell's own Hide, which is the close a Windows key performs.
+// The close both gesture paths schedule. The retract runs first; the tap is
+// armed for its end, where RunPendingCloseTap checks the pull generation and
+// either taps or drops the close. No deferral file and no bridge request exist.
+//
+// Committed dismiss: retract on the shared plan, then tap the Windows key, so
+// the shell's own key handler performs the Hide.
 //
 // The animation comes from AnimateProgressTo, the same helper the reveal cancel
 // and the return-to-rest paths use. The scoped batch around it only observes
@@ -1227,9 +1218,8 @@ bool BeginDismissSettle(float from, float velocity) {
                         // resetting it here flashes the fully open menu for the
                         // frames between this reset and the shell hiding the
                         // window. The next session resets it instead. The hide
-                        // itself is not requested from this compositor
-                        // callback: both close paths share the one deferred
-                        // request slot, see ScheduleClose.
+                        // itself is the Windows tap's job, so this compositor
+                        // callback only ends the settle.
                         if (g_state) {
                             g_state.StopAnimation(L"Progress");
                         }
@@ -1278,22 +1268,19 @@ bool BeginDismissSettle(float from, float velocity) {
         return false;
     }
 
-    // The gesture owns this hide from here: the retract is running and the
-    // request that makes the bridge call the shell's Hide follows it. The stamp
-    // tells the bridge that the panel already retracted, so a shell hide that
-    // races this close runs without asking for a second retract. The suppression
-    // window starts now: a contact on the taskbar edge inside the retract is a
-    // new pull, not a drag of the retracting panel, and that pull drops the
-    // request.
-    if (!WriteCloseMode()) {
-        FileLog(L"close mode write failed");
-    }
+    // The retract is running. The suppression window starts now: a contact on
+    // the taskbar edge inside it is a new pull, not a drag of the retracting
+    // panel. The tap is armed for the end of the retract, and the stamp is
+    // written now so a Win press during the retract is recognized as this close.
     const uint64_t now = GetTickCount64();
     g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
-    ScheduleClose(now + static_cast<uint64_t>(duration.count()) +
-                      kHideRequestMarginMs,
-                  CloseKind::Dismiss);
+    if (!WriteCloseMode(kCloseTapDelayMs)) {
+        FileLog(L"close mode write failed kind=%s",
+                CloseKindName(CloseKind::Dismiss));
+    }
+    ScheduleCloseTap(CloseKind::Dismiss,
+                     static_cast<uint64_t>(duration.count()));
 
     return true;
 }
@@ -1316,23 +1303,17 @@ bool BeginDismissSettle(float from, float velocity) {
 constexpr wchar_t kDebugFileName[] = L"debug.txt";
 constexpr DWORD kDebugFileMaxBytes = 4096;
 
-// The explorer-side bridge asks for a retract before it lets a hide run, but a
-// hide that follows a gesture close must not ask: that close already retracted
-// the panel. This file says which one is which. A gesture close writes it when
-// its retract starts; a Windows-key close writes nothing, so the bridge reads a
-// stamp younger than its own window and treats the hide as the tail of an
-// animation that already ran. Only the last-write time is read, never the
-// content.
+// The explorer-side bridge must know whether a Hide is the Start side's own tap
+// or a keyboard close. A gesture close stamps `gesture=0` at its release; its tap
+// comes after the retract, so the bridge passes that Hide at once. A close
+// dropped before its tap stamps `cancelled`, which the bridge cannot parse and
+// treats as a keyboard close, so that Hide still gets the 350 ms retract lead.
+// Only a file younger than 800 ms is used; `CREATE_ALWAYS` creates and
+// overwrites it.
 constexpr wchar_t kCloseModeFileName[] = L"close-mode.txt";
-constexpr char kCloseModeGesture[] = "gesture=1\r\n";
-
-// The request that makes both closes one mechanism. A gesture close retracts the
-// panel, then writes this file; the bridge answers with the same
-// CStartExperienceManager::Hide a Windows key makes the shell call. The content
-// is a constant marker and the bridge reads only the last-write time, so one
-// overwrite is the whole protocol.
-constexpr wchar_t kHideNowFileName[] = L"hide-now.txt";
-constexpr char kHideNowRequest[] = "1\r\n";
+// Written when a close is dropped before its tap: the stamp is fresh but names
+// no gesture close, so the next Hide takes the keyboard path.
+constexpr char kCloseModeCancelled[] = "cancelled\r\n";
 
 // `retract` is a live signal from the explorer-side bridge, not a state: the
 // bridge writes it right before it delays the hide. The file keeps the last
@@ -1360,11 +1341,11 @@ bool StorageFilePath(const wchar_t* name, WCHAR* path, size_t count) {
     return swprintf_s(path, count, L"%s\\%s", storage, name) > 0;
 }
 
-// Writes one constant marker into the mod storage directory. Both couplings are
-// timestamp-only, so the content never changes and `CREATE_ALWAYS` is the whole
-// update: it creates the file and touches its last-write time. CloseHandle
-// flushes the cached timestamp, which is what GetFileAttributesExW reports on
-// the other side.
+// Writes one marker into the mod storage directory with `CREATE_ALWAYS`, which
+// creates the file and touches its last-write time. CloseHandle flushes the
+// cached timestamp, which is what GetFileAttributesExW reports on the other
+// side. The close mode's content is read by the bridge; the debug command is
+// timestamp-only.
 bool WriteStorageMarker(const wchar_t* name, const char* text, size_t length) {
     WCHAR path[MAX_PATH] = {};
     if (!StorageFilePath(name, path, ARRAYSIZE(path))) {
@@ -1386,22 +1367,21 @@ bool WriteStorageMarker(const wchar_t* name, const char* text, size_t length) {
 }
 
 // Stamps the close mode for the explorer-side bridge. Called on the input thread
-// when a gesture close starts its retract; the bridge reads the file's
-// last-write time, so the write has to finish before the Hide it belongs to. A
-// failed write only costs a second retract on the bridge side: the hide then
-// waits 350 ms for an animation that is already over.
-bool WriteCloseMode() {
-    return WriteStorageMarker(kCloseModeFileName, kCloseModeGesture,
-                              sizeof(kCloseModeGesture) - 1);
-}
+// right before a gesture close taps the Windows key; the write has to finish
+// before the tap, because the shell can call Hide a few milliseconds after it.
+// The value is the planned retract plus the margin, so the bridge holds the hide
+// until the panel is gone. A failed write only costs an early 350 ms keyboard
+// lead on the bridge side, which still covers the retract.
+bool WriteCloseMode(uint64_t delayMs) {
+    char text[32] = {};
+    const int length = std::snprintf(text, sizeof(text), "gesture=%llu\r\n",
+                                     static_cast<unsigned long long>(delayMs));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(text)) {
+        return false;
+    }
 
-// Asks the explorer-side bridge for the shell's own Hide. This is the close
-// both close paths end in, and a failed write is the only reason the Windows-key
-// fallback is still in the build: without the request nothing would hide the
-// menu.
-bool WriteHideNowRequest() {
-    return WriteStorageMarker(kHideNowFileName, kHideNowRequest,
-                              sizeof(kHideNowRequest) - 1);
+    return WriteStorageMarker(kCloseModeFileName, text,
+                              static_cast<size_t>(length));
 }
 
 // Parses "v[,v...]" up to maxCount values. A missing, partial or trailing
@@ -1531,8 +1511,8 @@ void ApplyDebugLine(const char* line, bool fresh) {
     // slides out on the same retract a committed dismiss uses while the shell
     // waits. The value after `=` is ignored today; the bridge may carry the lead
     // time there later. It only ever writes this for a close the mod did not
-    // start itself (see close-mode.txt); a gesture close retracts first and then
-    // writes its own hide request instead.
+    // start itself (see close-mode.txt); a gesture close taps the Windows key
+    // and stamps its own delay instead.
     if (std::strncmp(line, "retract", 7) == 0) {
         if (!fresh) {
             // A leftover command from an earlier close: the panel it belonged to
@@ -2306,8 +2286,9 @@ float AxisOpeningSign(int32_t axis) {
 // start, not a candidate, unless a close of this mod is still in flight.
 //
 // A dismiss that is still settling does not block a candidate: the edge contact
-// during its retract is the pull that cancels the close, and refusing it would
-// let the pending close request take the menu away under the finger.
+// during its retract is the pull that can still cancel the close if it began
+// before the tap, and refusing it would let the tap take the menu away under the
+// finger.
 bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
     if (!g_hasRoot.load(std::memory_order_relaxed)) {
         return false;
@@ -2344,8 +2325,8 @@ bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
     BeginContactTiming();
 
     // The new pull owns the panel from this report on. It starts a new pull
-    // generation, which is what cancels a close request that is still waiting:
-    // the request would make the shell close the menu the finger is pulling out.
+    // generation; a close tap checks it once and is skipped while this pull
+    // exists, so the shell never hides the menu the finger is pulling out.
     g_pullSerial++;
     return true;
 }
@@ -2397,9 +2378,8 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
 
         // A cancel or dismiss animation from a previous gesture may still own
         // Progress; the follow must drive the scalar from this sample on. A
-        // close request that is still waiting is not touched here: the deferred
-        // request re-reads the pull generation and drops itself, so the single
-        // check on every close stays in RunPendingClose.
+        // close tap that is still ahead is not touched here: it re-checks the
+        // pull generation once, so a pull that began first drops the close.
         StopProgressAnimation();
     }
 
@@ -2507,34 +2487,30 @@ void ReleaseRevealSession() {
 
     // Short reveal: the same planner and the same helper the committed dismiss
     // uses, from the same release speed, so both close paths read identically
-    // from any finger position. The hide request follows the animation on the
-    // input timer, `duration + 30 ms` after the release; asking for the hide
-    // here froze the panel at the finger position and the window then hid
-    // without a retract.
+    // from any finger position. The Windows tap is armed for the end of the
+    // retract: it is what makes the shell call Hide, after the panel is gone.
     //
     // Progress stays at 0 afterwards and is not restored here: the hide takes a
     // moment, and restoring now would flash the fully open menu while the close
     // is in flight. The flag makes the next down restore the resting value once
     // the shell has finished hiding the reused root.
     //
-    // The suppression window starts at the release, not at the request: the
-    // close is already running, and a down inside the next 600 ms is a new
-    // reveal attempt, not a drag of the retracting panel.
+    // The suppression window starts at the release, not at the hide: the close
+    // is already running, and a down inside the next 600 ms is a new reveal
+    // attempt, not a drag of the retracting panel.
     const uint64_t now = GetTickCount64();
     const std::chrono::milliseconds duration = PlanRetract(velocity);
     if (AnimateProgressTo(from, 0.0f, duration)) {
         LogRetract(duration, velocity);
-        // The gesture owns this hide: stamp it so a shell hide that races this
-        // close does not ask for a second retract.
-        if (!WriteCloseMode()) {
-            FileLog(L"close mode write failed");
-        }
     }
     g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
-    ScheduleClose(now + static_cast<uint64_t>(duration.count()) +
-                      kHideRequestMarginMs,
-                  CloseKind::RevealCancel);
+    if (!WriteCloseMode(kCloseTapDelayMs)) {
+        FileLog(L"close mode write failed kind=%s",
+                CloseKindName(CloseKind::RevealCancel));
+    }
+    ScheduleCloseTap(CloseKind::RevealCancel,
+                     static_cast<uint64_t>(duration.count()));
     g_commitNeedsProgressReset = true;
 }
 
@@ -2552,8 +2528,8 @@ void LogHidRelease(const HidGestureSession& session, float velocity,
 }
 
 void BeginHidSession(float x, float y, uint64_t tickMs) {
-    // The previous commit is still sliding out; its hide request has not been
-    // written yet, so this down belongs to the same menu.
+    // The previous commit is still sliding out; the shell's Hide for it is still
+    // ahead, so this down belongs to the same menu.
     if (g_dismissSettling.load(std::memory_order_relaxed)) {
         return;
     }
@@ -2886,43 +2862,40 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     MaybeCoast(tickMs, qpcNow);
 }
 
-// The one close request both close paths wait for. It runs on the input thread
-// so the request follows the retract animation, and it opens the suppression
-// window so the poll cannot restore Progress while the close is in flight. The
-// bridge turns the write into the shell's own Hide, which is the same call a
-// Windows-key close makes.
-//
-// This is also where a close is cancelled. A pull that started after the close
-// was scheduled owns the menu again, so the request is dropped and the shell
-// never receives the close at all: no Hide, no desynced Start toggle, and the
-// follow keeps driving the visible panel.
-void RunPendingClose(uint64_t tickMs) {
-    if (g_pendingCloseTick == 0 || tickMs < g_pendingCloseTick) {
+// The tap both close paths arm. It runs on the input thread at the end of the
+// retract. A pull that started after the release owns the menu again, so the tap
+// is dropped and no Hide ever reaches the shell; the stamp is overwritten with a
+// value the bridge cannot parse, so a later keyboard close takes its own lead.
+void RunPendingCloseTap(uint64_t tickMs) {
+    if (g_pendingTapTick == 0 || tickMs < g_pendingTapTick) {
         return;
     }
 
-    const CloseKind kind = g_pendingCloseKind;
-    const uint32_t pull = g_pendingClosePull;
-    g_pendingCloseTick = 0;
-    g_pendingCloseKind = CloseKind::None;
+    const CloseKind kind = g_pendingTapKind;
+    const uint32_t pull = g_pendingTapPull;
+    g_pendingTapTick = 0;
+    g_pendingTapKind = CloseKind::None;
 
-    if (g_reveal.active || g_reveal.edgeCandidate || g_pullSerial != pull) {
-        FileLog(L"close request dropped kind=%s", CloseKindName(kind));
+    if (g_pullSerial != pull || g_reveal.active || g_reveal.edgeCandidate) {
+        if (!WriteStorageMarker(kCloseModeFileName, kCloseModeCancelled,
+                                sizeof(kCloseModeCancelled) - 1)) {
+            FileLog(L"close mode cancel write failed");
+        }
+        FileLog(L"close tap dropped kind=%s", CloseKindName(kind));
         return;
     }
 
-    g_suppressRestoreUntil.store(tickMs + kRestoreSuppressMs,
-                                 std::memory_order_relaxed);
-
-    if (WriteHideNowRequest()) {
-        FileLog(L"close hide requested kind=%s", CloseKindName(kind));
+    // A Win press during the retract has already hidden the menu. The tap would
+    // only toggle it back open.
+    if (!StartWindowIsOpen()) {
+        FileLog(L"close tap skipped kind=%s (already closed)",
+                CloseKindName(kind));
         return;
     }
 
-    // No request means no bridge hide: the tap is the only dismissal left.
-    FileLog(L"close hide request failed kind=%s win tap fallback",
-            CloseKindName(kind));
     TapWindowsKey();
+    FileLog(L"close tap kind=%s delay=%llu", CloseKindName(kind),
+            static_cast<unsigned long long>(kCloseTapDelayMs));
 }
 
 // Two things happen here. A closed-to-open transition that no reveal owns is a
@@ -2946,7 +2919,7 @@ void PollRootVisibility(uint64_t tickMs) {
 
     const bool open = StartWindowIsOpen();
     // A close this mod started reports the window open until the shell has run
-    // the hide behind its request. Reading that as a reopen restored Progress 1
+    // the Hide its tap caused. Reading that as a reopen restored Progress 1
     // while the close was still in flight, so a follow that began in that window
     // flashed the panel fully open and the window then vanished.
     const bool closeInFlight =
@@ -2964,6 +2937,10 @@ void PollRootVisibility(uint64_t tickMs) {
             FileLog(L"win open");
         }
     } else if (!open && g_rootWasOpen) {
+        // The close has landed, so its suppression no longer applies. Without
+        // this a Win press right after the hide opened the window with Progress
+        // still at 0, and the panel was invisible until the next open.
+        g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
         FileLog(L"win close observed");
     }
     g_rootWasOpen = open;
@@ -3198,9 +3175,7 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         case WM_TIMER:
             if (wParam == kIdleTimerId) {
                 const uint64_t now = GetTickCount64();
-                // The request runs before the poll so its suppression window is
-                // already in force for this tick's open/closed answer.
-                RunPendingClose(now);
+                RunPendingCloseTap(now);
                 CheckHidIdleRelease(now);
                 PollRootVisibility(now);
             } else if (wParam == kDebugTimerId) {
@@ -3299,9 +3274,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
         }
         if (idleTimer && wait == WAIT_OBJECT_0) {
             const uint64_t now = GetTickCount64();
-            // The request runs before the poll so its suppression window is
-            // already in force for this tick's open/closed answer.
-            RunPendingClose(now);
+            RunPendingCloseTap(now);
             CheckHidIdleRelease(now);
             PollRootVisibility(now);
             continue;
@@ -3329,8 +3302,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     EndContactTiming();
     g_contactDown = false;
     g_openCheckValid = false;
-    g_pendingCloseTick = 0;
-    g_pendingCloseKind = CloseKind::None;
+    g_pendingTapTick = 0;
+    g_pendingTapKind = CloseKind::None;
     g_coasting.store(false, std::memory_order_relaxed);
     ResetCoastVelocity();
     g_debugFileStamp = DebugFileStamp{};

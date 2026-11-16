@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.6.0
+// @version         0.7.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -16,18 +16,27 @@
 Explorer-side half of the touch-swipe bridge for the ExplorerPatcher legacy
 Windows 10 Start menu.
 
-The mod owns one close for both paths. A Windows-key close is the shell's own
-`CStartExperienceManager::Hide`, delayed by up to 350 ms so the Start side can
-retract the panel first. A gesture close retracts the panel in the Start mod,
-writes `hide-now.txt` there, and this mod calls `Hide(manager, 1)` itself, so a
-gesture close and a keyboard close end in the same shell call.
+The mod calls no hide of its own and presses no key. The Start side owns both
+closes: a keyboard close is the user's Windows tap, a gesture close is a Windows
+tap the Start mod sends at the end of its retract. This mod only decides how
+long the shell's key handler must wait for the panel.
+
+- A gesture close stamps `close-mode.txt` in the Start mod's storage with
+  `gesture=0` at its release. The tap comes after the retract, so when the Hide
+  arrives within 800 ms the panel is already gone; the hook logs
+  `hide passed (gesture)` and calls the original at once.
+- A gesture close that a new edge pull cancels before its tap stamps
+  `cancelled`, which does not parse: the next Hide is a keyboard close.
+- Any other Hide is a keyboard close: the mod writes `retract=1` to the Start
+  mod's `debug.txt`, waits up to 350 ms for the 260 ms retract on the calling
+  thread, then calls the original. A write that fails skips the wait, because a
+  delay without a retract would only slow the close down.
 
 Measured on this build, `Hide` is not the whole close: the shell keeps its Start
-toggle in the key handler, so after a programmatic Hide the next Windows press
-still calls Hide instead of Show and is spent on an already hidden menu. The mod
-therefore sends one Windows tap 120 ms after the hide it performed. That tap is
-invisible (in that state the handler's answer is the same Hide) and re-arms the
-toggle, which the first press after a gesture close needs.
+toggle in the key handler. Both closes now go through that handler, so the
+toggle is always in step and the next Windows press after the close opens the
+menu. The old programmatic hide plus a 120 ms re-arm tap is gone; that tap raced
+a user press inside its window, which is the bug this protocol removes.
 
 The mod also observes the taskbar-edge gesture path in `twinui.pcshell.dll`,
 then publishes the live `GestureAnimationData` handle (source/provider id), the
@@ -38,12 +47,11 @@ edge, the start point and the gesture state to shared memory:
 
 A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
-shipping Start mod does not read it. Its live couplings are `hide-now.txt` and
-the `retract` debug line described below.
+shipping Start mod does not read it. Its live couplings are `close-mode.txt` and
+the `retract` line described below.
 
-Hooked functions are forwarded unchanged except for the delay described below.
-The mod creates one worker thread, one message-only window on the shell's UI
-thread and no COM objects.
+Hooked functions are forwarded unchanged except for the keyboard wait described
+below. The mod creates no windows, threads or COM objects.
 
 Notes:
 - Windhawk compiles the mod from stdin, so the repository `mods` folder is
@@ -65,54 +73,30 @@ Notes:
 - Each gesture state transition appends one line to `bridge.log` in the mod
   storage folder: `state=... edge=... src=... prov=... <reason>`.
 
-The unified close:
+The delayed Hide:
 
-- `Show` and `Hide` both cache the `CStartExperienceManager` pointer. Every call
-  refreshes it, so a hide is never sent to an instance the shell has replaced.
-- One worker thread polls the Start mod's `hide-now.txt` every 20 ms. A
-  last-write time newer than the one already handled is a request; the content
-  is the constant `1` and is not read. The stamp that exists when the worker
-  starts is recorded first, so a request left over from an earlier session is
-  not replayed.
-- The request runs on the shell's UI thread: the first `Show` or `Hide` on that
-  thread creates a message-only window there, and the worker only posts to it.
-  The window proc calls the original `Hide(manager, 1)` and logs
-  `hide requested reason=1 thread=ui hr=...`. When the window cannot be created,
-  the worker calls the original itself and logs `thread=worker`. A request that
-  arrives before the first `Show`/`Hide` logs
-  `hide request skipped (no manager)` and is dropped.
-- The call bypasses this hook, so a gesture close never asks for a second
-  retract: the Start side already animated it.
-- 120 ms later the worker taps the Windows key once and logs
-  `hide toggle rearmed`. The shell's toggle lives in the key handler, so this
-  press is what makes the next Windows press open the menu instead of hiding it
-  again; it is invisible because the handler's answer in that state is the Hide
-  that already ran. The tap is skipped with `hide toggle rearm skipped
-  (reopened)` when a Show arrived in between (the user opened the menu again),
-  and with `hide toggle rearm skipped (hide failed)` when the original Hide
-  failed.
-
-The Windows-key close:
-
-- A Windows-key close is the shell's own `Hide`. The `Hide` hook delays it by
-  up to 350 ms; before the wait the mod writes `retract=1` to the Start mod's
-  `debug.txt`, and that mod retracts its composition `Progress` to 0 in 260 ms,
-  so the panel slides out instead of vanishing. One `hide delayed` line per
-  delayed hide. The delay runs only after the `Hide` hook was installed, and it
-  never exceeds 350 ms plus one 10 ms poll. When the write fails, the hide runs
-  immediately: a delay without a retract would only slow the close down.
-- A hide that follows a gesture close is not delayed and does not ask for a
-  retract. The Start mod stamps `close-mode.txt` when a gesture close starts,
-  and that close already retracted the panel. A stamp younger than 800 ms
-  therefore means "the animation has run": the hook logs
-  `hide passed (gesture)` and calls the original at once. This is a guard for a
-  shell hide that races a gesture close; the normal gesture path never reaches
-  this hook. The stamp is a last-write time only; its content is not read.
-- The hook never returns without the original. An earlier version cancelled a
-  delayed hide by returning `S_OK`; measured, the shell's Start toggle then
-  stayed one close ahead and the Windows key and the taskbar Start button stopped
-  working until `StartMenuExperienceHost.exe` restarted. A close is cancelled on
-  the Start side instead, by not writing its request.
+- Both closes are Windows taps, so every Hide this hook sees was decided by the
+  shell's own key handler. No manager pointer is cached, no worker exists, and no
+  call is made on the shell's behalf. Every Show and Hide logs one line
+  (`show a=... b=... c=...`, `hide reason=...`) before the delay decision.
+- A gesture close stamps `close-mode.txt` with `gesture=0` at its release; its
+  tap comes at the end of the retract, so the panel is already off screen when
+  the Hide arrives. A stamp younger than 800 ms names that case: the hook logs
+  `hide passed (gesture)` and calls the original at once. A nonzero value is
+  only for a hand-written stamp and waits that long (capped at 600 ms).
+- A stamp that does not parse means the Start side dropped the close before its
+  tap; the next Hide is a keyboard close. The same applies when the stamp is
+  older than 800 ms or already handled once.
+- A keyboard close writes `retract=1` to the Start mod's `debug.txt`, and that
+  mod retracts its composition `Progress` to 0 in 260 ms, so the panel slides out
+  instead of vanishing. It waits 350 ms, logs `hide delayed reason=...`, then
+  calls the original. One 10 ms poll can add to the 350 ms. When the write fails
+  the hide runs immediately: a delay without a retract would only slow the close
+  down.
+- The original always runs. An earlier version returned `S_OK` without it;
+  measured, the shell's Start toggle then stayed one close ahead and the Windows
+  key and the taskbar Start button stopped working until
+  `StartMenuExperienceHost.exe` restarted.
 - `Hide` is `HRESULT (void* this, uint32_t reason)` on
   twinui.pcshell.dll 26100.9949. The prologue reads `rcx` (this) and `edx`
   (reason), compares `edx` with 7 and returns 0 on success or the negative
@@ -126,30 +110,26 @@ The Windows-key close:
  *   EdgeAnimationRelationshipManager::ReportEdgeGesture,
  *   CStartExperienceManager::SetAnimationData/Show/Hide; on version.dll for the
  *   build gate; on LoadLibraryExW from kernelbase.dll for the late module load;
- *   on RegisterClassExW, CreateWindowExW and PostMessageW from user32; on the
- *   shared-memory contract in start_gesture_shared.h; on the Start mod's
- *   `close-mode.txt` last-write time to tell a gesture close from a Windows-key
- *   close; on the Start mod's `hide-now.txt` last-write time, the request that
- *   turns a gesture close into a Hide call.
+ *   on the shared-memory contract in start_gesture_shared.h; on the Start mod's
+ *   `close-mode.txt` content and last-write time, which name a gesture close
+ *   (`gesture=0`) and a close dropped before its tap (`cancelled`); on the Start
+ *   mod's `debug.txt` for the `retract=1` line a keyboard close needs.
  * [OUTPUT]: the `Local\WindhawkStartGestureShared` mapping and its auto-reset
  *   event, holding the edge, the gesture handle and the state under a seqlock;
  *   a `bridge.log` line per state transition; one `retract=1` line in the Start
  *   mod's `debug.txt` followed by a 350 ms wait in
  *   CStartExperienceManager::Hide, so a Windows-key close slides the panel out
- *   before the window is hidden; a `hide requested reason=1 thread=ui|worker
- *   hr=...` line and a call of the original Hide for every `hide-now.txt` write,
- *   so a gesture close ends in the shell's own Hide, plus one Windows tap 120 ms
- *   later (`hide toggle rearmed`) that re-arms the shell's Start toggle because
- *   Hide alone does not; a `hide passed (gesture)` line and an immediate hide
- *   when the Start mod's close-mode stamp is younger than 800 ms. Every path
- *   calls the original Hide. No exported symbols.
- * [POS]: explorer-side half of the legacy Start gesture work. It is the only
- *   code that calls or observes the shell's own hide decision. A gesture close
- *   asks for it through `hide-now.txt` and a Windows-key close is delayed for
- *   the Start side's retract, so both closes end in the same Hide call. The
- *   keyboard toggle that Hide does not update is the one thing this mod has to
- *   press a key for. The shipping Start mod does not read the shared memory; the
- *   hide request, the debug line and the close-mode stamp are the only couplings
+ *   before the window is hidden; a `hide passed (gesture)` line and the original
+ *   call at once for a Hide inside 800 ms of a `gesture=0` stamp, because the
+ *   Start side taps after its retract. Every path calls the original Hide;
+ *   nothing is pressed and no hide is requested. No exported symbols.
+ * [POS]: explorer-side half of the legacy Start gesture work. It observes the
+ *   shell's own hide decision and decides whether that Hide still needs the
+ *   retract lead. Both closes are Windows taps performed by the Start side, and
+ *   a gesture close is tapped only after its retract; the shell's Start toggle is
+ *   always updated by its key handler, so this mod needs no manager pointer,
+ *   worker thread, timer or re-arm tap. The shipping Start mod does not read the
+ *   shared memory; the debug line and the close-mode stamp are the only couplings
  *   that are live today.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
@@ -162,6 +142,8 @@ The Windows-key close:
 #include <cstdarg>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 #include "start_gesture_shared.h"
 
@@ -182,11 +164,11 @@ constexpr wchar_t kTwinuiModuleName[] = L"twinui.pcshell.dll";
 // The build the RVAs above were derived from.
 constexpr unsigned kTwinuiVersion[4] = {10, 0, 26100, 9949};
 
-// The Windows-key close is animated from the Start side. Hide is where the
-// shell takes the Start window away; the panel needs that long to retract, so
-// the hide waits for it. 350 ms covers the Start mod's 260 ms retract plus two
-// 50 ms poll ticks.
-constexpr DWORD kHideLeadMs = 350;
+// A keyboard close is a Windows tap by the user. Hide is where the shell takes
+// the Start window away; the panel needs time to retract, so the hide waits for
+// it. 350 ms covers the Start mod's 260 ms retract plus two 62 ms WM_TIMER
+// quanta and stays the same lead the earlier protocol used.
+constexpr uint64_t kHideLeadMs = 350;
 
 // The Start mod's debug channel. The bridge runs in explorer, so
 // Wh_GetModStoragePath would resolve to its own storage directory: the Start
@@ -196,51 +178,28 @@ constexpr wchar_t kStartDebugFilePath[] =
     L"local@start-menu-legacy-swipe\\debug.txt";
 constexpr char kRetractCommand[] = "retract=1\r\n";
 
-// The Start mod's close-mode stamp. A gesture close writes this file when its
-// retract starts, so a fresh stamp means the panel has already left the screen:
-// a hide that lands right after it is the tail of that animation, not a keyboard
-// close, and must run at once instead of waiting for a retract that already
-// happened. Only the last-write time is read.
+// The Start mod's close-mode file. A gesture close writes `gesture=0` just
+// before its Windows tap; the tap comes after the retract, so the Hide needs no
+// wait. Only a file younger than kCloseModeFreshMs is read. A value that does
+// not parse (the Start mod writes `cancelled` when a new pull drops the close)
+// means the next Hide is a keyboard close.
 constexpr wchar_t kStartCloseModeFilePath[] =
     L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
     L"local@start-menu-legacy-swipe\\close-mode.txt";
 
-// The Start mod's hide request. A gesture close retracts the panel in the Start
-// process and writes this file when the retract ends; this mod answers with the
-// same Hide a Windows-key close performs, so both closes end in one shell call
-// and no Windows key is tapped. The content is a constant marker; only the
-// last-write time is read.
-constexpr wchar_t kStartHideNowFilePath[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@start-menu-legacy-swipe\\hide-now.txt";
-
-// The worker polls this file. 20 ms is below one compositor frame at 120 Hz, so
-// the window is hidden within a frame or two of the retract ending, and it costs
-// one file-time query per tick.
-constexpr DWORD kHideRequestPollMs = 20;
-
-// The reason a gesture close passes to Hide. Measured on this build: the
-// Windows-key close passes 1, a click-away close passes 7. The reason does not
-// decide whether the shell's Start toggle stays in step, so a gesture close
-// passes the keyboard close's 1.
-constexpr uint32_t kHideReasonGesture = 1;
-
-// A gesture close writes the stamp when its retract starts, 290 ms before its
-// request and this hide. 800 ms covers the request, the worker poll, the shell's
-// own dispatch of the close and one Windows-timer tick, and stays short enough
-// that a Windows-key close a second later is animated again.
+// The stamp is written at the release and read after the tap's Hide, 260 ms
+// later. 800 ms covers the retract, the key dispatch, the shell's own handling
+// and the read, and stays short enough that a Windows-key close a second later
+// uses its own lead again.
 constexpr DWORD kCloseModeFreshMs = 800;
 
-// The hide waits in 10 ms steps, so the wait can end early when the mod is being
-// disabled under it.
-constexpr DWORD kHidePollMs = 10;
+// The delay is a safety valve for a future nonzero stamp; the shipping value is
+// 0. The cap keeps a corrupt value from holding the shell's UI thread.
+constexpr uint64_t kGestureHideDelayCapMs = 600;
 
-// The hide request runs on the thread that owns the manager, in a message-only
-// window created there on the first Show/Hide. WM_APP+0x51 is above the range
-// the shell's own windows use for control messages.
-constexpr wchar_t kHideDispatchClass[] =
-    L"WindhawkStartGestureHideDispatch";
-constexpr UINT kHideDispatchMessage = WM_APP + 0x51;
+// The hide waits in 10 ms steps, so the wait can end early when the mod is being
+// disabled under it. The shipping gesture path waits 0.
+constexpr DWORD kHidePollMs = 10;
 
 struct Point {
     float x;
@@ -265,19 +224,6 @@ std::atomic<bool> g_disabled{false};
 // Set only after Wh_SetFunctionHook accepted the Hide hook, so a hide is never
 // delayed on a build where the hook was refused.
 std::atomic<bool> g_hideDelayEnabled{false};
-
-// The cached CStartExperienceManager pointer, refreshed by every Show and Hide.
-// The hider is the message-only window on the shell's UI thread; it is created
-// by the first Show/Hide and only receives a post from the worker.
-std::atomic<void*> g_managerThis{nullptr};
-std::atomic<HWND> g_dispatchHwnd{nullptr};
-std::atomic<bool> g_dispatchCreateAttempted{false};
-HANDLE g_hideWorker = nullptr;
-HANDLE g_hideWorkerStop = nullptr;
-
-// Bumped by every Show. A hide request records it, so the toggle re-arm can tell
-// that the menu was opened again in the meantime and leave it alone.
-std::atomic<uint32_t> g_showSerial{0};
 
 enum : int {
     kSharedNotStarted = 0,
@@ -911,15 +857,9 @@ HRESULT SetAnimationData_Hook(void* self, uint64_t a, uint64_t b, uint64_t c) {
 using Show_t = HRESULT (*)(void*, uint8_t, uint8_t, uint32_t);
 Show_t Show_Original = nullptr;
 
-// Defined with the hide dispatch below. The dispatch window belongs to the
-// thread that owns the manager, so it is created from here, on that thread.
-void EnsureHideDispatchWindow();
-
 HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
-    // Every Show refreshes the pointer a gesture close will hide with.
-    g_managerThis.store(self, std::memory_order_release);
-    g_showSerial.fetch_add(1, std::memory_order_relaxed);
-    EnsureHideDispatchWindow();
+    FileLog(L"show a=%u b=%u c=%u", static_cast<unsigned int>(a),
+            static_cast<unsigned int>(b), static_cast<unsigned int>(c));
 
     // Only a Show that follows a real gesture handle publication is a
     // gesture-driven open. A normal mouse/keyboard open must not look like a
@@ -942,9 +882,7 @@ HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
 using Hide_t = HRESULT (*)(void*, uint32_t);
 Hide_t Hide_Original = nullptr;
 
-// Clears the published gesture record. Called by the Hide hook for a hide the
-// shell decided, and by the request path for a hide this mod performs, so both
-// closes leave the same state behind.
+// Clears the published gesture record when the shell hides the Start window.
 void ClearSharedGestureState(const wchar_t* reason) {
     const SharedUpdate update = UpdateShared([](StartGestureShared* shared) {
         shared->state = static_cast<uint32_t>(StartGestureState::None);
@@ -963,10 +901,10 @@ void ClearSharedGestureState(const wchar_t* reason) {
     g_startPointTick.store(0, std::memory_order_relaxed);
 }
 
-// Writes the one command line the Start mod polls for. The write is what makes
-// the delay meaningful: when it fails, the panel will not retract and the hide
-// runs at once instead of being 350 ms late for nothing.
-bool WriteStartRetractCommand() {
+// Writes one command line the Start mod polls for. The write is what makes the
+// delay meaningful: when the retract write fails, the panel will not retract and
+// the hide runs at once instead of being 350 ms late for nothing.
+bool WriteStartCommand(const char* command, size_t length) {
     HANDLE file = CreateFileW(kStartDebugFilePath, GENERIC_WRITE,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -975,15 +913,17 @@ bool WriteStartRetractCommand() {
     }
 
     DWORD written = 0;
-    const DWORD length = sizeof(kRetractCommand) - 1;
-    const BOOL ok = WriteFile(file, kRetractCommand, length, &written, nullptr);
+    const BOOL ok =
+        WriteFile(file, command, static_cast<DWORD>(length), &written, nullptr);
     CloseHandle(file);
     return ok && written == length;
 }
 
-// Last-write time of a file, false when it is missing or a directory. Both
-// couplings are timestamp-only: the content is a constant marker, so reading it
-// would add a race that the file time already answers.
+bool WriteStartRetractCommand() {
+    return WriteStartCommand(kRetractCommand, sizeof(kRetractCommand) - 1);
+}
+
+// Last-write time of a file, false when it is missing or a directory.
 bool ReadFileWriteTime(const wchar_t* path, FILETIME* writeTime) {
     WIN32_FILE_ATTRIBUTE_DATA attributes{};
     if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) ||
@@ -996,11 +936,11 @@ bool ReadFileWriteTime(const wchar_t* path, FILETIME* writeTime) {
 }
 
 // True when the Start mod stamped a gesture close less than kCloseModeFreshMs
-// ago. A stamp ahead of the local clock counts as fresh: it is the same write,
+// ago, and returns the stamp so the hook can tell the same stamp from a later
+// one. A stamp ahead of the local clock counts as fresh: it is the same write,
 // read before the clock caught up.
-bool GestureCloseStampFresh() {
-    FILETIME written{};
-    if (!ReadFileWriteTime(kStartCloseModeFilePath, &written)) {
+bool GestureCloseStampFresh(FILETIME* written) {
+    if (!ReadFileWriteTime(kStartCloseModeFilePath, written)) {
         return false;
     }
 
@@ -1011,19 +951,58 @@ bool GestureCloseStampFresh() {
     now.LowPart = nowFileTime.dwLowDateTime;
     now.HighPart = nowFileTime.dwHighDateTime;
     ULARGE_INTEGER stamp{};
-    stamp.LowPart = written.dwLowDateTime;
-    stamp.HighPart = written.dwHighDateTime;
+    stamp.LowPart = written->dwLowDateTime;
+    stamp.HighPart = written->dwHighDateTime;
 
     const ULONGLONG age =
         now.QuadPart > stamp.QuadPart ? now.QuadPart - stamp.QuadPart : 0;
     return age <= static_cast<ULONGLONG>(kCloseModeFreshMs) * 10000;
 }
 
-// Gives the Start side the time its 260 ms retract needs. The steps stay at
-// 10 ms so a mod that is being disabled mid-wait ends the delay at once instead
-// of holding the hide for a retract nothing will draw.
-void WaitForRetractLead() {
-    const ULONGLONG deadline = GetTickCount64() + kHideLeadMs;
+// Reads the delay a gesture close stamped into close-mode.txt. The content is
+// `gesture=<milliseconds>`; the shipping Start mod writes 0 because its tap comes
+// after the retract. Only a file that passed GestureCloseStampFresh is read.
+bool ReadGestureCloseDelayMs(uint64_t* delayMs) {
+    HANDLE file = CreateFileW(kStartCloseModeFilePath, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    char buffer[32] = {};
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr);
+    CloseHandle(file);
+    if (!ok || read == 0) {
+        return false;
+    }
+    buffer[read] = '\0';
+
+    constexpr char kPrefix[] = "gesture=";
+    constexpr size_t kPrefixLength = sizeof(kPrefix) - 1;
+    if (std::strncmp(buffer, kPrefix, kPrefixLength) != 0) {
+        return false;
+    }
+
+    const char* value = buffer + kPrefixLength;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value) {
+        return false;
+    }
+
+    *delayMs = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+// Gives the Start side the time its retract needs. The steps stay at 10 ms so a
+// mod that is being disabled mid-wait ends the delay at once instead of holding
+// the hide for a retract nothing will draw.
+void WaitForRetractLead(uint64_t leadMs) {
+    const ULONGLONG deadline = GetTickCount64() + leadMs;
     while (!g_disabled.load(std::memory_order_relaxed)) {
         const ULONGLONG now = GetTickCount64();
         if (now >= deadline) {
@@ -1034,216 +1013,29 @@ void WaitForRetractLead() {
     }
 }
 
+// The stamp handled as a gesture close. A later Hide that still sees the same
+// stamp is a keyboard close, not a second gesture close, and uses its own lead.
+FILETIME g_handledStamp{};
+bool g_hasHandledStamp = false;
+
+bool StampAlreadyHandled(const FILETIME& stamp) {
+    return g_hasHandledStamp && CompareFileTime(&stamp, &g_handledStamp) == 0;
+}
+
+void MarkStampHandled(const FILETIME& stamp) {
+    g_handledStamp = stamp;
+    g_hasHandledStamp = true;
+}
+
 // ---------------------------------------------------------------------------
-// A gesture close asks for the shell's own Hide
+// Delayed Hide
 //
-// The Start mod retracts the panel and writes hide-now.txt. This mod answers
-// with the call a Windows-key close makes, on the thread that owns the manager.
-// The manager object is shell state, so the call must not run on the worker: the
-// first Show/Hide on the shell's UI thread creates a message-only window there
-// and the worker only posts to it. When that window cannot be created the worker
-// calls Hide itself and says so in the log.
+// A gesture close taps the Windows key at the end of its retract, so the Hide
+// that tap causes needs no wait: the panel is already gone. close-mode.txt names
+// that case. A keyboard close has no usable stamp and uses the fixed retract lead
+// with the `retract=1` command. No worker, manager pointer, timer or re-arm tap is
+// involved: every Hide is the shell's own call, on its own thread.
 // ---------------------------------------------------------------------------
-
-// Hands the shell's Start toggle back in step with the window.
-//
-// Measured: the shell keeps that toggle in the key handler, not in Hide. After a
-// programmatic Hide the window is cloaked, but the next Windows press still
-// calls Hide instead of Show, so the first press after a gesture close is spent
-// on an already hidden menu. One Windows tap afterwards re-arms the toggle and
-// is invisible, because in that state the handler's answer is exactly the Hide
-// this mod just performed. A keyboard close needs none of this: its own key did
-// it.
-//
-// The tap runs from the worker, after the window is gone, so the shell's UI
-// thread is never held for it.
-constexpr DWORD kToggleRearmDelayMs = 120;
-
-std::atomic<bool> g_lastHideOk{false};
-
-void TapWindowsKey() {
-    keybd_event(VK_LWIN, 0, 0, 0);
-    Sleep(60);
-    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
-}
-
-void RearmStartToggle(uint32_t showSerial) {
-    Sleep(kToggleRearmDelayMs);
-    if (g_disabled.load(std::memory_order_relaxed)) {
-        return;
-    }
-    // A Show in the meantime is a menu the user opened again; its own Show put
-    // the toggle in step, and a tap here would close it.
-    if (g_showSerial.load(std::memory_order_relaxed) != showSerial) {
-        FileLog(L"hide toggle rearm skipped (reopened)");
-        return;
-    }
-    // A failed Hide left the menu on screen: the tap would close it the way the
-    // user expects, but it would also hide a menu this close never took away.
-    if (!g_lastHideOk.load(std::memory_order_relaxed)) {
-        FileLog(L"hide toggle rearm skipped (hide failed)");
-        return;
-    }
-
-    TapWindowsKey();
-    FileLog(L"hide toggle rearmed");
-}
-
-// Calls the shell's Hide for the cached manager. `thread` is the log's label for
-// where the call ran, so a worker-thread hide is visible in the log.
-bool CallShellHide(uint32_t reason, const wchar_t* thread) {
-    if (g_disabled.load(std::memory_order_relaxed)) {
-        return false;
-    }
-
-    void* manager = g_managerThis.load(std::memory_order_acquire);
-    if (!manager) {
-        FileLog(L"hide request skipped (no manager)");
-        return false;
-    }
-
-    const Hide_t original = Hide_Original;
-    if (!original) {
-        FileLog(L"hide request skipped (no original)");
-        return false;
-    }
-
-    ClearSharedGestureState(L"Hide (request)");
-    const HRESULT hr = original(manager, reason);
-    g_lastHideOk.store(SUCCEEDED(hr), std::memory_order_relaxed);
-    FileLog(L"hide requested reason=%u thread=%s hr=%08X",
-            static_cast<unsigned int>(reason), thread,
-            static_cast<unsigned int>(hr));
-    return true;
-}
-
-LRESULT CALLBACK HideDispatchProc(HWND hwnd, UINT message, WPARAM wParam,
-                                  LPARAM lParam) {
-    switch (message) {
-        case kHideDispatchMessage:
-            CallShellHide(static_cast<uint32_t>(wParam), L"ui");
-            return 0;
-        case WM_CLOSE:
-            DestroyWindow(hwnd);
-            return 0;
-        default:
-            return DefWindowProcW(hwnd, message, wParam, lParam);
-    }
-}
-
-// Runs on the thread that calls Show/Hide: the shell's UI thread, which owns the
-// manager. One attempt per process; a failure leaves the worker as the caller.
-void EnsureHideDispatchWindow() {
-    if (g_dispatchHwnd.load(std::memory_order_acquire) ||
-        g_dispatchCreateAttempted.exchange(true)) {
-        return;
-    }
-
-    HMODULE instance = GetModuleHandleW(nullptr);
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = HideDispatchProc;
-    windowClass.hInstance = instance;
-    windowClass.lpszClassName = kHideDispatchClass;
-    if (!RegisterClassExW(&windowClass) &&
-        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        FileLog(L"hide dispatch class failed err=%u",
-                static_cast<unsigned int>(GetLastError()));
-        return;
-    }
-
-    HWND hwnd = CreateWindowExW(0, kHideDispatchClass, L"", 0, 0, 0, 0, 0,
-                                HWND_MESSAGE, nullptr, instance, nullptr);
-    if (!hwnd) {
-        FileLog(L"hide dispatch window failed err=%u",
-                static_cast<unsigned int>(GetLastError()));
-        return;
-    }
-
-    g_dispatchHwnd.store(hwnd, std::memory_order_release);
-    FileLog(L"hide dispatch thread=%u",
-            static_cast<unsigned int>(GetCurrentThreadId()));
-}
-
-// Runs on the worker. A posted request is logged and executed by the window proc;
-// the toggle re-arm follows either path.
-void RequestHideNow() {
-    if (g_disabled.load(std::memory_order_relaxed)) {
-        return;
-    }
-
-    if (!g_managerThis.load(std::memory_order_acquire)) {
-        FileLog(L"hide request skipped (no manager)");
-        return;
-    }
-
-    g_lastHideOk.store(false, std::memory_order_relaxed);
-    // Recorded before the post: a Show after this point means the user opened
-    // the menu again, and the re-arm tap must not close it.
-    const uint32_t showSerial = g_showSerial.load(std::memory_order_relaxed);
-
-    const HWND hwnd = g_dispatchHwnd.load(std::memory_order_acquire);
-    if (!hwnd ||
-        !PostMessageW(hwnd, kHideDispatchMessage, kHideReasonGesture, 0)) {
-        CallShellHide(kHideReasonGesture, L"worker");
-    }
-
-    RearmStartToggle(showSerial);
-}
-
-// The hide-now.txt poll. The file keeps its last content, so a newer last-write
-// time is the whole request; the stamp that exists when the worker starts is
-// recorded first, so an earlier session's request is not replayed.
-DWORD WINAPI HideRequestWorker(LPVOID) {
-    FILETIME lastWrite{};
-    bool haveLast = ReadFileWriteTime(kStartHideNowFilePath, &lastWrite);
-
-    for (;;) {
-        if (WaitForSingleObject(g_hideWorkerStop, kHideRequestPollMs) !=
-            WAIT_TIMEOUT) {
-            break;
-        }
-
-        FILETIME written{};
-        if (!ReadFileWriteTime(kStartHideNowFilePath, &written)) {
-            continue;
-        }
-        if (haveLast && CompareFileTime(&written, &lastWrite) <= 0) {
-            continue;
-        }
-
-        lastWrite = written;
-        haveLast = true;
-        RequestHideNow();
-    }
-
-    return 0;
-}
-
-void StartHideRequestWorker() {
-    if (g_hideWorker) {
-        return;
-    }
-
-    g_hideWorkerStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_hideWorkerStop) {
-        FileLog(L"hide worker event failed err=%u",
-                static_cast<unsigned int>(GetLastError()));
-        return;
-    }
-
-    g_hideWorker =
-        CreateThread(nullptr, 0, HideRequestWorker, nullptr, 0, nullptr);
-    if (!g_hideWorker) {
-        FileLog(L"hide worker thread failed err=%u",
-                static_cast<unsigned int>(GetLastError()));
-        CloseHandle(g_hideWorkerStop);
-        g_hideWorkerStop = nullptr;
-        return;
-    }
-
-    FileLog(L"hide worker started");
-}
 
 // CStartExperienceManager::Hide(void* self, uint32_t reason) -> HRESULT
 // twinui.pcshell.dll 26100.9949, RVA 0x3C5960, vtable slot after Show.
@@ -1253,33 +1045,46 @@ void StartHideRequestWorker() {
 // takes two arguments. Both return paths set eax: 0 on success, the negative
 // HRESULT of a failing inner call otherwise, so the return type is HRESULT.
 HRESULT Hide_Hook(void* self, uint32_t reason) {
-    // Every Hide refreshes the pointer a later gesture close will use.
-    g_managerThis.store(self, std::memory_order_release);
-    EnsureHideDispatchWindow();
-
+    FileLog(L"hide reason=%u", reason);
     ClearSharedGestureState(L"Hide");
 
-    // The Windows-key close is decided here, while the Start panel is still on
-    // screen. The Start side owns the visual. A hide that follows a gesture
-    // close is already animated: the close-mode stamp names it, so the hide runs
-    // at once. Anything else is a Windows-key close: the debug line starts the
-    // panel's 260 ms slide and the wait covers the poll that reads the file
-    // (measured 13-67 ms, a 50 ms WM_TIMER quantised to 62 ms) with room for the
-    // whole animation.
+    // The shell's key handler decided this hide from a Windows tap. A gesture
+    // close stamps `gesture=0` at its release, after it has retracted the panel:
+    // the tap comes at the end of that retract, so this Hide is already too late
+    // to cut the animation and runs at once. A keyboard close (no usable stamp,
+    // a dropped gesture close, or a second Hide under the same stamp) writes
+    // `retract=1` and takes the fixed lead for the 260 ms retract, covering the
+    // poll that reads the file (measured 13-67 ms, a 50 ms WM_TIMER quantised to
+    // 62 ms).
     //
     // This hook always calls the original. An earlier version returned S_OK to
     // cancel a hide when the user pulled the menu open again; measured, the
     // shell's Start toggle then stayed one close ahead and the Windows key and
-    // the taskbar Start button stopped working until the host restarted. The
-    // cancel belongs on the Start side, where a close is a request that is
-    // simply not written.
+    // the taskbar Start button stopped working until the host restarted. A close
+    // is cancelled on the Start side instead, by not sending its tap.
     if (g_hideDelayEnabled.load(std::memory_order_relaxed) &&
         !g_disabled.load(std::memory_order_relaxed)) {
-        if (GestureCloseStampFresh()) {
-            FileLog(L"hide passed (gesture)");
+        FILETIME stamp{};
+        uint64_t delayMs = 0;
+
+        if (GestureCloseStampFresh(&stamp) && !StampAlreadyHandled(stamp) &&
+            ReadGestureCloseDelayMs(&delayMs)) {
+            delayMs = std::min(delayMs, kGestureHideDelayCapMs);
+            MarkStampHandled(stamp);
+            if (delayMs == 0) {
+                FileLog(L"hide passed (gesture)");
+            } else {
+                // A nonzero value is only for a hand-written stamp; the shipping
+                // Start mod writes 0 because it taps after the retract.
+                FileLog(L"hide delayed (gesture) ms=%llu",
+                        static_cast<unsigned long long>(delayMs));
+                WaitForRetractLead(delayMs);
+            }
         } else if (WriteStartRetractCommand()) {
             FileLog(L"hide delayed reason=%u", reason);
-            WaitForRetractLead();
+            WaitForRetractLead(kHideLeadMs);
+        } else {
+            FileLog(L"hide retract write failed");
         }
     }
 
@@ -1404,7 +1209,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.6.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.7.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();
@@ -1437,34 +1242,13 @@ void Wh_ModAfterInit() {
     g_afterInit = true;
     TryInstallFromLoadedModules(false);
     Wh_ApplyHookOperations();
-    StartHideRequestWorker();
 }
 
 void Wh_ModBeforeUninit() {
-    // Stop hook registration and writes before Windhawk removes the hooks.
-    // Wh_SetFunctionHook must not be called after this function returns.
+    // This must be set before Windhawk removes the hooks. The Hide hook reads it
+    // in its wait loop, so a hide that is being held ends its wait at once.
     g_disabled = true;
     g_startPointTick.store(0, std::memory_order_relaxed);
-
-    // The worker is the only code that can still call into the mod on its own.
-    if (g_hideWorkerStop) {
-        SetEvent(g_hideWorkerStop);
-    }
-    if (g_hideWorker) {
-        WaitForSingleObject(g_hideWorker, 2000);
-        CloseHandle(g_hideWorker);
-        g_hideWorker = nullptr;
-    }
-    if (g_hideWorkerStop) {
-        CloseHandle(g_hideWorkerStop);
-        g_hideWorkerStop = nullptr;
-    }
-
-    // The dispatch window belongs to the shell's UI thread.
-    const HWND hwnd = g_dispatchHwnd.exchange(nullptr);
-    if (hwnd) {
-        PostMessageW(hwnd, WM_CLOSE, 0, 0);
-    }
 
     PublishInactiveOnUnload();
 }

@@ -26,8 +26,8 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 | Mouse drag to dismiss | deliberately not enabled |
 | Reveal (edge swipe to open) following the finger | working, anchored to the panel edge |
 | Windows-key close | animated slide-out, 350 ms hide lead from the explorer-side bridge |
-| Gesture close | retract, then the shell's own `Hide` requested through a file |
-| Reopen during a close | the next edge pull drops the hide request, so the shell never sees the close |
+| Gesture close | retract, then one Windows tap at its end; the bridge skips its keyboard lead for the stamped Hide |
+| Reopen during a close | a new edge pull drops the armed tap, so the shell never sees that close |
 
 ## How the working path works
 
@@ -48,10 +48,11 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    `(1 - Progress) * Direction * Distance`.
 5. On release it commits when the release position passed 20% of the distance or
    the release speed exceeded 0.45 DIP/ms; a commit animates `Progress` to 0 and
-   then writes `hide-now.txt`, which the explorer-side bridge turns into the
-   shell's own `CStartExperienceManager::Hide` — the same call a Windows-key
-   close makes. Every close — dismiss or cancelled reveal — runs the same
-   planner:
+   arms a `VK_LWIN` tap (down 60 ms, up) for the end of that retract. That tap is
+   the shell's own Start toggle: its key handler performs
+   `CStartExperienceManager::Hide`, so the next Windows press opens the menu and
+   no re-arm tap exists. Every close — dismiss or cancelled reveal — runs the
+   same planner:
 
    ```
    flick    = max(0, velocity - 0.45 DIP/ms)
@@ -60,8 +61,9 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 
    One curve for all of them, `cubic-bezier(0.45, 0, 0.55, 1)`. A release below
    the commit threshold is not a flick, so it keeps the plain 260 ms; only a
-   real flick shortens the slide. A cancelled reveal defers its hide request by
-   the computed duration.
+   real flick shortens the slide. At the release the mod writes `gesture=0` to
+   `close-mode.txt`, so the bridge knows the Hide its tap causes needs no retract
+   lead.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.
@@ -77,31 +79,22 @@ run, frames at ~123 ms and ~189 ms after the key-down): the panel's right edge
 moved 0 → 119 → 344 DIP left and was gone by ~260 ms, instead of vanishing on
 the first frame.
 
-A gesture close needs no retract command. Both close paths put their hide
-request on one deferred slot in the Start mod and stamp `close-mode.txt` when the
-retract starts. At the end of the retract the slot writes `1` to
-`hide-now.txt`; the bridge polls that file every 20 ms and calls
-`Hide(manager, 1)` on the shell's UI thread. A hide that arrives inside 800 ms of
-the stamp is the tail of a gesture close whose animation already ran, so the
-bridge does not write a second `retract`.
+A gesture close needs no retract command. Its retract starts at the release and
+its tap comes at the end of it; the bridge sees the fresh `close-mode.txt` stamp
+and calls the shell's `Hide` at once, because the panel is already off screen.
+The tap is what updates the Start toggle, and it is the only tap: there is no
+programmatic `Hide` and no 120 ms re-arm tap, so a press cannot collide with
+one.
 
-`Hide` alone is not the whole close on this build, and that was measured, not
-assumed: the shell keeps its Start toggle in the key handler. After a
-programmatic `Hide` the window is cloaked but the next Windows press still calls
-`Hide` instead of `Show`, so the first press after a gesture close is spent on an
-already hidden menu. The bridge therefore sends one Windows tap 120 ms after the
-hide it performed: in that state the tap's answer is the same `Hide`, so it is
-invisible, and it re-arms the toggle. Measured: with the tap, one Windows press
-one second after a gesture close opens the menu (`win open`); without it, two
-presses are needed. The tap is skipped when the menu was reopened in between.
-
-A close is cancelled by not writing its request. The deferred slot re-reads the
-pull generation before it writes; a pull that started after the close was
-scheduled makes it log `close request dropped kind=dismiss` (or `kind=reveal`),
-the bridge never sees a request, and the pull's own follow keeps driving the
-panel. The earlier design returned `S_OK` from the bridge's `Hide` instead;
-measured, one such abort left the Windows key and the taskbar Start button dead
-until `StartMenuExperienceHost.exe` restarted, so that path is gone.
+A new edge pull during the retract cancels the close on the Start side: the
+armed tap is dropped before it is sent (the stamp becomes `cancelled`), no
+`Hide` runs, the shell's toggle is never touched, and the pull's own follow keeps
+driving the panel. A Win press during the retract is a keyboard close: the fresh
+stamp makes the bridge run that `Hide` at once, and the armed tap is skipped
+because the window is already closed. The earlier design returned `S_OK` from
+the bridge's `Hide` without calling it; measured, one such abort left the
+Windows key and the taskbar Start button dead until
+`StartMenuExperienceHost.exe` restarted, so every path calls the original.
 
 Release detection: the digitizer keeps reporting while the finger rests
 (measured 255 reports in a 1.5 s hold), so an 18 ms window without a report is a
@@ -150,8 +143,8 @@ Instead the mod takes over after the shell opens the window:
   the finger moved away from the edge since the touch began (the release value,
   not the peak), and the menu opens fully when `travel > 20%` of the distance or
   the release speed exceeds 0.45 DIP/ms. Otherwise the mod retracts the panel and
-  requests the shell's `Hide` through `hide-now.txt`, so a short slow pull, or
-  pulling out and pushing back, does not open the menu.
+  taps the Windows key, so a short slow pull, or pulling out and pushing back,
+  does not open the menu; the bridge holds the hide for the retract.
 
 An earlier version anchored progress to the frame in which the menu was first
 seen open and used the root width as the distance; that lagged the finger by
@@ -187,15 +180,14 @@ is closed after the down, so the only in-process source is the digitizer itself.
   logic. **Do not enable it together with the shipping mod**: Raw Input allows one
   sink per usage per process, and inputprobe takes the stream for itself.
 - **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`) — hooks
-  `CStartExperienceManager::Hide` and gives the Start side 350 ms to retract the
-  panel before the window goes away; a hide that follows a gesture close passes
-  at once (`hide passed (gesture)`), because that close already retracted the
-  panel. It also answers the Start mod's `hide-now.txt` request with `Hide` on
-  the shell's UI thread, and re-arms the shell's Windows-key toggle with one
-  invisible tap after that hide. Publishes the taskbar-edge gesture handle/state
-  from `twinui.pcshell.dll` to shared memory, which the shipping mod does not
-  read. **Enable it together with the Start mod**, or a Windows-key close goes
-  back to an instant hide and a gesture close has nothing to perform its hide.
+  `CStartExperienceManager::Hide`. A keyboard close gets the 350 ms retract lead
+  after `retract=1`; a gesture close is tapped only after its retract, and its
+  `gesture=0` stamp makes the Hide run at once (`hide passed (gesture)`). A
+  dropped gesture close stamps `cancelled`, which takes the keyboard path.
+  Publishes the taskbar-edge gesture handle/state from `twinui.pcshell.dll` to
+  shared memory, which the shipping mod does not read. **Enable it together with
+  the Start mod** for the slide-out; without it the menu still closes (the tap is
+  the close), but instantly.
 - **`mods/start-menu-touch-gesture-probe.wh.cpp`** — Phase 0 diagnostic probe.
 - **`mods/start_gesture_shared.h`** — shared-memory contract for the bridge.
 
@@ -239,8 +231,8 @@ to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
 explorer-side bridge writes it 350 ms before it lets `CStartExperienceManager::Hide`
 run, which is what animates a Windows-key close. It applies only to a file
 written in the last second, so the leftover command is not replayed by the next
-Start process. A gesture close never asks for this line: the mod retracts first,
-then writes `hide-now.txt`, and the bridge reads that file's last-write time.
+Start process. A gesture close never asks for `retract`: it retracts, then taps
+the Windows key and stamps `gesture=0` in `close-mode.txt`.
 
 ## Known limits and risks
 
@@ -261,22 +253,27 @@ then writes `hide-now.txt`, and the bridge reads that file's last-write time.
   fingers moving together can confuse which one is tracked.
 - Composition translation does not move XAML hit-testing: while the menu is
   dragged, the content still receives touches at its original position.
-- A gesture close does not go through the shell's keyboard handler, and the
-  shell's Start toggle lives there: the bridge sends one Windows tap 120 ms after
-  its `Hide` to re-arm it. That tap is invisible while the menu is closed, but it
-  is still a global key event; disabling the bridge leaves both the toggle and
-  the hide broken.
+- A gesture close is a real Windows tap at the end of its retract: the shell's key
+  handler performs the hide and updates its Start toggle. A Win press during the
+  retract closes the menu early (the fresh stamp makes the bridge run the Hide at
+  once) and the armed tap is skipped. A press just after that hide lands in the
+  shell's own settle and is ignored; the toggle is not advanced, and the next
+  press opens the menu. A press 50 ms after the menu reports closed opens it and
+  animates the panel in.
 - The bridge delays every `CStartExperienceManager::Hide` that is not a gesture
-  close by up to 350 ms, and the wait runs on explorer's UI thread: a
-  click-away close slides out too, and the taskbar is blocked for those 350 ms.
-  The `reason` argument is logged (`hide delayed reason=...`); the Windows-key
-  close reported 1 on this build.
-- `close-mode.txt` is an 800 ms timestamp window: a Windows-key close that lands
-  inside it hides instantly instead of sliding out, because the bridge cannot
-  tell it from the tail of a gesture close.
-- A gesture close that the user cancels by pulling the menu open again never
-  writes its request, so the panel is already retracted and is driven purely by
-  the follow from then on: it reappears at the mapped position under the finger
+  close by 350 ms, and that wait runs on explorer's UI thread: a click-away close
+  slides out too, and the taskbar is blocked for those 350 ms. The `reason`
+  argument is logged (`hide delayed reason=...`); the Windows-key close reported
+  1 on this build. The gesture path does not wait.
+- `close-mode.txt` is an 800 ms window. A gesture close stamps `gesture=0` at its
+  release; a dropped close stamps `cancelled`, so a keyboard close inside the
+  window still takes the 350 ms lead. A Windows-key close that lands right after
+  a gesture close but before its stamp is replaced is read as a gesture close and
+  hides at once.
+- A gesture close that the user cancels by pulling the menu open again drops its
+  armed tap before the shell is touched, so no `Hide` runs and the toggle is
+  never advanced. The panel is already retracted and is driven purely by the
+  follow from then on: it reappears at the mapped position under the finger
   (0.269 at the screen edge on this layout) instead of already being open.
 - `PrepareRootElement` is hooked through a hardcoded RVA for `StartUI_.dll`
   22621.3733; a different build needs a new RVA or a pattern scan.
