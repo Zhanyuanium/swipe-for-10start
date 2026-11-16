@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.8.0
+// @version         0.8.1
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -155,11 +155,21 @@ What it does:
   `CStartExperienceManager::Hide` by 350 ms and writes `retract=1` to
   `debug.txt`, so the mod retracts `Progress` to 0 in 260 ms while the shell
   waits and the panel slides out instead of vanishing. One line per transition.
+- A new edge pull cancels a hide the bridge is already waiting on. Every
+  candidate start stamps `hide-abort.txt`; the bridge compares its last-write
+  time with the `retract=1` write it made and returns `S_OK` without the hide
+  when the pull is newer. A `retract` that reaches the mod while that pull is
+  still running is ignored and restamps the marker: the measured backlash had
+  the previous cancel's Hide arrive after the next pull took over, so the
+  retract threw the panel out from 0.305 under the finger. A `retract` that is
+  not followed by a pull is ignored when a gesture close or reveal ran in the
+  last 600 ms (`debug retract ignored (gesture recent)`), but the hide then
+  proceeds normally, so a dismiss and a cancelled reveal still close.
 
 What it does not do:
 
 - It does not use the explorer-side bridge's shared memory; the bridge reaches
-  it only through the `retract` debug line.
+  it only through the `retract` line and the `hide-abort.txt` marker.
 - It does not attach XAML pointer handlers and has no DirectManipulation
   hook.
 - It does not remove the shell's open storyboard. Measured with `anim=0`:
@@ -186,10 +196,18 @@ Debug channel (kept in the build):
     Windows-key close into a slide-out. It applies only when the file was
     written within the last second: the file keeps the last command after the
     close, and a fresh Start process must not replay it on attach (that logs
-    `debug retract ignored (stale)`).
+    `debug retract ignored (stale)`). A fresh gesture close or reveal within the
+    last 600 ms logs `debug retract ignored (gesture recent)` instead: that
+    close already animated the panel, and when a reveal is still running the
+    mod also restamps `hide-abort.txt` so the bridge cancels its hide.
   Empty lines and unknown lines are ignored. The channel compares the rendering
   mechanisms without a gesture; it does nothing before the first
   `attached root=...` line.
+- `hide-abort.txt` in the same directory is not a command file. The mod writes
+  `abort=1` to it when an edge candidate starts (and again when a stale
+  `retract` arrives during that pull); the bridge reads only its last-write
+  time and compares it with its own `retract=1` write. `CREATE_ALWAYS`
+  creates and overwrites it, so no other setup is needed.
 
 Diagnostics:
 
@@ -206,7 +224,8 @@ Diagnostics:
   `hid decodefail dev=... err=...`,
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
   `debug e=...`, `debug anim=...`, `debug retract`,
-  `debug retract ignored (stale)`, `startui anim hooked`,
+  `debug retract ignored (stale)`, `debug retract ignored (gesture recent)`,
+  `startui anim hooked`,
   `startui anim hook skipped` and the first four
   `startui anim type=... edge=... trans=... suppress=...` calls go to
   `renderer.log`.
@@ -261,9 +280,17 @@ Known risks:
   much. The panel stays retracted until the tap runs.
 - The Windows-key close animation depends on the explorer-side bridge, which
   delays `CStartExperienceManager::Hide` by 350 ms: the menu window stays
-  visible until the retract ends. A contact that starts inside that lead is
-  treated as a new reveal attempt (the 600 ms suppression window) and can drive
-  a panel the shell is about to hide.
+  visible until the retract ends. A new edge pull inside that lead stamps
+  `hide-abort.txt` and the bridge cancels the hide, so the shell keeps its
+  close decision while the window stays up. The shell's Start toggle is one
+  step behind after such an abort: the next Windows tap only re-shows the
+  already visible window and the one after closes it. The pull's EP edge
+  gesture does not re-issue `Show` when the window never cloaked. Restarting
+  `StartMenuExperienceHost.exe` resets the pair.
+- A `retract` inside the 600 ms gesture window is ignored even when it belongs
+  to a genuine Windows-key close that followed a gesture open; that close then
+  hides without the slide-out. The window is what keeps a double retract away
+  from a panel the gesture already moved.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -291,7 +318,9 @@ Known risks:
  *   installed in Setup; on
  *   VisualTreeHelper and TransformToVisual
  *   from Windows.UI.Xaml.Media to map the panel trail; on `debug.txt` in the
- *   mod storage directory, read by the debug channel.
+ *   mod storage directory, read by the debug channel; on the fixed
+ *   `hide-abort.txt` path in the same directory, written as the bridge's hide
+ *   cancel marker.
  * [OUTPUT]: one message-only window and one worker thread per process; the
  *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
  *   published for the reveal follow; one global Windows-key tap per committed
@@ -307,7 +336,11 @@ Known risks:
  *   while a contact is down and one 5 ms high-resolution idle tick that detects
  *   the release; a 600 ms window after either tap in which a
  *   closed-to-open report does not restore `Progress` and an edge contact starts
- *   a new reveal rather than a drag of the retracting panel; an optional
+ *   a new reveal rather than a drag of the retracting panel; one
+ *   `abort=1` stamp in `hide-abort.txt` per edge candidate (and one more when a
+ *   stale bridge retract arrives while that pull runs) so the bridge cancels
+ *   the hide it is waiting on, plus a `debug retract ignored (gesture recent)`
+ *   line and no retract for a bridge command inside the same 600 ms; an optional
  *   suppressed open animation request
  *   (type 0, off by default because dropping it leaves the pane undrawn) while
  *   the close request (type 1) always passes through; five file-driven debug
@@ -319,8 +352,10 @@ Known risks:
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
  *   takes the menu's own open over from the taskbar edge and pins the panel's
  *   trailing edge to the finger) and carries the switch that can drop the
- *   shell's open storyboard for experiments. The composition helpers below it
- *   are shared with the root hook above it.
+ *   shell's open storyboard for experiments. It also owns the Start side of the
+ *   cancellable bridge hide: a new pull marks the hide for cancellation, and a
+ *   retract that belongs to a close the gesture already animated is dropped.
+ *   The composition helpers below it are shared with the root hook above it.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -773,6 +808,24 @@ std::atomic<uint32_t> g_dismissSerial{0};
 // on the input thread while the dismiss tap runs in a compositor callback, so
 // the deadline is atomic. 0 means no close of this mod is pending.
 std::atomic<uint64_t> g_suppressRestoreUntil{0};
+
+// When the last gesture started or ended its close, on the GetTickCount64
+// clock. The explorer-side bridge writes `retract=1` 350 ms before it lets a
+// hide run; a retract that arrives inside this window belongs to a close one of
+// our gestures already animated, and applying it would retract the panel a
+// second time from wherever a new pull has taken it.
+std::atomic<uint64_t> g_lastGestureTick{0};
+
+// A reveal candidate or follow owns a contact right now. The debug `retract`
+// reads it to tell a stale bridge retract (the next pull is already running)
+// from the tail of a close (no pull is running, the hide must proceed).
+std::atomic<bool> g_revealInProgress{false};
+
+// How recent a gesture has to be for the debug channel to treat a bridge
+// retract as the tail of that gesture's close. The bridge's whole lead is
+// 350 ms, so 600 ms covers the hide it triggers with one poll to spare.
+constexpr uint64_t kGestureRetractSuppressMs = 600;
+
 std::atomic<HWND> g_coreHwnd{nullptr};
 // Resolved in Wh_ModInit. A runtime resolve keeps the mod loadable without
 // dwmapi.dll in the import table.
@@ -1195,6 +1248,14 @@ bool BeginDismissSettle(float from, float velocity) {
 constexpr wchar_t kDebugFileName[] = L"debug.txt";
 constexpr DWORD kDebugFileMaxBytes = 4096;
 
+// The explorer-side bridge's hide is cancellable. Every new edge pull stamps
+// this file; the bridge compares its last-write time with the `retract=1` write
+// it made and cancels the hide when the pull is newer. The content is only a
+// marker, never parsed. `CreateFileW(CREATE_ALWAYS)` also creates the file the
+// first time, so the bridge never needs a bootstrapping write.
+constexpr wchar_t kHideAbortFileName[] = L"hide-abort.txt";
+constexpr char kHideAbortCommand[] = "abort=1\r\n";
+
 // `retract` is a live signal from the explorer-side bridge, not a state: the
 // bridge writes it right before it delays the hide. The file keeps the last
 // command after the close, so a fresh Start process would otherwise replay it
@@ -1218,6 +1279,40 @@ bool DebugFilePath(WCHAR* path, size_t count) {
     }
 
     return swprintf_s(path, count, L"%s\\%s", storage, kDebugFileName) > 0;
+}
+
+bool HideAbortFilePath(WCHAR* path, size_t count) {
+    WCHAR storage[MAX_PATH] = {};
+    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
+        return false;
+    }
+
+    return swprintf_s(path, count, L"%s\\%s", storage, kHideAbortFileName) > 0;
+}
+
+// Stamps the bridge's cancel marker. Called on the input thread when an edge
+// pull starts and again when a stale retract arrives while that pull runs; the
+// bridge only reads the file's last-write time, so the write has to finish
+// before the bridge's next 10 ms poll. CloseHandle flushes the cached
+// timestamp, which is what GetFileAttributesExW reports.
+bool WriteHideAbort() {
+    WCHAR path[MAX_PATH] = {};
+    if (!HideAbortFilePath(path, ARRAYSIZE(path))) {
+        return false;
+    }
+
+    HANDLE file = CreateFileW(path, GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD written = 0;
+    const DWORD length = sizeof(kHideAbortCommand) - 1;
+    const BOOL ok = WriteFile(file, kHideAbortCommand, length, &written, nullptr);
+    CloseHandle(file);
+    return ok && written == length;
 }
 
 // Parses "v[,v...]" up to maxCount values. A missing, partial or trailing
@@ -1354,6 +1449,28 @@ void ApplyDebugLine(const char* line, bool fresh) {
             FileLog(L"debug retract ignored (stale)");
             return;
         }
+
+        // A gesture that just ran already moved the panel. The bridge's 350 ms
+        // lead plus the deferred Windows tap of a cancelled reveal make this
+        // retract arrive after the next pull started; applying it retracted the
+        // panel from under the finger (measured: from=0.305 while the finger was
+        // pulling out). If a reveal is running right now, re-stamp the abort
+        // marker so the bridge cancels the hide it is waiting on: the marker
+        // must be newer than the `retract=1` write the bridge compares against.
+        // A dismiss close also lands here, but no pull is running then, so the
+        // hide still proceeds.
+        const uint64_t now = GetTickCount64();
+        const uint64_t lastGesture =
+            g_lastGestureTick.load(std::memory_order_relaxed);
+        if (lastGesture != 0 && now >= lastGesture &&
+            now - lastGesture <= kGestureRetractSuppressMs) {
+            if (g_revealInProgress.load(std::memory_order_relaxed)) {
+                WriteHideAbort();
+            }
+            FileLog(L"debug retract ignored (gesture recent)");
+            return;
+        }
+
         const float from =
             std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
                        1.0f);
@@ -2156,6 +2273,14 @@ bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
     g_reveal.lastTick = tickMs;
     g_reveal.lastSampleQpc = QpcMsNow();
     BeginContactTiming();
+
+    // The new pull owns the panel from this report on. Tell the bridge that a
+    // hide it is about to run (the late Hide of the previous close) must not
+    // take the window away under the finger, and remember the gesture so the
+    // debug channel can reject the retract that belongs to that close.
+    g_lastGestureTick.store(tickMs, std::memory_order_relaxed);
+    g_revealInProgress.store(true, std::memory_order_relaxed);
+    WriteHideAbort();
     return true;
 }
 
@@ -2178,6 +2303,7 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
             // A new root is being installed under the contact, so this contact
             // no longer has a renderer to drive.
             reveal.edgeCandidate = false;
+            g_revealInProgress.store(false, std::memory_order_relaxed);
             EndContactTiming();
             return;
         }
@@ -2188,6 +2314,17 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
         reveal.progress = 0.0f;
         reveal.lastInserted = 1.0f;  // the menu is fully in right now
         reveal.samples = 0;
+        g_lastGestureTick.store(tickMs, std::memory_order_relaxed);
+
+        // Diagnostic: what Progress the takeover replaces, so a reopen backlash
+        // can be traced to a value left behind or to an animation still running.
+        {
+            float current = -1.0f;
+            if (g_state) {
+                g_state.TryGetScalar(L"Progress", current);
+            }
+            FileLog(L"reveal takeover from=%.3f", current);
+        }
 
         // The takeover inserts the mapped progress (0.269 at the screen edge on
         // this layout) after the menu was at 1, so the first step of the follow
@@ -2265,6 +2402,8 @@ void ReleaseRevealSession() {
     }
 
     reveal.edgeCandidate = false;
+    g_revealInProgress.store(false, std::memory_order_relaxed);
+    g_lastGestureTick.store(GetTickCount64(), std::memory_order_relaxed);
     if (!reveal.active) {
         EndContactTiming();
         return;
@@ -2438,6 +2577,11 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
     if (commit) {
         if (BeginDismissSettle(from, velocity)) {
             g_commitNeedsProgressReset = true;
+            // This gesture is the one that closed the menu; the retract the
+            // bridge writes 350 ms before its own hide is the same animation
+            // and must not replay.
+            g_lastGestureTick.store(GetTickCount64(),
+                                    std::memory_order_relaxed);
         } else {
             ShowAtRest();
         }
@@ -3099,6 +3243,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
 
     g_hidSession = HidGestureSession{};
     g_reveal = HidRevealSession{};
+    g_revealInProgress.store(false, std::memory_order_relaxed);
     // A contact that is still down when the mod unloads must not leave its 1 ms
     // timer request behind.
     EndContactTiming();
@@ -3985,7 +4130,7 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.8.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.8.1 initializing");
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.

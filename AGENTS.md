@@ -15,8 +15,9 @@ Two mods ship together. `mods/start-menu-legacy-swipe.wh.cpp` runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
 every XAML/DirectManipulation source on this UI is empty (see README).
 `mods/start-menu-touch-gesture-bridge.wh.cpp` runs in `explorer.exe` and delays
-`CStartExperienceManager::Hide` by 350 ms so the Start side can retract the
-panel; it asks for that retract through the Start mod's `retract` debug line.
+`CStartExperienceManager::Hide` by up to 350 ms so the Start side can retract
+the panel; it asks for that retract through the Start mod's `retract` debug
+line, and a new edge pull cancels the delayed hide through `hide-abort.txt`.
 Everything else in `mods/` is diagnosis.
 
 Laws: measure before designing · one data source per claim · docs and code move together

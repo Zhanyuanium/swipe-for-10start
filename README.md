@@ -25,7 +25,8 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 | Taskbar on top / right / bottom | axis logic present, only left verified |
 | Mouse drag to dismiss | deliberately not enabled |
 | Reveal (edge swipe to open) following the finger | working, anchored to the panel edge |
-| Windows-key close | animated slide-out, 350 ms hide lead from the explorer-side bridge |
+| Windows-key close | animated slide-out, cancellable 350 ms hide lead from the explorer-side bridge |
+| Reopen during a close | the next edge pull cancels the delayed hide instead of being thrown out |
 
 ## How the working path works
 
@@ -73,6 +74,15 @@ shared 260 ms curve while the shell waits. Measured with the menu open (one
 run, frames at ~123 ms and ~189 ms after the key-down): the panel's right edge
 moved 0 → 119 → 344 DIP left and was gone by ~260 ms, instead of vanishing on
 the first frame.
+
+The delay is cancellable. A new edge pull stamps `hide-abort.txt`, and the
+bridge polls that file every 10 ms; a stamp newer than the `retract=1` write
+makes the hook log `hide aborted` and return `S_OK` without hiding the window.
+The Start side also drops a `retract` that arrives while the new pull is
+running (it restamps the marker) or within 600 ms of a gesture close, so the
+late Hide of a cancelled reveal cannot retract the panel from under the finger
+(measured backlash: `debug retract from=0.305` while the next pull was already
+at `reveal takeover from=0.000`).
 
 Release detection: the digitizer keeps reporting while the finger rests
 (measured 255 reports in a 1.5 s hold), so an 18 ms window without a report is a
@@ -159,10 +169,11 @@ is closed after the down, so the only in-process source is the digitizer itself.
   sink per usage per process, and inputprobe takes the stream for itself.
 - **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`) — hooks
   `CStartExperienceManager::Hide` and gives the Start side 350 ms to retract the
-  panel before the window goes away; publishes the taskbar-edge gesture
-  handle/state from `twinui.pcshell.dll` to shared memory, which the shipping mod
-  does not read. **Enable it together with the Start mod**, or a Windows-key
-  close goes back to an instant hide.
+  panel before the window goes away; the wait is cancelled (`hide aborted`) when
+  the Start mod stamped a newer `hide-abort.txt`. Publishes the taskbar-edge
+  gesture handle/state from `twinui.pcshell.dll` to shared memory, which the
+  shipping mod does not read. **Enable it together with the Start mod**, or a
+  Windows-key close goes back to an instant hide.
 - **`mods/start-menu-touch-gesture-probe.wh.cpp`** — Phase 0 diagnostic probe.
 - **`mods/start_gesture_shared.h`** — shared-memory contract for the bridge.
 
@@ -206,7 +217,10 @@ to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
 explorer-side bridge writes it 350 ms before it lets `CStartExperienceManager::Hide`
 run, which is what animates a Windows-key close. It applies only to a file
 written in the last second, so the leftover command is not replayed by the next
-Start process.
+Start process. A `retract` inside 600 ms of a gesture close is ignored (`debug
+retract ignored (gesture recent)`) because that close already animated the
+panel; when a new reveal is running, the mod also stamps `hide-abort.txt` so the
+bridge cancels the hide. The bridge reads only that file's last-write time.
 
 ## Known limits and risks
 
@@ -229,14 +243,21 @@ Start process.
   dragged, the content still receives touches at its original position.
 - A commit taps `VK_LWIN`. If the shell is mid-transition that tap can bounce and
   reopen the menu.
-- The bridge delays every `CStartExperienceManager::Hide` by 350 ms, not only
-  the Windows-key one, and the sleep runs on explorer's UI thread: a click-away
-  close slides out too, and the taskbar is blocked for those 350 ms. The
-  `reason` argument is logged (`hide delayed reason=...`); the Windows-key close
-  reported 1 on this build.
-- A contact that starts inside the 350 ms lead sees a window the shell has not
-  hidden yet. The 600 ms suppression window treats it as a new reveal attempt,
-  and the follow then drives a panel the shell is about to hide.
+- The bridge delays every `CStartExperienceManager::Hide` by up to 350 ms, not
+  only the Windows-key one, and the polled wait runs on explorer's UI thread: a
+  click-away close slides out too, and the taskbar is blocked for those 350 ms.
+  The `reason` argument is logged (`hide delayed reason=...`); the Windows-key
+  close reported 1 on this build.
+- The abort is a lie to the shell: `Hide` returns `S_OK` without hiding. The
+  window stays up and the follow keeps driving it, but the shell's Start toggle
+  is one step behind until the pair is reset. In the measured backlash the next
+  Windows tap only re-showed the already visible window and the one after
+  closed it; EP's edge gesture did not re-issue `Show` because the window never
+  cloaked. Restarting `StartMenuExperienceHost.exe` resets the pair.
+- A `retract` inside the 600 ms after a gesture close is ignored even when it is
+  a genuine Windows-key close that followed a gesture open: that close hides
+  without the slide-out. The rule exists to keep a second retract away from a
+  panel the gesture already moved.
 - `PrepareRootElement` is hooked through a hardcoded RVA for `StartUI_.dll`
   22621.3733; a different build needs a new RVA or a pattern scan.
 - The digitizer mapping assumes the touch panel covers the primary monitor.
