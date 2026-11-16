@@ -1,0 +1,22 @@
+# Windhawk / MSVC build outputs
+*.dll
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.idb
+*.res
+compile_flags.txt
+
+# Local test logs and captures
+*.log
+*.etl
+*.csv.tmp
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+desktop.ini
+Thumbs.db
