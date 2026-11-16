@@ -2618,26 +2618,49 @@ void UpdateDismissAxis() {
     }
 
     const RECT& work = info.rcWork;
+    const RECT& monitorRect = info.rcMonitor;
+
+    // The Start window is full-screen, so its own rect cannot say which side
+    // the taskbar is on: it touches every monitor edge and the first comparison
+    // would always pick Left. The work area is the reliable signal, because the
+    // taskbar is what shrinks it.
     DismissAxis axis = DismissAxis::Left;
-    if (windowRect.left <= work.left + 4) {
-        axis = DismissAxis::Left;
-    } else if (windowRect.top <= work.top + 4) {
-        axis = DismissAxis::Top;
-    } else if (windowRect.right >= work.right - 4) {
-        axis = DismissAxis::Right;
-    } else if (windowRect.bottom >= work.bottom - 4) {
-        axis = DismissAxis::Bottom;
+    const long insetLeft = work.left - monitorRect.left;
+    const long insetTop = work.top - monitorRect.top;
+    const long insetRight = monitorRect.right - work.right;
+    const long insetBottom = monitorRect.bottom - work.bottom;
+    const long largest = std::max(std::max(insetLeft, insetTop),
+                                  std::max(insetRight, insetBottom));
+    if (largest > 4) {
+        if (largest == insetLeft) {
+            axis = DismissAxis::Left;
+        } else if (largest == insetTop) {
+            axis = DismissAxis::Top;
+        } else if (largest == insetRight) {
+            axis = DismissAxis::Right;
+        } else {
+            axis = DismissAxis::Bottom;
+        }
+    } else if (windowRect.left <= work.left + 4) {
+        // No inset: the taskbar is auto-hidden or on another monitor. Fall back
+        // to the old window-rect heuristic.
+        if (windowRect.top <= work.top + 4) {
+            axis = DismissAxis::Top;
+        }
     }
 
     g_dismissAxis = static_cast<int32_t>(axis);
     FileLog(L"dismiss axis=%d (0=left,1=top,2=right,3=bottom) "
-            L"win=%d,%d,%d,%d work=%d,%d,%d,%d",
+            L"win=%d,%d,%d,%d work=%d,%d,%d,%d mon=%d,%d,%d,%d",
             g_dismissAxis, static_cast<int>(windowRect.left),
             static_cast<int>(windowRect.top),
             static_cast<int>(windowRect.right),
             static_cast<int>(windowRect.bottom), static_cast<int>(work.left),
             static_cast<int>(work.top), static_cast<int>(work.right),
-            static_cast<int>(work.bottom));
+            static_cast<int>(work.bottom), static_cast<int>(monitorRect.left),
+            static_cast<int>(monitorRect.top),
+            static_cast<int>(monitorRect.right),
+            static_cast<int>(monitorRect.bottom));
 
     PublishGestureGeometry();
 }
