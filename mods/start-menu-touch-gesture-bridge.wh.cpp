@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.3.0
+// @version         0.4.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -23,12 +23,14 @@ edge, the start point and the gesture state to shared memory:
 - mapping: `Local\WindhawkStartGestureShared` (`StartGestureShared`)
 - event:   `Local\WindhawkStartGestureEvent` (auto-reset, signalled on write)
 
-The StartMenuExperienceHost-side mod reads the mapping and binds a Composition
-animation with `InputAnimationTarget::GetInputAnimationObject`.
+A StartMenuExperienceHost-side consumer could read the mapping and bind a
+Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
+shipping Start mod does not read it. Its live coupling is the `retract` debug
+line described below.
 
-Every hooked function is forwarded unchanged, so the shell behavior is not
-modified. The mod creates no threads and makes no COM or process-enumeration
-calls.
+Every hooked function is forwarded unchanged except for one deliberate delay:
+`Hide` waits 350 ms so the Start side can retract the panel first (see below).
+The mod creates no threads and makes no COM or process-enumeration calls.
 
 Notes:
 - Windhawk compiles the mod from stdin, so the repository `mods` folder is
@@ -49,8 +51,40 @@ Notes:
   write as the edge and the handle. There is no per-frame position sampling.
 - Each gesture state transition appends one line to `bridge.log` in the mod
   storage folder: `state=... edge=... src=... prov=... <reason>`.
+- A Windows-key close is animated together with the Start side. `Hide` is
+  delayed by 350 ms, and before the delay the mod writes `retract=1` to the
+  Start mod's `debug.txt`; that mod retracts its composition `Progress` to 0 in
+  260 ms, so the panel slides out instead of vanishing. One `hide delayed`
+  line per delayed hide. The delay runs only after the `Hide` hook was
+  installed, and it never exceeds 350 ms. When the write fails, the hide runs
+  immediately: a delay without a retract would only slow the close down.
+- `Hide` is `HRESULT (void* this, uint32_t reason)` on
+  twinui.pcshell.dll 26100.9949. The prologue reads `rcx` (this) and `edx`
+  (reason), compares `edx` with 7 and returns 0 on success or the negative
+  HRESULT of the failing inner call. It never reads `r8` or `r9`.
 */
 // ==/WindhawkModReadme==
+
+/*
+ * [INPUT]: depends on twinui.pcshell.dll 10.0.26100.9949 in explorer.exe for
+ *   TouchEdgeGestureProcessor::InputGestureOperationStarted/Ended,
+ *   EdgeAnimationRelationshipManager::ReportEdgeGesture,
+ *   CStartExperienceManager::SetAnimationData/Show/Hide; on version.dll for the
+ *   build gate; on LoadLibraryExW from kernelbase.dll for the late module load;
+ *   on the shared-memory contract in start_gesture_shared.h.
+ * [OUTPUT]: the `Local\WindhawkStartGestureShared` mapping and its auto-reset
+ *   event, holding the edge, the gesture handle and the state under a seqlock;
+ *   a `bridge.log` line per state transition; and one `retract=1` line in the
+ *   Start mod's `debug.txt` followed by a 350 ms delay in
+ *   CStartExperienceManager::Hide, so a Windows-key close slides the panel out
+ *   before the window is hidden. No exported symbols.
+ * [POS]: explorer-side half of the legacy Start gesture work. It is the only
+ *   code that observes the shell's own hide decision; it changes one shell
+ *   behaviour (the hide is 350 ms late) and otherwise forwards every hooked
+ *   call unchanged. The shipping Start mod does not read the shared memory; the
+ *   debug line is the only coupling that is live today.
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
 
 #include <windows.h>
 #include <winver.h>
@@ -79,6 +113,21 @@ constexpr wchar_t kTwinuiModuleName[] = L"twinui.pcshell.dll";
 // The build the RVAs above were derived from.
 constexpr unsigned kTwinuiVersion[4] = {10, 0, 26100, 9949};
 
+// The Windows-key close is animated from the Start side. Hide is where the
+// shell takes the Start window away; the panel needs that long to retract, so
+// the hide waits for it. 350 ms covers the Start mod's 260 ms retract plus two
+// 50 ms poll ticks. The value is also the hard ceiling: Hide never blocks
+// longer than this.
+constexpr DWORD kHideLeadMs = 350;
+
+// The Start mod's debug channel. The bridge runs in explorer, so
+// Wh_GetModStoragePath would resolve to its own storage directory: the Start
+// mod's path is fixed by its id.
+constexpr wchar_t kStartDebugFilePath[] =
+    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
+    L"local@start-menu-legacy-swipe\\debug.txt";
+constexpr char kRetractCommand[] = "retract=1\r\n";
+
 struct Point {
     float x;
     float y;
@@ -99,6 +148,9 @@ static_assert(sizeof(GestureAnimationData) == 16,
 std::atomic<bool> g_explorerHooked{false};
 std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_disabled{false};
+// Set only after Wh_SetFunctionHook accepted the Hide hook, so a hide is never
+// delayed on a build where the hook was refused.
+std::atomic<bool> g_hideDelayEnabled{false};
 
 enum : int {
     kSharedNotStarted = 0,
@@ -754,7 +806,32 @@ HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
 using Hide_t = HRESULT (*)(void*, uint32_t);
 Hide_t Hide_Original = nullptr;
 
-HRESULT Hide_Hook(void* self, uint32_t a) {
+// Writes the one command line the Start mod polls for. The write is what makes
+// the delay meaningful: when it fails, the panel will not retract and the hide
+// runs at once instead of being 350 ms late for nothing.
+bool WriteStartRetractCommand() {
+    HANDLE file = CreateFileW(kStartDebugFilePath, GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD written = 0;
+    const DWORD length = sizeof(kRetractCommand) - 1;
+    const BOOL ok = WriteFile(file, kRetractCommand, length, &written, nullptr);
+    CloseHandle(file);
+    return ok && written == length;
+}
+
+// CStartExperienceManager::Hide(void* self, uint32_t reason) -> HRESULT
+// twinui.pcshell.dll 26100.9949, RVA 0x3C5960, vtable slot after Show.
+//
+// The prologue stores rcx (this) and edx (reason), zeroes dil and compares
+// `edx` with 7; r8 and r9 are written before they are read, so the function
+// takes two arguments. Both return paths set eax: 0 on success, the negative
+// HRESULT of a failing inner call otherwise, so the return type is HRESULT.
+HRESULT Hide_Hook(void* self, uint32_t reason) {
     const SharedUpdate update = UpdateShared([](StartGestureShared* shared) {
         shared->state = static_cast<uint32_t>(StartGestureState::None);
         // Drop the handle together with the Start window, so a later
@@ -771,7 +848,19 @@ HRESULT Hide_Hook(void* self, uint32_t a) {
     LogStateChange(update, L"Hide");
     g_startPointTick.store(0, std::memory_order_relaxed);
 
-    return Hide_Original ? Hide_Original(self, a) : S_OK;
+    // The Windows-key close is decided here, while the Start panel is still on
+    // screen. The Start side owns the visual, so it retracts first: the debug
+    // line starts its 260 ms slide and the sleep covers the poll that reads the
+    // file (measured 13-67 ms, a 50 ms WM_TIMER quantised to 62 ms) with room
+    // for the whole animation.
+    if (g_hideDelayEnabled.load(std::memory_order_relaxed) &&
+        !g_disabled.load(std::memory_order_relaxed) &&
+        WriteStartRetractCommand()) {
+        FileLog(L"hide delayed reason=%u", reason);
+        Sleep(kHideLeadMs);
+    }
+
+    return Hide_Original ? Hide_Original(self, reason) : S_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -841,9 +930,11 @@ void InstallExplorerHooks(HMODULE module) {
                 reinterpret_cast<void**>(&Show_Original),
                 L"CStartExperienceManager::Show");
 
-    InstallHook(at(kHideVa), reinterpret_cast<void*>(Hide_Hook),
-                reinterpret_cast<void**>(&Hide_Original),
-                L"CStartExperienceManager::Hide");
+    if (InstallHook(at(kHideVa), reinterpret_cast<void*>(Hide_Hook),
+                    reinterpret_cast<void**>(&Hide_Original),
+                    L"CStartExperienceManager::Hide")) {
+        g_hideDelayEnabled.store(true, std::memory_order_relaxed);
+    }
 }
 
 void TryInstallFromLoadedModules(bool apply) {
@@ -890,7 +981,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.3.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.4.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();

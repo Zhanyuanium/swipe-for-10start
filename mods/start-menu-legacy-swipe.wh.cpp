@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.6.6
+// @version         0.7.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -78,6 +78,14 @@ What it does:
   the 117 ms floor. The committed dismiss and the cancelled reveal call the same
   planner and the same animation helper. One line per close records it:
   `retract vel=... dur=...`.
+- A session ends when no report arrives for 18 ms (`kIdleReleaseMs`); the idle
+  tick runs every 5 ms, so the release is noticed about 18-23 ms after the
+  last report. The tick is a waitable timer created with
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`: measured on this build, WM_TIMER
+  stays on the 15.6 ms default tick even while the mod holds a 1 ms
+  `timeBeginPeriod(1)` request (resolved at runtime from `winmm.dll` and paired
+  with `timeEndPeriod` for the time a contact is down). Without the waitable
+  timer the release measured `relms=31`; the 1 ms request alone left it at 32.
 - A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
   the legacy menu ignores an injected `VK_ESCAPE`. A lone `VK_LWIN` tap (down,
   60 ms, up) closes it, because the shell acts on the key itself.
@@ -85,7 +93,7 @@ What it does:
   The menu reuses one XAML root, so a commit sets a flag that makes the next
   down stop the animation and restore `Progress = 1` before the drag starts.
 - Two or more contacts cancel the gesture and are ignored until the panel is
-  released. A lift report is not required: a session with no sample for 120 ms
+  released. A lift report is not required: a session with no sample for 18 ms
   ends on its own.
 - Reveal follow: a contact that starts within 12 DIP of the taskbar edge while
   the menu is closed is a candidate. EP opens the menu by itself once the
@@ -128,15 +136,19 @@ What it does:
   or tray open) is animated by the mod: `Progress` is set to 0 and eases to 1
   over 260 ms on `cubic-bezier(0.45, 0, 0.55, 1)`, so a keyboard open slides the
   same way a gesture open does. `PollRootVisibility` polls the cloaked attribute
-  at the 20 ms input timer tick and sees the transition; a live edge candidate
-  and the 600 ms suppression window both suppress the animation.
-  A close the shell performs by itself, such as the Windows key, is not fought:
-  the mod only logs `win close observed`, leaves `Progress` where the close left
-  it, and lets the next open animate from 0. One line per transition.
+  at most once per 20 ms on the 5 ms idle tick and sees the transition; a live
+  edge candidate and the 600 ms suppression window both suppress the animation.
+  A close the shell performs by itself logs `win close observed`, leaves
+  `Progress` where the close left it, and lets the next open animate from 0.
+  The Windows-key close is animated now: the explorer-side bridge delays
+  `CStartExperienceManager::Hide` by 350 ms and writes `retract=1` to
+  `debug.txt`, so the mod retracts `Progress` to 0 in 260 ms while the shell
+  waits and the panel slides out instead of vanishing. One line per transition.
 
 What it does not do:
 
-- It does not use the explorer-side bridge or shared memory.
+- It does not use the explorer-side bridge's shared memory; the bridge reaches
+  it only through the `retract` debug line.
 - It does not attach XAML pointer handlers and has no DirectManipulation
   hook.
 - It does not remove the shell's open storyboard. Measured with `anim=0`:
@@ -155,6 +167,15 @@ Debug channel (kept in the build):
   - `e=-300,0` sets `Properties["Offset"]` and `Visual.Offset` on the visual.
   - `anim=0` suppresses the shell's open storyboard; `anim=1` restores it. The
     default is `anim=1`, because suppression leaves the pane undrawn.
+  - `retract` plays the committed-dismiss retract from the current `Progress`:
+    `AnimateProgressTo(current, 0, PlanRetract(0))`, 260 ms, and logs
+    `debug retract`. The next open restores the scalar, so the command leaves
+    the reuse flag clear. The explorer-side bridge writes this line 350 ms
+    before `CStartExperienceManager::Hide` runs, which is what turns a
+    Windows-key close into a slide-out. It applies only when the file was
+    written within the last second: the file keeps the last command after the
+    close, and a fresh Start process must not replay it on attach (that logs
+    `debug retract ignored (stale)`).
   Empty lines and unknown lines are ignored. The channel compares the rendering
   mechanisms without a gesture; it does nothing before the first
   `attached root=...` line.
@@ -163,7 +184,8 @@ Diagnostics:
 
 - `mod init`, `hid init`, `hid reg usage=... ok=... err=...`,
   `hid down x=... y=... axis=... dist=...`,
-  `hid release delta=... perp=... vel=... commit=... n=...`,
+  `hid release src=idle|report|abort delta=... perp=... vel=... commit=...
+  n=... relms=...`,
   `hid dismiss win sent`,
   `retract vel=... dur=...`,
   `win open`, `win close observed`,
@@ -172,7 +194,8 @@ Diagnostics:
   `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`),
   `hid decodefail dev=... err=...`,
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
-  `debug e=...`, `debug anim=...`, `startui anim hooked`,
+  `debug e=...`, `debug anim=...`, `debug retract`,
+  `debug retract ignored (stale)`, `startui anim hooked`,
   `startui anim hook skipped` and the first four
   `startui anim type=... edge=... trans=... suppress=...` calls go to
   `renderer.log`.
@@ -218,9 +241,14 @@ Known risks:
   reopen without an edge contact, such as the Windows key, lands inside the
   600 ms after a close, that open is not animated; `Progress` stays 0 and the
   panel is invisible until the next open, which slides it back in.
-- The deferred cancel tap waits on `WM_TIMER`, which is low priority: a report
-  flood on the same thread delays the tap by that much. The panel stays
-  retracted until the tap runs.
+- The deferred cancel tap runs on the input thread's 5 ms idle tick, behind
+  the report queue: a report flood on the same thread delays the tap by that
+  much. The panel stays retracted until the tap runs.
+- The Windows-key close animation depends on the explorer-side bridge, which
+  delays `CStartExperienceManager::Hide` by 350 ms: the menu window stays
+  visible until the retract ends. A contact that starts inside that lead is
+  treated as a new reveal attempt (the 600 ms suppression window) and can drive
+  a panel the shell is about to hide.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -238,6 +266,10 @@ Known risks:
  *   GetDpiForWindow, GetSystemMetrics, GetWindowRect, MonitorFromWindow,
  *   GetMonitorInfoW and keybd_event from
  *   user32; on DwmGetWindowAttribute, resolved at init from dwmapi.dll; on
+ *   timeBeginPeriod and timeEndPeriod, resolved at init from winmm.dll so the
+ *   process holds a 1 ms period while a contact is down; on the
+ *   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION waitable timer that drives the 5 ms
+ *   idle tick (WM_TIMER stays on the 15.6 ms tick on this build); on
  *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps and
  *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet, the
  *   expression and the one cached cubic-bezier easing (0.45, 0, 0.55, 1)
@@ -254,14 +286,17 @@ Known risks:
  *   floor); a
  *   0-to-1 progress slide over 260 ms for a closed-to-open transition no reveal
  *   owns, plus a `win close observed` line when the shell hides the window by
- *   itself; a 600 ms window after either tap in which a
+ *   itself; a 1 ms timer period (timeBeginPeriod/timeEndPeriod) held exactly
+ *   while a contact is down and one 5 ms high-resolution idle tick that detects
+ *   the release; a 600 ms window after either tap in which a
  *   closed-to-open report does not restore `Progress` and an edge contact starts
  *   a new reveal rather than a drag of the retracting panel; an optional
  *   suppressed open animation request
  *   (type 0, off by default because dropping it leaves the pane undrawn) while
- *   the close request (type 1) always passes through; four file-driven debug
- *   commands (`p`, `t`, `e`, `anim`) that apply a Progress value, the XAML
- *   translation, the visual offset or the animation mode; no exported symbols.
+ *   the close request (type 1) always passes through; five file-driven debug
+ *   commands (`p`, `t`, `e`, `anim`, `retract`) that apply a Progress value, the
+ *   XAML translation, the visual offset, the animation mode or the retract
+ *   animation the explorer-side bridge asks for; no exported symbols.
  * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
  *   pointer and DirectManipulation paths with raw HID decoding, owns two
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
@@ -412,9 +447,9 @@ constexpr std::chrono::milliseconds kDismissCancelDuration{120};
 constexpr std::chrono::milliseconds kRevealCommitDuration{220};
 
 // A cancelled reveal taps the Windows key only after the panel has retracted
-// out of the screen edge: the planned retract duration plus 30 ms, about two
-// 20 ms input timer ticks. A tap inside the animation froze the panel
-// mid-retract and hid the window at that position.
+// out of the screen edge: the planned retract duration plus 30 ms, about six
+// 5 ms idle ticks. A tap inside the animation froze the panel mid-retract and
+// hid the window at that position.
 constexpr uint64_t kRevealCancelWinTapMarginMs = 30;
 
 // A Windows tap this mod sent closes the menu a moment later. Until then the
@@ -451,9 +486,14 @@ constexpr float kWindowMarginDip = 4.0f;
 // mapped progress: the screen edge already maps to Progress 0.269 here, so any
 // progress threshold commits every release.
 constexpr float kEdgeBandDip = 12.0f;
-constexpr uint64_t kIdleReleaseMs = 35;
+// The panel reports at ~170 Hz (about 6 ms apart) and keeps reporting while the
+// finger rests, so a short silence really is a lift. 18 ms is above the 15.6 ms
+// quantum that an injected step really takes (measured: Sleep(8) in pwsh yields
+// 15-16 ms gaps), so a step never reads as a lift, and the 5 ms high-resolution
+// idle tick then lands the release 18-23 ms after the last report.
+constexpr uint64_t kIdleReleaseMs = 18;
 constexpr UINT_PTR kIdleTimerId = 1;
-constexpr UINT kIdleTimerMs = 20;
+constexpr UINT kIdleTimerMs = 5;  // also the waitable timer period
 constexpr UINT_PTR kDebugTimerId = 2;
 constexpr UINT kDebugTimerMs = 50;
 // The DWM cloaked query is a syscall. The report handler accepts one answer
@@ -492,6 +532,110 @@ using GetCoreWindowHandleAbi = HRESULT(STDMETHODCALLTYPE*)(void*, HWND*);
 // reliable open/closed signal: 0 while the menu is shown.
 constexpr DWORD kDwmwaCloaked = 14;
 using DwmGetWindowAttribute_t = HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD);
+
+// ---------------------------------------------------------------------------
+// Timer resolution
+//
+// The idle timer detects the release: the tick is every 5 ms, but the process
+// keeps the default 15.6 ms system timer quantum, so a 20 ms silence plus one
+// quantum measured `relms=31`. Two separate clocks have to be fixed, and each
+// was measured on this build (26300.9974):
+//
+// - the tick: a 1 ms timeBeginPeriod request is held while a contact is down,
+//   as asked, and it raises the process resolution (Sleep(1) takes 1-2 ms).
+//   WM_TIMER ignores it: a 5 ms SetTimer still delivered every 15.6 ms. The
+//   idle tick is therefore a waitable timer created with
+//   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, which fires at the requested 5 ms
+//   with or without the period request (measured 5-6 ms). SetTimer remains the
+//   fallback when the timer cannot be created.
+// - the clock: GetTickCount64 also advances only every 15.6 ms, so an 18 ms
+//   silence read as 31. The silence is measured with QueryPerformanceCounter
+//   (QpcMsNow below).
+//
+// The silence window itself is 18 ms: above the 15.6 ms quantum that an
+// injected step really takes, below the 20 ms the mod used to wait. A 15 ms
+// window split every injected step into its own one-sample session.
+// ---------------------------------------------------------------------------
+
+constexpr UINT kContactTimerPeriodMs = 1;
+using TimePeriod_t = UINT(WINAPI*)(UINT);
+
+// CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (winbase.h 0x00000002). Spelled out so
+// the build does not depend on the MinGW headers carrying it.
+constexpr DWORD kCreateWaitableTimerHighResolution = 0x00000002;
+
+std::atomic<TimePeriod_t> g_timeBeginPeriod{nullptr};
+std::atomic<TimePeriod_t> g_timeEndPeriod{nullptr};
+
+bool g_timerPeriodHeld = false;  // input thread only
+
+void BeginContactTiming() {
+    if (g_timerPeriodHeld) {
+        return;
+    }
+
+    const TimePeriod_t begin =
+        g_timeBeginPeriod.load(std::memory_order_relaxed);
+    if (!begin || begin(kContactTimerPeriodMs) != 0) {
+        // No 1 ms quantum: the release still works on the default tick, only
+        // later. The flag stays clear so no unmatched end is sent.
+        return;
+    }
+
+    g_timerPeriodHeld = true;
+}
+
+void EndContactTiming() {
+    if (!g_timerPeriodHeld) {
+        return;
+    }
+
+    g_timerPeriodHeld = false;
+    const TimePeriod_t end = g_timeEndPeriod.load(std::memory_order_relaxed);
+    if (end) {
+        end(kContactTimerPeriodMs);
+    }
+}
+
+// The idle tick, independent of the 15.6 ms WM_TIMER quantum. Created on the
+// input thread and closed by it; nullptr means "use the WM_TIMER tick", which
+// is slower but still releases.
+HANDLE CreateIdleWaitableTimer() {
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                          kCreateWaitableTimerHighResolution,
+                                          TIMER_ALL_ACCESS);
+    if (!timer) {
+        return nullptr;
+    }
+
+    // Relative due time in 100 ns units, so the first tick is one period away.
+    LARGE_INTEGER due{};
+    due.QuadPart = -static_cast<LONGLONG>(kIdleTimerMs) * 10000;
+    if (!SetWaitableTimer(timer, &due, kIdleTimerMs, nullptr, nullptr, FALSE)) {
+        CloseHandle(timer);
+        return nullptr;
+    }
+
+    return timer;
+}
+
+// GetTickCount64 advances on the system tick (15.6 ms here), so it cannot tell
+// an 18 ms silence from a 31 ms one: an 18 ms threshold read as 31 and the
+// release stayed where it was. The contact silence that ends a gesture is
+// measured with QueryPerformanceCounter; the coarse tick stays for the velocity
+// windows and the suppression deadlines, which do not need better than a tick.
+uint64_t QpcMsNow() {
+    static const uint64_t frequency = []() {
+        LARGE_INTEGER value{};
+        QueryPerformanceFrequency(&value);
+        return value.QuadPart > 0 ? static_cast<uint64_t>(value.QuadPart)
+                                  : 1;
+    }();
+
+    LARGE_INTEGER counter{};
+    QueryPerformanceCounter(&counter);
+    return static_cast<uint64_t>(counter.QuadPart) * 1000 / frequency;
+}
 
 enum class DismissAxis : int32_t {
     Left = 0,
@@ -540,6 +684,11 @@ wuc::CompositionScopedBatch g_dismissBatch{nullptr};
 // ends gently: both close paths, both return-to-rest animations and the
 // keyboard open use it.
 wuc::CompositionEasingFunction g_retractEasing{nullptr};
+
+// The value the renderer currently shows. Composition has no read-back, so every
+// write to `Progress` records it here; the debug `retract` command starts its
+// animation from this value instead of from a gesture session that may be gone.
+std::atomic<float> g_progressNow{1.0f};
 
 wux::FrameworkElement g_root{nullptr};  // UI thread only
 wucore::CoreDispatcher g_dispatcher{nullptr};
@@ -599,6 +748,11 @@ void ResetComposition();
 void ResetRenderer();
 HWND FindStartCoreWindow();
 
+// Defined with the input-thread gesture state below. The debug `retract` command
+// clears it: the shell is about to hide the window, so nothing needs to restore
+// `Progress`, and the next open restores it anyway.
+extern bool g_commitNeedsProgressReset;
+
 // ---------------------------------------------------------------------------
 // Composition helpers
 // ---------------------------------------------------------------------------
@@ -612,6 +766,7 @@ bool ShowAtRest() {
     try {
         g_state.StopAnimation(L"Progress");
         g_state.InsertScalar(L"Progress", 1.0f);
+        g_progressNow.store(1.0f, std::memory_order_relaxed);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Composition reset failed: %08X %s", e.code(),
                e.message().c_str());
@@ -653,6 +808,7 @@ bool InsertProgress(float progress) {
 
     try {
         g_state.InsertScalar(L"Progress", progress);
+        g_progressNow.store(progress, std::memory_order_relaxed);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress update failed: %08X %s", e.code(),
                e.message().c_str());
@@ -694,6 +850,8 @@ bool AnimateProgressTo(float from, float to,
         // state instead of snapping back to the drag position.
         g_state.InsertScalar(L"Progress", std::clamp(to, 0.0f, 1.0f));
         g_state.StartAnimation(L"Progress", animation);
+        g_progressNow.store(std::clamp(to, 0.0f, 1.0f),
+                            std::memory_order_relaxed);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress animation failed: %08X %s", e.code(),
                e.message().c_str());
@@ -860,6 +1018,13 @@ bool BeginDismissSettle(float from, float velocity) {
 constexpr wchar_t kDebugFileName[] = L"debug.txt";
 constexpr DWORD kDebugFileMaxBytes = 4096;
 
+// `retract` is a live signal from the explorer-side bridge, not a state: the
+// bridge writes it right before it delays the hide. The file keeps the last
+// command after the close, so a fresh Start process would otherwise replay it
+// on attach and retract the menu that just opened. One second is far more than
+// the 350 ms lead and the poll that reads it.
+constexpr uint64_t kDebugCommandFreshMs = 1000;
+
 struct DebugFileStamp {
     bool seen = false;
     DWORD writeLow = 0;
@@ -975,7 +1140,7 @@ void RequestTranslation(float x, float y, float z) {
     }
 }
 
-void ApplyDebugLine(const char* line) {
+void ApplyDebugLine(const char* line, bool fresh) {
     while (*line == ' ' || *line == '\t' || *line == '\r') {
         ++line;
     }
@@ -997,6 +1162,32 @@ void ApplyDebugLine(const char* line) {
         const int anim = *value - '0';
         g_suppressOpenAnim.store(anim == 0, std::memory_order_relaxed);
         FileLog(L"debug anim=%d", anim);
+        return;
+    }
+
+    // The explorer-side bridge writes `retract=1` right before it delays
+    // CStartExperienceManager::Hide. The close is already decided, so the panel
+    // slides out on the same retract a committed dismiss uses while the shell
+    // waits. The value after `=` is ignored today; the bridge may carry the lead
+    // time there later.
+    if (std::strncmp(line, "retract", 7) == 0) {
+        if (!fresh) {
+            // A leftover command from an earlier close: the panel it belonged to
+            // is already gone, and the menu that is on screen now must stay.
+            FileLog(L"debug retract ignored (stale)");
+            return;
+        }
+        const float from =
+            std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
+                       1.0f);
+        const std::chrono::milliseconds duration = PlanRetract(0.0f);
+        if (AnimateProgressTo(from, 0.0f, duration)) {
+            // The window is about to be hidden: the next open restores Progress
+            // by itself, so no restore is owed after this retract.
+            g_commitNeedsProgressReset = false;
+            FileLog(L"debug retract from=%.3f dur=%llu", from,
+                    static_cast<unsigned long long>(duration.count()));
+        }
         return;
     }
 
@@ -1041,14 +1232,14 @@ void ApplyDebugLine(const char* line) {
     }
 }
 
-void ApplyDebugCommands(char* text) {
+void ApplyDebugCommands(char* text, bool fresh) {
     char* cursor = text;
     while (*cursor != '\0') {
         char* newline = std::strchr(cursor, '\n');
         if (newline) {
             *newline = '\0';
         }
-        ApplyDebugLine(cursor);
+        ApplyDebugLine(cursor, fresh);
         if (!newline) {
             return;
         }
@@ -1097,6 +1288,20 @@ void PollDebugFile() {
     g_debugFileStamp.writeHigh = attributes.ftLastWriteTime.dwHighDateTime;
     g_debugFileStamp.size = size;
 
+    // Age of this write, so a live `retract` is told apart from one the file
+    // kept from an earlier close.
+    ULARGE_INTEGER written{};
+    written.LowPart = attributes.ftLastWriteTime.dwLowDateTime;
+    written.HighPart = attributes.ftLastWriteTime.dwHighDateTime;
+    FILETIME nowFileTime{};
+    GetSystemTimeAsFileTime(&nowFileTime);
+    ULARGE_INTEGER now{};
+    now.LowPart = nowFileTime.dwLowDateTime;
+    now.HighPart = nowFileTime.dwHighDateTime;
+    const bool fresh =
+        now.QuadPart >= written.QuadPart &&
+        now.QuadPart - written.QuadPart <= kDebugCommandFreshMs * 10000ULL;
+
     if (size <= 0 || size > kDebugFileMaxBytes) {
         return;
     }
@@ -1127,7 +1332,7 @@ void PollDebugFile() {
         text += 3;
     }
 
-    ApplyDebugCommands(text);
+    ApplyDebugCommands(text, fresh);
 }
 
 // ---------------------------------------------------------------------------
@@ -1523,6 +1728,9 @@ struct HidGestureSession {
     float startY = 0.0f;
     uint64_t startTick = 0;
     uint64_t lastTick = 0;
+    // Last sample on the QPC clock. The idle release compares against this
+    // instead of lastTick, because GetTickCount64 only advances every 15.6 ms.
+    uint64_t lastSampleQpc = 0;
     float curDelta = 0.0f;
     float maxDelta = 0.0f;
     float maxPerp = 0.0f;
@@ -1563,6 +1771,7 @@ struct HidRevealSession {
     int samples = 0;
     uint64_t startTick = 0;
     uint64_t lastTick = 0;
+    uint64_t lastSampleQpc = 0;  // idle release clock, see HidGestureSession
 };
 
 HidRevealSession g_reveal;  // input thread only
@@ -1583,7 +1792,7 @@ float g_screenDipHeight = 0.0f;  // input thread only
 bool g_commitNeedsProgressReset = false;  // input thread only
 bool g_rootWasOpen = false;              // input thread only
 // A cancelled reveal closes the menu only after its retract animation, so the
-// Windows tap waits for this deadline on the 20 ms input timer. 0 means none is
+// Windows tap waits for this deadline on the 5 ms idle tick. 0 means none is
 // pending. A new follow clears it: that contact is pulling the menu out again.
 uint64_t g_pendingWinTapTick = 0;        // input thread only
 uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
@@ -1714,6 +1923,8 @@ bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
     g_reveal.edgeStartY = y;
     g_reveal.startTick = tickMs;
     g_reveal.lastTick = tickMs;
+    g_reveal.lastSampleQpc = QpcMsNow();
+    BeginContactTiming();
     return true;
 }
 
@@ -1723,6 +1934,7 @@ bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
 void UpdateRevealSession(float x, float y, uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
     reveal.lastTick = tickMs;
+    reveal.lastSampleQpc = QpcMsNow();
 
     if (!reveal.active) {
         if (!StartWindowIsOpenThrottled(tickMs)) {
@@ -1734,6 +1946,7 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
             // A new root is being installed under the contact, so this contact
             // no longer has a renderer to drive.
             reveal.edgeCandidate = false;
+            EndContactTiming();
             return;
         }
 
@@ -1806,6 +2019,7 @@ void ReleaseRevealSession() {
 
     reveal.edgeCandidate = false;
     if (!reveal.active) {
+        EndContactTiming();
         return;
     }
     reveal.active = false;
@@ -1828,6 +2042,7 @@ void ReleaseRevealSession() {
             L"commit=%d panel=%.0f n=%d",
             travel, reveal.maxTravel, progress, velocity, commit ? 1 : 0,
             reveal.panelTrail, reveal.samples);
+    EndContactTiming();
 
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
@@ -1867,13 +2082,14 @@ void ReleaseRevealSession() {
 }
 
 void LogHidRelease(const HidGestureSession& session, float velocity,
-                   bool commit, uint64_t releaseTick) {
-    const uint64_t releaseDelay =
-        releaseTick > session.lastTick ? releaseTick - session.lastTick : 0;
+                   bool commit, uint64_t releaseQpc, const wchar_t* source) {
+    const uint64_t releaseDelay = releaseQpc > session.lastSampleQpc
+                                      ? releaseQpc - session.lastSampleQpc
+                                      : 0;
     FileLog(
-        L"hid release delta=%.1f final=%.1f perp=%.1f vel=%.2f commit=%d "
-        L"n=%d relms=%llu",
-        session.maxDelta, session.curDelta, session.maxPerp, velocity,
+        L"hid release src=%s delta=%.1f final=%.1f perp=%.1f vel=%.2f "
+        L"commit=%d n=%d relms=%llu",
+        source, session.maxDelta, session.curDelta, session.maxPerp, velocity,
         commit ? 1 : 0, session.samples,
         static_cast<unsigned long long>(releaseDelay));
 }
@@ -1905,8 +2121,10 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     session.startY = y;
     session.startTick = tickMs;
     session.lastTick = tickMs;
+    session.lastSampleQpc = QpcMsNow();
     session.lastProgress = 1.0f;
     session.samples = 1;
+    BeginContactTiming();
 
     // A cancel animation from the previous gesture may still be running;
     // stop it so this drag owns Progress. After a commit the base value can
@@ -1927,7 +2145,7 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
             distance);
 }
 
-void ReleaseHidSession(uint64_t tickMs, bool allowCommit) {
+void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
     HidGestureSession& session = g_hidSession;
     if (!session.active) {
         return;
@@ -1949,7 +2167,8 @@ void ReleaseHidSession(uint64_t tickMs, bool allowCommit) {
         (finalDelta > kCommitDistanceFraction * distance ||
          velocity > kCommitVelocity);
 
-    LogHidRelease(session, velocity, commit, tickMs);
+    LogHidRelease(session, velocity, commit, QpcMsNow(), source);
+    EndContactTiming();
 
     if (commit) {
         const float from = std::clamp(session.lastProgress, 0.0f, 1.0f);
@@ -1983,8 +2202,9 @@ void AbortHidSession(uint64_t tickMs) {
     const float velocity =
         session.maxDelta / static_cast<float>(elapsed > 0 ? elapsed : 1);
 
-    LogHidRelease(session, velocity, false, tickMs);
+    LogHidRelease(session, velocity, false, QpcMsNow(), L"abort");
     session.active = false;
+    EndContactTiming();
     ShowAtRest();
 }
 
@@ -2002,6 +2222,7 @@ void UpdateHidSession(float x, float y, uint64_t tickMs) {
     const float perpendicular = PerpDelta(axis, session, x, y);
 
     session.lastTick = tickMs;
+    session.lastSampleQpc = QpcMsNow();
     session.curDelta = delta;
     session.maxDelta = std::max(session.maxDelta, delta);
     session.maxPerp = std::max(session.maxPerp, perpendicular);
@@ -2036,7 +2257,7 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
     // finger is present".
     if (contacts <= 0) {
         if (session.active) {
-            ReleaseHidSession(tickMs, true);
+            ReleaseHidSession(true, L"report");
         }
         session.suppress = false;
         ReleaseRevealSession();
@@ -2077,17 +2298,23 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
 }
 
 // A device that leaves the surface without a lift report still ends the
-// gesture; WM_TIMER only runs while no report is arriving.
+// gesture; the idle tick only has to notice the silence, which is measured on
+// the QPC clock because the tick clock is quantised to 15.6 ms.
 void CheckHidIdleRelease(uint64_t tickMs) {
     HidGestureSession& session = g_hidSession;
+    const uint64_t qpcNow = QpcMsNow();
 
-    if (session.active && tickMs > session.lastTick &&
-        tickMs - session.lastTick >= kIdleReleaseMs) {
-        ReleaseHidSession(tickMs, true);
+    const bool sessionIdle =
+        session.active && qpcNow >= session.lastSampleQpc &&
+        qpcNow - session.lastSampleQpc >= kIdleReleaseMs;
+    if (sessionIdle) {
+        ReleaseHidSession(true, L"idle");
     }
 
-    if (g_reveal.edgeCandidate && tickMs > g_reveal.lastTick &&
-        tickMs - g_reveal.lastTick >= kIdleReleaseMs) {
+    const bool revealIdle =
+        g_reveal.edgeCandidate && qpcNow >= g_reveal.lastSampleQpc &&
+        qpcNow - g_reveal.lastSampleQpc >= kIdleReleaseMs;
+    if (revealIdle) {
         ReleaseRevealSession();
     }
 
@@ -2123,11 +2350,12 @@ void RunPendingWinTap(uint64_t tickMs) {
 // gesture open does. A close the shell performs by itself (Windows key) is not
 // fought: nothing is inserted, and the next open starts from 0 again.
 //
-// The poll runs at the 20 ms timer tick, not the 100 ms it used for the restore
-// check alone: measured against the uncloak, a 100 ms throttle started the open
-// slide up to 94 ms late, so the panel sat at rest first and then jumped out and
-// slid back in. 20 ms keeps the start within one compositor frame of the shell's
-// own open, which is what makes the two read as one animation.
+// The poll runs on the 5 ms idle tick but accepts one cloaked answer per 20 ms;
+// it used 100 ms for the restore check alone. Measured against the uncloak, a
+// 100 ms throttle started the open slide up to 94 ms late, so the panel sat at
+// rest first and then jumped out and slid back in. 20 ms keeps the start within
+// one compositor frame of the shell's own open, which is what makes the two read
+// as one animation.
 void PollRootVisibility(uint64_t tickMs) {
     static uint64_t lastPollTick = 0;
     if (tickMs - lastPollTick < kOpenCheckIntervalMs) {
@@ -2456,22 +2684,68 @@ DWORD WINAPI HidInputThread(LPVOID) {
 
     RegisterHidUsage(kUsageTouchScreen, hwnd);
     RegisterHidUsage(kUsagePen, hwnd);
-    SetTimer(hwnd, kIdleTimerId, kIdleTimerMs, nullptr);
+
+    // The idle tick: a high-resolution waitable timer, because WM_TIMER stays on
+    // the 15.6 ms tick on this build even while a 1 ms period is held. The
+    // WM_TIMER tick stays as the fallback and is also the debug poll.
+    HANDLE idleTimer = CreateIdleWaitableTimer();
+    if (!idleTimer) {
+        FileLog(L"hid timer fallback err=%u",
+                static_cast<unsigned>(GetLastError()));
+        SetTimer(hwnd, kIdleTimerId, kIdleTimerMs, nullptr);
+    }
     SetTimer(hwnd, kDebugTimerId, kDebugTimerMs, nullptr);
 
     MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+    bool running = true;
+    while (running) {
+        // With the waitable timer, object 0 is the idle tick and the last index
+        // is the message queue; without it only the queue is waited on.
+        const DWORD objectCount = idleTimer ? 1 : 0;
+        const DWORD wait = MsgWaitForMultipleObjects(objectCount, &idleTimer,
+                                                     FALSE, INFINITE,
+                                                     QS_ALLINPUT);
+        if (wait == WAIT_OBJECT_0 + objectCount) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT) {
+                    running = false;
+                    break;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            continue;
+        }
+        if (idleTimer && wait == WAIT_OBJECT_0) {
+            const uint64_t now = GetTickCount64();
+            // The tap runs before the poll so its suppression window is
+            // already in force for this tick's open/closed answer.
+            RunPendingWinTap(now);
+            CheckHidIdleRelease(now);
+            PollRootVisibility(now);
+            continue;
+        }
+        break;  // WAIT_FAILED, or no timer and no input: leave the loop
+    }
+    if (running) {
+        FileLog(L"hid wait failed err=%u",
+                static_cast<unsigned>(GetLastError()));
     }
 
     KillTimer(hwnd, kIdleTimerId);
     KillTimer(hwnd, kDebugTimerId);
+    if (idleTimer) {
+        CancelWaitableTimer(idleTimer);
+        CloseHandle(idleTimer);
+    }
     UnregisterHidUsage(kUsageTouchScreen);
     UnregisterHidUsage(kUsagePen);
 
     g_hidSession = HidGestureSession{};
     g_reveal = HidRevealSession{};
+    // A contact that is still down when the mod unloads must not leave its 1 ms
+    // timer request behind.
+    EndContactTiming();
     g_contactDown = false;
     g_openCheckValid = false;
     g_pendingWinTapTick = 0;
@@ -3315,6 +3589,7 @@ void ResetComposition() {
         if (g_state) {
             g_state.StopAnimation(L"Progress");
             g_state.InsertScalar(L"Progress", 1.0f);
+            g_progressNow.store(1.0f, std::memory_order_relaxed);
         }
         if (g_visual) {
             g_visual.StopAnimation(L"Translation");
@@ -3351,7 +3626,7 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.6.6 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.7.0 initializing");
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.
@@ -3364,6 +3639,25 @@ BOOL Wh_ModInit() {
     }
     if (!g_dwmGetWindowAttribute.load(std::memory_order_relaxed)) {
         Wh_Log(L"DwmGetWindowAttribute not resolved; gestures stay disabled");
+    }
+
+    // The 1 ms timer period is what makes the release land 18-22 ms after the
+    // last report instead of 31. Resolved at runtime; the module is kept loaded
+    // for the process lifetime so the resolved pointers never dangle.
+    HMODULE winmm = LoadLibraryW(L"winmm.dll");
+    if (winmm) {
+        g_timeBeginPeriod.store(
+            reinterpret_cast<TimePeriod_t>(
+                GetProcAddress(winmm, "timeBeginPeriod")),
+            std::memory_order_relaxed);
+        g_timeEndPeriod.store(
+            reinterpret_cast<TimePeriod_t>(GetProcAddress(winmm, "timeEndPeriod")),
+            std::memory_order_relaxed);
+    }
+    if (!g_timeBeginPeriod.load(std::memory_order_relaxed) ||
+        !g_timeEndPeriod.load(std::memory_order_relaxed)) {
+        Wh_Log(L"timeBeginPeriod not resolved; release keeps the default timer "
+               L"quantum");
     }
 
     HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");

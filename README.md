@@ -25,6 +25,7 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 | Taskbar on top / right / bottom | axis logic present, only left verified |
 | Mouse drag to dismiss | deliberately not enabled |
 | Reveal (edge swipe to open) following the finger | working, anchored to the panel edge |
+| Windows-key close | animated slide-out, 350 ms hide lead from the explorer-side bridge |
 
 ## How the working path works
 
@@ -64,13 +65,29 @@ continuous rather than stepping on a progress grid.
 
 The keyboard path uses the same machinery: a closed→open transition that no
 gesture owns sets `Progress = 0` and animates it to 1 over 260 ms, so a Win-key
-open slides in the way a gesture open does. A Win-key close is left to the shell
-(the window is hidden by the time any animation could run); the mod only keeps
-its scalar bookkeeping consistent.
+open slides in the way a gesture open does. A Win-key close is animated too:
+`twinui.pcshell.dll` `CStartExperienceManager::Hide` is where the shell takes
+the menu away, so the explorer-side bridge delays that call by 350 ms and writes
+`retract=1` to the mod's debug file first; the mod retracts `Progress` with the
+shared 260 ms curve while the shell waits. Measured with the menu open (one
+run, frames at ~123 ms and ~189 ms after the key-down): the panel's right edge
+moved 0 → 119 → 344 DIP left and was gone by ~260 ms, instead of vanishing on
+the first frame.
 
 Release detection: the digitizer keeps reporting while the finger rests
-(measured 255 reports in a 1.5 s hold), so a 35 ms window without a report is a
-reliable lift. Observed release latency is ~47 ms.
+(measured 255 reports in a 1.5 s hold), so an 18 ms window without a report is a
+reliable lift. Both halves of the timing matter on this build, and each was
+measured separately:
+
+- the idle check needs a **`QueryPerformanceCounter`** silence: `GetTickCount64`
+  only advances every 15.6 ms, so an 18 ms window read as 31 ms;
+- the idle tick needs a **`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` waitable
+  timer**: `WM_TIMER` stayed on the 15.6 ms quantum even while the process held
+  a 1 ms `timeBeginPeriod(1)` request. The request is still made, paired through
+  `timeEndPeriod`, for the time a contact is down.
+
+Measured release latency (`relms` on the release line): 31 ms before, 19-23 ms
+after.
 
 ## Opening follows the finger too
 
@@ -140,9 +157,12 @@ is closed after the down, so the only in-process source is the digitizer itself.
 - **`mods/inputprobe.wh.cpp`** — diagnostic: raw HID decoding without the gesture
   logic. **Do not enable it together with the shipping mod**: Raw Input allows one
   sink per usage per process, and inputprobe takes the stream for itself.
-- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`) — publishes
-  the taskbar-edge gesture handle/state from `twinui.pcshell.dll` to shared
-  memory. Not used by the shipping mod; kept for future work.
+- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`) — hooks
+  `CStartExperienceManager::Hide` and gives the Start side 350 ms to retract the
+  panel before the window goes away; publishes the taskbar-edge gesture
+  handle/state from `twinui.pcshell.dll` to shared memory, which the shipping mod
+  does not read. **Enable it together with the Start mod**, or a Windows-key
+  close goes back to an instant hide.
 - **`mods/start-menu-touch-gesture-probe.wh.cpp`** — Phase 0 diagnostic probe.
 - **`mods/start_gesture_shared.h`** — shared-memory contract for the bridge.
 
@@ -150,12 +170,17 @@ is closed after the down, so the only in-process source is the digitizer itself.
 
 ```powershell
 & 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-legacy-swipe.wh.cpp
+& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-touch-gesture-bridge.wh.cpp
+& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod enable local@start-menu-touch-gesture-bridge
 ```
 
-The CLI needs an elevated shell. Windhawk reloads the mod in place, but the
+The CLI needs an elevated shell. Windhawk reloads a mod in place, but the
 `StartUI::App::PrepareRootElement` hook only fires when a new Start root is
 created, so restart `StartMenuExperienceHost.exe` (or log off and on) before
-testing; the menu then attaches its renderer on the next open.
+testing; the menu then attaches its renderer on the next open. `mod install`
+leaves a previously disabled mod disabled, so the `enable` line is required for
+the Windows-key close animation; the bridge installs its explorer hooks when it
+is enabled, without an explorer restart on this build.
 
 ## Test tools
 
@@ -177,6 +202,11 @@ The mod has a file-driven debug channel for the renderer:
 write `p=0.5`, `t=x,y,z` or `e=x,y` to
 `C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\debug.txt`
 to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
+`retract` plays the committed-dismiss retract from the current `Progress`; the
+explorer-side bridge writes it 350 ms before it lets `CStartExperienceManager::Hide`
+run, which is what animates a Windows-key close. It applies only to a file
+written in the last second, so the leftover command is not replayed by the next
+Start process.
 
 ## Known limits and risks
 
@@ -199,6 +229,14 @@ to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
   dragged, the content still receives touches at its original position.
 - A commit taps `VK_LWIN`. If the shell is mid-transition that tap can bounce and
   reopen the menu.
+- The bridge delays every `CStartExperienceManager::Hide` by 350 ms, not only
+  the Windows-key one, and the sleep runs on explorer's UI thread: a click-away
+  close slides out too, and the taskbar is blocked for those 350 ms. The
+  `reason` argument is logged (`hide delayed reason=...`); the Windows-key close
+  reported 1 on this build.
+- A contact that starts inside the 350 ms lead sees a window the shell has not
+  hidden yet. The 600 ms suppression window treats it as a new reveal attempt,
+  and the follow then drives a panel the shell is about to hide.
 - `PrepareRootElement` is hooked through a hardcoded RVA for `StartUI_.dll`
   22621.3733; a different build needs a new RVA or a pattern scan.
 - The digitizer mapping assumes the touch panel covers the primary monitor.
