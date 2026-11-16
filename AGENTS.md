@@ -14,13 +14,15 @@ README.md - what works, what was falsified, build and test instructions
 Two mods ship together. `mods/start-menu-legacy-swipe.wh.cpp` runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
 every XAML/DirectManipulation source on this UI is empty (see README). Both of
-its close paths share one deferred `VK_LWIN` tap, and that tap is dropped when a
-new edge pull starts, so a cancelled close never reaches the shell.
-`mods/start-menu-touch-gesture-bridge.wh.cpp` runs in `explorer.exe` and delays
-`CStartExperienceManager::Hide` by up to 350 ms so the Start side can retract
-the panel for a Windows-key close; a gesture close passes through at once,
-announced by the Start mod's `close-mode.txt` stamp. Everything else in `mods/`
-is diagnosis.
+its close paths retract the panel and then write one deferred `hide-now.txt`
+request, and that request is dropped when a new edge pull starts, so a cancelled
+close never reaches the shell.
+`mods/start-menu-touch-gesture-bridge.wh.cpp` runs in `explorer.exe`, performs
+the shell's own `CStartExperienceManager::Hide` for that request, and delays the
+shell's `Hide` by up to 350 ms so the Start side can retract the panel for a
+Windows-key close. The shell keeps its Start toggle in the key handler, so the
+bridge re-arms it with one invisible Windows tap 120 ms after each hide it
+performs. Everything else in `mods/` is diagnosis.
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
