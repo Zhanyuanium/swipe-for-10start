@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.6.2
+// @version         0.6.3
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -89,11 +89,24 @@ What it does:
   `openingSign` is +1 for a left or top taskbar and -1 for right or bottom. A
   release past 20% of `Distance`, or one whose average velocity
   `travel / max(elapsed, 1)` exceeds 0.45 DIP/ms, animates `Progress` to 1 over
-  150 ms and keeps the menu; anything else taps `VK_LWIN`, restores
-  `Progress = 1` and leaves the menu closed. Pulling out and pushing back
-  therefore cancels, as it does inside the open menu. The line
+  150 ms and keeps the menu. Anything else is a cancel: `Progress` animates to 0
+  over the same 150 ms, so the panel slides back out of the screen edge, and the
+  `VK_LWIN` tap that closes the menu follows the animation 180 ms after the
+  release on the input timer. `Progress` stays 0; a later open restores it,
+  unless an edge contact is already driving that open. Pulling out and pushing
+  back therefore cancels, as it does inside the open menu. The line
   `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`
-  is written once per reveal.
+  is written once per reveal; the cancel adds `reveal cancel win sent` when the
+  deferred tap runs, or `reveal cancel tap dropped` when a new pull takes the
+  panel over before it does.
+- Every close the mod starts suppresses the reopen restore for 600 ms: the
+  dismiss tap, and the reveal cancel from the moment its retract starts. The
+  reused root reports itself open until the shell has processed the tap, and
+  restoring `Progress = 1` in that gap flashed the fully open panel while the
+  close was in flight. For the same 600 ms a contact on the edge counts as a new
+  reveal attempt even while the window still reports open: otherwise the down
+  was read as a drag of the retracting panel, which stopped the retract and
+  restored `Progress = 1` on the first sample.
 - The candidate path polls the cloaked attribute at most once per 20 ms; the
   cached answer is dropped on every lift, so each contact starts from a fresh
   query.
@@ -129,6 +142,7 @@ Diagnostics:
   `hid down x=... y=... axis=... dist=...`,
   `hid release delta=... perp=... vel=... commit=... n=...`,
   `hid dismiss win sent`,
+  `reveal cancel win sent`, `reveal cancel tap dropped`,
   `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
   `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`),
   `hid decodefail dev=... err=...`,
@@ -175,6 +189,13 @@ Known risks:
 - A committed dismiss taps the Windows key globally, so it lands on whichever
   window has the foreground; a lone Windows tap opens Start if the menu is
   already gone.
+- The suppression window is time based, not tied to the shell's own signal. If a
+  reopen without an edge contact, such as the Windows key, lands inside the
+  600 ms after a close, that open is not restored; `Progress` stays 0 and the
+  panel is invisible until the next open.
+- The deferred cancel tap waits on `WM_TIMER`, which is low priority: a report
+  flood on the same thread delays the tap by that much. The panel stays
+  retracted until the tap runs.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -200,7 +221,11 @@ Known risks:
  * [OUTPUT]: one message-only window and one worker thread per process; the
  *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
  *   published for the reveal follow; one global Windows-key tap per committed
- *   dismiss or short reveal; an optional suppressed open animation request
+ *   dismiss or short reveal, the reveal's one deferred to the input timer until
+ *   its retract animation has run; a 600 ms window after either tap in which a
+ *   closed-to-open report does not restore `Progress` and an edge contact starts
+ *   a new reveal rather than a drag of the retracting panel; an optional
+ *   suppressed open animation request
  *   (type 0, off by default because dropping it leaves the pane undrawn) while
  *   the close request (type 1) always passes through; four file-driven debug
  *   commands (`p`, `t`, `e`, `anim`) that apply a Progress value, the XAML
@@ -329,6 +354,18 @@ constexpr uint8_t kAnimPrologue[] = {
 constexpr std::chrono::milliseconds kDismissSettleDuration{150};
 constexpr std::chrono::milliseconds kDismissCancelDuration{120};
 
+// A cancelled reveal taps the Windows key only after the panel has slid back
+// out of the screen edge, which is the mirror of the committed dismiss. The tap
+// waits on the 20 ms input timer, so the deadline carries one timer tick of
+// margin over the retract animation.
+constexpr uint64_t kRevealCancelWinTapMs =
+    static_cast<uint64_t>(kDismissSettleDuration.count()) + 30;
+
+// A Windows tap this mod sent closes the menu a moment later. Until then the
+// shell still reports the window open, so the reopen poll must not read that as
+// a fresh open and restore Progress while the close is in flight.
+constexpr uint64_t kRestoreSuppressMs = 600;
+
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
 constexpr float kCommitDistanceFraction = 0.20f;
 constexpr float kCommitVelocity = 0.45f;
@@ -437,6 +474,11 @@ winrt::event_token g_sizeToken{};
 
 std::atomic<bool> g_dismissSettling{false};
 std::atomic<uint32_t> g_dismissSerial{0};
+// Set whenever this mod starts a close itself: the dismiss tap in the settle
+// batch and the reveal cancel tap on the input thread. PollRootVisibility runs
+// on the input thread while the dismiss tap runs in a compositor callback, so
+// the deadline is atomic. 0 means no close of this mod is pending.
+std::atomic<uint64_t> g_suppressRestoreUntil{0};
 std::atomic<HWND> g_coreHwnd{nullptr};
 // Resolved in Wh_ModInit. A runtime resolve keeps the mod loadable without
 // dwmapi.dll in the import table.
@@ -578,6 +620,16 @@ bool AnimateProgressTo(float from, float to,
     return true;
 }
 
+// A lone Windows-key tap is acted on by the shell itself, so it closes the menu
+// even when the menu was opened without keyboard focus and an injected
+// VK_ESCAPE never reaches it. The 60 ms hold is the same one the dismiss path
+// always used; both callers live on threads that already sleep in that path.
+void TapWindowsKey() {
+    keybd_event(VK_LWIN, 0, 0, 0);
+    Sleep(60);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+}
+
 // Committed dismiss: slide out over 150 ms, then tap the Windows key so the
 // shell closes the menu through its normal input path.
 bool BeginDismissSettle(float from) {
@@ -621,10 +673,13 @@ bool BeginDismissSettle(float from) {
                         // foreground on SearchHost, so an injected VK_ESCAPE
                         // does not reach it. A lone Windows-key tap is acted
                         // on by the shell itself and closes the menu in that
-                        // state.
-                        keybd_event(VK_LWIN, 0, 0, 0);
-                        Sleep(60);
-                        keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+                        // state. The suppression window starts before the tap:
+                        // the keydown already closes the window, and the poll
+                        // between the two events must not restore Progress.
+                        g_suppressRestoreUntil.store(
+                            GetTickCount64() + kRestoreSuppressMs,
+                            std::memory_order_relaxed);
+                        TapWindowsKey();
                         FileLog(L"hid dismiss win sent");
 
                         // Leave Progress at 0: resetting it here flashes the
@@ -1413,6 +1468,10 @@ float g_screenDipHeight = 0.0f;  // input thread only
 // value of 0, so BeginHidSession restores the resting value first.
 bool g_commitNeedsProgressReset = false;  // input thread only
 bool g_rootWasOpen = false;              // input thread only
+// A cancelled reveal closes the menu only after its retract animation, so the
+// Windows tap waits for this deadline on the 20 ms input timer. 0 means none is
+// pending. A new follow clears it: that contact is pulling the menu out again.
+uint64_t g_pendingWinTapTick = 0;        // input thread only
 uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
 // The edge line was a measurement instrument: it is off in the shipping build.
 constexpr bool g_debugEdge = false;
@@ -1524,7 +1583,14 @@ bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
         return false;
     }
 
-    if (StartWindowIsOpenThrottled(tickMs)) {
+    // A close this mod started still reports the window open for a moment. A
+    // contact on the edge in that window is a new reveal attempt, not a drag of
+    // the retracting panel: the shell opens the menu again under the contact
+    // and the follow takes over. Treating it as a dismiss drag froze the
+    // retract and restored Progress 1 on the down.
+    const bool closeInFlight =
+        tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+    if (!closeInFlight && StartWindowIsOpenThrottled(tickMs)) {
         return false;
     }
 
@@ -1564,8 +1630,15 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
         reveal.samples = 0;
 
         // A cancel or dismiss animation from a previous gesture may still own
-        // Progress; the follow must drive the scalar from this sample on.
+        // Progress; the follow must drive the scalar from this sample on. The
+        // deferred Windows tap of a cancelled reveal is dropped here as well:
+        // the menu is being pulled out again, and a tap mid-follow would close
+        // it under the finger.
         StopProgressAnimation();
+        if (g_pendingWinTapTick != 0) {
+            g_pendingWinTapTick = 0;
+            FileLog(L"reveal cancel tap dropped");
+        }
     }
 
     const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
@@ -1650,18 +1723,26 @@ void ReleaseRevealSession() {
         return;
     }
 
-    // Short reveal: the Windows tap closes the menu again, then the scalar
-    // returns to rest. The flag additionally makes the next down restore
-    // Progress 1, because the reused root still carries the pulled-out value
-    // until the shell has finished hiding it.
-    keybd_event(VK_LWIN, 0, 0, 0);
-    Sleep(60);
-    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    // Short reveal: the panel slides back out of the screen edge first, over
+    // the same duration as the committed dismiss, so the cancel reads as the
+    // mirror of that spring-back. The Windows tap that actually closes the menu
+    // follows the animation on the input timer; tapping here froze the panel at
+    // the finger position and the window then hid without a retract.
+    //
+    // Progress stays at 0 afterwards and is not restored here: the tap takes a
+    // moment to hide the window, and restoring now would flash the fully open
+    // menu while the close is in flight. The flag makes the next down restore
+    // the resting value once the shell has finished hiding the reused root.
+    //
+    // The suppression window starts at the release, not at the tap: the close
+    // is already running, and a down inside the next 180 ms is a new reveal
+    // attempt, not a drag of the retracting panel.
+    const uint64_t now = GetTickCount64();
+    AnimateProgressTo(progress, 0.0f, kDismissSettleDuration);
+    g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
+                                 std::memory_order_relaxed);
+    g_pendingWinTapTick = now + kRevealCancelWinTapMs;
     g_commitNeedsProgressReset = true;
-    // Do not restore Progress here: the Windows tap takes a moment to hide the
-    // window, and resetting now would flash the fully open menu first. The menu
-    // is left at the finger's position (mostly off-screen) and the next open
-    // restores the scalar.
 }
 
 void LogHidRelease(const HidGestureSession& session, float velocity,
@@ -1709,9 +1790,13 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // A cancel animation from the previous gesture may still be running;
     // stop it so this drag owns Progress. After a commit the base value can
     // still be 0, because the settle callback may not have run yet, so restore
-    // the resting value before the first sample drives the scalar.
+    // the resting value before the first sample drives the scalar. The restore
+    // is skipped while a close this mod started is still in flight: inserting 1
+    // there flashed the fully open panel until the shell hid the window. The
+    // flag stays set so the next open restores the scalar.
     StopProgressAnimation();
-    if (g_commitNeedsProgressReset) {
+    if (g_commitNeedsProgressReset &&
+        tickMs >= g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
         g_commitNeedsProgressReset = false;
         InsertProgress(1.0f);
     }
@@ -1894,6 +1979,22 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     }
 }
 
+// The deferred tap of a cancelled reveal. It runs on the input thread so the
+// tap follows the retract animation, and it opens the same suppression window
+// the dismiss tap uses, so the poll cannot restore Progress while the shell
+// hides the menu.
+void RunPendingWinTap(uint64_t tickMs) {
+    if (g_pendingWinTapTick == 0 || tickMs < g_pendingWinTapTick) {
+        return;
+    }
+
+    g_pendingWinTapTick = 0;
+    g_suppressRestoreUntil.store(tickMs + kRestoreSuppressMs,
+                                 std::memory_order_relaxed);
+    TapWindowsKey();
+    FileLog(L"reveal cancel win sent");
+}
+
 // The XAML root is reused across menu opens, and PrepareRootElement does not
 // run again, so a committed dismiss leaves Progress at 0. Without this the next
 // open shows a window that is on screen but slid out of view.
@@ -1905,7 +2006,18 @@ void PollRootVisibility(uint64_t tickMs) {
     lastPollTick = tickMs;
 
     const bool open = StartWindowIsOpen();
-    if (open && !g_rootWasOpen && g_commitNeedsProgressReset) {
+    // A close this mod started reports the window open until the shell has
+    // processed the tap. Reading that as a reopen restored Progress 1 while the
+    // close was still in flight, so a follow that began in that window flashed
+    // the panel fully open and the window then vanished.
+    const bool closeInFlight =
+        tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+    // An edge contact that is still down owns the open: the follow drives the
+    // scalar from the finger, and restoring 1 here would insert a fully open
+    // frame between two follow samples.
+    const bool gestureOwnsProgress = g_reveal.edgeCandidate;
+    if (open && !g_rootWasOpen && g_commitNeedsProgressReset &&
+        !closeInFlight && !gestureOwnsProgress) {
         g_commitNeedsProgressReset = false;
         ShowAtRest();
         FileLog(L"hid root restored after reopen");
@@ -2142,8 +2254,11 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         case WM_TIMER:
             if (wParam == kIdleTimerId) {
                 const uint64_t now = GetTickCount64();
-    CheckHidIdleRelease(now);
-    PollRootVisibility(now);
+                // The tap runs before the poll so its suppression window is
+                // already in force for this tick's open/closed answer.
+                RunPendingWinTap(now);
+                CheckHidIdleRelease(now);
+                PollRootVisibility(now);
             } else if (wParam == kDebugTimerId) {
                 PollDebugFile();
             }
@@ -2224,6 +2339,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     g_reveal = HidRevealSession{};
     g_contactDown = false;
     g_openCheckValid = false;
+    g_pendingWinTapTick = 0;
     g_debugFileStamp = DebugFileStamp{};
     FreeHidDevices();
 
