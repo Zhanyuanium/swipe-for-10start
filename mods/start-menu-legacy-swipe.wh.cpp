@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.7.0
+// @version         0.8.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -78,6 +78,17 @@ What it does:
   the 117 ms floor. The committed dismiss and the cancelled reveal call the same
   planner and the same animation helper. One line per close records it:
   `retract vel=... dur=...`.
+- The release itself is one idle window plus one tick, so the panel stood still
+  for 20-23 ms after the last report before the retract started, and the eye
+  read that as a stop. The panel now coasts through that window: the average
+  speed of the last three reports, capped at 6 DIP/ms, continues `Progress` on
+  a 200 ms linear animation as soon as no report has arrived for 8 ms. A report
+  ends the coast, pins the interpolated value and inserts the real one, so the
+  correction is the few DIP the panel drifted; a release ends it first and
+  plans the close from where it got to, so the retract starts from a moving
+  panel. Nothing coasts while the menu is closed, inside the 600 ms suppression
+  window, or in the reveal's first 50 ms. A held finger never coasts: the panel
+  reports at ~170 Hz, so a live contact leaves no 8 ms gap.
 - A session ends when no report arrives for 18 ms (`kIdleReleaseMs`); the idle
   tick runs every 5 ms, so the release is noticed about 18-23 ms after the
   last report. The tick is a waitable timer created with
@@ -199,9 +210,13 @@ Diagnostics:
   `startui anim hook skipped` and the first four
   `startui anim type=... edge=... trans=... suppress=...` calls go to
   `renderer.log`.
-- Only begin and release are logged, never individual samples. The `edge` line
-  stays in the code behind `g_debugEdge`, which is false; it measured the raw
-  edge contact and EP's own open threshold.
+- Only begin and release are logged, never individual samples or coasts. The
+  `edge` line stays in the code behind `g_debugEdge`, which is false; it measured
+  the raw edge contact and EP's own open threshold. The `coast start/stop` lines
+  are behind `g_debugCoast`, also false; they measured the coast's endpoints and
+  showed that `CompositionPropertySet.TryGetScalar` answers with the stored base
+  value while a coast younger than a compositor frame is running, which is why
+  the coast's own line, not a read-back, is what gets pinned.
 
 Known risks:
 
@@ -283,7 +298,9 @@ Known risks:
  *   dismiss or short reveal, the reveal's one deferred to the input timer until
  *   its retract animation has run; one retract planner and one easing for both
  *   close paths (260 ms at rest, shortened by the release speed to a 117 ms
- *   floor); a
+ *   floor); a linear coast of `Progress` at the finger's smoothed speed while
+ *   no report arrives, ended by the next report or by the release, which then
+ *   plans the close from the value the coast reached; a
  *   0-to-1 progress slide over 260 ms for a closed-to-open transition no reveal
  *   owns, plus a `win close observed` line when the shell hides the window by
  *   itself; a 1 ms timer period (timeBeginPeriod/timeEndPeriod) held exactly
@@ -500,6 +517,45 @@ constexpr UINT kDebugTimerMs = 50;
 // per interval and reuses it for every other report.
 constexpr uint64_t kOpenCheckIntervalMs = 20;
 
+// ---------------------------------------------------------------------------
+// Coast between reports
+//
+// The release is one idle window plus one tick: report, 18 ms of silence, then
+// the tick that plans the close, measured 20-23 ms. The panel stood still for
+// that whole window, and the eye reads the stop before the retract starts. The
+// panel now keeps moving at the finger's own speed until the close takes over:
+//
+// - the speed is the average over the last three reports, so one slow report
+//   cannot fling the panel, and it is capped at 6 DIP/ms so a bad sample cannot
+//   throw it across the screen either;
+// - the coast starts after 8 ms without a report, so it is already moving when
+//   the release is planned 10-15 ms later;
+// - a report ends it, pins the interpolated value and inserts the real one, so
+//   the correction is the few DIP the panel drifted;
+// - the release ends it first and plans the close from where it got to.
+//
+// The 200 ms run is the animation's own length, not how long it lives: the
+// release or the next report always interrupts it. `Progress` is linear here,
+// never eased: a curve would slow the panel in the first frames, which is the
+// stop the coast exists to hide.
+//
+// The real digitizer reports at ~170 Hz (5.9 ms), so a contact that is still
+// down never leaves an 8 ms gap and a held finger never coasts.
+constexpr uint64_t kCoastStartMs = 8;
+constexpr std::chrono::milliseconds kCoastDuration{200};
+// Below this speed the coast would move the panel about one DIP in the window it
+// lives, and a report stream slower than the panel's own, such as an injector's
+// 10 ms keep-alive, must not nudge it. No coast starts there.
+constexpr float kCoastMinVelocityDip = 0.1f;
+// Progress moves with the panel in both gestures, so the one clamp serves both:
+// DIP per millisecond, reached here with Distance.
+constexpr float kCoastMaxVelocityDip = 6.0f;
+// The reveal maps Progress from the panel trail, which the UI thread publishes
+// when the root opens; for the first 50 ms that mapping is still settling.
+constexpr uint64_t kRevealCoastSettleMs = 50;
+// The coast start/stop lines measured the coast; off in the shipping build.
+constexpr bool g_debugCoast = false;
+
 // Raw input and HID decoding limits.
 constexpr int kMaxHidDevices = 4;
 constexpr int kMaxContactCollections = 8;
@@ -688,7 +744,19 @@ wuc::CompositionEasingFunction g_retractEasing{nullptr};
 // The value the renderer currently shows. Composition has no read-back, so every
 // write to `Progress` records it here; the debug `retract` command starts its
 // animation from this value instead of from a gesture session that may be gone.
+// A coast moves the value without a write, so it is not reflected here until
+// StopCoast pins what it reached.
 std::atomic<float> g_progressNow{1.0f};
+
+// The coast owns Progress between reports. Its endpoints and start time are kept
+// here because the animation is linear: `CoastValueAt` answers where the panel is
+// at any instant, and StopCoast turns that answer into a base value so the next
+// sample or the close continues from it. All four are input thread state; the
+// flag is atomic because ResetComposition clears it from the UI thread.
+std::atomic<bool> g_coasting{false};
+uint64_t g_coastStartQpc = 0;
+float g_coastFrom = 1.0f;
+float g_coastTo = 1.0f;
 
 wux::FrameworkElement g_root{nullptr};  // UI thread only
 wucore::CoreDispatcher g_dispatcher{nullptr};
@@ -765,6 +833,7 @@ bool ShowAtRest() {
 
     try {
         g_state.StopAnimation(L"Progress");
+        g_coasting.store(false, std::memory_order_relaxed);
         g_state.InsertScalar(L"Progress", 1.0f);
         g_progressNow.store(1.0f, std::memory_order_relaxed);
     } catch (winrt::hresult_error const& e) {
@@ -788,6 +857,9 @@ bool StopProgressAnimation() {
 
     try {
         g_state.StopAnimation(L"Progress");
+        // A new drag owns the scalar from here: a coast still running belongs to
+        // the gesture that just ended.
+        g_coasting.store(false, std::memory_order_relaxed);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Stopping Progress failed: %08X %s", e.code(),
                e.message().c_str());
@@ -807,6 +879,11 @@ bool InsertProgress(float progress) {
     }
 
     try {
+        // A direct insert is the new base value, so a coast still animating over
+        // it ends here: the sample it belongs to has already been replaced.
+        if (g_coasting.exchange(false, std::memory_order_relaxed)) {
+            g_state.StopAnimation(L"Progress");
+        }
         g_state.InsertScalar(L"Progress", progress);
         g_progressNow.store(progress, std::memory_order_relaxed);
     } catch (winrt::hresult_error const& e) {
@@ -845,6 +922,7 @@ bool AnimateProgressTo(float from, float to,
         animation.Duration(duration);
 
         g_state.StopAnimation(L"Progress");
+        g_coasting.store(false, std::memory_order_relaxed);
         // Insert the target as the base value *before* the animation starts, so
         // a cancelled or interrupted animation still lands on the intended end
         // state instead of snapping back to the drag position.
@@ -861,6 +939,105 @@ bool AnimateProgressTo(float from, float to,
         return false;
     }
 
+    return true;
+}
+
+// Where the linear coast is at qpcNow: from + (to - from) * elapsed / duration.
+// Exact, because the animation has no easing and its start time is known here.
+float CoastValueAt(uint64_t qpcNow) {
+    if (qpcNow <= g_coastStartQpc) {
+        return g_coastFrom;
+    }
+
+    const uint64_t duration = static_cast<uint64_t>(kCoastDuration.count());
+    const uint64_t elapsed = qpcNow - g_coastStartQpc;
+    if (elapsed >= duration) {
+        return g_coastTo;
+    }
+
+    const float t = static_cast<float>(elapsed) / static_cast<float>(duration);
+    return std::clamp(g_coastFrom + (g_coastTo - g_coastFrom) * t, 0.0f, 1.0f);
+}
+
+// Starts the continuation between reports. This is deliberately not
+// AnimateProgressTo: that helper inserts the target as the base value, and a
+// coast must leave the base alone so a report can replace the motion without the
+// panel jumping to the end of the coast first. Nothing is logged per coast in the
+// shipping build.
+bool StartCoast(float from, float to) {
+    const uint64_t qpcNow = QpcMsNow();
+    from = std::clamp(from, 0.0f, 1.0f);
+    to = std::clamp(to, 0.0f, 1.0f);
+
+    std::lock_guard lock(g_compositionMutex);
+    if (!g_state || !g_compositor) {
+        return false;
+    }
+
+    try {
+        wuc::ScalarKeyFrameAnimation animation =
+            g_compositor.CreateScalarKeyFrameAnimation();
+        animation.InsertKeyFrame(0.0f, from);
+        // No easing on the keyframe at t=1: the panel keeps the finger's speed
+        // for the whole run, which is the only reason the coast is invisible.
+        animation.InsertKeyFrame(1.0f, to);
+        animation.Duration(kCoastDuration);
+
+        g_state.StopAnimation(L"Progress");
+        g_state.StartAnimation(L"Progress", animation);
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Progress coast failed: %08X %s", e.code(),
+               e.message().c_str());
+        return false;
+    } catch (...) {
+        Wh_Log(L"Progress coast failed with an unknown exception");
+        return false;
+    }
+
+    g_coastFrom = from;
+    g_coastTo = to;
+    g_coastStartQpc = qpcNow;
+    g_coasting.store(true, std::memory_order_relaxed);
+    return true;
+}
+
+// Ends the coast and pins the value the panel shows at this instant, so the next
+// sample or the close animation continues from a moving panel instead of
+// snapping back to the last report.
+//
+// The linear line above is the source of truth, not a read-back: measured on this
+// build, CompositionPropertySet.TryGetScalar answers with the stored base value
+// while an animation younger than one compositor frame is running (a coast that
+// lived 15 ms at -0.23 DIP/ms read back 0.722, the value of the report before it,
+// where the line read 0.720). Pinning the read-back would undo exactly the motion
+// the coast was started for.
+bool StopCoast(float& value) {
+    const uint64_t qpcNow = QpcMsNow();
+    value = CoastValueAt(qpcNow);
+
+    std::lock_guard lock(g_compositionMutex);
+    g_coasting.store(false, std::memory_order_relaxed);
+    if (!g_state) {
+        return false;
+    }
+
+    try {
+        // The animation has to be stopped before its value can become the base.
+        g_state.StopAnimation(L"Progress");
+        g_state.InsertScalar(L"Progress", value);
+        g_progressNow.store(value, std::memory_order_relaxed);
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Progress coast stop failed: %08X %s", e.code(),
+               e.message().c_str());
+        return false;
+    } catch (...) {
+        Wh_Log(L"Progress coast stop failed with an unknown exception");
+        return false;
+    }
+
+    if (g_debugCoast) {
+        FileLog(L"coast stop value=%.3f", value);
+    }
     return true;
 }
 
@@ -1772,6 +1949,9 @@ struct HidRevealSession {
     uint64_t startTick = 0;
     uint64_t lastTick = 0;
     uint64_t lastSampleQpc = 0;  // idle release clock, see HidGestureSession
+    // QPC time of the report that took Progress over. The trail mapping is still
+    // settling for the first 50 ms of the follow, so the coast stays off there.
+    uint64_t activeSinceQpc = 0;
 };
 
 HidRevealSession g_reveal;  // input thread only
@@ -1798,6 +1978,57 @@ uint64_t g_pendingWinTapTick = 0;        // input thread only
 uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
 // The edge line was a measurement instrument: it is off in the shipping build.
 constexpr bool g_debugEdge = false;
+
+// The coast runs on the finger's own speed, smoothed over the last three
+// reports. At the panel's ~170 Hz that is a 12 ms window: long enough to ignore
+// one slow report, short enough to follow a real stop. Each sample is the mapped
+// progress and the QPC time it arrived at. Progress moves with the panel in both
+// gestures, so its sign needs no per-gesture correction.
+struct CoastVelocitySample {
+    float progress = 0.0f;
+    uint64_t qpc = 0;
+};
+
+constexpr int kCoastVelocitySamples = 3;
+CoastVelocitySample g_coastVelocity[kCoastVelocitySamples];  // input thread
+int g_coastVelocityCount = 0;                                // input thread
+
+void ResetCoastVelocity() {
+    g_coastVelocityCount = 0;
+}
+
+// Keeps the last three reports and drops the oldest.
+void SampleCoastVelocity(float progress, uint64_t qpcMs) {
+    if (g_coastVelocityCount == kCoastVelocitySamples) {
+        std::memmove(g_coastVelocity, g_coastVelocity + 1,
+                     sizeof(CoastVelocitySample) *
+                         (kCoastVelocitySamples - 1));
+        g_coastVelocityCount--;
+    }
+    g_coastVelocity[g_coastVelocityCount++] =
+        CoastVelocitySample{progress, qpcMs};
+}
+
+// Progress per millisecond over the whole window. The 6 DIP/ms cap lives in DIP
+// space: on this 1440 DIP root it is a fast flick, and one injected jump between
+// two reports must not throw the panel across the screen.
+float CoastVelocity(float distance) {
+    if (g_coastVelocityCount < 2 || !(distance > 0.0f)) {
+        return 0.0f;
+    }
+
+    const CoastVelocitySample& oldest = g_coastVelocity[0];
+    const CoastVelocitySample& newest =
+        g_coastVelocity[g_coastVelocityCount - 1];
+    if (newest.qpc <= oldest.qpc) {
+        return 0.0f;
+    }
+
+    const float elapsedMs = static_cast<float>(newest.qpc - oldest.qpc);
+    const float velocity = (newest.progress - oldest.progress) / elapsedMs;
+    const float limit = kCoastMaxVelocityDip / distance;
+    return std::clamp(velocity, -limit, limit);
+}
 
 float AxisDelta(int32_t axis, const HidGestureSession& session, float x,
                 float y) {
@@ -1933,8 +2164,9 @@ bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
 // Progress over and every later report drives it.
 void UpdateRevealSession(float x, float y, uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
+    const uint64_t sampleQpc = QpcMsNow();
     reveal.lastTick = tickMs;
-    reveal.lastSampleQpc = QpcMsNow();
+    reveal.lastSampleQpc = sampleQpc;
 
     if (!reveal.active) {
         if (!StartWindowIsOpenThrottled(tickMs)) {
@@ -1951,10 +2183,16 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
         }
 
         reveal.active = true;
+        reveal.activeSinceQpc = sampleQpc;
         reveal.distance = distance;
         reveal.progress = 0.0f;
         reveal.lastInserted = 1.0f;  // the menu is fully in right now
         reveal.samples = 0;
+
+        // The takeover inserts the mapped progress (0.269 at the screen edge on
+        // this layout) after the menu was at 1, so the first step of the follow
+        // must not become the coast speed.
+        ResetCoastVelocity();
 
         // A cancel or dismiss animation from a previous gesture may still own
         // Progress; the follow must drive the scalar from this sample on. The
@@ -1995,10 +2233,19 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
         1.0f - (finger - panelTrail) / (AxisDirection(axis) * reveal.distance),
         0.0f, 1.0f);
 
+    // A report ends the coast: pin where it got to, then insert the real value
+    // below even when it is inside the 0.5 DIP filter, so the panel returns to
+    // the finger at once. The correction is only the few DIP it drifted.
+    float coastValue = reveal.lastInserted;
+    const bool resumed =
+        g_coasting.load(std::memory_order_relaxed) && StopCoast(coastValue);
+
     reveal.progress = progress;
     reveal.samples++;
-    if (std::fabs(progress - reveal.lastInserted) * reveal.distance >=
-            kProgressEpsilonDip &&
+    SampleCoastVelocity(progress, sampleQpc);
+    if ((resumed ||
+         std::fabs(progress - reveal.lastInserted) * reveal.distance >=
+             kProgressEpsilonDip) &&
         InsertProgress(progress)) {
         reveal.lastInserted = progress;
     }
@@ -2044,10 +2291,18 @@ void ReleaseRevealSession() {
             reveal.panelTrail, reveal.samples);
     EndContactTiming();
 
+    // The coast carried the panel past the last report, so both outcomes start
+    // from where it got to. `progress` above stays the mapped release position,
+    // which is the measurement, not the point the animation starts from.
+    float from = std::clamp(reveal.lastInserted, 0.0f, 1.0f);
+    if (g_coasting.load(std::memory_order_relaxed)) {
+        StopCoast(from);
+    }
+
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
         // finishes the slide instead of snapping.
-        if (!AnimateProgressTo(progress, 1.0f, kRevealCommitDuration)) {
+        if (!AnimateProgressTo(from, 1.0f, kRevealCommitDuration)) {
             ShowAtRest();
         }
         return;
@@ -2070,7 +2325,7 @@ void ReleaseRevealSession() {
     // attempt, not a drag of the retracting panel.
     const uint64_t now = GetTickCount64();
     const std::chrono::milliseconds duration = PlanRetract(velocity);
-    if (AnimateProgressTo(progress, 0.0f, duration)) {
+    if (AnimateProgressTo(from, 0.0f, duration)) {
         LogRetract(duration, velocity);
     }
     g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
@@ -2125,6 +2380,8 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     session.lastProgress = 1.0f;
     session.samples = 1;
     BeginContactTiming();
+    // The speed of the previous gesture must not survive into this one.
+    ResetCoastVelocity();
 
     // A cancel animation from the previous gesture may still be running;
     // stop it so this drag owns Progress. After a commit the base value can
@@ -2170,8 +2427,15 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
     LogHidRelease(session, velocity, commit, QpcMsNow(), source);
     EndContactTiming();
 
+    // The coast continued the drag after the last report; the close has to start
+    // from where it got to, not from the last report, or the panel jumps back
+    // before it retracts.
+    float from = std::clamp(session.lastProgress, 0.0f, 1.0f);
+    if (g_coasting.load(std::memory_order_relaxed)) {
+        StopCoast(from);
+    }
+
     if (commit) {
-        const float from = std::clamp(session.lastProgress, 0.0f, 1.0f);
         if (BeginDismissSettle(from, velocity)) {
             g_commitNeedsProgressReset = true;
         } else {
@@ -2183,7 +2447,7 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
 
     session.active = false;
     if (distance > 0.0f) {
-        AnimateProgressTo(session.lastProgress, 1.0f, kDismissCancelDuration);
+        AnimateProgressTo(from, 1.0f, kDismissCancelDuration);
     } else {
         ShowAtRest();
     }
@@ -2217,12 +2481,20 @@ void UpdateHidSession(float x, float y, uint64_t tickMs) {
         return;
     }
 
+    // A report ends the coast: pin where it got to, then insert the real value
+    // below even when it is inside the 0.5 DIP filter, so the panel returns to
+    // the finger at once. The correction is only the few DIP it drifted.
+    float coastValue = session.lastProgress;
+    const bool resumed =
+        g_coasting.load(std::memory_order_relaxed) && StopCoast(coastValue);
+
     const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
     const float delta = AxisDelta(axis, session, x, y);
     const float perpendicular = PerpDelta(axis, session, x, y);
 
     session.lastTick = tickMs;
-    session.lastSampleQpc = QpcMsNow();
+    const uint64_t sampleQpc = QpcMsNow();
+    session.lastSampleQpc = sampleQpc;
     session.curDelta = delta;
     session.maxDelta = std::max(session.maxDelta, delta);
     session.maxPerp = std::max(session.maxPerp, perpendicular);
@@ -2239,9 +2511,11 @@ void UpdateHidSession(float x, float y, uint64_t tickMs) {
 
     const float progress =
         std::clamp(1.0f - delta / distance, 0.0f, 1.0f);
+    SampleCoastVelocity(progress, sampleQpc);
     if ((delta > 0.0f || session.lastProgress < 1.0f) &&
-        std::fabs(progress - session.lastProgress) * distance >=
-            kProgressEpsilonDip) {
+        (resumed ||
+         std::fabs(progress - session.lastProgress) * distance >=
+             kProgressEpsilonDip)) {
         InsertProgress(progress);
         session.lastProgress = progress;
     }
@@ -2297,6 +2571,84 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
     BeginHidSession(xDip, yDip, tickMs);
 }
 
+// The coast through the window between the last report and the release. Only the
+// idle tick runs while the stream is silent, so it starts the coast, and it is
+// also the tick that ends the session 10-15 ms later: that release stops the
+// coast and plans the close from its value.
+void MaybeCoast(uint64_t tickMs, uint64_t qpcNow) {
+    if (g_coasting.load(std::memory_order_relaxed)) {
+        // Nothing interrupted this coast: pin the value it was heading to. The
+        // animation is over at this point, and its base value is the report
+        // before it, which would snap the panel back.
+        if (qpcNow >= g_coastStartQpc &&
+            qpcNow - g_coastStartQpc >=
+                static_cast<uint64_t>(kCoastDuration.count())) {
+            if (g_debugCoast) {
+                FileLog(L"coast end value=%.3f", g_coastTo);
+            }
+            InsertProgress(g_coastTo);  // ends the coast, see InsertProgress
+        }
+        return;
+    }
+
+    // A close this mod started still owns Progress, and a menu that is already
+    // closing has no finger motion left to continue.
+    if (tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    const bool revealActive = g_reveal.active;
+    if (!g_hidSession.active && !revealActive) {
+        return;
+    }
+
+    const float distance = g_distancePub.load(std::memory_order_relaxed);
+    if (!(distance > 0.0f)) {
+        return;
+    }
+
+    // The reveal maps Progress from the panel trail, which the UI thread
+    // publishes when the root opens. The first 50 ms of the follow settle.
+    if (revealActive &&
+        (qpcNow < g_reveal.activeSinceQpc ||
+         qpcNow - g_reveal.activeSinceQpc < kRevealCoastSettleMs)) {
+        return;
+    }
+
+    const uint64_t lastSample =
+        revealActive ? g_reveal.lastSampleQpc : g_hidSession.lastSampleQpc;
+    if (qpcNow < lastSample || qpcNow - lastSample < kCoastStartMs) {
+        return;
+    }
+
+    // The HWND outlives the menu and IsWindowVisible stays TRUE while it is
+    // closed, so only the cloaked attribute says the menu is on screen. One
+    // query per coast is affordable where one per report would not be.
+    if (!StartWindowIsOpen()) {
+        return;
+    }
+
+    const float velocity = CoastVelocity(distance);
+    if (std::fabs(velocity) * distance < kCoastMinVelocityDip) {
+        return;
+    }
+
+    const float from = std::clamp(
+        revealActive ? g_reveal.lastInserted : g_hidSession.lastProgress,
+        0.0f, 1.0f);
+    const float to = std::clamp(
+        from + velocity * static_cast<float>(kCoastDuration.count()), 0.0f,
+        1.0f);
+    if (to == from) {
+        return;  // the travel is used up; there is nothing to continue
+    }
+
+    if (StartCoast(from, to) && g_debugCoast) {
+        FileLog(L"coast start from=%.3f to=%.3f vel=%.2f", from, to,
+                velocity * distance);
+    }
+}
+
 // A device that leaves the surface without a lift report still ends the
 // gesture; the idle tick only has to notice the silence, which is measured on
 // the QPC clock because the tick clock is quantised to 15.6 ms.
@@ -2326,6 +2678,10 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         g_contactDown = false;
         g_openCheckValid = false;
     }
+
+    // Last, so a session this tick released does not also start a coast, and a
+    // coast that reached its end is pinned before this tick returns.
+    MaybeCoast(tickMs, qpcNow);
 }
 
 // The deferred tap of a cancelled reveal. It runs on the input thread so the
@@ -2749,6 +3105,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     g_contactDown = false;
     g_openCheckValid = false;
     g_pendingWinTapTick = 0;
+    g_coasting.store(false, std::memory_order_relaxed);
+    ResetCoastVelocity();
     g_debugFileStamp = DebugFileStamp{};
     FreeHidDevices();
 
@@ -3588,6 +3946,7 @@ void ResetComposition() {
     try {
         if (g_state) {
             g_state.StopAnimation(L"Progress");
+            g_coasting.store(false, std::memory_order_relaxed);
             g_state.InsertScalar(L"Progress", 1.0f);
             g_progressNow.store(1.0f, std::memory_order_relaxed);
         }
@@ -3626,7 +3985,7 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.7.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.8.0 initializing");
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.
