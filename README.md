@@ -24,7 +24,7 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 | Pen | registered, not yet exercised by hand |
 | Taskbar on top / right / bottom | axis logic present, only left verified |
 | Mouse drag to dismiss | deliberately not enabled |
-| Reveal (edge swipe to open) following the finger | not achievable, see below |
+| Reveal (edge swipe to open) following the finger | working, anchored to the panel edge |
 
 ## How the working path works
 
@@ -52,6 +52,41 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 Release detection: the digitizer keeps reporting while the finger rests
 (measured 255 reports in a 1.5 s hold), so a 35 ms window without a report is a
 reliable lift. Observed release latency is ~47 ms.
+
+## Opening follows the finger too
+
+The left-edge swipe is Windows' own gesture: `twinui.pcshell.dll`
+`TouchEdgeGestureProcessor` calls `CStartExperienceManager::Show(..., 16)` and
+`StartUI_.dll` starts its own reveal animation. ExplorerPatcher is not involved.
+
+The mod cannot suppress that animation: hooking
+`StartUI::SplitViewFrame::OnGlobalAnimationRequested` and skipping the `type=0`
+request also skips presenting the panel, which leaves a window that DWM reports
+as shown but that draws nothing. That hook exists in the mod as an experiment
+(`anim=0` in the debug file) and is off by default.
+
+Instead the mod takes over after the shell opens the window:
+
+- A touch that starts within 12 DIP of the taskbar's screen edge while the menu
+  is closed becomes an edge candidate. Raw Input sees it from the first report
+  (`edge x=0 ...`), before the shell opens anything.
+- Once the menu is open and the contact is still down, every report drives
+  `Progress` from the **absolute** finger position and the panel's trailing edge:
+
+  ```
+  Progress = 1 - (finger - panelTrail) / (direction * distance)
+  ```
+
+  The trailing edge is measured on the UI thread from the root's visible child
+  (`StartSizingFrame`, ~1053 DIP here) and published to the input thread. With
+  that anchor the panel edge equals the finger: measured within 4-5 px at 150,
+  450 and 800 DIP.
+- Release above 25% progress animates to fully open; below it the mod taps
+  `VK_LWIN` to close again.
+
+An earlier version anchored progress to the frame in which the menu was first
+seen open and used the root width as the distance; that lagged the finger by
+565 DIP and made the commit decision depend on swipe speed. Both are fixed.
 
 ## Data sources that do not work
 
@@ -108,6 +143,9 @@ testing; the menu then attaches its renderer on the next open.
   `DWMWA_CLOAKED`; `IsWindowVisible` stays TRUE while the menu is hidden.
 - `tools/inject_swipe.ps1` — inject a touch swipe (virtual digitizer).
 - `tools/touch_hold.ps1` — drag to a point, hold, capture, then release.
+- `tools/follow_hold.ps1` — same, but keeps sending updates while the screenshot
+  is taken: the virtual digitizer stops reporting during a plain hold, unlike the
+  real panel, so this is the only way to photograph a mid-gesture state.
 - `tools/inject_swipe_holds.ps1` — swipe with pauses at waypoints.
 - `tools/measure_swipe.ps1`, `tools/read_shared_gesture.ps1` — earlier
   investigation helpers for the edge-gesture bridge.
@@ -120,8 +158,17 @@ to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
 ## Known limits and risks
 
 - Only the left-taskbar case is verified. `UpdateDismissAxis` maps the taskbar
-  edge to a dismiss direction and the translation is axis-aware, but the other
-  three sides are untested.
+  edge to a dismiss direction and both the translation and the reveal anchor are
+  axis-aware, but the other three sides are untested.
+- The reveal's cancel branch is currently unreachable: at the screen edge the
+  computed progress is already ~0.27, above the 0.25 commit threshold, so every
+  edge release ends with the menu open. That matches the shell's own behaviour.
+- The panel trailing edge is measured from the root's visible child; if the menu
+  layout changes (another panel becomes the first visible child) the anchor needs
+  revisiting. The XAML island is inset to the monitor work area, not to the
+  window rect, which is 95 px of error if the window rect is used instead.
+- The reveal trails the finger by 4-5 px because of the 0.004 progress filter; a
+  finer threshold costs extra property writes on the input thread.
 - The contact collection is chosen by proximity to the previous raw position; two
   fingers moving together can confuse which one is tracked.
 - Composition translation does not move XAML hit-testing: while the menu is

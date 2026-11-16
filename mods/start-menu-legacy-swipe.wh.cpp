@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              start-menu-legacy-swipe
-// @name            Legacy Start Edge Swipe Dismiss
-// @description     Touch/pen swipe toward the anchored edge to dismiss the legacy Start menu
-// @version         0.4.0
+// @name            Legacy Start Edge Swipe
+// @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
+// @version         0.6.1
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -11,19 +11,25 @@
 
 // ==WindhawkModReadme==
 /*
-# Legacy Start edge swipe to dismiss (raw HID touch/pen)
+# Legacy Start edge swipe (reveal follow and dismiss)
 
 StartMenuExperienceHost-side companion for ExplorerPatcher's legacy Windows 10
-Start menu. A one-finger swipe toward the edge the menu is anchored to slides
-the menu out and dismisses it. The input layer reads raw HID touch and pen
-reports; it does not use XAML pointers, DirectManipulation or the pointer
-message queue.
+Start menu. A one-finger swipe from the taskbar edge opens the menu and makes it
+follow the finger; a swipe toward the same edge slides the menu out and
+dismisses it. The input layer reads raw HID touch and pen reports; it does not
+use XAML pointers, DirectManipulation or the pointer message queue.
 
 What it does:
 
 - Hooks `StartUI::App::PrepareRootElement` (`StartUI_.dll`, RVA `0xAD730`),
   captures the returned root after it loads and enables Composition
   translation.
+- Hooks `StartUI::SplitViewFrame::OnGlobalAnimationRequested` (`StartUI_.dll`,
+  RVA `0x4164C0`) and can drop the request whose `AnimationType` is 0 when the
+  debug line `anim=0` sets the switch; the switch starts at `anim=1`, the
+  original behaviour. The close request (`AnimationType` 1) always reaches the
+  original unchanged. The animation type is read from the event arguments with
+  the same three int getters the original calls, not from a call argument.
 - At every setup it gets the Start CoreWindow HWND via `ICoreWindowInterop`,
   compares `GetWindowRect` with the monitor work area and picks the dismiss
   direction: left if the window is anchored to the work-area left, then top,
@@ -68,13 +74,35 @@ What it does:
 - Two or more contacts cancel the gesture and are ignored until the panel is
   released. A lift report is not required: a session with no sample for 120 ms
   ends on its own.
+- Reveal follow: a contact that starts within 12 DIP of the taskbar edge while
+  the menu is closed is a candidate. EP opens the menu by itself once the
+  contact passes its own edge threshold; the first report that sees the menu
+  open takes `Progress` over. The follow works in absolute screen DIP against
+  the panel edge that faces the taskbar (`panelTrail`), which the UI thread maps
+  from the first visible child of the root (`StartSizingFrame`) and translates
+  by the work area origin: `Progress = 1 - (finger - panelTrail) / (dir *
+  Distance)`. The panel edge therefore meets the finger at every sample, and the
+  panel is exactly off screen at the screen edge (Progress 0.269 for a 1052 DIP
+  trail on a 1440 DIP root). A release past 25% animates to 1 and keeps the menu; a
+  shorter release taps `VK_LWIN` and restores `Progress = 1` without animation.
+  EP already committed to the open when the follow starts, so a release after a
+  mapped trail commits: the screen edge already reads 0.269. The cancel branch
+  stays for the fallback trail, which reads 0 at the edge. The line
+  `open follow travel=... progress=... commit=... panel=... n=...` is written
+  once per reveal.
+- The candidate path polls the cloaked attribute at most once per 20 ms; the
+  cached answer is dropped on every lift, so each contact starts from a fresh
+  query.
 
 What it does not do:
 
-- It does not drive the slide-in reveal and has no per-frame reveal. It does
-  not use the explorer-side bridge or shared memory.
+- It does not use the explorer-side bridge or shared memory.
 - It does not attach XAML pointer handlers and has no DirectManipulation
   hook.
+- It does not remove the shell's open storyboard. Measured with `anim=0`:
+  dropping the open request leaves the Start window uncloaked with no pane
+  drawn, because the same request is the step that presents the content. The
+  switch is therefore off and the open still slides from the shell.
 
 Debug channel (kept in the build):
 
@@ -85,6 +113,8 @@ Debug channel (kept in the build):
   - `p=0.5` inserts `Progress`, clamped to 0..1.
   - `t=-300,0,0` sets `UIElement.Translation` on the UI thread.
   - `e=-300,0` sets `Properties["Offset"]` and `Visual.Offset` on the visual.
+  - `anim=0` suppresses the shell's open storyboard; `anim=1` restores it. The
+    default is `anim=1`, because suppression leaves the pane undrawn.
   Empty lines and unknown lines are ignored. The channel compares the rendering
   mechanisms without a gesture; it does nothing before the first
   `attached root=...` line.
@@ -94,10 +124,18 @@ Diagnostics:
 - `mod init`, `hid init`, `hid reg usage=... ok=... err=...`,
   `hid down x=... y=... axis=... dist=...`,
   `hid release delta=... perp=... vel=... commit=... n=...`,
-  `hid dismiss win sent`, `hid decodefail dev=... err=...`,
+  `hid dismiss win sent`,
+  `open follow travel=... progress=... commit=... panel=... n=...`,
+  `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`),
+  `hid decodefail dev=... err=...`,
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
-  `debug e=...` go to `renderer.log`.
-- Only begin and release are logged, never individual samples.
+  `debug e=...`, `debug anim=...`, `startui anim hooked`,
+  `startui anim hook skipped` and the first four
+  `startui anim type=... edge=... trans=... suppress=...` calls go to
+  `renderer.log`.
+- Only begin and release are logged, never individual samples. The `edge` line
+  stays in the code behind `g_debugEdge`, which is false; it measured the raw
+  edge contact and EP's own open threshold.
 
 Known risks:
 
@@ -109,6 +147,23 @@ Known risks:
   range decodes to the wrong DIP point.
 - The legacy menu also receives the same touch through its normal XAML input,
   so a drag can scroll or click a tile while the menu slides.
+- The reveal takes `Progress` over on the first report that sees the menu open,
+  so the menu drops to the computed progress at that instant (0.269 at the
+  screen edge on this layout) and then follows. The mapping needs the panel
+  trail: it is the first visible child of the root with a width. If that child
+  is missing or unlaid when `Setup` and `SizeChanged` run, the trail falls back
+  to the root extent and the follow lags the finger again (log
+  `reveal panelTrail=... (fallback)`).
+- The trail assumes the XAML island sits at the work area origin. Measured on
+  this build: the CoreWindow is full screen and `GetWindowRect` returns
+  `0,0,2880,1800`, yet the panel's border lands 48 DIP right of the mapped
+  transform because the island is inset by the taskbar. A shell that lays the
+  island out at the screen origin would read 48 DIP high on a left taskbar.
+- `panelTrail` is republished on every root `SizeChanged`. A panel resize during
+  a follow moves the mapping, so the panel edge jumps to the new trail under the
+  same finger.
+- `Distance` is sampled at takeover. A layout change during the follow keeps
+  the old extent until the contact lifts.
 - Composition calls and the settle batch run from the input thread. The batch
   completion arrives on the compositor's dispatcher; if it never arrives,
   `Progress` stays at 0 and every later down is ignored until that batch
@@ -118,27 +173,41 @@ Known risks:
   already gone.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
-- The `PrepareRootElement` RVA is specific to `StartUI_.dll` 10.0.22621.3733.
+- The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
+  `StartUI_.dll` 10.0.22621.3733. The animation hook checks its target prologue
+  and the three argument getters before it installs; a different build logs
+  `startui anim hook skipped` and keeps the original animation.
 */
 // ==/WindhawkModReadme==
 
 /*
- * [INPUT]: depends on StartUI::App::PrepareRootElement in StartUI_.dll; on
- *   RegisterRawInputDevices, GetRawInputData, GetRawInputDeviceInfoW,
- *   GetDpiForWindow, GetSystemMetrics, GetWindowRect and keybd_event from
+ * [INPUT]: depends on StartUI::App::PrepareRootElement and
+ *   StartUI::SplitViewFrame::OnGlobalAnimationRequested plus its three argument
+ *   getters in StartUI_.dll; on RegisterRawInputDevices, GetRawInputData,
+ *   GetRawInputDeviceInfoW,
+ *   GetDpiForWindow, GetSystemMetrics, GetWindowRect, MonitorFromWindow,
+ *   GetMonitorInfoW and keybd_event from
  *   user32; on DwmGetWindowAttribute, resolved at init from dwmapi.dll; on
  *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps and
  *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet and
- *   expression installed in Setup; on `debug.txt` in the mod storage
- *   directory, read by the debug channel.
+ *   expression installed in Setup; on VisualTreeHelper and TransformToVisual
+ *   from Windows.UI.Xaml.Media to map the panel trail; on `debug.txt` in the
+ *   mod storage directory, read by the debug channel.
  * [OUTPUT]: one message-only window and one worker thread per process; the
- *   Composition `Progress` scalar; one global Windows-key tap per committed
- *   dismiss; three file-driven debug commands (`p`, `t`, `e`) that apply a
- *   Progress value, the XAML translation or the visual offset; no exported
- *   symbols.
- * [POS]: input and gesture layer of the legacy Start dismiss mod. It replaces
- *   the XAML pointer and DirectManipulation paths with raw HID decoding; the
- *   composition helpers below it are shared with the root hook above it.
+ *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
+ *   published for the reveal follow; one global Windows-key tap per committed
+ *   dismiss or short reveal; an optional suppressed open animation request
+ *   (type 0, off by default because dropping it leaves the pane undrawn) while
+ *   the close request (type 1) always passes through; four file-driven debug
+ *   commands (`p`, `t`, `e`, `anim`) that apply a Progress value, the XAML
+ *   translation, the visual offset or the animation mode; no exported symbols.
+ * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
+ *   pointer and DirectManipulation paths with raw HID decoding, owns two
+ *   gestures (the dismiss drag inside the open menu and the reveal follow that
+ *   takes the menu's own open over from the taskbar edge and pins the panel's
+ *   trailing edge to the finger) and carries the switch that can drop the
+ *   shell's open storyboard for experiments. The composition helpers below it
+ *   are shared with the root hook above it.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -156,6 +225,7 @@ Known risks:
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <algorithm>
 #include <atomic>
@@ -222,6 +292,36 @@ constexpr uintptr_t kPreferredBase = 0x180000000;
 // StartUI_.dll 10.0.22621.3733 (x86-64).
 constexpr uintptr_t kPrepareRootElementVa = 0x1800AD730;
 
+// StartUI::SplitViewFrame::OnGlobalAnimationRequested(sender, args) -> void
+// StartUI_.dll 10.0.22621.3733 (x86-64).
+//
+// The handler forwards the shell's animation request to a delegate stored at
+// this+0x3C0. The animation type is NOT an argument: the handler reads three
+// ints from the args object through the wrappers below (vtable slots 6, 7 and
+// 8). The function never writes eax and has no direct call site, so its return
+// value is unused and the hook must return void as well.
+constexpr uintptr_t kOnGlobalAnimationRequestedVa = 0x1804164C0;
+constexpr uintptr_t kAnimTypeGetterVa = 0x18041A978;
+constexpr uintptr_t kAnimEdgeGetterVa = 0x18041AA20;
+constexpr uintptr_t kAnimTransitionGetterVa = 0x18041A9CC;
+
+// Bytes 0x00..0x27 of the target. The three E8 calls at +0x27, +0x33 and
+// +0x3F read the animation type, the taskbar edge and the transition type; the
+// installer resolves their rel32 targets before it trusts this layout.
+constexpr uint8_t kAnimPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10,  // mov qword ptr [rsp+0x10], rbx
+    0x48, 0x89, 0x74, 0x24, 0x20,  // mov qword ptr [rsp+0x20], rsi
+    0x57,                          // push rdi
+    0x48, 0x83, 0xEC, 0x70,        // sub  rsp, 0x70
+    0x48, 0x8B, 0x05,              // mov  rax, [rip+cookie]
+    0x00, 0x00, 0x00, 0x00,        //      ... displacement, checked below
+    0x48, 0x33, 0xC4,              // xor  rax, rsp
+    0x48, 0x89, 0x44, 0x24, 0x60,  // mov  qword ptr [rsp+0x60], rax
+    0x49, 0x8B, 0xD8,              // mov  rbx, r8   (args)
+    0x48, 0x8B, 0xF9,              // mov  rdi, rcx  (self)
+    0x49, 0x8B, 0xC8,              // mov  rcx, r8
+};
+
 constexpr std::chrono::milliseconds kDismissSettleDuration{150};
 constexpr std::chrono::milliseconds kDismissCancelDuration{120};
 
@@ -233,11 +333,20 @@ constexpr float kScrollAbortRatio = 1.5f;
 constexpr float kScrollAbortMaxDelta = 60.0f;
 constexpr float kProgressStep = 0.004f;
 constexpr float kWindowMarginDip = 4.0f;
+
+// Reveal follow (edge swipe to open). A contact that starts inside the edge
+// band on the taskbar side can drive the menu's own open; a release past a
+// quarter of the distance keeps the menu, a shorter one closes it again.
+constexpr float kEdgeBandDip = 12.0f;
+constexpr float kRevealCommitFraction = 0.25f;
 constexpr uint64_t kIdleReleaseMs = 35;
 constexpr UINT_PTR kIdleTimerId = 1;
 constexpr UINT kIdleTimerMs = 20;
 constexpr UINT_PTR kDebugTimerId = 2;
 constexpr UINT kDebugTimerMs = 50;
+// The DWM cloaked query is a syscall. The report handler accepts one answer
+// per interval and reuses it for every other report.
+constexpr uint64_t kOpenCheckIntervalMs = 20;
 
 // Raw input and HID decoding limits.
 constexpr int kMaxHidDevices = 4;
@@ -288,6 +397,14 @@ std::atomic<bool> g_disabled{false};
 std::atomic<bool> g_unloading{false};
 std::atomic<bool> g_stopDismissCallback{false};
 
+// The open storyboard drops only when the debug line `anim=0` asks for it.
+// Measured on this build: skipping the open request leaves the window open
+// (DWMWA_CLOAKED 0) with no pane drawn, because that request is also the step
+// that presents the SplitViewFrame content. The switch therefore starts at the
+// original behaviour.
+std::atomic<bool> g_suppressOpenAnim{false};
+std::atomic<int32_t> g_animLogCount{0};
+
 // ---------------------------------------------------------------------------
 // Composition state
 //
@@ -335,6 +452,18 @@ std::atomic<bool> g_hasRoot{false};
 std::atomic<int32_t> g_axisPub{static_cast<int32_t>(DismissAxis::Left)};
 std::atomic<float> g_distancePub{0.0f};
 std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
+
+// The panel edge that faces the taskbar, in absolute screen DIP. The root
+// canvas spans the screen (1440 DIP here) while the visible panel is narrower
+// (~993 DIP), so the reveal must be measured against this edge, not against the
+// root extent. 0 means "not known yet"; the input thread then uses
+// g_distancePub, which restores the old root-width travel.
+std::atomic<float> g_panelTrailDip{0.0f};
+
+// UI thread only. Setup resets the open log; a failed mapping logs its fallback
+// once per process so a missing panel does not flood the log every resize.
+bool g_panelTrailLogged = false;
+bool g_panelTrailFallbackLogged = false;
 
 HANDLE g_hidThread = nullptr;
 std::atomic<HWND> g_hidHwnd{nullptr};
@@ -676,7 +805,28 @@ void ApplyDebugLine(const char* line) {
     while (*line == ' ' || *line == '\t' || *line == '\r') {
         ++line;
     }
-    if (line[0] == '\0' || line[1] != '=') {
+    if (line[0] == '\0') {
+        return;
+    }
+
+    // anim=0 drops the shell's own open storyboard, anim=1 restores it. The
+    // switch is its own command word, so it is matched before the one-letter
+    // commands and their `letter=value` shape.
+    if (std::strncmp(line, "anim=", 5) == 0) {
+        const char* value = line + 5;
+        while (*value == ' ' || *value == '\t') {
+            ++value;
+        }
+        if (*value != '0' && *value != '1') {
+            return;
+        }
+        const int anim = *value - '0';
+        g_suppressOpenAnim.store(anim == 0, std::memory_order_relaxed);
+        FileLog(L"debug anim=%d", anim);
+        return;
+    }
+
+    if (line[1] != '=') {
         return;
     }
 
@@ -1118,9 +1268,16 @@ HWND FindStartCoreWindow() {
     return nullptr;
 }
 
+// Cached answer of StartWindowIsOpen() for the report handler. The cloaked
+// query is a syscall, so one answer serves every report inside 20 ms; the
+// cache is dropped on each lift so a down always starts from a fresh query.
+bool g_openCheckValid = false;     // input thread only
+bool g_openCheckOpen = false;      // input thread only
+uint64_t g_lastOpenCheckTick = 0;  // input thread only
+
 // The menu closes by cloaking its CoreWindow, not by destroying or hiding it.
-// Called once per down; nothing is cached, because the menu opens and closes
-// many times on the same HWND.
+// Called once per down; nothing is cached here, because the menu opens and
+// closes many times on the same HWND.
 bool StartWindowIsOpen() {
     HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
     if (!hwnd) {
@@ -1137,6 +1294,21 @@ bool StartWindowIsOpen() {
     const HRESULT hr =
         dwmGetWindowAttribute(hwnd, kDwmwaCloaked, &cloaked, sizeof(cloaked));
     return hr == S_OK && cloaked == 0;
+}
+
+// The candidate contact needs the open state on every report, but the cloaked
+// query is a syscall. One answer serves all reports inside 20 ms; the cache is
+// invalidated when a contact lifts, so a down always starts from a fresh one.
+bool StartWindowIsOpenThrottled(uint64_t tickMs) {
+    if (g_openCheckValid &&
+        tickMs - g_lastOpenCheckTick < kOpenCheckIntervalMs) {
+        return g_openCheckOpen;
+    }
+
+    g_lastOpenCheckTick = tickMs;
+    g_openCheckValid = true;
+    g_openCheckOpen = StartWindowIsOpen();
+    return g_openCheckOpen;
 }
 
 float HidDpiScale() {
@@ -1186,11 +1358,53 @@ struct HidGestureSession {
 
 HidGestureSession g_hidSession;  // input thread only
 
+// Reveal follow. The contact that starts on the taskbar edge is remembered
+// while the menu is closed. EP opens the menu by itself once the contact
+// passes its own edge threshold, and the same contact is still down at that
+// moment, so it takes Progress over and the menu follows it from there.
+//
+// `distance` is the root extent along the axis: Progress 1 leaves the root at
+// rest, Progress 0 slides it out by Distance. `panelTrail` is the panel edge in
+// absolute screen DIP that the finger meets: the reveal is
+// Progress = 1 - (finger - panelTrail) / (dir * distance), so the panel's
+// trailing edge sits under the finger at every sample and Progress no longer
+// depends on when the menu was seen opening. `progress` is the last computed
+// value, `lastInserted` the last one that reached the property set, so the
+// 0.004 change filter compares against what the renderer actually shows.
+struct HidRevealSession {
+    bool edgeCandidate = false;
+    bool active = false;
+    float edgeStartX = 0.0f;  // first report, kept for the edge-band test
+    float edgeStartY = 0.0f;
+    float distance = 0.0f;
+    float panelTrail = 0.0f;
+    float travel = 0.0f;
+    float progress = 0.0f;
+    float lastInserted = 1.0f;
+    int samples = 0;
+    uint64_t lastTick = 0;
+};
+
+HidRevealSession g_reveal;  // input thread only
+
+// True from the first report of a contact until it lifts. The edge test runs
+// once per contact, never on a finger that slides into the band later.
+bool g_contactDown = false;      // input thread only
+uint64_t g_contactTick = 0;      // input thread only, last report of a contact
+
+// Screen size in DIP, rewritten by FeedHidReport before every state-machine
+// step. The right and bottom edge bands are measured from it.
+float g_screenDipWidth = 0.0f;   // input thread only
+float g_screenDipHeight = 0.0f;  // input thread only
+
 // Set when a commit hands Progress to the settle animation. The reuse of one
 // XAML root means the next drag can still see a translated root or a base
 // value of 0, so BeginHidSession restores the resting value first.
 bool g_commitNeedsProgressReset = false;  // input thread only
 bool g_rootWasOpen = false;              // input thread only
+uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
+// The edge line was a measurement instrument: it is off in the shipping build.
+constexpr bool g_debugEdge = false;
 
 float AxisDelta(int32_t axis, const HidGestureSession& session, float x,
                 float y) {
@@ -1232,6 +1446,174 @@ bool PointInStartWindow(float x, float y) {
            y <= static_cast<float>(bottom) + kWindowMarginDip;
 }
 
+// The taskbar sits on the side the dismiss axis slides out along, so that axis
+// also names the edge band the reveal starts from.
+bool PointInEdgeBand(int32_t axis, float x, float y) {
+    switch (static_cast<DismissAxis>(axis)) {
+        case DismissAxis::Left:
+            return x <= kEdgeBandDip;
+        case DismissAxis::Top:
+            return y <= kEdgeBandDip;
+        case DismissAxis::Right:
+            return g_screenDipWidth > kEdgeBandDip &&
+                   x >= g_screenDipWidth - kEdgeBandDip;
+        case DismissAxis::Bottom:
+            return g_screenDipHeight > kEdgeBandDip &&
+                   y >= g_screenDipHeight - kEdgeBandDip;
+    }
+    return false;
+}
+
+// Finger position on the gesture axis in absolute screen DIP. The reveal
+// formula compares it to the panel trail directly, so the same drag yields the
+// same progress on every open.
+float AxisScreenPosition(int32_t axis, float x, float y) {
+    return IsHorizontalAxis(axis) ? x : y;
+}
+
+// The direction the menu slides out along, as the DirX/DirY sign: -1 for a
+// left or top taskbar, +1 for right or bottom.
+float AxisDirection(int32_t axis) {
+    switch (static_cast<DismissAxis>(axis)) {
+        case DismissAxis::Left:
+        case DismissAxis::Top:
+            return -1.0f;
+        case DismissAxis::Right:
+        case DismissAxis::Bottom:
+            return 1.0f;
+    }
+    return -1.0f;
+}
+
+// Runs on the first report of a contact. A contact that starts on the taskbar
+// edge while the menu is closed can own the menu's own open; anything else is
+// left to the dismiss path. A touch on the edge of an *open* menu is a dismiss
+// start, not a candidate.
+bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
+    if (g_dismissSettling.load(std::memory_order_relaxed) ||
+        !g_hasRoot.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    const float distance = g_distancePub.load(std::memory_order_relaxed);
+    if (!(distance > 0.0f)) {
+        return false;  // renderer not ready: no distance to follow
+    }
+
+    const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
+    if (!PointInEdgeBand(axis, x, y)) {
+        return false;
+    }
+
+    if (StartWindowIsOpenThrottled(tickMs)) {
+        return false;
+    }
+
+    g_reveal = HidRevealSession{};
+    g_reveal.edgeCandidate = true;
+    g_reveal.edgeStartX = x;
+    g_reveal.edgeStartY = y;
+    g_reveal.lastTick = tickMs;
+    return true;
+}
+
+// One reveal step. While the menu is still closed the contact is only
+// remembered; the moment it is open under the contact, the follow takes
+// Progress over and every later report drives it.
+void UpdateRevealSession(float x, float y, uint64_t tickMs) {
+    HidRevealSession& reveal = g_reveal;
+    reveal.lastTick = tickMs;
+
+    if (!reveal.active) {
+        if (!StartWindowIsOpenThrottled(tickMs)) {
+            return;
+        }
+
+        const float distance = g_distancePub.load(std::memory_order_relaxed);
+        if (!(distance > 0.0f)) {
+            // A new root is being installed under the contact, so this contact
+            // no longer has a renderer to drive.
+            reveal.edgeCandidate = false;
+            return;
+        }
+
+        reveal.active = true;
+        reveal.distance = distance;
+        reveal.progress = 0.0f;
+        reveal.lastInserted = 1.0f;  // the menu is fully in right now
+        reveal.samples = 0;
+
+        // A cancel or dismiss animation from a previous gesture may still own
+        // Progress; the follow must drive the scalar from this sample on.
+        StopProgressAnimation();
+    }
+
+    const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
+    const float finger = AxisScreenPosition(axis, x, y);
+    reveal.travel =
+        finger - AxisScreenPosition(axis, reveal.edgeStartX, reveal.edgeStartY);
+
+    // The trail is published by the UI thread before the root opens. A zero
+    // value means the renderer is between roots; the root extent keeps the
+    // follow monotonic instead of dividing by a stale or missing edge.
+    float panelTrail = g_panelTrailDip.load(std::memory_order_relaxed);
+    if (!(panelTrail > 0.0f)) {
+        panelTrail = reveal.distance;
+    }
+    reveal.panelTrail = panelTrail;
+
+    // Absolute screen DIP on both sides of the subtraction: the panel's
+    // trailing edge meets the finger, so the progress no longer depends on
+    // where the finger was when the menu was first seen open.
+    const float progress = std::clamp(
+        1.0f - (finger - panelTrail) / (AxisDirection(axis) * reveal.distance),
+        0.0f, 1.0f);
+
+    reveal.progress = progress;
+    reveal.samples++;
+    if (std::fabs(progress - reveal.lastInserted) > kProgressStep &&
+        InsertProgress(progress)) {
+        reveal.lastInserted = progress;
+    }
+}
+
+// Release of the edge contact. A candidate that never saw the menu open ends
+// silently: it did not touch Progress. A reveal that ran logs exactly one line.
+void ReleaseRevealSession() {
+    HidRevealSession& reveal = g_reveal;
+    if (!reveal.edgeCandidate) {
+        return;
+    }
+
+    reveal.edgeCandidate = false;
+    if (!reveal.active) {
+        return;
+    }
+    reveal.active = false;
+
+    const float progress = std::clamp(reveal.progress, 0.0f, 1.0f);
+    const bool commit = progress > kRevealCommitFraction;
+    FileLog(L"open follow travel=%.0f progress=%.2f commit=%d panel=%.0f n=%d",
+            reveal.travel, progress, commit ? 1 : 0, reveal.panelTrail,
+            reveal.samples);
+
+    if (commit) {
+        // Let go past the commit point: the menu stays open and the follow
+        // finishes the slide instead of snapping.
+        if (!AnimateProgressTo(progress, 1.0f, kDismissSettleDuration)) {
+            ShowAtRest();
+        }
+        return;
+    }
+
+    // Short reveal: the Windows tap closes the menu again, then the scalar
+    // returns to rest without animation so the next open is not slid out.
+    keybd_event(VK_LWIN, 0, 0, 0);
+    Sleep(60);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    ShowAtRest();
+}
+
 void LogHidRelease(const HidGestureSession& session, float velocity,
                    bool commit, uint64_t releaseTick) {
     const uint64_t releaseDelay =
@@ -1259,7 +1641,8 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // The renderer must exist and the menu must be on screen right now. A
     // closed menu keeps its HWND and reports itself visible, so only the DWM
     // cloaked attribute answers this.
-    if (!g_hasRoot.load(std::memory_order_relaxed) || !StartWindowIsOpen()) {
+    if (!g_hasRoot.load(std::memory_order_relaxed) ||
+        !StartWindowIsOpenThrottled(tickMs)) {
         return;
     }
 
@@ -1399,6 +1782,9 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
             ReleaseHidSession(tickMs, true);
         }
         session.suppress = false;
+        ReleaseRevealSession();
+        g_contactDown = false;
+        g_openCheckValid = false;
         return;
     }
 
@@ -1406,27 +1792,55 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
         return;
     }
 
-    if (!session.active) {
-        if (!PointInStartWindow(xDip, yDip)) {
-            return;
-        }
-        BeginHidSession(xDip, yDip, tickMs);
+    if (session.active) {
+        UpdateHidSession(xDip, yDip, tickMs);
         return;
     }
 
-    UpdateHidSession(xDip, yDip, tickMs);
+    // The edge test belongs to the first report of the contact: a finger that
+    // slides into the band after starting elsewhere is not a reveal candidate,
+    // and a candidate that already exists owns the contact until it lifts.
+    const bool newContact =
+        !g_contactDown ||
+        (tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs);
+    g_contactDown = true;
+    g_contactTick = tickMs;
+    if (newContact) {
+        BeginEdgeCandidate(xDip, yDip, tickMs);
+    }
+    if (g_reveal.edgeCandidate) {
+        UpdateRevealSession(xDip, yDip, tickMs);
+        return;
+    }
+
+    if (!PointInStartWindow(xDip, yDip)) {
+        return;
+    }
+    BeginHidSession(xDip, yDip, tickMs);
 }
 
 // A device that leaves the surface without a lift report still ends the
 // gesture; WM_TIMER only runs while no report is arriving.
 void CheckHidIdleRelease(uint64_t tickMs) {
     HidGestureSession& session = g_hidSession;
-    if (!session.active) {
-        return;
-    }
-    if (tickMs > session.lastTick &&
+
+    if (session.active && tickMs > session.lastTick &&
         tickMs - session.lastTick >= kIdleReleaseMs) {
         ReleaseHidSession(tickMs, true);
+    }
+
+    if (g_reveal.edgeCandidate && tickMs > g_reveal.lastTick &&
+        tickMs - g_reveal.lastTick >= kIdleReleaseMs) {
+        ReleaseRevealSession();
+    }
+
+    // A contact that holds no session is not tracked per report, so the same
+    // silence that ends a gesture ends the "this contact already started"
+    // latch. Without it a lost lift would swallow the next edge swipe.
+    if (!session.active && !g_reveal.edgeCandidate && g_contactDown &&
+        tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs) {
+        g_contactDown = false;
+        g_openCheckValid = false;
     }
 }
 
@@ -1597,6 +2011,21 @@ void FeedHidReport(HidDevice& device, USHORT reportId, const BYTE* report,
     const float xDip = static_cast<float>(pixelX) / dpiScale;
     const float yDip = static_cast<float>(pixelY) / dpiScale;
 
+    // The right and bottom edge bands are measured from the screen, which this
+    // thread only knows in pixels; publish it in the same DIP space as xDip.
+    g_screenDipWidth = static_cast<float>(screenWidth) / dpiScale;
+    g_screenDipHeight = static_cast<float>(screenHeight) / dpiScale;
+
+    // Diagnostic: does the digitizer see a touch that starts on the screen edge
+    // before the menu is open? Off in the shipping build; it measured the edge
+    // contact and EP's own open threshold.
+    if (g_debugEdge && !g_hidSession.active && xDip < 200.0f &&
+        tickMs > g_edgeLogTick + 100) {
+        g_edgeLogTick = tickMs;
+        FileLog(L"edge x=%.0f y=%.0f open=%d", xDip, yDip,
+                StartWindowIsOpen() ? 1 : 0);
+    }
+
     OnHidSample(contacts, xDip, yDip, tickMs);
 }
 
@@ -1742,6 +2171,9 @@ DWORD WINAPI HidInputThread(LPVOID) {
     UnregisterHidUsage(kUsagePen);
 
     g_hidSession = HidGestureSession{};
+    g_reveal = HidRevealSession{};
+    g_contactDown = false;
+    g_openCheckValid = false;
     g_debugFileStamp = DebugFileStamp{};
     FreeHidDevices();
 
@@ -1790,6 +2222,132 @@ void PublishGestureGeometry() {
     g_winRectDip[3].store(
         static_cast<int64_t>(std::llround(rect.bottom / scale)),
         std::memory_order_relaxed);
+}
+
+// Maps the panel's trailing edge into absolute screen DIP. The visible panel is
+// the first visible child of the root with a width (StartSizingFrame); the rest
+// of the root canvas is transparent and must not be part of the reveal travel.
+// The edge that faces the taskbar is the right edge on a left taskbar, the
+// bottom on top, the left on right and the top on bottom. Runs on the UI thread
+// and returns false while that child is not laid out yet.
+bool ComputePanelTrailDip(float& trail) {
+    wux::FrameworkElement root = g_root;
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!root || !hwnd) {
+        return false;
+    }
+
+    float frameLeft = 0.0f;
+    float frameTop = 0.0f;
+    float frameRight = 0.0f;
+    float frameBottom = 0.0f;
+    bool measured = false;
+
+    const int32_t childCount =
+        wux::Media::VisualTreeHelper::GetChildrenCount(root);
+    for (int32_t i = 0; i < childCount; ++i) {
+        wux::FrameworkElement child =
+            wux::Media::VisualTreeHelper::GetChild(root, i)
+                .try_as<wux::FrameworkElement>();
+        if (!child) {
+            continue;
+        }
+        const float width = static_cast<float>(child.ActualWidth());
+        if (!(width > 0.0f) ||
+            child.Visibility() != wux::Visibility::Visible) {
+            continue;
+        }
+
+        // The transform is relative to the window's XAML root; null asks for
+        // that root. A scaling or offset transform stays in the mapping.
+        wux::Media::GeneralTransform transform = child.TransformToVisual(nullptr);
+        const winrt::Windows::Foundation::Point topLeft =
+            transform.TransformPoint({0.0f, 0.0f});
+        frameLeft = topLeft.X;
+        frameTop = topLeft.Y;
+        frameRight = transform.TransformPoint({width, 0.0f}).X;
+        frameBottom =
+            transform
+                .TransformPoint(
+                    {0.0f, static_cast<float>(child.ActualHeight())})
+                .Y;
+        measured = true;
+        break;
+    }
+
+    if (!measured) {
+        return false;
+    }
+
+    // The Start CoreWindow spans the whole screen, but its XAML island is laid
+    // out in the work area: the mapped frame comes out 48 DIP left of where the
+    // pixels are when the taskbar is on the left. GetWindowRect returns the
+    // full-screen rect, so the work area origin is the offset the XAML
+    // coordinates are measured from. Measured: frame right 1005 DIP + work
+    // left 48 DIP = 1053 DIP, the panel's border at 2105 physical px.
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!monitor || !GetMonitorInfoW(monitor, &monitorInfo)) {
+        return false;
+    }
+    const float scale = DpiScaleForWindow(hwnd);
+    const float originX = monitorInfo.rcWork.left / scale;
+    const float originY = monitorInfo.rcWork.top / scale;
+
+    switch (static_cast<DismissAxis>(g_dismissAxis)) {
+        case DismissAxis::Left:
+            trail = originX + frameRight;
+            break;
+        case DismissAxis::Top:
+            trail = originY + frameBottom;
+            break;
+        case DismissAxis::Right:
+            trail = originX + frameLeft;
+            break;
+        case DismissAxis::Bottom:
+            trail = originY + frameTop;
+            break;
+    }
+
+    return true;
+}
+
+// Publishes the panel trail for the reveal follow. Falls back to the root
+// extent, which reproduces the earlier root-width travel, and says so once.
+void PublishPanelTrailDip() {
+    const float distance = g_dismissDistance;
+    if (!(distance > 0.0f)) {
+        return;
+    }
+
+    float trail = 0.0f;
+    bool computed = false;
+    try {
+        computed = ComputePanelTrailDip(trail);
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Panel trail mapping failed: %08X", e.code());
+    } catch (...) {
+        // A tree mid-teardown must not break Setup or SizeChanged.
+    }
+
+    if (!computed) {
+        trail = distance;
+    }
+    g_panelTrailDip.store(trail, std::memory_order_relaxed);
+
+    if (!computed) {
+        if (!g_panelTrailFallbackLogged) {
+            g_panelTrailFallbackLogged = true;
+            FileLog(L"reveal panelTrail=%.0f (fallback)", trail);
+        }
+        return;
+    }
+
+    if (!g_panelTrailLogged) {
+        g_panelTrailLogged = true;
+        FileLog(L"reveal panelTrail=%.0f", trail);
+    }
 }
 
 // The HWND is needed for the DWM cloaked query that decides whether the menu
@@ -1895,6 +2453,7 @@ bool Setup(wux::FrameworkElement const& root) {
     g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     g_root = root;
     g_dispatcher = root.Dispatcher();
+    g_panelTrailLogged = false;  // one reveal trail line per open
 
     CaptureCoreWindowHandle();
     if (!g_coreHwnd.load(std::memory_order_relaxed)) {
@@ -1985,6 +2544,9 @@ bool Setup(wux::FrameworkElement const& root) {
                 }
 
                 PublishGestureGeometry();
+                // The root may have been resized by the panel layout, so the
+                // trail is remapped with the new extent in force.
+                PublishPanelTrailDip();
             } catch (winrt::hresult_error const& e) {
                 Wh_Log(L"SizeChanged update failed: %08X", e.code());
             } catch (...) {
@@ -1994,6 +2556,7 @@ bool Setup(wux::FrameworkElement const& root) {
 
     // Everything the input thread reads is published before the root opens.
     PublishGestureGeometry();
+    PublishPanelTrailDip();
     g_hasRoot.store(true, std::memory_order_release);
 
     const winrt::hstring rootClassName = winrt::get_class_name(root);
@@ -2090,10 +2653,61 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
 }
 
 // ---------------------------------------------------------------------------
+// Hook: StartUI::SplitViewFrame::OnGlobalAnimationRequested
+//
+// The shell raises this request to start the XAML open and close storyboards.
+// Dropping the open request leaves the pane at its final layout position, so
+// the composition `Progress` expression is the only remaining motion. The
+// close request (type 1) always reaches the original.
+// ---------------------------------------------------------------------------
+
+using OnGlobalAnimationRequested_t = void (*)(void*, void*, void*);
+OnGlobalAnimationRequested_t OnGlobalAnimationRequested_Original = nullptr;
+
+// The args object exposes the three ints through vtable slots 6, 7 and 8; the
+// wrappers at the RVAs above dispatch exactly those slots and return the value
+// in eax. Null until the layout check in InstallAnimHook succeeds.
+using AnimArgsIntGetter_t = int (*)(void*);
+AnimArgsIntGetter_t g_animTypeGetter = nullptr;
+AnimArgsIntGetter_t g_animEdgeGetter = nullptr;
+AnimArgsIntGetter_t g_animTransitionGetter = nullptr;
+
+void OnGlobalAnimationRequested_Hook(void* self, void* sender, void* args) {
+    int type = -1;
+    int edge = -1;
+    int transition = -1;
+    if (args && g_animTypeGetter && g_animEdgeGetter &&
+        g_animTransitionGetter) {
+        type = g_animTypeGetter(args);
+        edge = g_animEdgeGetter(args);
+        transition = g_animTransitionGetter(args);
+    }
+
+    // Type 0 is the open request. Any other value, and any unreadable type,
+    // keeps the shell's own behaviour.
+    const bool suppress =
+        type == 0 && g_suppressOpenAnim.load(std::memory_order_relaxed);
+
+    if (g_animLogCount.fetch_add(1, std::memory_order_relaxed) < 4) {
+        FileLog(L"startui anim type=%d edge=%d trans=%d suppress=%d", type,
+                edge, transition, suppress ? 1 : 0);
+    }
+
+    if (suppress) {
+        return;
+    }
+
+    if (OnGlobalAnimationRequested_Original) {
+        OnGlobalAnimationRequested_Original(self, sender, args);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hook installation
 // ---------------------------------------------------------------------------
 
 std::atomic<bool> g_startUIHooked{false};
+std::atomic<bool> g_animHookAttempted{false};
 std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_stopPolling{false};
 HANDLE g_pollThread = nullptr;
@@ -2124,17 +2738,113 @@ void InstallStartUIHooks(HMODULE module) {
     Wh_Log(L"Hooked StartUI::App::PrepareRootElement at %p", target);
 }
 
+// Confirms that the target is the function the hook was written for: the exact
+// prologue, the three int getters called in order, and the argument registers
+// those calls imply. A different StartUI_ build fails here and the hook is left
+// out instead of being installed on a guessed ABI.
+bool AnimHookAbiMatches(uintptr_t base) {
+    const auto* code = reinterpret_cast<const uint8_t*>(
+        base + (kOnGlobalAnimationRequestedVa - kPreferredBase));
+    constexpr size_t kCookieDispBegin = 0x12;
+    constexpr size_t kCookieDispEnd = 0x16;
+
+    for (size_t i = 0; i < sizeof(kAnimPrologue); ++i) {
+        if (i >= kCookieDispBegin && i < kCookieDispEnd) {
+            continue;
+        }
+        if (code[i] != kAnimPrologue[i]) {
+            return false;
+        }
+    }
+
+    const uintptr_t getters[] = {
+        base + (kAnimTypeGetterVa - kPreferredBase),
+        base + (kAnimEdgeGetterVa - kPreferredBase),
+        base + (kAnimTransitionGetterVa - kPreferredBase),
+    };
+    // The three calls are separated by their result stores, so they are not
+    // adjacent: call type, store; call edge, store; call transition, store.
+    constexpr size_t kGetterCallOffsets[] = {0x27, 0x33, 0x3F};
+    const uintptr_t function = reinterpret_cast<uintptr_t>(code);
+    for (size_t i = 0; i < ARRAYSIZE(getters); ++i) {
+        const size_t offset = kGetterCallOffsets[i];
+        if (code[offset] != 0xE8) {
+            return false;
+        }
+        int32_t displacement = 0;
+        std::memcpy(&displacement, code + offset + 1, sizeof(displacement));
+        if (function + offset + 5 + displacement != getters[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool InstallAnimHook(HMODULE module) {
+    if (!module || g_animHookAttempted.exchange(true)) {
+        return false;
+    }
+    if (g_disabled.load(std::memory_order_relaxed)) {
+        g_animHookAttempted.store(false);
+        return false;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+    void* target = reinterpret_cast<void*>(
+        base + (kOnGlobalAnimationRequestedVa - kPreferredBase));
+
+    if (!AnimHookAbiMatches(base)) {
+        Wh_Log(L"StartUI_.dll does not match the expected "
+               L"OnGlobalAnimationRequested layout");
+        FileLog(L"startui anim hook skipped");
+        return false;
+    }
+
+    const AnimArgsIntGetter_t typeGetter = reinterpret_cast<AnimArgsIntGetter_t>(
+        base + (kAnimTypeGetterVa - kPreferredBase));
+    const AnimArgsIntGetter_t edgeGetter = reinterpret_cast<AnimArgsIntGetter_t>(
+        base + (kAnimEdgeGetterVa - kPreferredBase));
+    const AnimArgsIntGetter_t transitionGetter =
+        reinterpret_cast<AnimArgsIntGetter_t>(
+            base + (kAnimTransitionGetterVa - kPreferredBase));
+
+    if (!Wh_SetFunctionHook(
+            target, reinterpret_cast<void*>(OnGlobalAnimationRequested_Hook),
+            reinterpret_cast<void**>(&OnGlobalAnimationRequested_Original))) {
+        Wh_Log(L"Failed to hook "
+               L"StartUI::SplitViewFrame::OnGlobalAnimationRequested at %p",
+               target);
+        FileLog(L"startui anim hook skipped");
+        return false;
+    }
+
+    g_animTypeGetter = typeGetter;
+    g_animEdgeGetter = edgeGetter;
+    g_animTransitionGetter = transitionGetter;
+
+    Wh_Log(L"Hooked StartUI::SplitViewFrame::OnGlobalAnimationRequested at %p",
+           target);
+    FileLog(L"startui anim hooked");
+    return true;
+}
+
 void TryInstallFromLoadedModules(bool apply) {
     if (g_disabled.load(std::memory_order_relaxed)) {
         return;
     }
 
     bool installed = false;
-    if (!g_startUIHooked.load(std::memory_order_relaxed)) {
-        HMODULE startUI = GetModuleHandleW(L"StartUI_.dll");
-        if (startUI) {
+    HMODULE startUI = GetModuleHandleW(L"StartUI_.dll");
+    if (startUI) {
+        if (!g_startUIHooked.load(std::memory_order_relaxed)) {
             InstallStartUIHooks(startUI);
             installed = true;
+        }
+        if (!g_animHookAttempted.load(std::memory_order_relaxed)) {
+            if (InstallAnimHook(startUI)) {
+                installed = true;
+            }
         }
     }
 
@@ -2290,6 +3000,7 @@ void ResetComposition() {
     g_visual = nullptr;
 
     g_distancePub.store(0.0f, std::memory_order_relaxed);
+    g_panelTrailDip.store(0.0f, std::memory_order_relaxed);
 
     // Invalidate a stale Loaded handler from the previous root.
     g_setupGeneration.fetch_add(1, std::memory_order_relaxed);
@@ -2306,7 +3017,7 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe Dismiss 0.3.1 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.6.1 initializing");
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.
