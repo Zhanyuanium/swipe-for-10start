@@ -45,10 +45,10 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    `(1 - Progress) * Direction * Distance`.
 5. On release it commits when the release position passed 20% of the distance or
    the release speed exceeded 0.45 DIP/ms; a commit animates `Progress` to 0 over
-   220 ms with an ease-out curve (`cubic-bezier(0.2, 0.85, 0.3, 1)`) and then
-   taps `VK_LWIN`, which is the only dismissal that works when the menu was
-   opened without keyboard focus. Otherwise `Progress` animates back to 1 with
-   the same curve.
+   260 ms with `cubic-bezier(0.45, 0, 0.55, 1)` and then taps `VK_LWIN`, which is
+   the only dismissal that works when the menu was opened without keyboard focus.
+   The same single curve and duration serve a cancelled reveal, and the same
+   curve drives the two "return to rest" animations.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.
