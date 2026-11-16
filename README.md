@@ -81,8 +81,12 @@ Instead the mod takes over after the shell opens the window:
   (`StartSizingFrame`, ~1053 DIP here) and published to the input thread. With
   that anchor the panel edge equals the finger: measured within 4-5 px at 150,
   450 and 800 DIP.
-- Release above 25% progress animates to fully open; below it the mod taps
-  `VK_LWIN` to close again.
+- Release is decided symmetrically with the dismiss gesture: `travel` is how far
+  the finger moved away from the edge since the touch began (the release value,
+  not the peak), and the menu opens fully when `travel > 20%` of the distance or
+  the release speed exceeds 0.45 DIP/ms. Otherwise the mod taps `VK_LWIN` to
+  close it again, so a short slow pull, or pulling out and pushing back, does
+  not open the menu.
 
 An earlier version anchored progress to the frame in which the menu was first
 seen open and used the root width as the distance; that lagged the finger by
@@ -160,9 +164,9 @@ to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
 - Only the left-taskbar case is verified. `UpdateDismissAxis` maps the taskbar
   edge to a dismiss direction and both the translation and the reveal anchor are
   axis-aware, but the other three sides are untested.
-- The reveal's cancel branch is currently unreachable: at the screen edge the
-  computed progress is already ~0.27, above the 0.25 commit threshold, so every
-  edge release ends with the menu open. That matches the shell's own behaviour.
+- The reveal and the dismiss share the 20% / 0.45 DIP/ms thresholds, but their
+  visual anchors differ (panel edge vs. drag start), so the same physical travel
+  reads as a different `progress` in each; the decision uses travel, not progress.
 - The panel trailing edge is measured from the root's visible child; if the menu
   layout changes (another panel becomes the first visible child) the anchor needs
   revisiting. The XAML island is inset to the monitor work area, not to the

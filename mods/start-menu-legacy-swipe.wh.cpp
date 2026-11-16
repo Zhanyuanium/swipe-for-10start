@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.6.1
+// @version         0.6.2
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -83,13 +83,17 @@ What it does:
   by the work area origin: `Progress = 1 - (finger - panelTrail) / (dir *
   Distance)`. The panel edge therefore meets the finger at every sample, and the
   panel is exactly off screen at the screen edge (Progress 0.269 for a 1052 DIP
-  trail on a 1440 DIP root). A release past 25% animates to 1 and keeps the menu; a
-  shorter release taps `VK_LWIN` and restores `Progress = 1` without animation.
-  EP already committed to the open when the follow starts, so a release after a
-  mapped trail commits: the screen edge already reads 0.269. The cancel branch
-  stays for the fallback trail, which reads 0 at the edge. The line
-  `open follow travel=... progress=... commit=... panel=... n=...` is written
-  once per reveal.
+  trail on a 1440 DIP root). That mapping drives the visual only. The release
+  decision mirrors the dismiss path: it judges the travel away from the edge at
+  release, `(finger - edgeStart) * openingSign` clamped at 0, where
+  `openingSign` is +1 for a left or top taskbar and -1 for right or bottom. A
+  release past 20% of `Distance`, or one whose average velocity
+  `travel / max(elapsed, 1)` exceeds 0.45 DIP/ms, animates `Progress` to 1 over
+  150 ms and keeps the menu; anything else taps `VK_LWIN`, restores
+  `Progress = 1` and leaves the menu closed. Pulling out and pushing back
+  therefore cancels, as it does inside the open menu. The line
+  `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`
+  is written once per reveal.
 - The candidate path polls the cloaked attribute at most once per 20 ms; the
   cached answer is dropped on every lift, so each contact starts from a fresh
   query.
@@ -125,7 +129,7 @@ Diagnostics:
   `hid down x=... y=... axis=... dist=...`,
   `hid release delta=... perp=... vel=... commit=... n=...`,
   `hid dismiss win sent`,
-  `open follow travel=... progress=... commit=... panel=... n=...`,
+  `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
   `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`),
   `hid decodefail dev=... err=...`,
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
@@ -335,10 +339,11 @@ constexpr float kProgressStep = 0.004f;
 constexpr float kWindowMarginDip = 4.0f;
 
 // Reveal follow (edge swipe to open). A contact that starts inside the edge
-// band on the taskbar side can drive the menu's own open; a release past a
-// quarter of the distance keeps the menu, a shorter one closes it again.
+// band on the taskbar side can drive the menu's own open. The release decision
+// uses the dismiss thresholds on the travel away from the edge, not on the
+// mapped progress: the screen edge already maps to Progress 0.269 here, so any
+// progress threshold commits every release.
 constexpr float kEdgeBandDip = 12.0f;
-constexpr float kRevealCommitFraction = 0.25f;
 constexpr uint64_t kIdleReleaseMs = 35;
 constexpr UINT_PTR kIdleTimerId = 1;
 constexpr UINT kIdleTimerMs = 20;
@@ -1368,9 +1373,13 @@ HidGestureSession g_hidSession;  // input thread only
 // absolute screen DIP that the finger meets: the reveal is
 // Progress = 1 - (finger - panelTrail) / (dir * distance), so the panel's
 // trailing edge sits under the finger at every sample and Progress no longer
-// depends on when the menu was seen opening. `progress` is the last computed
-// value, `lastInserted` the last one that reached the property set, so the
-// 0.004 change filter compares against what the renderer actually shows.
+// depends on when the menu was seen opening. That mapping is visual only.
+// `travel` is the decision quantity: the distance the finger moved away from
+// the taskbar edge since the touch began, clamped at 0, so pulling out and back
+// reads 0 at release. `maxTravel` is the furthest it got; the log shows it.
+// `progress` is the last computed value, `lastInserted` the last one that
+// reached the property set, so the 0.004 change filter compares against what
+// the renderer actually shows.
 struct HidRevealSession {
     bool edgeCandidate = false;
     bool active = false;
@@ -1379,9 +1388,11 @@ struct HidRevealSession {
     float distance = 0.0f;
     float panelTrail = 0.0f;
     float travel = 0.0f;
+    float maxTravel = 0.0f;
     float progress = 0.0f;
     float lastInserted = 1.0f;
     int samples = 0;
+    uint64_t startTick = 0;
     uint64_t lastTick = 0;
 };
 
@@ -1485,6 +1496,14 @@ float AxisDirection(int32_t axis) {
     return -1.0f;
 }
 
+// The direction a revealing finger moves away from the taskbar edge: the
+// opposite of AxisDirection, so +1 for a left or top taskbar and -1 for right
+// or bottom. The reveal's travel and velocity use it; the visual mapping does
+// not, because that one already divides by AxisDirection.
+float AxisOpeningSign(int32_t axis) {
+    return -AxisDirection(axis);
+}
+
 // Runs on the first report of a contact. A contact that starts on the taskbar
 // edge while the menu is closed can own the menu's own open; anything else is
 // left to the dismiss path. A touch on the edge of an *open* menu is a dismiss
@@ -1513,6 +1532,7 @@ bool BeginEdgeCandidate(float x, float y, uint64_t tickMs) {
     g_reveal.edgeCandidate = true;
     g_reveal.edgeStartX = x;
     g_reveal.edgeStartY = y;
+    g_reveal.startTick = tickMs;
     g_reveal.lastTick = tickMs;
     return true;
 }
@@ -1550,8 +1570,14 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
 
     const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
     const float finger = AxisScreenPosition(axis, x, y);
-    reveal.travel =
-        finger - AxisScreenPosition(axis, reveal.edgeStartX, reveal.edgeStartY);
+    // Decision quantity: how far the finger moved away from the taskbar edge
+    // since the touch began. Signed by the opening direction and clamped at 0,
+    // so a pull back toward the edge reads 0 and cannot commit.
+    reveal.travel = std::max(
+        0.0f, (finger - AxisScreenPosition(axis, reveal.edgeStartX,
+                                           reveal.edgeStartY)) *
+                  AxisOpeningSign(axis));
+    reveal.maxTravel = std::max(reveal.maxTravel, reveal.travel);
 
     // The trail is published by the UI thread before the root opens. A zero
     // value means the renderer is between roots; the root extent keeps the
@@ -1579,6 +1605,11 @@ void UpdateRevealSession(float x, float y, uint64_t tickMs) {
 
 // Release of the edge contact. A candidate that never saw the menu open ends
 // silently: it did not touch Progress. A reveal that ran logs exactly one line.
+//
+// The decision mirrors ReleaseHidSession: it judges the travel at the moment of
+// release, not the mapped progress. Progress reads 0.269 at the screen edge on
+// this layout, so a progress threshold would commit a pull-out that never left
+// the edge and a pull out and back alike.
 void ReleaseRevealSession() {
     HidRevealSession& reveal = g_reveal;
     if (!reveal.edgeCandidate) {
@@ -1591,11 +1622,24 @@ void ReleaseRevealSession() {
     }
     reveal.active = false;
 
+    // The release arrives from the idle timer, so elapsed stops at the last
+    // observed sample; adding the idle wait would dilute a quick flick.
+    const uint64_t elapsed = reveal.lastTick > reveal.startTick
+                                 ? reveal.lastTick - reveal.startTick
+                                 : 0;
+    const float travel = std::max(0.0f, reveal.travel);
+    const float velocity =
+        travel / static_cast<float>(elapsed > 0 ? elapsed : 1);
+    const float distance = reveal.distance;
     const float progress = std::clamp(reveal.progress, 0.0f, 1.0f);
-    const bool commit = progress > kRevealCommitFraction;
-    FileLog(L"open follow travel=%.0f progress=%.2f commit=%d panel=%.0f n=%d",
-            reveal.travel, progress, commit ? 1 : 0, reveal.panelTrail,
-            reveal.samples);
+    const bool commit = distance > 0.0f &&
+                        (travel > kCommitDistanceFraction * distance ||
+                         velocity > kCommitVelocity);
+
+    FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f vel=%.2f "
+            L"commit=%d panel=%.0f n=%d",
+            travel, reveal.maxTravel, progress, velocity, commit ? 1 : 0,
+            reveal.panelTrail, reveal.samples);
 
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
@@ -1607,10 +1651,13 @@ void ReleaseRevealSession() {
     }
 
     // Short reveal: the Windows tap closes the menu again, then the scalar
-    // returns to rest without animation so the next open is not slid out.
+    // returns to rest. The flag additionally makes the next down restore
+    // Progress 1, because the reused root still carries the pulled-out value
+    // until the shell has finished hiding it.
     keybd_event(VK_LWIN, 0, 0, 0);
     Sleep(60);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    g_commitNeedsProgressReset = true;
     ShowAtRest();
 }
 
