@@ -352,14 +352,16 @@ constexpr uint8_t kAnimPrologue[] = {
 };
 
 constexpr std::chrono::milliseconds kDismissSettleDuration{150};
+// A cancelled reveal retracts faster than a dismiss slides out: the panel is
+// only partly on screen, so 90 ms reads as a snap back rather than a pause.
+constexpr std::chrono::milliseconds kRevealRetractDuration{90};
 constexpr std::chrono::milliseconds kDismissCancelDuration{120};
 
 // A cancelled reveal taps the Windows key only after the panel has slid back
 // out of the screen edge, which is the mirror of the committed dismiss. The tap
 // waits on the 20 ms input timer, so the deadline carries one timer tick of
 // margin over the retract animation.
-constexpr uint64_t kRevealCancelWinTapMs =
-    static_cast<uint64_t>(kDismissSettleDuration.count()) + 30;
+constexpr uint64_t kRevealCancelWinTapMs = 100;
 
 // A Windows tap this mod sent closes the menu a moment later. Until then the
 // shell still reports the window open, so the reopen poll must not read that as
@@ -1738,7 +1740,7 @@ void ReleaseRevealSession() {
     // is already running, and a down inside the next 180 ms is a new reveal
     // attempt, not a drag of the retracting panel.
     const uint64_t now = GetTickCount64();
-    AnimateProgressTo(progress, 0.0f, kDismissSettleDuration);
+    AnimateProgressTo(progress, 0.0f, kRevealRetractDuration);
     g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
     g_pendingWinTapTick = now + kRevealCancelWinTapMs;
