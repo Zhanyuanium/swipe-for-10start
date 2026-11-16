@@ -44,14 +44,23 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    `CompositionPropertySet`; an expression translates the root visual by
    `(1 - Progress) * Direction * Distance`.
 5. On release it commits when the release position passed 20% of the distance or
-   the release speed exceeded 0.45 DIP/ms; a commit animates `Progress` to 0 over
-   260 ms with `cubic-bezier(0.45, 0, 0.55, 1)` and then taps `VK_LWIN`, which is
-   the only dismissal that works when the menu was opened without keyboard focus.
-   The same single curve and duration serve a cancelled reveal, and the same
-   curve drives the two "return to rest" animations.
+   the release speed exceeded 0.45 DIP/ms; a commit animates `Progress` to 0 and
+   then taps `VK_LWIN`, which is the only dismissal that works when the menu was
+   opened without keyboard focus. The retract duration comes from the release
+   velocity — `clamp(remaining / max(velocity, 0.25), 110 ms, 260 ms)` — so a
+   flick leaves immediately: above 0.6 DIP/ms it uses
+   `cubic-bezier(0.1, 0.75, 0.25, 1)` (fast start, decelerating), otherwise
+   `cubic-bezier(0.45, 0, 0.55, 1)` (soft at both ends). A cancelled reveal uses
+   the same planning and defers its Windows tap by the computed duration.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.
+
+The keyboard path uses the same machinery: a closed→open transition that no
+gesture owns sets `Progress = 0` and animates it to 1 over 260 ms, so a Win-key
+open slides in the way a gesture open does. A Win-key close is left to the shell
+(the window is hidden by the time any animation could run); the mod only keeps
+its scalar bookkeeping consistent.
 
 Release detection: the digitizer keeps reporting while the finger rests
 (measured 255 reports in a 1.5 s hold), so a 35 ms window without a report is a

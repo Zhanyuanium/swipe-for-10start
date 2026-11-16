@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.6.5
+// @version         0.6.6
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -65,11 +65,19 @@ What it does:
   axis travel and keeps the axis travel below 60 DIP is a scroll, not a
   dismiss: it restores `Progress = 1` without animation.
 - Release commits when the axis travel exceeds 20% of `Distance` or the average
-  velocity exceeds 0.45 DIP/ms. A commit animates `Progress` to 0 over 260 ms
-  on the one curve (`cubic-bezier(0.45, 0, 0.55, 1)`, ease-in-out) and then taps
-  the Windows key; a cancel animates back to 1 over 120 ms on the same curve.
-  Both animations place the easing on the keyframe at t=1, and both insert the
-  target as the base value before `StartAnimation`.
+  velocity exceeds 0.45 DIP/ms. A commit retracts `Progress` to 0 and then taps
+  the Windows key; a cancel animates back to 1 over 120 ms on
+  `cubic-bezier(0.45, 0, 0.55, 1)`. Every Progress animation places the easing
+  on the keyframe at t=1 and inserts the target as the base value before
+  `StartAnimation`.
+- The retract is velocity-driven, not one fixed duration. The panel still has to
+  cover `max(0.05, progress) * Distance` DIP, a release at `velocity` DIP/ms
+  covers that in `remaining / velocity`, and the result is clamped to
+  110..260 ms with the divisor floored at 0.25 DIP/ms. A release above
+  0.6 DIP/ms uses `cubic-bezier(0.1, 0.75, 0.25, 1)`, which starts fast and
+  decelerates like the fling it came from; a slower release keeps
+  `cubic-bezier(0.45, 0, 0.55, 1)` and the old 260 ms feel. One line per close
+  records the choice: `retract vel=... dur=... ease=...`.
 - A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
   the legacy menu ignores an injected `VK_ESCAPE`. A lone `VK_LWIN` tap (down,
   60 ms, up) closes it, because the shell acts on the key itself.
@@ -94,15 +102,14 @@ What it does:
   `openingSign` is +1 for a left or top taskbar and -1 for right or bottom. A
   release past 20% of `Distance`, or one whose average velocity
   `travel / max(elapsed, 1)` exceeds 0.45 DIP/ms, animates `Progress` to 1 over
-  220 ms on the one curve and keeps the menu. Anything else is a cancel:
-  `Progress` retracts to 0 over 260 ms on `cubic-bezier(0.45, 0, 0.55, 1)`, the
-  same duration and curve as the committed dismiss, so the panel leaves the
-  finger gently and leaves the screen edge the same way from any position. The
-  `VK_LWIN` tap that closes the menu follows the animation 290 ms after the
-  release on the input timer. `Progress` stays 0; a later open restores it,
-  unless an edge contact is already driving that open. Pulling out and pushing
-  back therefore cancels, as it does inside the open menu. The line
-  `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`
+  220 ms on the ease-in-out curve and keeps the menu. Anything else is a cancel:
+  `Progress` retracts to 0 with the same velocity-driven duration and curve as
+  the committed dismiss, so both close paths read the same from any finger
+  position. The `VK_LWIN` tap that closes the menu follows the retract on the
+  input timer, `duration + 30 ms` after the release. `Progress` stays 0; a later
+  open restores it, unless an edge contact is already driving that open. Pulling
+  out and pushing back therefore cancels, as it does inside the open menu. The
+  line `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`
   is written once per reveal; the cancel adds `reveal cancel win sent` when the
   deferred tap runs, or `reveal cancel tap dropped` when a new pull takes the
   panel over before it does.
@@ -117,6 +124,15 @@ What it does:
 - The candidate path polls the cloaked attribute at most once per 20 ms; the
   cached answer is dropped on every lift, so each contact starts from a fresh
   query.
+- A closed-to-open transition that no reveal owns (a Windows-key, Start-button
+  or tray open) is animated by the mod: `Progress` is set to 0 and eases to 1
+  over 260 ms on `cubic-bezier(0.45, 0, 0.55, 1)`, so a keyboard open slides the
+  same way a gesture open does. `PollRootVisibility` polls the cloaked attribute
+  at the 20 ms input timer tick and sees the transition; a live edge candidate
+  and the 600 ms suppression window both suppress the animation.
+  A close the shell performs by itself, such as the Windows key, is not fought:
+  the mod only logs `win close observed`, leaves `Progress` where the close left
+  it, and lets the next open animate from 0. One line per transition.
 
 What it does not do:
 
@@ -149,6 +165,8 @@ Diagnostics:
   `hid down x=... y=... axis=... dist=...`,
   `hid release delta=... perp=... vel=... commit=... n=...`,
   `hid dismiss win sent`,
+  `retract vel=... dur=... ease=...`,
+  `win open`, `win close observed`,
   `reveal cancel win sent`, `reveal cancel tap dropped`,
   `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
   `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`),
@@ -198,8 +216,8 @@ Known risks:
   already gone.
 - The suppression window is time based, not tied to the shell's own signal. If a
   reopen without an edge contact, such as the Windows key, lands inside the
-  600 ms after a close, that open is not restored; `Progress` stays 0 and the
-  panel is invisible until the next open.
+  600 ms after a close, that open is not animated; `Progress` stays 0 and the
+  panel is invisible until the next open, which slides it back in.
 - The deferred cancel tap waits on `WM_TIMER`, which is low priority: a report
   flood on the same thread delays the tap by that much. The panel stays
   retracted until the tap runs.
@@ -222,7 +240,8 @@ Known risks:
  *   user32; on DwmGetWindowAttribute, resolved at init from dwmapi.dll; on
  *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps and
  *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet, the
- *   expression and the two cubic-bezier easing functions installed in Setup; on
+ *   expression and the two cached cubic-bezier easings (ease-in-out and fling)
+ *   installed in Setup; on
  *   VisualTreeHelper and TransformToVisual
  *   from Windows.UI.Xaml.Media to map the panel trail; on `debug.txt` in the
  *   mod storage directory, read by the debug channel.
@@ -230,7 +249,11 @@ Known risks:
  *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
  *   published for the reveal follow; one global Windows-key tap per committed
  *   dismiss or short reveal, the reveal's one deferred to the input timer until
- *   its retract animation has run; a 600 ms window after either tap in which a
+ *   its retract animation has run; a velocity-chosen retract on both close paths
+ *   (110..260 ms, ease-in-out below 0.6 DIP/ms and a fling curve above it); a
+ *   0-to-1 progress slide over 260 ms for a closed-to-open transition no reveal
+ *   owns, plus a `win close observed` line when the shell hides the window by
+ *   itself; a 600 ms window after either tap in which a
  *   closed-to-open report does not restore `Progress` and an edge contact starts
  *   a new reveal rather than a drag of the retracting panel; an optional
  *   suppressed open animation request
@@ -360,14 +383,25 @@ constexpr uint8_t kAnimPrologue[] = {
     0x49, 0x8B, 0xC8,              // mov  rcx, r8
 };
 
-// One close duration and one close curve. A committed dismiss and a cancelled
-// reveal both retract the panel with `Progress` to 0 over kRetractDuration on
-// g_retractEasing, from whatever position the gesture reached: 260 ms on an
-// ease-in-out curve starts gently, ends gently and reads slower than the old
-// 220/140 ms split. The two paths used different curves before, so the retract
-// changed shape with the path that started it; the panel leaves the screen at
-// the end of either animation, so its end state does not need its own curve.
-constexpr std::chrono::milliseconds kRetractDuration{260};
+// The retract is velocity-driven, not one fixed duration. The panel still has
+// to cover max(0.05, progress) * Distance DIP; a release at `velocity` DIP/ms
+// covers that in remaining / velocity, clamped to 110..260 ms with the divisor
+// floored at 0.25 DIP/ms. A fast flick therefore finishes sooner instead of
+// starting on the slow phase of an ease-in-out curve, and a slow release keeps
+// the 260 ms feel. Both close paths (the dismiss commit and the reveal cancel)
+// go through PlanRetract, so the panel leaves the screen the same way whichever
+// one started it.
+constexpr std::chrono::milliseconds kRetractMinDuration{110};
+constexpr std::chrono::milliseconds kRetractMaxDuration{260};
+constexpr float kRetractMinVelocity = 0.25f;   // DIP/ms, divisor floor
+constexpr float kRetractFlingVelocity = 0.6f;  // DIP/ms, fling curve switch
+
+// A closed-to-open transition that no gesture owns (Windows key, Start button,
+// tray) gets the slide a reveal produces: Progress from 0 to 1 on the ease-in-out
+// curve. 260 ms is the slow end of the retract clamp, so a keyboard open and a
+// slow gesture open take the same time.
+constexpr std::chrono::milliseconds kOpenSlideDuration{260};
+
 // The return-to-rest animations keep the durations they always had: a
 // cancelled dismiss springs back from a short drag, and a reveal commit
 // finishes the slide to the open position.
@@ -375,10 +409,10 @@ constexpr std::chrono::milliseconds kDismissCancelDuration{120};
 constexpr std::chrono::milliseconds kRevealCommitDuration{220};
 
 // A cancelled reveal taps the Windows key only after the panel has retracted
-// out of the screen edge: kRetractDuration plus one 20 ms input timer tick. A
-// tap inside the animation froze the panel mid-retract and hid the window at
-// that position.
-constexpr uint64_t kRevealCancelWinTapMs = 290;
+// out of the screen edge: the computed retract duration plus 30 ms, about two
+// 20 ms input timer ticks. A tap inside the animation froze the panel
+// mid-retract and hid the window at that position.
+constexpr uint64_t kRevealCancelWinTapMarginMs = 30;
 
 // A Windows tap this mod sent closes the menu a moment later. Until then the
 // shell still reports the window open, so the reopen poll must not read that as
@@ -488,10 +522,14 @@ wuc::ExpressionAnimation g_translationExpression{nullptr};
 wuc::Visual g_visual{nullptr};
 wuc::CompositionScopedBatch g_dismissBatch{nullptr};
 
-// The only easing curve in the file, created in Setup and cleared with the
-// property set. Every animation reads it under g_compositionMutex, so it never
-// outlives the compositor that created it.
+// The two cached curves, created in Setup and cleared with the property set.
+// Every animation reads one of them under g_compositionMutex, so neither
+// outlives the compositor that created it. g_retractEasing is ease-in-out
+// (0.45, 0, 0.55, 1): every return-to-rest animation, the keyboard open and a
+// slow close use it. g_flingEasing is (0.1, 0.75, 0.25, 1), which starts fast
+// and decelerates; only a release above kRetractFlingVelocity uses it.
 wuc::CompositionEasingFunction g_retractEasing{nullptr};
+wuc::CompositionEasingFunction g_flingEasing{nullptr};
 
 wux::FrameworkElement g_root{nullptr};  // UI thread only
 wucore::CoreDispatcher g_dispatcher{nullptr};
@@ -617,17 +655,22 @@ bool InsertProgress(float progress) {
     return true;
 }
 
+// Which of the two cached curves an animation uses.
+enum class RetractEase { Standard, Fling };
+
 // The easing sits on the keyframe at t=1, the one that defines the motion into
 // the target. The t=0 frame carries the start value only; a keyframe pair
 // without an easing curve is linear and starts at its peak speed.
-bool AnimateProgressTo(float from, float to,
-                       std::chrono::milliseconds duration) {
+bool AnimateProgressTo(
+    float from, float to, std::chrono::milliseconds duration,
+    RetractEase ease = RetractEase::Standard) {
     std::lock_guard lock(g_compositionMutex);
     if (!g_state || !g_compositor) {
         return false;
     }
 
-    const wuc::CompositionEasingFunction easing = g_retractEasing;
+    const wuc::CompositionEasingFunction easing =
+        ease == RetractEase::Fling ? g_flingEasing : g_retractEasing;
     if (!easing) {
         return false;
     }
@@ -657,6 +700,37 @@ bool AnimateProgressTo(float from, float to,
     return true;
 }
 
+// The one decision point for a close: how long the panel takes and which curve
+// it uses. `progress` is the visual Progress at release, `distance` the DIP the
+// panel covers along the dismiss axis, `velocity` the release speed on that
+// axis. The caller logs the plan once its animation actually started.
+struct RetractPlan {
+    std::chrono::milliseconds duration{};
+    RetractEase ease = RetractEase::Standard;
+};
+
+RetractPlan PlanRetract(float progress, float distance, float velocity) {
+    const float remaining =
+        std::max(0.05f, std::clamp(progress, 0.0f, 1.0f)) * distance;
+    const float speed = std::max(velocity, kRetractMinVelocity);
+    const float raw = remaining / speed;
+    const float minMs = static_cast<float>(kRetractMinDuration.count());
+    const float maxMs = static_cast<float>(kRetractMaxDuration.count());
+
+    return RetractPlan{
+        std::chrono::milliseconds{
+            static_cast<int64_t>(std::llround(std::clamp(raw, minMs, maxMs)))},
+        velocity > kRetractFlingVelocity ? RetractEase::Fling
+                                         : RetractEase::Standard};
+}
+
+// One line per close, whatever path started it.
+void LogRetract(const RetractPlan& plan, float velocity) {
+    FileLog(L"retract vel=%.2f dur=%llu ease=%s", velocity,
+            static_cast<unsigned long long>(plan.duration.count()),
+            plan.ease == RetractEase::Fling ? L"fast" : L"standard");
+}
+
 // A lone Windows-key tap is acted on by the shell itself, so it closes the menu
 // even when the menu was opened without keyboard focus and an injected
 // VK_ESCAPE never reaches it. The 60 ms hold is the same one the dismiss path
@@ -667,26 +741,34 @@ void TapWindowsKey() {
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
 }
 
-// Committed dismiss: retract over kRetractDuration on the one curve, then tap
-// the Windows key so the shell closes the menu through its normal input path.
-bool BeginDismissSettle(float from) {
+// Committed dismiss: retract over the velocity-chosen duration and curve, then
+// tap the Windows key so the shell closes the menu through its normal input
+// path.
+bool BeginDismissSettle(float from, float velocity) {
+    const RetractPlan plan = PlanRetract(
+        from, g_distancePub.load(std::memory_order_relaxed), velocity);
     wuc::CompositionScopedBatch batch{nullptr};
     uint32_t serial = 0;
 
     try {
         {
             std::lock_guard lock(g_compositionMutex);
-            if (!g_state || !g_compositor || !g_retractEasing) {
+            if (!g_state || !g_compositor || !g_retractEasing ||
+                !g_flingEasing) {
                 return false;
             }
+
+            const wuc::CompositionEasingFunction easing =
+                plan.ease == RetractEase::Fling ? g_flingEasing
+                                                : g_retractEasing;
 
             serial = g_dismissSerial.fetch_add(1) + 1;
 
             wuc::ScalarKeyFrameAnimation animation =
                 g_compositor.CreateScalarKeyFrameAnimation();
             animation.InsertKeyFrame(0.0f, std::clamp(from, 0.0f, 1.0f));
-            animation.InsertKeyFrame(1.0f, 0.0f, g_retractEasing);
-            animation.Duration(kRetractDuration);
+            animation.InsertKeyFrame(1.0f, 0.0f, easing);
+            animation.Duration(plan.duration);
 
             batch = g_compositor.CreateScopedBatch(
                 wuc::CompositionBatchTypes::Animation);
@@ -737,7 +819,7 @@ bool BeginDismissSettle(float from) {
             g_dismissSettling.store(true, std::memory_order_relaxed);
             g_state.StopAnimation(L"Progress");
             // Base value first: inserting after StartAnimation overrides the
-            // animation and turns the 260 ms retract into an instant jump.
+            // animation and turns the retract into an instant jump.
             g_state.InsertScalar(L"Progress", 0.0f);
             g_state.StartAnimation(L"Progress", animation);
         }
@@ -751,6 +833,7 @@ bool BeginDismissSettle(float from) {
                 g_dismissBatch = batch;
             }
         }
+        LogRetract(plan, velocity);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Dismiss animation failed: %08X %s", e.code(),
                e.message().c_str());
@@ -1761,11 +1844,12 @@ void ReleaseRevealSession() {
         return;
     }
 
-    // Short reveal: the panel retracts with the same 260 ms ease-in-out curve
-    // as the committed dismiss, so both close paths read identically from any
-    // finger position. The Windows tap that actually closes the menu follows
-    // the animation on the input timer; tapping here froze the panel at the
-    // finger position and the window then hid without a retract.
+    // Short reveal: the panel retracts with the same velocity-driven duration
+    // and curve as the committed dismiss, so both close paths read identically
+    // from any finger position. The Windows tap that actually closes the menu
+    // follows the animation on the input timer, `duration + 30 ms` after the
+    // release; tapping here froze the panel at the finger position and the
+    // window then hid without a retract.
     //
     // Progress stays at 0 afterwards and is not restored here: the tap takes a
     // moment to hide the window, and restoring now would flash the fully open
@@ -1776,10 +1860,15 @@ void ReleaseRevealSession() {
     // is already running, and a down inside the next 600 ms is a new reveal
     // attempt, not a drag of the retracting panel.
     const uint64_t now = GetTickCount64();
-    AnimateProgressTo(progress, 0.0f, kRetractDuration);
+    const RetractPlan plan = PlanRetract(progress, distance, velocity);
+    if (AnimateProgressTo(progress, 0.0f, plan.duration, plan.ease)) {
+        LogRetract(plan, velocity);
+    }
     g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
-    g_pendingWinTapTick = now + kRevealCancelWinTapMs;
+    g_pendingWinTapTick = now +
+                          static_cast<uint64_t>(plan.duration.count()) +
+                          kRevealCancelWinTapMarginMs;
     g_commitNeedsProgressReset = true;
 }
 
@@ -1870,7 +1959,7 @@ void ReleaseHidSession(uint64_t tickMs, bool allowCommit) {
 
     if (commit) {
         const float from = std::clamp(session.lastProgress, 0.0f, 1.0f);
-        if (BeginDismissSettle(from)) {
+        if (BeginDismissSettle(from, velocity)) {
             g_commitNeedsProgressReset = true;
         } else {
             ShowAtRest();
@@ -2034,12 +2123,20 @@ void RunPendingWinTap(uint64_t tickMs) {
     FileLog(L"reveal cancel win sent");
 }
 
-// The XAML root is reused across menu opens, and PrepareRootElement does not
-// run again, so a committed dismiss leaves Progress at 0. Without this the next
-// open shows a window that is on screen but slid out of view.
+// Two things happen here. A closed-to-open transition that no reveal owns is a
+// keyboard, Start-button or tray open: the shell slides its own storyboard and
+// the mod makes `Progress` follow from 0, so the same root slides the same way a
+// gesture open does. A close the shell performs by itself (Windows key) is not
+// fought: nothing is inserted, and the next open starts from 0 again.
+//
+// The poll runs at the 20 ms timer tick, not the 100 ms it used for the restore
+// check alone: measured against the uncloak, a 100 ms throttle started the open
+// slide up to 94 ms late, so the panel sat at rest first and then jumped out and
+// slid back in. 20 ms keeps the start within one compositor frame of the shell's
+// own open, which is what makes the two read as one animation.
 void PollRootVisibility(uint64_t tickMs) {
     static uint64_t lastPollTick = 0;
-    if (tickMs - lastPollTick < 100) {
+    if (tickMs - lastPollTick < kOpenCheckIntervalMs) {
         return;
     }
     lastPollTick = tickMs;
@@ -2052,14 +2149,19 @@ void PollRootVisibility(uint64_t tickMs) {
     const bool closeInFlight =
         tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
     // An edge contact that is still down owns the open: the follow drives the
-    // scalar from the finger, and restoring 1 here would insert a fully open
-    // frame between two follow samples.
+    // scalar from the finger, and inserting a fully open frame here would fight
+    // it.
     const bool gestureOwnsProgress = g_reveal.edgeCandidate;
-    if (open && !g_rootWasOpen && g_commitNeedsProgressReset &&
-        !closeInFlight && !gestureOwnsProgress) {
-        g_commitNeedsProgressReset = false;
-        ShowAtRest();
-        FileLog(L"hid root restored after reopen");
+    if (open && !g_rootWasOpen) {
+        if (!closeInFlight && !gestureOwnsProgress &&
+            AnimateProgressTo(0.0f, 1.0f, kOpenSlideDuration)) {
+            // The animation now owns Progress, so no later path needs to
+            // restore the resting value for this open.
+            g_commitNeedsProgressReset = false;
+            FileLog(L"win open");
+        }
+    } else if (!open && g_rootWasOpen) {
+        FileLog(L"win close observed");
     }
     g_rootWasOpen = open;
 }
@@ -2730,14 +2832,18 @@ bool Setup(wux::FrameworkElement const& root) {
     state.InsertScalar(L"DirX", dirX);
     state.InsertScalar(L"DirY", dirY);
 
-    // The one easing curve for every Progress animation: ease-in-out
-    // (0.45, 0, 0.55, 1) starts gently, ends gently and applies to both close
-    // paths and both return-to-rest animations alike. Without a curve a
+    // Two cached curves. The ease-in-out one (0.45, 0, 0.55, 1) starts gently
+    // and ends gently: a slow close, both return-to-rest animations and the
+    // keyboard open use it. The fling one (0.1, 0.75, 0.25, 1) starts fast and
+    // decelerates, for a release the hand still carries. Without a curve a
     // keyframe pair is linear and starts at its peak velocity: a short retract
     // then reads as the panel flying away on the first frame.
     const wuc::CompositionEasingFunction retractEasing =
         compositor.CreateCubicBezierEasingFunction(float2{0.45f, 0.0f},
                                                    float2{0.55f, 1.0f});
+    const wuc::CompositionEasingFunction flingEasing =
+        compositor.CreateCubicBezierEasingFunction(float2{0.1f, 0.75f},
+                                                   float2{0.25f, 1.0f});
 
     // The translation property must exist before the expression is started.
     visual.Properties().InsertVector3(L"Translation",
@@ -2756,6 +2862,7 @@ bool Setup(wux::FrameworkElement const& root) {
         g_state = state;
         g_translationExpression = translation;
         g_retractEasing = retractEasing;
+        g_flingEasing = flingEasing;
     }
 
     g_sizeToken = root.SizeChanged(
@@ -3237,6 +3344,7 @@ void ResetComposition() {
     g_state = nullptr;
     g_visual = nullptr;
     g_retractEasing = nullptr;
+    g_flingEasing = nullptr;
 
     g_distancePub.store(0.0f, std::memory_order_relaxed);
     g_panelTrailDip.store(0.0f, std::memory_order_relaxed);
@@ -3256,7 +3364,7 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.6.5 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.6.6 initializing");
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.
