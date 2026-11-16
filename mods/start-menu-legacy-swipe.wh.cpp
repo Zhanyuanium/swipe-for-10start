@@ -233,7 +233,7 @@ constexpr float kScrollAbortRatio = 1.5f;
 constexpr float kScrollAbortMaxDelta = 60.0f;
 constexpr float kProgressStep = 0.004f;
 constexpr float kWindowMarginDip = 4.0f;
-constexpr uint64_t kIdleReleaseMs = 500;
+constexpr uint64_t kIdleReleaseMs = 35;
 constexpr UINT_PTR kIdleTimerId = 1;
 constexpr UINT kIdleTimerMs = 20;
 constexpr UINT_PTR kDebugTimerId = 2;
@@ -427,10 +427,11 @@ bool AnimateProgressTo(float from, float to,
         animation.Duration(duration);
 
         g_state.StopAnimation(L"Progress");
+        // Insert the target as the base value *before* the animation starts, so
+        // a cancelled or interrupted animation still lands on the intended end
+        // state instead of snapping back to the drag position.
+        g_state.InsertScalar(L"Progress", std::clamp(to, 0.0f, 1.0f));
         g_state.StartAnimation(L"Progress", animation);
-        // Keep the base value in sync so a later StopAnimation does not snap
-        // back to the drag position.
-        g_state.InsertScalar(L"Progress", to);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress animation failed: %08X %s", e.code(),
                e.message().c_str());
@@ -492,9 +493,12 @@ bool BeginDismissSettle(float from) {
                         keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
                         FileLog(L"hid dismiss win sent");
 
+                        // Leave Progress at 0: resetting it here flashes the
+                        // fully open menu for the frames between this reset and
+                        // the shell actually hiding the window. The next
+                        // session resets it instead.
                         if (g_state) {
                             g_state.StopAnimation(L"Progress");
-                            g_state.InsertScalar(L"Progress", 1.0f);
                         }
                         g_dismissSettling.store(
                             false, std::memory_order_relaxed);
@@ -506,8 +510,10 @@ bool BeginDismissSettle(float from) {
 
             g_dismissSettling.store(true, std::memory_order_relaxed);
             g_state.StopAnimation(L"Progress");
-            g_state.StartAnimation(L"Progress", animation);
+            // Base value first: inserting after StartAnimation overrides the
+            // animation and turns the 150 ms slide-out into an instant jump.
             g_state.InsertScalar(L"Progress", 0.0f);
+            g_state.StartAnimation(L"Progress", animation);
         }
 
         // End the batch outside the lock: its completion handler takes the
@@ -818,6 +824,8 @@ struct HidDevice {
     std::vector<HIDP_VALUE_CAPS> valueCaps;
     USHORT contactNodes[kMaxContactCollections] = {};
     int contactNodeCount = 0;
+    USHORT contactCountLink = 0;
+    bool hasContactCount = false;
 };
 
 HidDevice g_hidDevices[kMaxHidDevices];
@@ -939,6 +947,29 @@ void InitHidDevice(HidDevice& device) {
             }
         }
     }
+
+    // The Contact Count that reports how many contacts are down lives in the
+    // top-level digitizer collection, not in collection 0. Reading it with the
+    // wrong collection makes a lift report look like "still one contact",
+    // which forces the idle timer to guess the release.
+    for (const HIDP_VALUE_CAPS& cap : device.valueCaps) {
+        if (cap.UsagePage != kUsagePageDigitizer) {
+            continue;
+        }
+        const bool matches =
+            cap.IsRange ? (cap.Range.UsageMin <= kUsageContactCount &&
+                           kUsageContactCount <= cap.Range.UsageMax)
+                        : (cap.NotRange.Usage == kUsageContactCount);
+        if (!matches) {
+            continue;
+        }
+        device.contactCountLink = cap.LinkCollection;
+        device.hasContactCount = true;
+        break;
+    }
+    FileLog(L"hidcc dev=%s have=%d link=%u", device.path,
+            device.hasContactCount ? 1 : 0,
+            static_cast<unsigned>(device.contactCountLink));
 
     device.ready = true;
 }
@@ -1140,6 +1171,8 @@ float HidDpiScale() {
 struct HidGestureSession {
     bool active = false;
     bool suppress = false;  // ignore samples until all contacts are released
+    long lastRawX = 0;
+    long lastRawY = 0;
     float startX = 0.0f;
     float startY = 0.0f;
     uint64_t startTick = 0;
@@ -1199,10 +1232,15 @@ bool PointInStartWindow(float x, float y) {
 }
 
 void LogHidRelease(const HidGestureSession& session, float velocity,
-                   bool commit) {
-    FileLog(L"hid release delta=%.1f perp=%.1f vel=%.2f commit=%d n=%d",
-            session.maxDelta, session.maxPerp, velocity, commit ? 1 : 0,
-            session.samples);
+                   bool commit, uint64_t releaseTick) {
+    const uint64_t releaseDelay =
+        releaseTick > session.lastTick ? releaseTick - session.lastTick : 0;
+    FileLog(
+        L"hid release delta=%.1f final=%.1f perp=%.1f vel=%.2f commit=%d "
+        L"n=%d relms=%llu",
+        session.maxDelta, session.curDelta, session.maxPerp, velocity,
+        commit ? 1 : 0, session.samples,
+        static_cast<unsigned long long>(releaseDelay));
 }
 
 void BeginHidSession(float x, float y, uint64_t tickMs) {
@@ -1261,15 +1299,17 @@ void ReleaseHidSession(uint64_t tickMs, bool allowCommit) {
     const uint64_t lastSample = session.lastTick;
     const uint64_t elapsed =
         lastSample > session.startTick ? lastSample - session.startTick : 0;
-    const float velocity =
-        session.maxDelta / static_cast<float>(elapsed > 0 ? elapsed : 1);
+    // Judge on where the finger actually let go, not on how far it once went:
+    // dragging out and back in must cancel, not dismiss.
+    const float finalDelta = std::max(0.0f, session.curDelta);
+    const float velocity = finalDelta / static_cast<float>(elapsed > 0 ? elapsed : 1);
     const float distance = g_distancePub.load(std::memory_order_relaxed);
     const bool commit =
         allowCommit && distance > 0.0f &&
-        (session.maxDelta > kCommitDistanceFraction * distance ||
+        (finalDelta > kCommitDistanceFraction * distance ||
          velocity > kCommitVelocity);
 
-    LogHidRelease(session, velocity, commit);
+    LogHidRelease(session, velocity, commit, tickMs);
 
     if (commit) {
         const float from = std::clamp(session.lastProgress, 0.0f, 1.0f);
@@ -1303,7 +1343,7 @@ void AbortHidSession(uint64_t tickMs) {
     const float velocity =
         session.maxDelta / static_cast<float>(elapsed > 0 ? elapsed : 1);
 
-    LogHidRelease(session, velocity, false);
+    LogHidRelease(session, velocity, false, tickMs);
     session.active = false;
     ShowAtRest();
 }
@@ -1350,14 +1390,9 @@ void UpdateHidSession(float x, float y, uint64_t tickMs) {
 void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
     HidGestureSession& session = g_hidSession;
 
-    if (contacts >= 2) {
-        if (session.active) {
-            ReleaseHidSession(tickMs, false);
-        }
-        session.suppress = true;
-        return;
-    }
-
+    // Extra contacts (palm, ghost slot) are filtered when the report is
+    // decoded; by the time a sample reaches here it always means "the tracked
+    // finger is present".
     if (contacts <= 0) {
         if (session.active) {
             ReleaseHidSession(tickMs, true);
@@ -1414,10 +1449,15 @@ void FeedHidReport(HidDevice& device, USHORT reportId, const BYTE* report,
     }
 
     int nonZero = 0;
-    bool primaryValid = false;
-    long primaryX = 0;
-    long primaryY = 0;
+    int chosen = -1;
+    long chosenX = 0;
+    long chosenY = 0;
+    long bestDistance = 0;
 
+    // A precision touchscreen reports one collection per contact slot. Extra
+    // contacts (palm, a ghost slot) must not cancel the gesture, so pick the
+    // collection nearest the position the tracked finger last had instead of
+    // just the first non-zero one.
     for (int i = 0; i < collectionCount; ++i) {
         ULONG x = 0;
         ULONG y = 0;
@@ -1430,20 +1470,43 @@ void FeedHidReport(HidDevice& device, USHORT reportId, const BYTE* report,
         if (!haveX || !haveY) {
             continue;
         }
-        if (x != 0 || y != 0) {
-            nonZero++;
+        if (x == 0 && y == 0) {
+            continue;
         }
-        if (!primaryValid && (x != 0 || y != 0)) {
-            primaryValid = true;
-            primaryX = static_cast<long>(x);
-            primaryY = static_cast<long>(y);
+        nonZero++;
+
+        if (!g_hidSession.active) {
+            if (chosen < 0) {
+                chosen = i;
+                chosenX = static_cast<long>(x);
+                chosenY = static_cast<long>(y);
+            }
+            continue;
+        }
+
+        const long dx = static_cast<long>(x) - g_hidSession.lastRawX;
+        const long dy = static_cast<long>(y) - g_hidSession.lastRawY;
+        const long distance = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
+        if (chosen < 0 || distance < bestDistance) {
+            chosen = i;
+            chosenX = static_cast<long>(x);
+            chosenY = static_cast<long>(y);
+            bestDistance = distance;
         }
     }
 
+    const bool primaryValid = chosen >= 0;
+    const long primaryX = chosenX;
+    const long primaryY = chosenY;
+
     ULONG topLevelCount = 0;
-    const bool haveCount =
-        ReadUsageValue(device, kUsagePageDigitizer, 0, kUsageContactCount,
-                       report, reportLength, &topLevelCount);
+    bool haveCount = false;
+    if (device.hasContactCount) {
+        haveCount = ReadUsageValue(device, kUsagePageDigitizer,
+                                   device.contactCountLink,
+                                   kUsageContactCount, report, reportLength,
+                                   &topLevelCount);
+    }
 
     int contacts = 0;
     if (haveCount) {
@@ -1469,14 +1532,33 @@ void FeedHidReport(HidDevice& device, USHORT reportId, const BYTE* report,
         }
     }
 
-    if (contacts <= 0) {
+    if (haveCount && contacts == 0) {
+        // Contact Count is authoritative: on a lift report the position fields
+        // often keep their last value, so trusting them would hide the lift and
+        // force the idle timer to guess.
         OnHidSample(0, 0.0f, 0.0f, tickMs);
         return;
+    }
+
+    if (contacts <= 0) {
+        // No Contact Count to trust: a report with no usable collection is a
+        // lift, and a count above our tracked contact just means an extra
+        // finger, which must not end the gesture.
+        if (!primaryValid) {
+            OnHidSample(0, 0.0f, 0.0f, tickMs);
+            return;
+        }
+        contacts = 1;
     }
 
     if (!primaryValid) {
         LogDecodeFail(device, 0);
         return;
+    }
+
+    if (g_hidSession.active) {
+        g_hidSession.lastRawX = primaryX;
+        g_hidSession.lastRawY = primaryY;
     }
 
     const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
