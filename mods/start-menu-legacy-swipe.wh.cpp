@@ -2,149 +2,180 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe Dismiss
 // @description     Touch/pen swipe toward the anchored edge to dismiss the legacy Start menu
-// @version         0.1.0
+// @version         0.3.1
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -Wall -Wextra -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
-# Legacy Start edge swipe to dismiss (touch/pen)
+# Legacy Start edge swipe to dismiss (raw HID touch/pen)
 
 StartMenuExperienceHost-side companion for ExplorerPatcher's legacy Windows 10
-Start menu. It adds an in-menu swipe towards the anchored edge to dismiss the
-menu; it does not draw the slide-in reveal.
+Start menu. A one-finger swipe toward the edge the menu is anchored to slides
+the menu out and dismisses it. The input layer reads raw HID touch and pen
+reports; it does not use XAML pointers, DirectManipulation or the pointer
+message queue.
 
 What it does:
 
 - Hooks `StartUI::App::PrepareRootElement` (`StartUI_.dll`, RVA `0xAD730`),
-  captures the returned root after it loads, and enables Composition
+  captures the returned root after it loads and enables Composition
   translation.
 - At every setup it gets the Start CoreWindow HWND via `ICoreWindowInterop`,
   compares `GetWindowRect` with the monitor work area and picks the dismiss
   direction: left if the window is anchored to the work-area left, then top,
-  then right, then bottom (a full-height left flyout resolves to left). It
-  logs `dismiss axis=...` once.
+  then right, then bottom. It logs `dismiss axis=...` once and publishes the
+  axis, the window width/height and the window bounds in DIP for the input
+  thread.
 - Installs a `CompositionPropertySet` with `Progress` (animatable),
   `Distance` (static window width or height), `DirX` and `DirY`, plus the
   expression
   `Vector3((1 - state.Progress) * state.DirX * state.Distance, (1 - state.Progress) * state.DirY * state.Distance, 0)`.
-- Attaches `PointerPressed`, `PointerMoved`, `PointerReleased` and
-  `PointerCaptureLost` to the root with `handledEventsToo`.
-- If the XAML build matches, the first root attach installs a hook on
-  `DManipDataBase::SetContentOffsetsHelper` (`Windows.UI.Xaml.dll` RVA
-  `0x4DE388`). It runs on the XAML UI thread and sees the menu's own content
-  offset updates; it records only while a press session is active. The first
-  value is the baseline, then the largest positive and negative deviation
-  along the dismiss axis (X for left/right, Y for top/bottom) is tracked.
-  No per-call logging, no pointer capture.
-- On release it logs `dmhook n=... maxPos=... maxNeg=... base=(...) el=...`
-  and uses `m = max(maxPos, -maxNeg)`: 25% of `Distance` or 0.5 DIP/ms
-  commits. Commit sets `Progress = clamp(1 - m / Distance, 0, 1)` and runs the
-  150 ms animate-to-0 + `VK_ESCAPE` + reset path. Otherwise `Progress` resets
-  to 1 without animation and the ScrollViewer snaps back naturally.
-- Without the hook (version mismatch or a failed install), the pointer
-  fallback remains: a touch/pen press records the start point and innermost
-  `ScrollViewer`; the drag takes over after 8 DIP of axis-dominant movement
-  when the ScrollViewer cannot scroll further, calls
-  `CancelDirectManipulations` on the hit element and root, captures the
-  pointer and follows with `Progress`. On release the same 25% / 0.5 rules
-  apply; cancel animates back to 1 over 120 ms.
-- Every `PrepareRootElement` resets the previous root's handlers and
-  composition state, recomputes the axis and installs a fresh driver.
+- `Wh_ModAfterInit` starts one input thread. The thread owns a message-only
+  window and registers `RAWINPUTDEVICE{0x0D, 0x04}` (touch) and
+  `{0x0D, 0x02}` (pen) with `RIDEV_INPUTSINK`, so it still receives reports
+  while the Start menu is in front.
+- Each device is decoded from its `RIDI_PREPARSEDDATA` blob, never by opening
+  the device. Contact collections are the `0x0D/0x05` and `0x0D/0x22` link
+  nodes. `contacts` is the top-level Contact Count (`0x0D/0x54`); X and Y come
+  from the first contact collection with a non-zero position.
+- Raw X/Y is mapped from the HID logical range to physical screen pixels with
+  `GetSystemMetrics`, then to DIP with `GetDpiForWindow(...) / 96`.
+- The gesture state machine runs on the input thread. It begins at one
+  contact inside the Start window (4 DIP margin) while the CoreWindow is not
+  DWM-cloaked. While the finger moves it inserts
+  `Progress = 1 - delta / Distance`, and only when the value changes by more
+  than 0.004.
+- The Start CoreWindow HWND outlives the menu and `IsWindowVisible` stays TRUE
+  while it is closed, so `DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED)` decides
+  whether the menu is open: 0 while shown, 2 while closed. One query runs per
+  down, after the settling check.
+- A gesture whose perpendicular travel exceeds 120 DIP, is more than 1.5x the
+  axis travel and keeps the axis travel below 60 DIP is a scroll, not a
+  dismiss: it restores `Progress = 1` without animation.
+- Release commits when the axis travel exceeds 20% of `Distance` or the average
+  velocity exceeds 0.45 DIP/ms. A commit animates `Progress` to 0 over 150 ms
+  and then taps the Windows key; a cancel animates back over 120 ms.
+- A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
+  the legacy menu ignores an injected `VK_ESCAPE`. A lone `VK_LWIN` tap (down,
+  60 ms, up) closes it, because the shell acts on the key itself.
+- A down that arrives while the previous commit is still settling is ignored.
+  The menu reuses one XAML root, so a commit sets a flag that makes the next
+  down stop the animation and restore `Progress = 1` before the drag starts.
+- Two or more contacts cancel the gesture and are ignored until the panel is
+  released. A lift report is not required: a session with no sample for 120 ms
+  ends on its own.
 
 What it does not do:
 
-- It does not drive the slide-in reveal and has no per-frame reveal. The
-  ExplorerPatcher Start window appears at its final position; its own flyout
-  animation covers the open transition.
-- It does not use the explorer-side bridge mod, shared memory, or the
-  `InputAnimationTarget` experiments.
+- It does not drive the slide-in reveal and has no per-frame reveal. It does
+  not use the explorer-side bridge or shared memory.
+- It does not attach XAML pointer handlers and has no DirectManipulation
+  hook.
+
+Debug channel (kept in the build):
+
+- `debug.txt` in the mod storage directory
+  (`C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\`)
+  is polled every 50 ms on the raw input thread and re-read only when its write
+  time or size changes. One command per line:
+  - `p=0.5` inserts `Progress`, clamped to 0..1.
+  - `t=-300,0,0` sets `UIElement.Translation` on the UI thread.
+  - `e=-300,0` sets `Properties["Offset"]` and `Visual.Offset` on the visual.
+  Empty lines and unknown lines are ignored. The channel compares the rendering
+  mechanisms without a gesture; it does nothing before the first
+  `attached root=...` line.
 
 Diagnostics:
 
-- `mod init`, `root pending load ...`, `attached root=...`,
-  `dismiss axis=...`, `dmhook installed target=...`,
-  `dmhook n=... maxPos=... maxNeg=... base=(...) el=...`, and the
-  pointer-fallback diagnostics `press type=...` (capped at 20 per process),
-  first `move ...` (capped at 20 per process) and `takeover ...` go to
-  `renderer.log`; the fallback's dismiss commit/cancel/dragging go to the
-  Windhawk log.
+- `mod init`, `hid init`, `hid reg usage=... ok=... err=...`,
+  `hid down x=... y=... axis=... dist=...`,
+  `hid release delta=... perp=... vel=... commit=... n=...`,
+  `hid dismiss win sent`, `hid decodefail dev=... err=...`,
+  `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
+  `debug e=...` go to `renderer.log`.
+- Only begin and release are logged, never individual samples.
 
 Known risks:
 
-- The offset hook relies on a PDB-confirmed signature and a hard-coded RVA:
-  `self` in `rcx`, `x` in `xmm1`, `y` in `xmm2`, `changed` in `r9`. Windows
-  x64 defines one calling convention, so a Windhawk function hook with the
-  same prototype is ABI-compatible; a wrong prototype, a stale RVA or a
-  different XAML build corrupts arguments or crashes. The file-version gate is
-  the only guard.
-- The hook also sees offset changes from other XAML surfaces in the process.
-  It accepts all of them while a press session is active, because the process
-  hosts only the Start UI; `el=...` shows which element produced them.
-- `PointerDeviceType` is Touch/Pen only in the pointer fallback; the offset
-  hook itself accepts any device. A precision touchpad or mouse reports Mouse
-  and does not reach the fallback.
-- `CancelDirectManipulations` is used only by the pointer fallback. It is
-  called on the pressed hit element first and then on the root; the API
-  cancels manipulations on ScrollViewer *parents*, so the hit-element call is
-  the meaningful one.
-- Dismiss posts synthetic `WM_KEYDOWN`/`WM_KEYUP` for `VK_ESCAPE` to the
-  CoreWindow HWND; it depends on the legacy Start processing posted key input
-  as its normal Escape. Not runtime-verified.
-- The pointer fallback's scroll gate uses the innermost ScrollViewer's
-  offsets. Nested or custom scroll surfaces may not be found, and at an
-  overscroll edge the reported offsets may not reflect the visual position.
-- Composition translation does not move XAML hit-testing. A drag either
-  cancels back to 1 or the shell hides the menu; content is never left offset.
-- The RVA is specific to `StartUI_.dll` 10.0.22621.3733.
-- The dismiss settle uses an asynchronous `CompositionScopedBatch`
-  completion. A stop flag and a serial guard it against unload/re-open, but an
-  in-flight callback at module unload remains a teardown risk.
-- Pointer handlers only see input that reaches the XAML root; input consumed
-  by the shell before XAML will not dismiss.
+- Raw input has one sink per usage per process. Another mod that registers
+  `0x0D/0x04` (the `inputprobe` diagnostic does) redirects or removes the
+  stream; `inputprobe` must stay disabled.
+- The digitizer is assumed to cover the primary screen and match the window
+  DPI. A panel on another display, a rotated panel or a non-default logical
+  range decodes to the wrong DIP point.
+- The legacy menu also receives the same touch through its normal XAML input,
+  so a drag can scroll or click a tile while the menu slides.
+- Composition calls and the settle batch run from the input thread. The batch
+  completion arrives on the compositor's dispatcher; if it never arrives,
+  `Progress` stays at 0 and every later down is ignored until that batch
+  completes.
+- A committed dismiss taps the Windows key globally, so it lands on whichever
+  window has the foreground; a lone Windows tap opens Start if the menu is
+  already gone.
+- `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
+  is missing, no gesture starts.
+- The `PrepareRootElement` RVA is specific to `StartUI_.dll` 10.0.22621.3733.
 */
+// ==/WindhawkModReadme==
 
+/*
+ * [INPUT]: depends on StartUI::App::PrepareRootElement in StartUI_.dll; on
+ *   RegisterRawInputDevices, GetRawInputData, GetRawInputDeviceInfoW,
+ *   GetDpiForWindow, GetSystemMetrics, GetWindowRect and keybd_event from
+ *   user32; on DwmGetWindowAttribute, resolved at init from dwmapi.dll; on
+ *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps and
+ *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet and
+ *   expression installed in Setup; on `debug.txt` in the mod storage
+ *   directory, read by the debug channel.
+ * [OUTPUT]: one message-only window and one worker thread per process; the
+ *   Composition `Progress` scalar; one global Windows-key tap per committed
+ *   dismiss; three file-driven debug commands (`p`, `t`, `e`) that apply a
+ *   Progress value, the XAML translation or the visual offset; no exported
+ *   symbols.
+ * [POS]: input and gesture layer of the legacy Start dismiss mod. It replaces
+ *   the XAML pointer and DirectManipulation paths with raw HID decoding; the
+ *   composition helpers below it are shared with the root hook above it.
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
 
 #include <windhawk_utils.h>
 #include <windows.h>
 #undef GetCurrentTime  // MinGW winbase.h macro vs. Timeline.GetCurrentTime
 
+#include <hidusage.h>
+#include <hidpi.h>
+
 #include <winrt/base.h>
-#include <winrt/Windows.Devices.Input.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Core.h>
-#include <winrt/Windows.UI.Input.h>
 #include <winrt/Windows.UI.Xaml.h>
-#include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
-#include <winrt/Windows.UI.Xaml.Input.h>
-#include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
-#include <cstdio>
 #include <cstdint>
-#include <cwchar>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <new>
+#include <vector>
 
 namespace {
 
 namespace wuc = winrt::Windows::UI::Composition;
 namespace wucore = winrt::Windows::UI::Core;
-namespace wudi = winrt::Windows::Devices::Input;
 namespace wux = winrt::Windows::UI::Xaml;
-namespace wuxc = winrt::Windows::UI::Xaml::Controls;
 namespace wuxh = winrt::Windows::UI::Xaml::Hosting;
-namespace wuxi = winrt::Windows::UI::Xaml::Input;
-namespace wuxm = winrt::Windows::UI::Xaml::Media;
 
 using winrt::Windows::Foundation::Numerics::float3;
 
@@ -194,9 +225,39 @@ constexpr uintptr_t kPrepareRootElementVa = 0x1800AD730;
 constexpr std::chrono::milliseconds kDismissSettleDuration{150};
 constexpr std::chrono::milliseconds kDismissCancelDuration{120};
 
-constexpr float kDragStartThreshold = 8.0f;       // DIP
-constexpr float kDismissDistanceFraction = 0.25f; // of Distance
-constexpr float kDismissVelocity = 0.5f;          // DIP per ms
+// Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
+constexpr float kCommitDistanceFraction = 0.20f;
+constexpr float kCommitVelocity = 0.45f;
+constexpr float kScrollAbortPerp = 120.0f;
+constexpr float kScrollAbortRatio = 1.5f;
+constexpr float kScrollAbortMaxDelta = 60.0f;
+constexpr float kProgressStep = 0.004f;
+constexpr float kWindowMarginDip = 4.0f;
+constexpr uint64_t kIdleReleaseMs = 500;
+constexpr UINT_PTR kIdleTimerId = 1;
+constexpr UINT kIdleTimerMs = 20;
+constexpr UINT_PTR kDebugTimerId = 2;
+constexpr UINT kDebugTimerMs = 50;
+
+// Raw input and HID decoding limits.
+constexpr int kMaxHidDevices = 4;
+constexpr int kMaxContactCollections = 8;
+constexpr int kMaxLinkNodes = 64;
+constexpr int kHidPathChars = 512;
+constexpr wchar_t kHidWindowClass[] =
+    L"WindhawkLegacyStartSwipeRawInputWindow";
+
+constexpr USAGE kUsagePageGeneric = 0x01;
+constexpr USAGE kUsagePageDigitizer = 0x0D;
+constexpr USAGE kUsageTouchScreen = 0x04;
+constexpr USAGE kUsagePen = 0x02;
+constexpr USAGE kUsageContact = 0x05;
+constexpr USAGE kUsageFinger = 0x22;
+constexpr USAGE kUsageX = 0x30;
+constexpr USAGE kUsageY = 0x31;
+constexpr USAGE kUsageInRange = 0x32;
+constexpr USAGE kUsageTipSwitch = 0x42;
+constexpr USAGE kUsageContactCount = 0x54;
 
 // ICoreWindowInterop (45D64A29-A63E-4CB6-B498-5781D298CB4F). Slot 3 is
 // get_WindowHandle; the interface is classic COM, so it is called directly.
@@ -205,8 +266,11 @@ constexpr GUID kCoreWindowInteropIid = {
     {0xB4, 0x98, 0x57, 0x81, 0xD2, 0x98, 0xCB, 0x4F}};
 using GetCoreWindowHandleAbi = HRESULT(STDMETHODCALLTYPE*)(void*, HWND*);
 
-// One-shot XAML object reconnaissance, gated on the XAML build.
-constexpr unsigned kXamlVersion[4] = {10, 0, 26100, 9949};
+// DWMWA_CLOAKED (dwmapi.h value 14). The CoreWindow HWND outlives the menu and
+// IsWindowVisible stays TRUE while it is closed, so cloaking is the only
+// reliable open/closed signal: 0 while the menu is shown.
+constexpr DWORD kDwmwaCloaked = 14;
+using DwmGetWindowAttribute_t = HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD);
 
 enum class DismissAxis : int32_t {
     Left = 0,
@@ -228,11 +292,10 @@ std::atomic<bool> g_stopDismissCallback{false};
 // Composition state
 //
 // Progress is the only animated scalar; Distance is the static window width
-// or height, depending on the dismiss axis.
-// Both the property set and the visual are agile Composition objects, so the
-// pointer handlers and the settle batch callback can use them. The mutex
-// protects the projection pointers and the check-then-update sequence against
-// teardown; it is never held across a wait.
+// or height. Both the property set and the visual are agile Composition
+// objects, so the input thread and the settle batch callback can use them.
+// The mutex protects the projection pointers and the check-then-update
+// sequence against teardown; it is never held across a wait.
 // ---------------------------------------------------------------------------
 
 std::mutex g_compositionMutex;
@@ -250,66 +313,38 @@ std::atomic<uint32_t> g_setupGeneration{0};
 winrt::event_token g_loadedToken{};
 winrt::event_token g_sizeToken{};
 
-// XAML keeps only a weak reference to a routed-event handler, so the delegate
-// objects must stay alive for as long as the handlers are attached.
-wuxi::PointerEventHandler g_pointerPressedHandler{nullptr};
-wuxi::PointerEventHandler g_pointerMovedHandler{nullptr};
-wuxi::PointerEventHandler g_pointerReleasedHandler{nullptr};
-wuxi::PointerEventHandler g_pointerCaptureLostHandler{nullptr};
-
-// AddHandler takes an IReference<delegate>, so the boxed handlers are kept
-// too; the same object is passed to RemoveHandler.
-winrt::Windows::Foundation::IInspectable g_pointerPressedSink{nullptr};
-winrt::Windows::Foundation::IInspectable g_pointerMovedSink{nullptr};
-winrt::Windows::Foundation::IInspectable g_pointerReleasedSink{nullptr};
-winrt::Windows::Foundation::IInspectable g_pointerCaptureLostSink{nullptr};
-
-// Swipe dismiss state. UI thread only unless marked atomic.
-bool g_dismissPressed = false;
-bool g_dismissDragging = false;
-bool g_moveLogged = false;
-float g_dismissStartX = 0.0f;
-float g_dismissStartY = 0.0f;
-float g_dismissLastAxisDelta = 0.0f;
-uint64_t g_dismissStartTick = 0;
-uint32_t g_dismissPointerId = 0;
-wux::UIElement g_pressHitElement{nullptr};
-wuxc::ScrollViewer g_pressScrollViewer{nullptr};
-double g_pressVerticalOffset = 0.0;
-double g_pressScrollableHeight = 0.0;
-double g_pressHorizontalOffset = 0.0;
-double g_pressScrollableWidth = 0.0;
 std::atomic<bool> g_dismissSettling{false};
 std::atomic<uint32_t> g_dismissSerial{0};
-std::atomic<uint32_t> g_pressLogCount{0};
-std::atomic<uint32_t> g_moveLogCount{0};
-HWND g_coreHwnd = nullptr;
+std::atomic<HWND> g_coreHwnd{nullptr};
+// Resolved in Wh_ModInit. A runtime resolve keeps the mod loadable without
+// dwmapi.dll in the import table.
+std::atomic<DwmGetWindowAttribute_t> g_dwmGetWindowAttribute{nullptr};
 
 // Filled in at setup and on every PrepareRootElement.
 int32_t g_dismissAxis = static_cast<int32_t>(DismissAxis::Left);
 float g_dismissDistance = 0.0f;
 
-// DManip hook state. The hook and the pointer handlers both run on the XAML UI
-// thread, so the session state needs no atomics and no locks.
-bool g_dmHookChecked = false;
-bool g_dmHookInstalled = false;
-bool g_dmSessionActive = false;
-bool g_dmHaveBaseline = false;
-float g_dmBaseX = 0.0f;
-float g_dmBaseY = 0.0f;
-float g_dmMaxPos = 0.0f;
-float g_dmMaxNeg = 0.0f;
-int g_dmSamples = 0;
-void* g_dmElement = nullptr;
-uint64_t g_dmPressStartTick = 0;
+// Published by the UI thread and read by the input thread. No XAML object is
+// shared: only these plain values.
+//
+// g_hasRoot is set by Setup and never cleared: PrepareRootElement does not fire
+// again for a reused XAML root, so it only answers "the renderer was installed
+// once in this process". Whether the menu is open is decided per down by the
+// DWM cloaked attribute, never by a latch.
+std::atomic<bool> g_hasRoot{false};
+std::atomic<int32_t> g_axisPub{static_cast<int32_t>(DismissAxis::Left)};
+std::atomic<float> g_distancePub{0.0f};
+std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
+
+HANDLE g_hidThread = nullptr;
+std::atomic<HWND> g_hidHwnd{nullptr};
 
 // Defined with the unload helpers; PrepareRootElement uses them to reset on
 // every open.
 void RevokeHandlers();
 void ResetComposition();
 void ResetRenderer();
-bool EnsureDmHook();
-void EndDmSession();
+HWND FindStartCoreWindow();
 
 // ---------------------------------------------------------------------------
 // Composition helpers
@@ -336,8 +371,7 @@ bool ShowAtRest() {
     return true;
 }
 
-// Stops the current Progress animation so a drag can drive the scalar
-// directly.
+// Stops the cancel animation so a new drag can drive the scalar directly.
 bool StopProgressAnimation() {
     std::lock_guard lock(g_compositionMutex);
     if (!g_state) {
@@ -409,125 +443,8 @@ bool AnimateProgressTo(float from, float to,
     return true;
 }
 
-double AverageDismissVelocity(float axisDelta, uint64_t startTick) {
-    const uint64_t now = GetTickCount64();
-    uint64_t elapsed = now > startTick ? now - startTick : 0;
-    if (elapsed == 0) {
-        elapsed = 1;
-    }
-    return static_cast<double>(axisDelta) / static_cast<double>(elapsed);
-}
-
-// Finds the innermost ScrollViewer between the pressed element and the root.
-wuxc::ScrollViewer FindInnermostScrollViewer(
-    winrt::Windows::Foundation::IInspectable const& source,
-    wux::FrameworkElement const& root) {
-    wux::DependencyObject node = source.try_as<wux::DependencyObject>();
-    while (node) {
-        wuxc::ScrollViewer viewer = node.try_as<wuxc::ScrollViewer>();
-        if (viewer) {
-            return viewer;
-        }
-        if (winrt::get_abi(node) == winrt::get_abi(root)) {
-            break;
-        }
-        node = wuxm::VisualTreeHelper::GetParent(node);
-    }
-    return nullptr;
-}
-
-bool RecordedCanScrollInDismissDirection() {
-    switch (static_cast<DismissAxis>(g_dismissAxis)) {
-        case DismissAxis::Left:
-            return g_pressHorizontalOffset > 0.0;
-        case DismissAxis::Right:
-            return g_pressHorizontalOffset < g_pressScrollableWidth - 1.0;
-        case DismissAxis::Top:
-            return g_pressVerticalOffset > 0.0;
-        case DismissAxis::Bottom:
-            return g_pressVerticalOffset < g_pressScrollableHeight - 1.0;
-    }
-    return false;
-}
-
-// True while the ScrollViewer under the press can still scroll in the
-// dismiss direction; until it reaches that end, the swipe belongs to the list.
-bool CanScrollInDismissDirection() {
-    wuxc::ScrollViewer viewer = g_pressScrollViewer;
-    if (!viewer) {
-        return false;
-    }
-
-    try {
-        switch (static_cast<DismissAxis>(g_dismissAxis)) {
-            case DismissAxis::Left:
-                return viewer.HorizontalOffset() > 0.0;
-            case DismissAxis::Right:
-                return viewer.HorizontalOffset() <
-                       viewer.ScrollableWidth() - 1.0;
-            case DismissAxis::Top:
-                return viewer.VerticalOffset() > 0.0;
-            case DismissAxis::Bottom:
-                return viewer.VerticalOffset() <
-                       viewer.ScrollableHeight() - 1.0;
-        }
-    } catch (...) {
-        return RecordedCanScrollInDismissDirection();
-    }
-
-    return false;
-}
-
-float ComputeAxisDelta(float x, float y) {
-    switch (static_cast<DismissAxis>(g_dismissAxis)) {
-        case DismissAxis::Left:
-            return g_dismissStartX - x;
-        case DismissAxis::Top:
-            return g_dismissStartY - y;
-        case DismissAxis::Right:
-            return x - g_dismissStartX;
-        case DismissAxis::Bottom:
-            return y - g_dismissStartY;
-    }
-    return g_dismissStartX - x;
-}
-
-float ComputePerpendicular(float x, float y) {
-    if (IsHorizontalAxis(g_dismissAxis)) {
-        return std::fabs(y - g_dismissStartY);
-    }
-    return std::fabs(x - g_dismissStartX);
-}
-
-void ClearDismissPress() {
-    g_dismissPressed = false;
-    g_dismissDragging = false;
-    g_moveLogged = false;
-    g_dismissLastAxisDelta = 0.0f;
-    g_dismissStartX = 0.0f;
-    g_dismissStartY = 0.0f;
-    g_dismissStartTick = 0;
-    g_dismissPointerId = 0;
-    g_pressHitElement = nullptr;
-    g_pressScrollViewer = nullptr;
-    g_pressVerticalOffset = 0.0;
-    g_pressScrollableHeight = 0.0;
-    g_pressHorizontalOffset = 0.0;
-    g_pressScrollableWidth = 0.0;
-}
-
-void ResetDismissDrag() {
-    ClearDismissPress();
-    if (g_root) {
-        try {
-            g_root.ReleasePointerCaptures();
-        } catch (...) {
-        }
-    }
-}
-
-// Committed dismiss: slide out over 150 ms, then post Escape so the shell
-// closes the menu through its normal input path.
+// Committed dismiss: slide out over 150 ms, then tap the Windows key so the
+// shell closes the menu through its normal input path.
 bool BeginDismissSettle(float from) {
     wuc::CompositionScopedBatch batch{nullptr};
     uint32_t serial = 0;
@@ -540,12 +457,6 @@ bool BeginDismissSettle(float from) {
             }
 
             serial = g_dismissSerial.fetch_add(1) + 1;
-            HWND coreHwnd = g_coreHwnd;
-            if (!coreHwnd) {
-                // The pointer handler runs on the UI thread; the Start window
-                // is normally the active window of this thread.
-                coreHwnd = GetActiveWindow();
-            }
 
             wuc::ScalarKeyFrameAnimation animation =
                 g_compositor.CreateScalarKeyFrameAnimation();
@@ -556,7 +467,7 @@ bool BeginDismissSettle(float from) {
             batch = g_compositor.CreateScopedBatch(
                 wuc::CompositionBatchTypes::Animation);
             batch.Completed(
-                [serial, coreHwnd](
+                [serial](
                     winrt::Windows::Foundation::IInspectable const&,
                     wuc::CompositionBatchCompletedEventArgs const&) {
                     try {
@@ -571,10 +482,15 @@ bool BeginDismissSettle(float from) {
                             return;
                         }
 
-                        if (coreHwnd) {
-                            PostMessageW(coreHwnd, WM_KEYDOWN, VK_ESCAPE, 0);
-                            PostMessageW(coreHwnd, WM_KEYUP, VK_ESCAPE, 0);
-                        }
+                        // A menu opened without keyboard focus keeps the
+                        // foreground on SearchHost, so an injected VK_ESCAPE
+                        // does not reach it. A lone Windows-key tap is acted
+                        // on by the shell itself and closes the menu in that
+                        // state.
+                        keybd_event(VK_LWIN, 0, 0, 0);
+                        Sleep(60);
+                        keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+                        FileLog(L"hid dismiss win sent");
 
                         if (g_state) {
                             g_state.StopAnimation(L"Progress");
@@ -617,280 +533,1165 @@ bool BeginDismissSettle(float from) {
     return true;
 }
 
-void OnDismissPointerPressed(wuxi::PointerRoutedEventArgs const& args) {
-    try {
-        if (g_dismissDragging ||
-            g_dismissSettling.load(std::memory_order_relaxed)) {
-            return;
-        }
+// ---------------------------------------------------------------------------
+// Debug command channel
+//
+// Kept in the shipping build. It applies one rendering mechanism at a time so
+// the candidates can be compared without a gesture. The file is
+//   C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\
+//   local@start-menu-legacy-swipe\debug.txt
+// which is the directory Wh_GetModStoragePath returns. One command per line:
+//   p=<progress>        InsertProgress, clamped to 0..1
+//   t=<x>,<y>,<z>       UIElement.Translation, applied on the UI thread (DIP)
+//   e=<x>[,<y>]         visual Properties["Offset"] and Visual.Offset (DIP)
+// The raw input thread polls the file every 50 ms and re-reads it only when
+// its write time or size changes. Nothing is logged per poll.
+// ---------------------------------------------------------------------------
 
-        // A session whose release never arrived is finished before the new one
-        // starts recording.
-        if (g_dmSessionActive) {
-            EndDmSession();
-        }
+constexpr wchar_t kDebugFileName[] = L"debug.txt";
+constexpr DWORD kDebugFileMaxBytes = 4096;
 
-        if (EnsureDmHook()) {
-            g_dmHaveBaseline = false;
-            g_dmBaseX = 0.0f;
-            g_dmBaseY = 0.0f;
-            g_dmMaxPos = 0.0f;
-            g_dmMaxNeg = 0.0f;
-            g_dmSamples = 0;
-            g_dmElement = nullptr;
-            g_dmPressStartTick = GetTickCount64();
-            g_dmSessionActive = true;
+struct DebugFileStamp {
+    bool seen = false;
+    DWORD writeLow = 0;
+    DWORD writeHigh = 0;
+    LONGLONG size = 0;
+};
 
-            // The offset hook is the distance source; the pointer is never
-            // captured or consumed.
-            ClearDismissPress();
-            return;
-        }
+DebugFileStamp g_debugFileStamp;  // input thread only
 
-        const wudi::PointerDeviceType deviceType =
-            args.Pointer().PointerDeviceType();
-        if (deviceType != wudi::PointerDeviceType::Touch &&
-            deviceType != wudi::PointerDeviceType::Pen) {
-            return;
-        }
-
-        // A new touch/pen press supersedes a pending press that never became
-        // a drag, so a lost release cannot block later gestures.
-        ClearDismissPress();
-
-        wux::FrameworkElement root = g_root;
-        if (!root) {
-            return;
-        }
-
-        const auto point = args.GetCurrentPoint(root);
-        g_dismissStartX = point.Position().X;
-        g_dismissStartY = point.Position().Y;
-        g_dismissLastAxisDelta = 0.0f;
-        g_dismissStartTick = GetTickCount64();
-        g_dismissPointerId = args.Pointer().PointerId();
-        g_dismissPressed = true;
-        g_pressHitElement = args.OriginalSource().try_as<wux::UIElement>();
-
-        const uint32_t count =
-            g_pressLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (count <= 20) {
-            FileLog(L"press type=%d", static_cast<int>(deviceType));
-        }
-
-        // The whole legacy Start content can live inside one ScrollViewer.
-        // Remember the innermost one; the drag only takes over once it cannot
-        // scroll further in the dismiss direction.
-        g_pressScrollViewer =
-            FindInnermostScrollViewer(args.OriginalSource(), root);
-        if (g_pressScrollViewer) {
-            try {
-                g_pressVerticalOffset =
-                    g_pressScrollViewer.VerticalOffset();
-                g_pressScrollableHeight =
-                    g_pressScrollViewer.ScrollableHeight();
-                g_pressHorizontalOffset =
-                    g_pressScrollViewer.HorizontalOffset();
-                g_pressScrollableWidth =
-                    g_pressScrollViewer.ScrollableWidth();
-            } catch (...) {
-            }
-        }
-    } catch (...) {
-        ClearDismissPress();
-        // Never let an exception escape into XAML.
+bool DebugFilePath(WCHAR* path, size_t count) {
+    WCHAR storage[MAX_PATH] = {};
+    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
+        return false;
     }
+
+    return swprintf_s(path, count, L"%s\\%s", storage, kDebugFileName) > 0;
 }
 
-void OnDismissPointerMoved(wuxi::PointerRoutedEventArgs const& args) {
+// Parses "v[,v...]" up to maxCount values. A missing, partial or trailing
+// token rejects the whole line.
+bool ParseFloatList(const char* text, int maxCount, float* values,
+                    int& count) {
+    count = 0;
+    const char* cursor = text;
+
+    while (count < maxCount) {
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+
+        char* end = nullptr;
+        const float value = std::strtof(cursor, &end);
+        if (end == cursor || !std::isfinite(value)) {
+            return false;
+        }
+        values[count++] = value;
+        cursor = end;
+
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == ',') {
+            ++cursor;
+            continue;
+        }
+        break;
+    }
+
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' ||
+           *cursor == '\n') {
+        ++cursor;
+    }
+    return *cursor == '\0';
+}
+
+// The alternative to the expression: write the visual Offset directly. Both
+// the property set entry and the visual property are written, because the
+// probe must cover both forms the visual may read.
+bool SetVisualOffset(float x, float y) {
+    std::lock_guard lock(g_compositionMutex);
+    if (!g_visual) {
+        return false;
+    }
+
     try {
-        if (g_dmSessionActive) {
-            // The offset hook is the distance source; never take the pointer
-            // or drive Progress during the gesture.
-            return;
-        }
+        g_visual.Properties().InsertVector3(L"Offset", float3{x, y, 0.0f});
+        g_visual.Offset(float3{x, y, 0.0f});
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Visual offset failed: %08X %s",
+               static_cast<unsigned>(e.code()), e.message().c_str());
+        return false;
+    } catch (...) {
+        Wh_Log(L"Visual offset failed with an unknown exception");
+        return false;
+    }
 
-        if (!g_dismissPressed ||
-            args.Pointer().PointerId() != g_dismissPointerId) {
-            return;
-        }
+    return true;
+}
 
-        wux::FrameworkElement root = g_root;
-        if (!root) {
-            return;
-        }
+// The other alternative: the XAML framework translation property, which must be
+// set on the UI thread. The call is asynchronous, so the applied line is logged
+// from the callback and never claims a change the dispatcher refused.
+void RequestTranslation(float x, float y, float z) {
+    wucore::CoreDispatcher dispatcher = g_dispatcher;
+    if (!dispatcher || g_unloading.load(std::memory_order_relaxed)) {
+        return;
+    }
 
-        const auto point = args.GetCurrentPoint(root);
-        const float x = point.Position().X;
-        const float y = point.Position().Y;
-        const float axisDelta = ComputeAxisDelta(x, y);
-        const float perpendicular = ComputePerpendicular(x, y);
-        g_dismissLastAxisDelta = axisDelta;
-
-        if (!g_moveLogged) {
-            g_moveLogged = true;
-            const bool canScroll = CanScrollInDismissDirection();
-            const uint32_t count =
-                g_moveLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count <= 20) {
-                FileLog(L"move axisDelta=%.1f perp=%.1f scrollable=%d "
-                        L"canScroll=%d",
-                        axisDelta, perpendicular,
-                        g_pressScrollViewer ? 1 : 0, canScroll ? 1 : 0);
-            }
-        }
-
-        if (!g_dismissDragging) {
-            if (axisDelta <= kDragStartThreshold ||
-                perpendicular >= axisDelta) {
-                return;
-            }
-            if (CanScrollInDismissDirection()) {
-                return;
-            }
-            if (!(g_dismissDistance > 0.0f)) {
-                ClearDismissPress();
-                return;
-            }
-
-            // CancelDirectManipulations affects ScrollViewer ancestors of the
-            // element it is called on, so try the pressed hit element first;
-            // the root call is a cheap fallback. Either may throw if the
-            // element has left the tree; the capture is still attempted.
-            bool cancelHit = false;
-            bool cancelRoot = false;
-            try {
-                if (g_pressHitElement) {
-                    cancelHit = g_pressHitElement.CancelDirectManipulations();
+    try {
+        dispatcher.TryRunAsync(
+            wucore::CoreDispatcherPriority::Normal,
+            [x, y, z]() {
+                try {
+                    wux::FrameworkElement root = g_root;
+                    if (!root) {
+                        return;
+                    }
+                    wuxh::ElementCompositionPreview::SetIsTranslationEnabled(
+                        root, true);
+                    root.Translation(float3{x, y, z});
+                    FileLog(L"debug t=%.1f,%.1f,%.1f", x, y, z);
+                } catch (winrt::hresult_error const& e) {
+                    FileLog(L"debug t fail err=%08X",
+                            static_cast<unsigned>(e.code()));
+                } catch (...) {
+                    FileLog(L"debug t fail err=unknown");
                 }
-            } catch (...) {
-            }
-            try {
-                cancelRoot = root.CancelDirectManipulations();
-            } catch (...) {
-            }
-            FileLog(L"takeover cancelHit=%d cancelRoot=%d",
-                    cancelHit ? 1 : 0, cancelRoot ? 1 : 0);
-
-            if (!root.CapturePointer(args.Pointer())) {
-                // Never follow without capture: moves and the release could
-                // be lost, leaving the panel half-offset.
-                ClearDismissPress();
-                return;
-            }
-
-            g_dismissDragging = true;
-            StopProgressAnimation();
-            Wh_Log(L"dismissPressed");
-            Wh_Log(L"dismissDragging axisDelta=%.1f vel=%.2f", axisDelta,
-                   AverageDismissVelocity(axisDelta, g_dismissStartTick));
-        }
-
-        if (!(g_dismissDistance > 0.0f)) {
-            return;
-        }
-        InsertProgress(
-            std::clamp(1.0f - axisDelta / g_dismissDistance, 0.0f, 1.0f));
-        args.Handled(true);
+            });
+    } catch (winrt::hresult_error const& e) {
+        FileLog(L"debug t queue err=%08X", static_cast<unsigned>(e.code()));
     } catch (...) {
-        // Never let an exception escape into XAML.
+        FileLog(L"debug t queue err=unknown");
     }
 }
 
-void FinishDismiss(wuxi::PointerRoutedEventArgs const* args, bool captureLost) {
-    if (!g_dismissPressed) {
-        return;
+void ApplyDebugLine(const char* line) {
+    while (*line == ' ' || *line == '\t' || *line == '\r') {
+        ++line;
     }
-    if (args && args->Pointer().PointerId() != g_dismissPointerId) {
+    if (line[0] == '\0' || line[1] != '=') {
         return;
     }
 
-    wux::FrameworkElement root = g_root;
-    float axisDelta = g_dismissLastAxisDelta;
-    if (args && root) {
-        try {
-            const auto point = args->GetCurrentPoint(root);
-            axisDelta =
-                ComputeAxisDelta(point.Position().X, point.Position().Y);
-        } catch (...) {
+    float values[3] = {};
+    int count = 0;
+
+    switch (line[0]) {
+        case 'p':
+            if (!ParseFloatList(line + 2, 1, values, count) || count != 1) {
+                return;
+            }
+            {
+                const float progress = std::clamp(values[0], 0.0f, 1.0f);
+                if (InsertProgress(progress)) {
+                    FileLog(L"debug p=%.3f", progress);
+                }
+            }
+            return;
+        case 't':
+            if (!ParseFloatList(line + 2, 3, values, count) || count != 3) {
+                return;
+            }
+            RequestTranslation(values[0], values[1], values[2]);
+            return;
+        case 'e':
+            if (!ParseFloatList(line + 2, 2, values, count) || count < 1) {
+                return;
+            }
+            {
+                const float y = count > 1 ? values[1] : 0.0f;
+                if (SetVisualOffset(values[0], y)) {
+                    FileLog(L"debug e=%.1f,%.1f", values[0], y);
+                }
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+void ApplyDebugCommands(char* text) {
+    char* cursor = text;
+    while (*cursor != '\0') {
+        char* newline = std::strchr(cursor, '\n');
+        if (newline) {
+            *newline = '\0';
+        }
+        ApplyDebugLine(cursor);
+        if (!newline) {
+            return;
+        }
+        cursor = newline + 1;
+    }
+}
+
+// Reads the command file only when its write time or size changed, and only
+// after the renderer exists: before the first Setup neither mechanism has an
+// object to act on.
+void PollDebugFile() {
+    if (g_unloading.load(std::memory_order_relaxed) ||
+        !g_hasRoot.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    WCHAR path[MAX_PATH] = {};
+    if (!DebugFilePath(path, ARRAYSIZE(path))) {
+        return;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) ||
+        (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        // A missing file is not an error. Forget the stamp so a recreated file
+        // is read even when it keeps the old size.
+        g_debugFileStamp = DebugFileStamp{};
+        return;
+    }
+
+    const LONGLONG size =
+        (static_cast<LONGLONG>(attributes.nFileSizeHigh) << 32) |
+        static_cast<LONGLONG>(attributes.nFileSizeLow);
+
+    if (g_debugFileStamp.seen &&
+        attributes.ftLastWriteTime.dwLowDateTime ==
+            g_debugFileStamp.writeLow &&
+        attributes.ftLastWriteTime.dwHighDateTime ==
+            g_debugFileStamp.writeHigh &&
+        size == g_debugFileStamp.size) {
+        return;
+    }
+
+    g_debugFileStamp.seen = true;
+    g_debugFileStamp.writeLow = attributes.ftLastWriteTime.dwLowDateTime;
+    g_debugFileStamp.writeHigh = attributes.ftLastWriteTime.dwHighDateTime;
+    g_debugFileStamp.size = size;
+
+    if (size <= 0 || size > kDebugFileMaxBytes) {
+        return;
+    }
+
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                  FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    char buffer[kDebugFileMaxBytes + 1] = {};
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, buffer, kDebugFileMaxBytes, &read, nullptr);
+    CloseHandle(file);
+    if (!ok || read == 0) {
+        return;
+    }
+    buffer[read] = '\0';
+
+    // An editor may prepend a UTF-8 BOM; skip it so the first line parses.
+    char* text = buffer;
+    if (read >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
+        static_cast<unsigned char>(text[1]) == 0xBB &&
+        static_cast<unsigned char>(text[2]) == 0xBF) {
+        text += 3;
+    }
+
+    ApplyDebugCommands(text);
+}
+
+// ---------------------------------------------------------------------------
+// Raw HID input
+//
+// The legacy Start consumes the pointer stream before XAML sees it, so the
+// only reliable live source is raw input. Each digitizer is decoded from its
+// RIDI_PREPARSEDDATA blob; the device is never opened.
+// ---------------------------------------------------------------------------
+
+struct HidDevice {
+    HANDLE handle = nullptr;
+    bool ready = false;
+    bool decodeFailLogged = false;
+    uint64_t lastUsedTick = 0;
+    WCHAR path[kHidPathChars] = {};
+    PHIDP_PREPARSED_DATA preparsed = nullptr;
+    std::vector<HIDP_VALUE_CAPS> valueCaps;
+    USHORT contactNodes[kMaxContactCollections] = {};
+    int contactNodeCount = 0;
+};
+
+HidDevice g_hidDevices[kMaxHidDevices];
+int g_hidDeviceCount = 0;  // input thread only
+bool g_hidCacheFullLogged = false;
+
+void CopyDevicePath(HANDLE handle, WCHAR* out, size_t outCount) {
+    out[0] = L'\0';
+
+    UINT chars = 0;
+    SetLastError(0);
+    if (GetRawInputDeviceInfoW(handle, RIDI_DEVICENAME, nullptr, &chars) ==
+            static_cast<UINT>(-1) ||
+        chars == 0) {
+        wcsncpy_s(out, outCount, L"?", _TRUNCATE);
+        return;
+    }
+
+    WCHAR* name = new (std::nothrow) WCHAR[chars + 1];
+    if (!name) {
+        wcsncpy_s(out, outCount, L"?", _TRUNCATE);
+        return;
+    }
+
+    name[0] = L'\0';
+    UINT fetched = chars;
+    SetLastError(0);
+    if (GetRawInputDeviceInfoW(handle, RIDI_DEVICENAME, name, &fetched) ==
+        static_cast<UINT>(-1)) {
+        wcsncpy_s(out, outCount, L"?", _TRUNCATE);
+    } else {
+        name[chars] = L'\0';
+        wcsncpy_s(out, outCount, name, _TRUNCATE);
+    }
+
+    delete[] name;
+}
+
+void LogDecodeFail(HidDevice& device, unsigned error) {
+    if (device.decodeFailLogged) {
+        return;
+    }
+
+    device.decodeFailLogged = true;
+    FileLog(L"hid decodefail dev=%s err=%u", device.path, error);
+}
+
+// Reads the path, the preparsed blob, the contact collection indices and the
+// value caps once per device. Runs on the input thread.
+void InitHidDevice(HidDevice& device) {
+    CopyDevicePath(device.handle, device.path, ARRAYSIZE(device.path));
+
+    UINT bytes = 0;
+    SetLastError(0);
+    if (GetRawInputDeviceInfoW(device.handle, RIDI_PREPARSEDDATA, nullptr,
+                               &bytes) == static_cast<UINT>(-1) ||
+        bytes == 0 || bytes > 64 * 1024) {
+        LogDecodeFail(device, GetLastError());
+        return;
+    }
+
+    BYTE* blob = new (std::nothrow) BYTE[bytes];
+    if (!blob) {
+        return;
+    }
+
+    UINT fetched = bytes;
+    SetLastError(0);
+    if (GetRawInputDeviceInfoW(device.handle, RIDI_PREPARSEDDATA, blob,
+                               &fetched) == static_cast<UINT>(-1) ||
+        fetched == 0) {
+        LogDecodeFail(device, GetLastError());
+        delete[] blob;
+        return;
+    }
+
+    device.preparsed = reinterpret_cast<PHIDP_PREPARSED_DATA>(blob);
+
+    HIDP_CAPS caps{};
+    const NTSTATUS capsStatus = HidP_GetCaps(device.preparsed, &caps);
+    if (capsStatus != HIDP_STATUS_SUCCESS) {
+        device.decodeFailLogged = true;
+        FileLog(L"hid decodefail dev=%s err=0x%08X", device.path,
+                static_cast<unsigned>(capsStatus));
+        return;
+    }
+
+    // The logical range of X and Y is needed to map raw values to pixels.
+    if (caps.NumberInputValueCaps > 0) {
+        device.valueCaps.resize(caps.NumberInputValueCaps);
+        USHORT length = caps.NumberInputValueCaps;
+        if (HidP_GetValueCaps(HidP_Input, device.valueCaps.data(), &length,
+                              device.preparsed) == HIDP_STATUS_SUCCESS) {
+            device.valueCaps.resize(length);
+        } else {
+            device.valueCaps.clear();
         }
     }
 
-    const bool wasDragging = g_dismissDragging;
-    const float distance = g_dismissDistance;
-    const double velocity =
-        AverageDismissVelocity(axisDelta, g_dismissStartTick);
+    // Contact collections are 0x0D/0x05 on classic digitizers and 0x0D/0x22
+    // (Finger) on the ELAN2513. Both carry X/Y per contact.
+    HIDP_LINK_COLLECTION_NODE nodes[kMaxLinkNodes]{};
+    ULONG nodeCount = kMaxLinkNodes;
+    if (HidP_GetLinkCollectionNodes(nodes, &nodeCount, device.preparsed) ==
+        HIDP_STATUS_SUCCESS) {
+        if (nodeCount > kMaxLinkNodes) {
+            nodeCount = kMaxLinkNodes;
+        }
 
-    ClearDismissPress();
-
-    if (!wasDragging) {
-        // A pending press that never dragged has no capture, no animation and
-        // must not log anything.
-        return;
-    }
-
-    if (root && !captureLost && args) {
-        try {
-            root.ReleasePointerCapture(args->Pointer());
-        } catch (...) {
+        for (ULONG i = 0; i < nodeCount; ++i) {
+            if (nodes[i].LinkUsagePage != kUsagePageDigitizer ||
+                (nodes[i].LinkUsage != kUsageContact &&
+                 nodes[i].LinkUsage != kUsageFinger)) {
+                continue;
+            }
+            if (device.contactNodeCount < kMaxContactCollections) {
+                device.contactNodes[device.contactNodeCount++] =
+                    static_cast<USHORT>(i);
+            }
         }
     }
 
+    device.ready = true;
+}
+
+HidDevice* GetHidDevice(HANDLE handle) {
+    if (!handle) {
+        return nullptr;
+    }
+
+    const uint64_t now = GetTickCount64();
+    for (int i = 0; i < g_hidDeviceCount; ++i) {
+        if (g_hidDevices[i].handle == handle) {
+            g_hidDevices[i].lastUsedTick = now;
+            return &g_hidDevices[i];
+        }
+    }
+
+    HidDevice* device = nullptr;
+    if (g_hidDeviceCount < kMaxHidDevices) {
+        device = &g_hidDevices[g_hidDeviceCount++];
+    } else {
+        // Injectors create a fresh virtual digitizer handle for every process,
+        // so the table must recycle instead of going deaf after four devices.
+        device = &g_hidDevices[0];
+        for (int i = 1; i < g_hidDeviceCount; ++i) {
+            if (g_hidDevices[i].lastUsedTick < device->lastUsedTick) {
+                device = &g_hidDevices[i];
+            }
+        }
+        delete[] reinterpret_cast<BYTE*>(device->preparsed);
+        if (!g_hidCacheFullLogged) {
+            g_hidCacheFullLogged = true;
+            FileLog(L"hid device table recycled (was full)");
+        }
+    }
+
+    *device = HidDevice{};
+    device->handle = handle;
+    device->lastUsedTick = now;
+    InitHidDevice(*device);
+    return device;
+}
+
+void FreeHidDevices() {
+    for (int i = 0; i < g_hidDeviceCount; ++i) {
+        delete[] reinterpret_cast<BYTE*>(g_hidDevices[i].preparsed);
+        g_hidDevices[i] = HidDevice{};
+    }
+    g_hidDeviceCount = 0;
+}
+
+bool ReadUsageValue(const HidDevice& device, USAGE usagePage,
+                    USHORT collection, USAGE usage, const BYTE* report,
+                    ULONG reportLength, ULONG* value) {
+    if (!device.preparsed) {
+        return false;
+    }
+
+    ULONG parsed = 0;
+    const NTSTATUS status = HidP_GetUsageValue(
+        HidP_Input, usagePage, collection, usage, &parsed, device.preparsed,
+        reinterpret_cast<PCHAR>(const_cast<BYTE*>(report)), reportLength);
+    if (status != HIDP_STATUS_SUCCESS) {
+        return false;
+    }
+
+    *value = parsed;
+    return true;
+}
+
+struct HidAxisRange {
+    long min = 0;
+    long max = 0;
+    bool valid = false;
+};
+
+// Selects the value cap that describes this report. reportId is the HID
+// report ID from RAWINPUTHEADER.wParam; 0 means the device has no report IDs.
+HidAxisRange FindAxisRange(const HidDevice& device, USAGE usage,
+                           USHORT reportId) {
+    HidAxisRange range;
+
+    for (const HIDP_VALUE_CAPS& cap : device.valueCaps) {
+        if (cap.UsagePage != kUsagePageGeneric) {
+            continue;
+        }
+
+        const bool usageMatches =
+            cap.IsRange
+                ? (usage >= cap.Range.UsageMin && usage <= cap.Range.UsageMax)
+                : (cap.NotRange.Usage == usage);
+        if (!usageMatches) {
+            continue;
+        }
+        if (cap.ReportID != 0 && reportId != 0 && cap.ReportID != reportId) {
+            continue;
+        }
+        if (cap.LogicalMax <= cap.LogicalMin) {
+            continue;
+        }
+
+        range.min = cap.LogicalMin;
+        range.max = cap.LogicalMax;
+        range.valid = true;
+        break;
+    }
+
+    return range;
+}
+
+int32_t ToScreenPixel(long raw, const HidAxisRange& range, int screenSize) {
+    if (!range.valid || screenSize <= 1) {
+        return static_cast<int32_t>(raw);
+    }
+
+    const int64_t span = static_cast<int64_t>(range.max) - range.min;
+    if (span <= 0) {
+        return static_cast<int32_t>(raw);
+    }
+
+    const int64_t value = static_cast<int64_t>(raw) - range.min;
+    int64_t pixel = value * (screenSize - 1) / span;
+    if (pixel < 0) {
+        pixel = 0;
+    }
+    if (pixel > screenSize - 1) {
+        pixel = screenSize - 1;
+    }
+    return static_cast<int32_t>(pixel);
+}
+
+// The HID thread never sees the XAML thread's CoreWindow pointer. The UI
+// thread stores it in Setup; if that did not happen, look it up once.
+HWND FindStartCoreWindow() {
+    DWORD processId = GetCurrentProcessId();
+    HWND hwnd = FindWindowW(L"Windows.UI.Core.CoreWindow", nullptr);
+    while (hwnd) {
+        DWORD owner = 0;
+        GetWindowThreadProcessId(hwnd, &owner);
+        if (owner == processId) {
+            return hwnd;
+        }
+        hwnd = FindWindowExW(nullptr, hwnd, L"Windows.UI.Core.CoreWindow",
+                             nullptr);
+    }
+    return nullptr;
+}
+
+// The menu closes by cloaking its CoreWindow, not by destroying or hiding it.
+// Called once per down; nothing is cached, because the menu opens and closes
+// many times on the same HWND.
+bool StartWindowIsOpen() {
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!hwnd) {
+        return false;
+    }
+
+    DwmGetWindowAttribute_t dwmGetWindowAttribute =
+        g_dwmGetWindowAttribute.load(std::memory_order_relaxed);
+    if (!dwmGetWindowAttribute) {
+        return false;
+    }
+
+    DWORD cloaked = 0;
+    const HRESULT hr =
+        dwmGetWindowAttribute(hwnd, kDwmwaCloaked, &cloaked, sizeof(cloaked));
+    return hr == S_OK && cloaked == 0;
+}
+
+float HidDpiScale() {
+    static HWND cachedHwnd = nullptr;
+    static float cachedScale = 1.0f;
+
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!hwnd) {
+        hwnd = FindStartCoreWindow();
+        if (hwnd) {
+            g_coreHwnd.store(hwnd, std::memory_order_relaxed);
+        }
+    }
+    if (!hwnd) {
+        return 1.0f;
+    }
+
+    if (hwnd != cachedHwnd) {
+        const UINT dpi = GetDpiForWindow(hwnd);
+        if (dpi == 0) {
+            // The window may still be initializing; retry on the next report
+            // instead of caching a wrong scale for the whole session.
+            return 1.0f;
+        }
+        cachedHwnd = hwnd;
+        cachedScale = static_cast<float>(dpi) / 96.0f;
+    }
+
+    return cachedScale;
+}
+
+struct HidGestureSession {
+    bool active = false;
+    bool suppress = false;  // ignore samples until all contacts are released
+    float startX = 0.0f;
+    float startY = 0.0f;
+    uint64_t startTick = 0;
+    uint64_t lastTick = 0;
+    float curDelta = 0.0f;
+    float maxDelta = 0.0f;
+    float maxPerp = 0.0f;
+    float lastProgress = 1.0f;
+    int samples = 0;
+};
+
+HidGestureSession g_hidSession;  // input thread only
+
+// Set when a commit hands Progress to the settle animation. The reuse of one
+// XAML root means the next drag can still see a translated root or a base
+// value of 0, so BeginHidSession restores the resting value first.
+bool g_commitNeedsProgressReset = false;  // input thread only
+
+float AxisDelta(int32_t axis, const HidGestureSession& session, float x,
+                float y) {
+    switch (static_cast<DismissAxis>(axis)) {
+        case DismissAxis::Left:
+            return session.startX - x;
+        case DismissAxis::Right:
+            return x - session.startX;
+        case DismissAxis::Top:
+            return session.startY - y;
+        case DismissAxis::Bottom:
+            return y - session.startY;
+    }
+    return session.startX - x;
+}
+
+float PerpDelta(int32_t axis, const HidGestureSession& session, float x,
+                float y) {
+    if (IsHorizontalAxis(axis)) {
+        return std::fabs(y - session.startY);
+    }
+    return std::fabs(x - session.startX);
+}
+
+bool PointInStartWindow(float x, float y) {
+    const int64_t left = g_winRectDip[0].load(std::memory_order_relaxed);
+    const int64_t top = g_winRectDip[1].load(std::memory_order_relaxed);
+    const int64_t right = g_winRectDip[2].load(std::memory_order_relaxed);
+    const int64_t bottom = g_winRectDip[3].load(std::memory_order_relaxed);
+
+    // Without published bounds, do not reject a plausible touch.
+    if (right <= left || bottom <= top) {
+        return true;
+    }
+
+    return x >= static_cast<float>(left) - kWindowMarginDip &&
+           x <= static_cast<float>(right) + kWindowMarginDip &&
+           y >= static_cast<float>(top) - kWindowMarginDip &&
+           y <= static_cast<float>(bottom) + kWindowMarginDip;
+}
+
+void LogHidRelease(const HidGestureSession& session, float velocity,
+                   bool commit) {
+    FileLog(L"hid release delta=%.1f perp=%.1f vel=%.2f commit=%d n=%d",
+            session.maxDelta, session.maxPerp, velocity, commit ? 1 : 0,
+            session.samples);
+}
+
+void BeginHidSession(float x, float y, uint64_t tickMs) {
+    // The previous commit is still sliding out; its Windows-key tap has not
+    // been sent yet, so this down belongs to the same menu.
+    if (g_dismissSettling.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    const float distance = g_distancePub.load(std::memory_order_relaxed);
     if (!(distance > 0.0f)) {
-        ShowAtRest();
         return;
     }
 
-    const float from = std::clamp(1.0f - axisDelta / distance, 0.0f, 1.0f);
-    if (axisDelta > kDismissDistanceFraction * distance ||
-        velocity > kDismissVelocity) {
-        Wh_Log(L"dismissCommit");
-        if (!BeginDismissSettle(from)) {
+    // The renderer must exist and the menu must be on screen right now. A
+    // closed menu keeps its HWND and reports itself visible, so only the DWM
+    // cloaked attribute answers this.
+    if (!g_hasRoot.load(std::memory_order_relaxed) || !StartWindowIsOpen()) {
+        return;
+    }
+
+    HidGestureSession& session = g_hidSession;
+    session = HidGestureSession{};
+    session.active = true;
+    session.startX = x;
+    session.startY = y;
+    session.startTick = tickMs;
+    session.lastTick = tickMs;
+    session.lastProgress = 1.0f;
+    session.samples = 1;
+
+    // A cancel animation from the previous gesture may still be running;
+    // stop it so this drag owns Progress. After a commit the base value can
+    // still be 0, because the settle callback may not have run yet, so restore
+    // the resting value before the first sample drives the scalar.
+    StopProgressAnimation();
+    if (g_commitNeedsProgressReset) {
+        g_commitNeedsProgressReset = false;
+        InsertProgress(1.0f);
+    }
+
+    const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
+    FileLog(L"hid down x=%.1f y=%.1f axis=%d dist=%.0f", x, y, axis,
+            distance);
+}
+
+void ReleaseHidSession(uint64_t tickMs, bool allowCommit) {
+    HidGestureSession& session = g_hidSession;
+    if (!session.active) {
+        return;
+    }
+
+    // Measure the gesture up to the last observed sample. The release itself
+    // arrives from an idle timer, so using it here would add the whole idle
+    // wait to the elapsed time and dilute the velocity of a quick flick.
+    const uint64_t lastSample = session.lastTick;
+    const uint64_t elapsed =
+        lastSample > session.startTick ? lastSample - session.startTick : 0;
+    const float velocity =
+        session.maxDelta / static_cast<float>(elapsed > 0 ? elapsed : 1);
+    const float distance = g_distancePub.load(std::memory_order_relaxed);
+    const bool commit =
+        allowCommit && distance > 0.0f &&
+        (session.maxDelta > kCommitDistanceFraction * distance ||
+         velocity > kCommitVelocity);
+
+    LogHidRelease(session, velocity, commit);
+
+    if (commit) {
+        const float from = std::clamp(session.lastProgress, 0.0f, 1.0f);
+        if (BeginDismissSettle(from)) {
+            g_commitNeedsProgressReset = true;
+        } else {
             ShowAtRest();
+        }
+        session.active = false;
+        return;
+    }
+
+    session.active = false;
+    if (distance > 0.0f) {
+        AnimateProgressTo(session.lastProgress, 1.0f, kDismissCancelDuration);
+    } else {
+        ShowAtRest();
+    }
+}
+
+// Scroll abort: the menu returns to its resting position at once; no
+// animation and no dismissal.
+void AbortHidSession(uint64_t tickMs) {
+    HidGestureSession& session = g_hidSession;
+    if (!session.active) {
+        return;
+    }
+
+    const uint64_t elapsed =
+        tickMs > session.startTick ? tickMs - session.startTick : 0;
+    const float velocity =
+        session.maxDelta / static_cast<float>(elapsed > 0 ? elapsed : 1);
+
+    LogHidRelease(session, velocity, false);
+    session.active = false;
+    ShowAtRest();
+}
+
+void UpdateHidSession(float x, float y, uint64_t tickMs) {
+    HidGestureSession& session = g_hidSession;
+
+    const float distance = g_distancePub.load(std::memory_order_relaxed);
+    if (!(distance > 0.0f)) {
+        AbortHidSession(tickMs);
+        return;
+    }
+
+    const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
+    const float delta = AxisDelta(axis, session, x, y);
+    const float perpendicular = PerpDelta(axis, session, x, y);
+
+    session.lastTick = tickMs;
+    session.curDelta = delta;
+    session.maxDelta = std::max(session.maxDelta, delta);
+    session.maxPerp = std::max(session.maxPerp, perpendicular);
+    session.samples++;
+
+    // A mostly perpendicular movement with little axis travel is a scroll of
+    // the content, not a dismiss.
+    if (session.maxPerp > kScrollAbortPerp &&
+        session.maxPerp > kScrollAbortRatio * session.maxDelta &&
+        session.maxDelta < kScrollAbortMaxDelta) {
+        AbortHidSession(tickMs);
+        return;
+    }
+
+    const float progress =
+        std::clamp(1.0f - delta / distance, 0.0f, 1.0f);
+    if ((delta > 0.0f || session.lastProgress < 1.0f) &&
+        std::fabs(progress - session.lastProgress) > kProgressStep) {
+        InsertProgress(progress);
+        session.lastProgress = progress;
+    }
+}
+
+// One pure state-machine step, called on the input thread only. It never
+// touches a XAML object; composition goes through the mutex-guarded helpers.
+void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
+    HidGestureSession& session = g_hidSession;
+
+    if (contacts >= 2) {
+        if (session.active) {
+            ReleaseHidSession(tickMs, false);
+        }
+        session.suppress = true;
+        return;
+    }
+
+    if (contacts <= 0) {
+        if (session.active) {
+            ReleaseHidSession(tickMs, true);
+        }
+        session.suppress = false;
+        return;
+    }
+
+    if (session.suppress) {
+        return;
+    }
+
+    if (!session.active) {
+        if (!PointInStartWindow(xDip, yDip)) {
+            return;
+        }
+        BeginHidSession(xDip, yDip, tickMs);
+        return;
+    }
+
+    UpdateHidSession(xDip, yDip, tickMs);
+}
+
+// A device that leaves the surface without a lift report still ends the
+// gesture; WM_TIMER only runs while no report is arriving.
+void CheckHidIdleRelease(uint64_t tickMs) {
+    HidGestureSession& session = g_hidSession;
+    if (!session.active) {
+        return;
+    }
+    if (tickMs > session.lastTick &&
+        tickMs - session.lastTick >= kIdleReleaseMs) {
+        ReleaseHidSession(tickMs, true);
+    }
+}
+
+void FeedHidReport(HidDevice& device, USHORT reportId, const BYTE* report,
+                   ULONG reportLength, uint64_t tickMs) {
+    if (!device.ready || !device.preparsed) {
+        LogDecodeFail(device, 0);
+        return;
+    }
+
+    USHORT collections[kMaxContactCollections] = {};
+    int collectionCount = 0;
+    if (device.contactNodeCount > 0) {
+        collectionCount = device.contactNodeCount;
+        for (int i = 0; i < collectionCount; ++i) {
+            collections[i] = device.contactNodes[i];
         }
     } else {
-        Wh_Log(L"dismissCancel");
-        if (!AnimateProgressTo(from, 1.0f, kDismissCancelDuration)) {
-            ShowAtRest();
+        collectionCount = 1;
+        collections[0] = 0;
+    }
+
+    int nonZero = 0;
+    bool primaryValid = false;
+    long primaryX = 0;
+    long primaryY = 0;
+
+    for (int i = 0; i < collectionCount; ++i) {
+        ULONG x = 0;
+        ULONG y = 0;
+        const bool haveX = ReadUsageValue(device, kUsagePageGeneric,
+                                          collections[i], kUsageX, report,
+                                          reportLength, &x);
+        const bool haveY = ReadUsageValue(device, kUsagePageGeneric,
+                                          collections[i], kUsageY, report,
+                                          reportLength, &y);
+        if (!haveX || !haveY) {
+            continue;
+        }
+        if (x != 0 || y != 0) {
+            nonZero++;
+        }
+        if (!primaryValid && (x != 0 || y != 0)) {
+            primaryValid = true;
+            primaryX = static_cast<long>(x);
+            primaryY = static_cast<long>(y);
         }
     }
-}
 
-void OnDismissPointerReleased(wuxi::PointerRoutedEventArgs const& args) {
-    try {
-        if (g_dmSessionActive) {
-            EndDmSession();
+    ULONG topLevelCount = 0;
+    const bool haveCount =
+        ReadUsageValue(device, kUsagePageDigitizer, 0, kUsageContactCount,
+                       report, reportLength, &topLevelCount);
+
+    int contacts = 0;
+    if (haveCount) {
+        contacts = static_cast<int>(topLevelCount);
+    } else {
+        // No top-level Contact Count: contact buttons are authoritative,
+        // otherwise count the collections that carry a position. A readable
+        // but all-zero collection 0 is a lift, not a contact.
+        ULONG tipSwitch = 0;
+        ULONG inRange = 0;
+        const bool haveTip =
+            ReadUsageValue(device, kUsagePageDigitizer, collections[0],
+                           kUsageTipSwitch, report, reportLength, &tipSwitch);
+        const bool haveInRange =
+            ReadUsageValue(device, kUsagePageDigitizer, collections[0],
+                           kUsageInRange, report, reportLength, &inRange);
+        if (haveInRange) {
+            contacts = inRange ? 1 : 0;
+        } else if (haveTip) {
+            contacts = tipSwitch ? 1 : 0;
         } else {
-            FinishDismiss(&args, false);
+            contacts = nonZero > 0 ? nonZero : 0;
         }
-    } catch (...) {
-        // Never let an exception escape into XAML.
+    }
+
+    if (contacts <= 0) {
+        OnHidSample(0, 0.0f, 0.0f, tickMs);
+        return;
+    }
+
+    if (!primaryValid) {
+        LogDecodeFail(device, 0);
+        return;
+    }
+
+    const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    if (screenWidth <= 1 || screenHeight <= 1) {
+        LogDecodeFail(device, 0);
+        return;
+    }
+
+    const HidAxisRange xRange = FindAxisRange(device, kUsageX, reportId);
+    const HidAxisRange yRange = FindAxisRange(device, kUsageY, reportId);
+    const float dpiScale = HidDpiScale();
+
+    const int32_t pixelX = ToScreenPixel(primaryX, xRange, screenWidth);
+    const int32_t pixelY = ToScreenPixel(primaryY, yRange, screenHeight);
+    const float xDip = static_cast<float>(pixelX) / dpiScale;
+    const float yDip = static_cast<float>(pixelY) / dpiScale;
+
+    OnHidSample(contacts, xDip, yDip, tickMs);
+}
+
+void HandleHidInput(const RAWINPUT* raw) {
+    const RAWHID& hid = raw->data.hid;
+    if (hid.dwSizeHid == 0 || hid.dwCount == 0) {
+        return;
+    }
+
+    HidDevice* device = GetHidDevice(raw->header.hDevice);
+    if (!device) {
+        return;
+    }
+
+    const uint64_t tickMs = GetTickCount64();
+    for (UINT i = 0; i < hid.dwCount; ++i) {
+        const BYTE* report =
+            hid.bRawData + static_cast<size_t>(i) * hid.dwSizeHid;
+        FeedHidReport(*device, static_cast<USHORT>(raw->header.wParam), report,
+                      hid.dwSizeHid, tickMs);
     }
 }
 
-void OnDismissPointerCaptureLost(wuxi::PointerRoutedEventArgs const& args) {
-    try {
-        if (g_dmSessionActive) {
-            EndDmSession();
-        } else {
-            FinishDismiss(&args, true);
+void HandleRawInput(HRAWINPUT rawHandle) {
+    BYTE stackBuffer[512];
+    UINT size = sizeof(stackBuffer);
+    SetLastError(0);
+    UINT read = GetRawInputData(rawHandle, RID_INPUT, stackBuffer, &size,
+                                sizeof(RAWINPUTHEADER));
+    BYTE* heapBuffer = nullptr;
+
+    if (read == static_cast<UINT>(-1)) {
+        if (size <= sizeof(stackBuffer) || size > 64 * 1024) {
+            return;
         }
-    } catch (...) {
-        // Never let an exception escape into XAML.
+        heapBuffer = new (std::nothrow) BYTE[size];
+        if (!heapBuffer) {
+            return;
+        }
+        UINT heapSize = size;
+        read = GetRawInputData(rawHandle, RID_INPUT, heapBuffer, &heapSize,
+                               sizeof(RAWINPUTHEADER));
+        if (read == static_cast<UINT>(-1)) {
+            delete[] heapBuffer;
+            return;
+        }
+    }
+
+    const auto* raw = reinterpret_cast<const RAWINPUT*>(
+        heapBuffer ? heapBuffer : stackBuffer);
+    if (raw->header.dwType == RIM_TYPEHID) {
+        HandleHidInput(raw);
+    }
+
+    delete[] heapBuffer;
+}
+
+LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
+                               LPARAM lParam) {
+    switch (msg) {
+        case WM_INPUT:
+            HandleRawInput(reinterpret_cast<HRAWINPUT>(lParam));
+            return 0;
+        case WM_TIMER:
+            if (wParam == kIdleTimerId) {
+                CheckHidIdleRelease(GetTickCount64());
+            } else if (wParam == kDebugTimerId) {
+                PollDebugFile();
+            }
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 }
 
-using PointerHandlerFn = void (*)(wuxi::PointerRoutedEventArgs const&);
+void RegisterHidUsage(USAGE usage, HWND hwnd) {
+    RAWINPUTDEVICE device{};
+    device.usUsagePage = kUsagePageDigitizer;
+    device.usUsage = usage;
+    device.dwFlags = RIDEV_INPUTSINK;
+    device.hwndTarget = hwnd;
 
-wuxi::PointerEventHandler MakePointerHandler(PointerHandlerFn fn) {
-    return wuxi::PointerEventHandler(
-        [fn](winrt::Windows::Foundation::IInspectable const&,
-             wuxi::PointerRoutedEventArgs const& args) { fn(args); });
+    SetLastError(0);
+    const BOOL ok = RegisterRawInputDevices(&device, 1, sizeof(device));
+    const DWORD error = ok ? 0 : GetLastError();
+    FileLog(L"hid reg usage=%u ok=%d err=%u", static_cast<unsigned>(usage),
+            ok ? 1 : 0, static_cast<unsigned>(error));
 }
 
-// The HWND is needed to post Escape after a committed dismiss.
+void UnregisterHidUsage(USAGE usage) {
+    RAWINPUTDEVICE device{};
+    device.usUsagePage = kUsagePageDigitizer;
+    device.usUsage = usage;
+    device.dwFlags = RIDEV_REMOVE;
+    device.hwndTarget = nullptr;
+    RegisterRawInputDevices(&device, 1, sizeof(device));
+}
+
+DWORD WINAPI HidInputThread(LPVOID) {
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.lpfnWndProc = HidWindowProc;
+    windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.lpszClassName = kHidWindowClass;
+
+    if (!RegisterClassExW(&windowClass)) {
+        FileLog(L"hid thread fail err=%u",
+                static_cast<unsigned>(GetLastError()));
+        return 0;
+    }
+
+    HWND hwnd = CreateWindowExW(0, kHidWindowClass, L"", 0, 0, 0, 0, 0,
+                                HWND_MESSAGE, nullptr, windowClass.hInstance,
+                                nullptr);
+    if (!hwnd) {
+        FileLog(L"hid thread fail err=%u",
+                static_cast<unsigned>(GetLastError()));
+        UnregisterClassW(kHidWindowClass, windowClass.hInstance);
+        return 0;
+    }
+
+    g_hidHwnd.store(hwnd, std::memory_order_relaxed);
+
+    RegisterHidUsage(kUsageTouchScreen, hwnd);
+    RegisterHidUsage(kUsagePen, hwnd);
+    SetTimer(hwnd, kIdleTimerId, kIdleTimerMs, nullptr);
+    SetTimer(hwnd, kDebugTimerId, kDebugTimerMs, nullptr);
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    KillTimer(hwnd, kIdleTimerId);
+    KillTimer(hwnd, kDebugTimerId);
+    UnregisterHidUsage(kUsageTouchScreen);
+    UnregisterHidUsage(kUsagePen);
+
+    g_hidSession = HidGestureSession{};
+    g_debugFileStamp = DebugFileStamp{};
+    FreeHidDevices();
+
+    if (IsWindow(hwnd)) {
+        DestroyWindow(hwnd);
+    }
+    g_hidHwnd.store(nullptr, std::memory_order_relaxed);
+    UnregisterClassW(kHidWindowClass, windowClass.hInstance);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// UI-thread state publication
+// ---------------------------------------------------------------------------
+
+float DpiScaleForWindow(HWND hwnd) {
+    const UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 0;
+    return dpi ? static_cast<float>(dpi) / 96.0f : 1.0f;
+}
+
+// Publishes the plain values the input thread needs. Runs on the UI thread.
+void PublishGestureGeometry() {
+    g_axisPub.store(g_dismissAxis, std::memory_order_relaxed);
+    g_distancePub.store(g_dismissDistance, std::memory_order_relaxed);
+
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!hwnd) {
+        return;
+    }
+
+    RECT rect{};
+    if (!GetWindowRect(hwnd, &rect)) {
+        return;
+    }
+
+    const float scale = DpiScaleForWindow(hwnd);
+    g_winRectDip[0].store(
+        static_cast<int64_t>(std::llround(rect.left / scale)),
+        std::memory_order_relaxed);
+    g_winRectDip[1].store(
+        static_cast<int64_t>(std::llround(rect.top / scale)),
+        std::memory_order_relaxed);
+    g_winRectDip[2].store(
+        static_cast<int64_t>(std::llround(rect.right / scale)),
+        std::memory_order_relaxed);
+    g_winRectDip[3].store(
+        static_cast<int64_t>(std::llround(rect.bottom / scale)),
+        std::memory_order_relaxed);
+}
+
+// The HWND is needed for the DWM cloaked query that decides whether the menu
+// is open, and for the window bounds the input thread tests against.
 void CaptureCoreWindowHandle() {
-    g_coreHwnd = nullptr;
+    g_coreHwnd.store(nullptr, std::memory_order_relaxed);
 
     try {
         wucore::CoreWindow coreWindow =
@@ -918,9 +1719,9 @@ void CaptureCoreWindowHandle() {
             getWindowHandle(interop, &hwnd);
         }
         static_cast<IUnknown*>(interop)->Release();
-        g_coreHwnd = hwnd;
+        g_coreHwnd.store(hwnd, std::memory_order_relaxed);
     } catch (...) {
-        // A missing CoreWindow handle only disables the Escape fallback.
+        // No HWND means no cloaked query, so no gesture starts.
     }
 }
 
@@ -928,16 +1729,17 @@ void CaptureCoreWindowHandle() {
 // window is anchored to. Checked on every setup because the window can move
 // between displays.
 void UpdateDismissAxis() {
-    if (!g_coreHwnd) {
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!hwnd) {
         return;
     }
 
     RECT windowRect{};
-    if (!GetWindowRect(g_coreHwnd, &windowRect)) {
+    if (!GetWindowRect(hwnd, &windowRect)) {
         return;
     }
 
-    HMONITOR monitor = MonitorFromWindow(g_coreHwnd, MONITOR_DEFAULTTONEAREST);
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
     if (!monitor) {
         return;
     }
@@ -969,297 +1771,10 @@ void UpdateDismissAxis() {
             static_cast<int>(windowRect.bottom), static_cast<int>(work.left),
             static_cast<int>(work.top), static_cast<int>(work.right),
             static_cast<int>(work.bottom));
+
+    PublishGestureGeometry();
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostic: one-shot XAML object reconnaissance
-//
-// Dumps the captured root's field pointers and the first qwords of plausible
-// heap candidates once per process. Read-only; no behaviour change.
-// ---------------------------------------------------------------------------
-
-using GetFileVersionInfoSizeW_t = decltype(&GetFileVersionInfoSizeW);
-using GetFileVersionInfoW_t = decltype(&GetFileVersionInfoW);
-using VerQueryValueW_t = decltype(&VerQueryValueW);
-
-struct VersionApi {
-    HMODULE module = nullptr;
-    bool ownsReference = false;
-    GetFileVersionInfoSizeW_t size = nullptr;
-    GetFileVersionInfoW_t info = nullptr;
-    VerQueryValueW_t query = nullptr;
-};
-
-void UnloadVersionApi(VersionApi& api) {
-    if (api.ownsReference && api.module) {
-        FreeLibrary(api.module);
-    }
-    api = {};
-}
-
-bool LoadVersionApi(VersionApi* api) {
-    HMODULE module = GetModuleHandleW(L"version.dll");
-    if (!module) {
-        module = LoadLibraryW(L"version.dll");
-        if (!module) {
-            return false;
-        }
-        api->ownsReference = true;
-    }
-    api->module = module;
-
-    api->size = reinterpret_cast<GetFileVersionInfoSizeW_t>(
-        GetProcAddress(module, "GetFileVersionInfoSizeW"));
-    api->info = reinterpret_cast<GetFileVersionInfoW_t>(
-        GetProcAddress(module, "GetFileVersionInfoW"));
-    api->query = reinterpret_cast<VerQueryValueW_t>(
-        GetProcAddress(module, "VerQueryValueW"));
-
-    if (!api->size || !api->info || !api->query) {
-        UnloadVersionApi(*api);
-        return false;
-    }
-    return true;
-}
-
-bool QueryFileVersionString(const VersionApi& api, const wchar_t* path,
-                            wchar_t* out, size_t outCount) {
-    DWORD handle = 0;
-    const DWORD size = api.size(path, &handle);
-    if (size == 0 || size > 8192) {
-        return false;
-    }
-
-    BYTE buffer[8192];
-    if (!api.info(path, 0, size, buffer)) {
-        return false;
-    }
-
-    struct Translation {
-        WORD language;
-        WORD codePage;
-    };
-
-    Translation* translations = nullptr;
-    UINT translationBytes = 0;
-    if (!api.query(buffer, L"\\VarFileInfo\\Translation",
-                   reinterpret_cast<void**>(&translations),
-                   &translationBytes) ||
-        !translations) {
-        return false;
-    }
-
-    const size_t translationCount = translationBytes / sizeof(Translation);
-    for (size_t i = 0; i < translationCount; i++) {
-        wchar_t key[64] = {};
-        swprintf_s(key, ARRAYSIZE(key),
-                   L"\\StringFileInfo\\%04x%04x\\FileVersion",
-                   translations[i].language, translations[i].codePage);
-
-        wchar_t* value = nullptr;
-        UINT valueChars = 0;
-        if (!api.query(buffer, key, reinterpret_cast<void**>(&value),
-                       &valueChars) ||
-            !value || valueChars == 0) {
-            continue;
-        }
-
-        size_t length = 0;
-        while (length + 1 < outCount && value[length] != L'\0') {
-            out[length] = value[length];
-            length++;
-        }
-        out[length] = L'\0';
-        return length != 0;
-    }
-
-    return false;
-}
-
-bool ParseVersion(const wchar_t* text, unsigned* parts) {
-    const wchar_t* cursor = text;
-    for (int i = 0; i < 4; i++) {
-        while (*cursor == L' ' || *cursor == L'\t') {
-            cursor++;
-        }
-        if (*cursor < L'0' || *cursor > L'9') {
-            return false;
-        }
-
-        unsigned value = 0;
-        while (*cursor >= L'0' && *cursor <= L'9') {
-            value = value * 10 + static_cast<unsigned>(*cursor - L'0');
-            if (value > 0xFFFF) {
-                return false;
-            }
-            cursor++;
-        }
-        parts[i] = value;
-
-        if (i < 3) {
-            if (*cursor != L'.') {
-                return false;
-            }
-            cursor++;
-        }
-    }
-    return true;
-}
-
-bool XamlBuildMatches(HMODULE module) {
-    wchar_t path[MAX_PATH] = {};
-    if (!GetModuleFileNameW(module, path, ARRAYSIZE(path))) {
-        FileLog(L"xaml build mismatch unknown; DManip hook disabled");
-        return false;
-    }
-
-    wchar_t rawVersion[64] = {};
-    wchar_t displayVersion[64] = L"unknown";
-    unsigned parts[4] = {};
-    bool versionMatches = false;
-
-    VersionApi api;
-    if (LoadVersionApi(&api)) {
-        if (QueryFileVersionString(api, path, rawVersion,
-                                   ARRAYSIZE(rawVersion)) &&
-            ParseVersion(rawVersion, parts)) {
-            swprintf_s(displayVersion, ARRAYSIZE(displayVersion),
-                       L"%u.%u.%u.%u", parts[0], parts[1], parts[2],
-                       parts[3]);
-            versionMatches = true;
-            for (int i = 0; i < 4; i++) {
-                if (parts[i] != kXamlVersion[i]) {
-                    versionMatches = false;
-                    break;
-                }
-            }
-        }
-        UnloadVersionApi(api);
-    }
-
-    if (!versionMatches) {
-        FileLog(L"xaml build mismatch %s; DManip hook disabled",
-                displayVersion);
-        return false;
-    }
-
-    return true;
-}
-
-// DManipDataBase::SetContentOffsetsHelper, Windows.UI.Xaml.dll 10.0.26100.9949.
-// HRESULT (DManipDataBase* self, float x, float y, bool* changed): self in
-// rcx, x in xmm1, y in xmm2, changed in r9.
-using SetContentOffsetsHelper_t = HRESULT (*)(void*, float, float, bool*);
-
-SetContentOffsetsHelper_t g_setContentOffsetsHelperOriginal = nullptr;
-
-// Runs on the XAML UI thread, inside the offset update. No logging here.
-void RecordDmOffset(void* self, float x, float y) {
-    const bool horizontal = IsHorizontalAxis(g_dismissAxis);
-    const float value = horizontal ? x : y;
-    if (!std::isfinite(value)) {
-        return;
-    }
-
-    if (!g_dmHaveBaseline) {
-        g_dmHaveBaseline = true;
-        g_dmBaseX = x;
-        g_dmBaseY = y;
-        if (self) {
-            g_dmElement = *reinterpret_cast<void**>(
-                static_cast<BYTE*>(self) + 0x40);
-        }
-    }
-
-    const float delta = value - (horizontal ? g_dmBaseX : g_dmBaseY);
-    if (delta > g_dmMaxPos) {
-        g_dmMaxPos = delta;
-    }
-    if (-delta > g_dmMaxNeg) {
-        g_dmMaxNeg = -delta;
-    }
-    g_dmSamples++;
-}
-
-HRESULT SetContentOffsetsHelper_Hook(void* self, float x, float y,
-                                     bool* changed) {
-    if (g_dmSessionActive && self && g_setContentOffsetsHelperOriginal) {
-        RecordDmOffset(self, x, y);
-    }
-    return g_setContentOffsetsHelperOriginal(self, x, y, changed);
-}
-
-// Installs the offset hook once, after the first root attach. The file version
-// is the only guard for the hard-coded RVA.
-bool EnsureDmHook() {
-    if (g_dmHookInstalled) {
-        return true;
-    }
-    if (g_dmHookChecked) {
-        return false;
-    }
-    g_dmHookChecked = true;
-
-    HMODULE module = GetModuleHandleW(L"Windows.UI.Xaml.dll");
-    if (!module) {
-        FileLog(L"xaml build mismatch unknown; DManip hook disabled");
-        return false;
-    }
-    if (!XamlBuildMatches(module)) {
-        return false;
-    }
-
-    void* target = reinterpret_cast<BYTE*>(module) + 0x4DE388;
-    if (!Wh_SetFunctionHook(
-            target, reinterpret_cast<void*>(SetContentOffsetsHelper_Hook),
-            reinterpret_cast<void**>(&g_setContentOffsetsHelperOriginal))) {
-        FileLog(L"dmhook install failed; pointer fallback only");
-        return false;
-    }
-
-    // A hook registered after Wh_ModInit needs an explicit apply.
-    Wh_ApplyHookOperations();
-
-    g_dmHookInstalled = true;
-    FileLog(L"dmhook installed target=%p", target);
-    return true;
-}
-
-void EndDmSession() {
-    if (!g_dmSessionActive) {
-        return;
-    }
-    g_dmSessionActive = false;
-
-    const uint64_t now = GetTickCount64();
-    const uint64_t elapsed =
-        now > g_dmPressStartTick ? now - g_dmPressStartTick : 0;
-    const float m = std::max(g_dmMaxPos, g_dmMaxNeg);
-
-    FileLog(L"dmhook n=%d maxPos=%.1f maxNeg=%.1f base=(%.1f,%.1f) el=%p",
-            g_dmSamples, g_dmMaxPos, g_dmMaxNeg, g_dmBaseX, g_dmBaseY,
-            g_dmElement);
-
-    const float distance = g_dismissDistance;
-    if (!(distance > 0.0f)) {
-        ShowAtRest();
-        return;
-    }
-
-    const double speed = static_cast<double>(m) /
-                         static_cast<double>(elapsed > 0 ? elapsed : 1);
-    if (m > kDismissDistanceFraction * distance ||
-        speed > kDismissVelocity) {
-        const float from = std::clamp(1.0f - m / distance, 0.0f, 1.0f);
-        InsertProgress(from);
-        if (!BeginDismissSettle(from)) {
-            ShowAtRest();
-        }
-    } else {
-        // Let the native ScrollViewer snap back; reset without animation.
-        ShowAtRest();
-    }
-}
 // Runs on the UI thread, after the root element is loaded.
 bool Setup(wux::FrameworkElement const& root) {
     if (!root) {
@@ -1278,8 +1793,8 @@ bool Setup(wux::FrameworkElement const& root) {
     g_dispatcher = root.Dispatcher();
 
     CaptureCoreWindowHandle();
-    if (!g_coreHwnd) {
-        Wh_Log(L"No CoreWindow HWND; dismiss will fall back to GetActiveWindow");
+    if (!g_coreHwnd.load(std::memory_order_relaxed)) {
+        Wh_Log(L"No CoreWindow HWND; gestures stay disabled");
     }
     UpdateDismissAxis();
 
@@ -1358,10 +1873,14 @@ bool Setup(wux::FrameworkElement const& root) {
                     IsHorizontalAxis(g_dismissAxis) ? width : height;
                 g_dismissDistance = distance;
 
-                std::lock_guard lock(g_compositionMutex);
-                if (g_state) {
-                    g_state.InsertScalar(L"Distance", distance);
+                {
+                    std::lock_guard lock(g_compositionMutex);
+                    if (g_state) {
+                        g_state.InsertScalar(L"Distance", distance);
+                    }
                 }
+
+                PublishGestureGeometry();
             } catch (winrt::hresult_error const& e) {
                 Wh_Log(L"SizeChanged update failed: %08X", e.code());
             } catch (...) {
@@ -1369,35 +1888,15 @@ bool Setup(wux::FrameworkElement const& root) {
             }
         });
 
-    g_pointerPressedHandler = MakePointerHandler(&OnDismissPointerPressed);
-    g_pointerMovedHandler = MakePointerHandler(&OnDismissPointerMoved);
-    g_pointerReleasedHandler = MakePointerHandler(&OnDismissPointerReleased);
-    g_pointerCaptureLostHandler =
-        MakePointerHandler(&OnDismissPointerCaptureLost);
-
-    g_pointerPressedSink = winrt::box_value(g_pointerPressedHandler);
-    g_pointerMovedSink = winrt::box_value(g_pointerMovedHandler);
-    g_pointerReleasedSink = winrt::box_value(g_pointerReleasedHandler);
-    g_pointerCaptureLostSink = winrt::box_value(g_pointerCaptureLostHandler);
-
-    root.AddHandler(wux::UIElement::PointerPressedEvent(),
-                    g_pointerPressedSink, true);
-    root.AddHandler(wux::UIElement::PointerMovedEvent(), g_pointerMovedSink,
-                    true);
-    root.AddHandler(wux::UIElement::PointerReleasedEvent(),
-                    g_pointerReleasedSink, true);
-    root.AddHandler(wux::UIElement::PointerCaptureLostEvent(),
-                    g_pointerCaptureLostSink, true);
-
-    // The XAML module is loaded by the time the root exists; install the
-    // offset hook once so the first press can use it.
-    EnsureDmHook();
+    // Everything the input thread reads is published before the root opens.
+    PublishGestureGeometry();
+    g_hasRoot.store(true, std::memory_order_release);
 
     const winrt::hstring rootClassName = winrt::get_class_name(root);
     FileLog(L"attached root=%s size=%.0fx%.0f", rootClassName.c_str(), width,
             height);
 
-    Wh_Log(L"Dismiss handlers attached; composition translation enabled "
+    Wh_Log(L"Dismiss input armed; composition translation enabled "
            L"root=%s (distance=%.1f)",
            rootClassName.c_str(), distance);
     return true;
@@ -1431,8 +1930,8 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
         Wh_Log(L"PrepareRootElement root class=%s name=%s",
                winrt::get_class_name(root).c_str(), root.Name().c_str());
 
-        // A new open: drop the previous root's handlers, property set,
-        // animation and drag state before installing the fresh renderer.
+        // A new open: drop the previous root's property set, animation and
+        // gesture state before installing the fresh renderer.
         ResetRenderer();
 
         bool alreadyLoaded = false;
@@ -1580,44 +2079,12 @@ DWORD WINAPI PollModulesThread(LPVOID) {
 
 // Runs on the UI thread.
 void RevokeHandlers() {
-    // No reference is held here; just stop recording offsets.
-    g_dmSessionActive = false;
-    g_dmHaveBaseline = false;
-    g_dmElement = nullptr;
-
-    // The press cache holds a XAML reference; release it on the UI thread.
-    g_pressHitElement = nullptr;
-
     wux::FrameworkElement root = g_root;
     if (!root) {
         return;
     }
 
     try {
-        if (g_pointerPressedSink) {
-            root.RemoveHandler(wux::UIElement::PointerPressedEvent(),
-                               g_pointerPressedSink);
-            g_pointerPressedSink = nullptr;
-            g_pointerPressedHandler = nullptr;
-        }
-        if (g_pointerMovedSink) {
-            root.RemoveHandler(wux::UIElement::PointerMovedEvent(),
-                               g_pointerMovedSink);
-            g_pointerMovedSink = nullptr;
-            g_pointerMovedHandler = nullptr;
-        }
-        if (g_pointerReleasedSink) {
-            root.RemoveHandler(wux::UIElement::PointerReleasedEvent(),
-                               g_pointerReleasedSink);
-            g_pointerReleasedSink = nullptr;
-            g_pointerReleasedHandler = nullptr;
-        }
-        if (g_pointerCaptureLostSink) {
-            root.RemoveHandler(wux::UIElement::PointerCaptureLostEvent(),
-                               g_pointerCaptureLostSink);
-            g_pointerCaptureLostSink = nullptr;
-            g_pointerCaptureLostHandler = nullptr;
-        }
         if (g_sizeToken.value) {
             root.SizeChanged(g_sizeToken);
             g_sizeToken = {};
@@ -1693,7 +2160,7 @@ void ResetComposition() {
     std::lock_guard lock(g_compositionMutex);
 
     // Invalidate a pending dismiss completion before stopping its animation,
-    // so an old batch cannot post Escape into a newly opened menu.
+    // so an old batch cannot tap the Windows key into a newly opened menu.
     g_dismissSerial.fetch_add(1, std::memory_order_relaxed);
     g_dismissSettling.store(false, std::memory_order_relaxed);
 
@@ -1718,14 +2185,15 @@ void ResetComposition() {
     g_state = nullptr;
     g_visual = nullptr;
 
+    g_distancePub.store(0.0f, std::memory_order_relaxed);
+
     // Invalidate a stale Loaded handler from the previous root.
     g_setupGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Drops the previous root's renderer before a new open installs its own
-// property set, animation and handlers. Runs on the UI thread.
+// property set, animation and input state. Runs on the UI thread.
 void ResetRenderer() {
-    ResetDismissDrag();
     RevokeHandlers();
     ResetComposition();
 }
@@ -1734,7 +2202,20 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe Dismiss 0.1.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe Dismiss 0.3.1 initializing");
+
+    // The open/closed signal comes from DWM. Resolve it at runtime so a build
+    // without the dwmapi import library still links and loads.
+    HMODULE dwmapi = LoadLibraryW(L"dwmapi.dll");
+    if (dwmapi) {
+        g_dwmGetWindowAttribute.store(
+            reinterpret_cast<DwmGetWindowAttribute_t>(
+                GetProcAddress(dwmapi, "DwmGetWindowAttribute")),
+            std::memory_order_relaxed);
+    }
+    if (!g_dwmGetWindowAttribute.load(std::memory_order_relaxed)) {
+        Wh_Log(L"DwmGetWindowAttribute not resolved; gestures stay disabled");
+    }
 
     HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
     auto loadLibraryExW = kernelBase
@@ -1766,6 +2247,14 @@ void Wh_ModAfterInit() {
     g_afterInit = true;
     TryInstallFromLoadedModules(false);
     Wh_ApplyHookOperations();
+
+    FileLog(L"hid init");
+    g_hidThread =
+        CreateThread(nullptr, 0, HidInputThread, nullptr, 0, nullptr);
+    if (!g_hidThread) {
+        FileLog(L"hid thread fail err=%u",
+                static_cast<unsigned>(GetLastError()));
+    }
 }
 
 void Wh_ModBeforeUninit() {
@@ -1786,8 +2275,21 @@ void Wh_ModBeforeUninit() {
         g_pollThread = nullptr;
     }
 
-    // The offset hook must stop recording before the module goes away.
-    g_dmSessionActive = false;
+    // The message-only window and its raw input registration belong to the
+    // input thread. Ask it to leave the message loop and wait for it before
+    // the module's code can be unmapped.
+    HWND hwnd = g_hidHwnd.load(std::memory_order_relaxed);
+    if (hwnd) {
+        PostMessageW(hwnd, WM_QUIT, 0, 0);
+    }
+    if (g_hidThread) {
+        const DWORD waitResult = WaitForSingleObject(g_hidThread, 2000);
+        CloseHandle(g_hidThread);
+        g_hidThread = nullptr;
+        if (waitResult != WAIT_OBJECT_0) {
+            Wh_Log(L"Timed out waiting for the raw input thread");
+        }
+    }
 }
 
 void Wh_ModUninit() {

@@ -79,9 +79,4 @@ if ($dir -and -not (Test-Path -LiteralPath $dir)) {
 $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
 
-[pscustomobject]@{
-    Path   = $Path
-    Width  = $rect.Width
-    Height = $rect.Height
-    Bytes  = (Get-Item -LiteralPath $Path).Length
-}
+"SHOT path={0} width={1} height={2} bytes={3}" -f $Path, $rect.Width, $rect.Height, (Get-Item -LiteralPath $Path).Length
