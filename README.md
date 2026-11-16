@@ -46,12 +46,20 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 5. On release it commits when the release position passed 20% of the distance or
    the release speed exceeded 0.45 DIP/ms; a commit animates `Progress` to 0 and
    then taps `VK_LWIN`, which is the only dismissal that works when the menu was
-   opened without keyboard focus. The retract duration comes from the release
-   velocity — `clamp(remaining / max(velocity, 0.25), 110 ms, 260 ms)` — so a
-   flick leaves immediately: above 0.6 DIP/ms it uses
+   opened without keyboard focus. The retract is planned from the gesture's
+   travel at a fixed speed, not from a fixed duration:
+
+   ```
+   speed    = max(velocity, 2.2 DIP/ms)
+   duration = clamp(travel / speed, 260 ms, 560 ms)
+   ```
+
+   Planning from the gesture travel (rather than the remaining panel distance)
+   is what keeps a long drag from being covered at twice the speed of a short
+   one. Above 0.6 DIP/ms the curve switches to
    `cubic-bezier(0.1, 0.75, 0.25, 1)` (fast start, decelerating), otherwise
-   `cubic-bezier(0.45, 0, 0.55, 1)` (soft at both ends). A cancelled reveal uses
-   the same planning and defers its Windows tap by the computed duration.
+   `cubic-bezier(0.45, 0, 0.55, 1)`. A cancelled reveal uses the same planning
+   and defers its Windows tap by the computed duration.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.

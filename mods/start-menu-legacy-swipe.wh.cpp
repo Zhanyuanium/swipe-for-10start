@@ -70,14 +70,19 @@ What it does:
   `cubic-bezier(0.45, 0, 0.55, 1)`. Every Progress animation places the easing
   on the keyframe at t=1 and inserts the target as the base value before
   `StartAnimation`.
-- The retract is velocity-driven, not one fixed duration. The panel still has to
-  cover `max(0.05, progress) * Distance` DIP, a release at `velocity` DIP/ms
-  covers that in `remaining / velocity`, and the result is clamped to
-  110..260 ms with the divisor floored at 0.25 DIP/ms. A release above
-  0.6 DIP/ms uses `cubic-bezier(0.1, 0.75, 0.25, 1)`, which starts fast and
-  decelerates like the fling it came from; a slower release keeps
-  `cubic-bezier(0.45, 0, 0.55, 1)` and the old 260 ms feel. One line per close
-  records the choice: `retract vel=... dur=... ease=...`.
+- The retract is planned from the gesture, not from a duration cap. The finger
+  covered `travel` DIP on the dismiss axis since it took the panel (dismiss) or
+  left the taskbar edge (cancelled reveal); the panel settles that at
+  `travel / max(velocity, 2.2)` DIP/ms, clamped to 260..560 ms. A release
+  faster than 2.2 DIP/ms shortens the retract, never lengthens it. Measured
+  feel: a cancelled reveal of ~490 DIP stays at the 260 ms floor, a ~1037 DIP
+  dismiss from the open menu takes ~470 ms, so a longer gesture no longer
+  produces a faster close. Planning from the panel's remaining distance would
+  do the opposite, because that distance falls as the gesture grows. A release
+  above 0.6 DIP/ms uses `cubic-bezier(0.1, 0.75, 0.25, 1)`, which starts fast
+  and decelerates like the fling it came from; a slower release keeps
+  `cubic-bezier(0.45, 0, 0.55, 1)`. One line per close records the choice:
+  `retract vel=... dur=... ease=...`.
 - A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
   the legacy menu ignores an injected `VK_ESCAPE`. A lone `VK_LWIN` tap (down,
   60 ms, up) closes it, because the shell acts on the key itself.
@@ -103,7 +108,7 @@ What it does:
   release past 20% of `Distance`, or one whose average velocity
   `travel / max(elapsed, 1)` exceeds 0.45 DIP/ms, animates `Progress` to 1 over
   220 ms on the ease-in-out curve and keeps the menu. Anything else is a cancel:
-  `Progress` retracts to 0 with the same velocity-driven duration and curve as
+  `Progress` retracts to 0 with the same travel-planned duration and curve as
   the committed dismiss, so both close paths read the same from any finger
   position. The `VK_LWIN` tap that closes the menu follows the retract on the
   input timer, `duration + 30 ms` after the release. `Progress` stays 0; a later
@@ -249,8 +254,9 @@ Known risks:
  *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
  *   published for the reveal follow; one global Windows-key tap per committed
  *   dismiss or short reveal, the reveal's one deferred to the input timer until
- *   its retract animation has run; a velocity-chosen retract on both close paths
- *   (110..260 ms, ease-in-out below 0.6 DIP/ms and a fling curve above it); a
+ *   its retract animation has run; a retract planned from the gesture travel on
+ *   both close paths (260..560 ms at 2.2 DIP/ms, shortened by a release faster
+ *   than that; ease-in-out below 0.6 DIP/ms and a fling curve above it); a
  *   0-to-1 progress slide over 260 ms for a closed-to-open transition no reveal
  *   owns, plus a `win close observed` line when the shell hides the window by
  *   itself; a 600 ms window after either tap in which a
@@ -383,23 +389,33 @@ constexpr uint8_t kAnimPrologue[] = {
     0x49, 0x8B, 0xC8,              // mov  rcx, r8
 };
 
-// The retract is velocity-driven, not one fixed duration. The panel still has
-// to cover max(0.05, progress) * Distance DIP; a release at `velocity` DIP/ms
-// covers that in remaining / velocity, clamped to 110..260 ms with the divisor
-// floored at 0.25 DIP/ms. A fast flick therefore finishes sooner instead of
-// starting on the slow phase of an ease-in-out curve, and a slow release keeps
-// the 260 ms feel. Both close paths (the dismiss commit and the reveal cancel)
-// go through PlanRetract, so the panel leaves the screen the same way whichever
-// one started it.
-constexpr std::chrono::milliseconds kRetractMinDuration{110};
-constexpr std::chrono::milliseconds kRetractMaxDuration{260};
-constexpr float kRetractMinVelocity = 0.25f;   // DIP/ms, divisor floor
+// The retract is planned from a speed, not from a duration cap. `travel` is how
+// far the finger moved along the dismiss axis: from the point where it took the
+// panel for a dismiss, from the taskbar edge for a cancelled reveal. The panel
+// settles that at kRetractBaseSpeed DIP/ms, so a longer gesture takes longer
+// instead of covering the same 260 ms faster. A release above the base speed
+// may only shorten the retract, never lengthen it; the result is clamped to
+// 260..560 ms.
+//
+// Measured: a cancelled reveal of ~490 DIP of travel felt right at 260 ms
+// (1.9 DIP/ms); the same 260 ms on a ~1037 DIP dismiss from the open menu read
+// as 4 DIP/ms and was far too fast. travel / 2.2 keeps the reveal at the floor
+// and gives the dismiss ~470 ms. Planning from the panel's remaining distance
+// (Progress * Distance) would do the opposite: that distance falls as the
+// gesture grows, because the panel has already followed the finger.
+//
+// Both close paths (the dismiss commit and the reveal cancel) go through
+// PlanRetract, so the panel leaves the screen the same way whichever one
+// started it.
+constexpr float kRetractBaseSpeed = 2.2f;      // DIP/ms, base settle speed
+constexpr std::chrono::milliseconds kRetractMinDuration{260};
+constexpr std::chrono::milliseconds kRetractMaxDuration{560};
 constexpr float kRetractFlingVelocity = 0.6f;  // DIP/ms, fling curve switch
 
 // A closed-to-open transition that no gesture owns (Windows key, Start button,
 // tray) gets the slide a reveal produces: Progress from 0 to 1 on the ease-in-out
-// curve. 260 ms is the slow end of the retract clamp, so a keyboard open and a
-// slow gesture open take the same time.
+// curve. 260 ms is the fast end of the retract clamp, so a keyboard open takes
+// as long as the quickest close.
 constexpr std::chrono::milliseconds kOpenSlideDuration{260};
 
 // The return-to-rest animations keep the durations they always had: a
@@ -418,6 +434,15 @@ constexpr uint64_t kRevealCancelWinTapMarginMs = 30;
 // shell still reports the window open, so the reopen poll must not read that as
 // a fresh open and restore Progress while the close is in flight.
 constexpr uint64_t kRestoreSuppressMs = 600;
+
+// The deferred reveal-cancel tap has to run inside that window, or the poll
+// reads the still-open window as a fresh open and restores Progress while the
+// close is in flight. The longest retract puts the tap at 590 ms, 10 ms inside
+// the window, so a longer kRetractMaxDuration must widen the window too.
+static_assert(static_cast<uint64_t>(kRetractMaxDuration.count()) +
+                      kRevealCancelWinTapMarginMs <=
+                  kRestoreSuppressMs,
+              "the reveal cancel tap must run inside the restore suppression");
 
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
 constexpr float kCommitDistanceFraction = 0.20f;
@@ -701,19 +726,21 @@ bool AnimateProgressTo(
 }
 
 // The one decision point for a close: how long the panel takes and which curve
-// it uses. `progress` is the visual Progress at release, `distance` the DIP the
-// panel covers along the dismiss axis, `velocity` the release speed on that
-// axis. The caller logs the plan once its animation actually started.
+// it uses. `travel` is the DIP the finger covered along the dismiss axis since
+// it took the panel (dismiss) or left the taskbar edge (reveal); `velocity` is
+// the release speed on that axis. The caller logs the plan once its animation
+// actually started.
 struct RetractPlan {
     std::chrono::milliseconds duration{};
     RetractEase ease = RetractEase::Standard;
 };
 
-RetractPlan PlanRetract(float progress, float distance, float velocity) {
-    const float remaining =
-        std::max(0.05f, std::clamp(progress, 0.0f, 1.0f)) * distance;
-    const float speed = std::max(velocity, kRetractMinVelocity);
-    const float raw = remaining / speed;
+RetractPlan PlanRetract(float travel, float velocity) {
+    // The gesture sets the length of the close; a release faster than the base
+    // speed shortens it. The clamps keep a tap-length gesture animated and a
+    // long dismiss from turning into a crawl.
+    const float speed = std::max(velocity, kRetractBaseSpeed);
+    const float raw = std::max(0.0f, travel) / speed;
     const float minMs = static_cast<float>(kRetractMinDuration.count());
     const float maxMs = static_cast<float>(kRetractMaxDuration.count());
 
@@ -741,12 +768,14 @@ void TapWindowsKey() {
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
 }
 
-// Committed dismiss: retract over the velocity-chosen duration and curve, then
-// tap the Windows key so the shell closes the menu through its normal input
-// path.
+// Committed dismiss: retract over the planned duration and curve, then tap the
+// Windows key so the shell closes the menu through its normal input path.
 bool BeginDismissSettle(float from, float velocity) {
-    const RetractPlan plan = PlanRetract(
-        from, g_distancePub.load(std::memory_order_relaxed), velocity);
+    // The panel followed the finger for (1 - Progress) * Distance, so that is
+    // the gesture length the plan reads.
+    const float travel = g_distancePub.load(std::memory_order_relaxed) *
+                         (1.0f - std::clamp(from, 0.0f, 1.0f));
+    const RetractPlan plan = PlanRetract(travel, velocity);
     wuc::CompositionScopedBatch batch{nullptr};
     uint32_t serial = 0;
 
@@ -1844,7 +1873,7 @@ void ReleaseRevealSession() {
         return;
     }
 
-    // Short reveal: the panel retracts with the same velocity-driven duration
+    // Short reveal: the panel retracts with the same travel-planned duration
     // and curve as the committed dismiss, so both close paths read identically
     // from any finger position. The Windows tap that actually closes the menu
     // follows the animation on the input timer, `duration + 30 ms` after the
@@ -1860,7 +1889,7 @@ void ReleaseRevealSession() {
     // is already running, and a down inside the next 600 ms is a new reveal
     // attempt, not a drag of the retracting panel.
     const uint64_t now = GetTickCount64();
-    const RetractPlan plan = PlanRetract(progress, distance, velocity);
+    const RetractPlan plan = PlanRetract(travel, velocity);
     if (AnimateProgressTo(progress, 0.0f, plan.duration, plan.ease)) {
         LogRetract(plan, velocity);
     }
