@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.4.1
+// @version         0.5.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -60,13 +60,18 @@ Notes:
   installed, and it never exceeds 350 ms plus one 10 ms poll. When the write
   fails, the hide runs immediately: a delay without a retract would only slow
   the close down.
-- The wait is cancellable. The Start mod stamps `hide-abort.txt` whenever a new
-  edge pull starts (and again when a stale retract arrives during that pull);
-  the bridge polls that file every 10 ms and compares its last-write time with
-  the `retract=1` write. A newer stamp means the user is already pulling the
-  menu out again, so the hook logs `hide aborted` and returns `S_OK` without
-  calling the original. A hide that no retract request preceded is never
-  cancelled. The marker is a timestamp only; its content is not read.
+- A hide that follows a gesture close is not delayed and does not ask for a
+  retract. The Start mod stamps `close-mode.txt` when one of its gestures starts
+  the close, and that close already retracted the panel before its tap made the
+  shell decide to hide. A stamp younger than 800 ms therefore means "the
+  animation has run": the hook logs `hide passed (gesture)` and calls the
+  original at once. The stamp is a last-write time only; its content is not
+  read.
+- The hook never returns without the original. An earlier version cancelled a
+  delayed hide by returning `S_OK`; measured, the shell's Start toggle then
+  stayed one close ahead and the Windows key and the taskbar Start button stopped
+  working until `StartMenuExperienceHost.exe` restarted. A close is cancelled on
+  the Start side instead, by not sending its tap at all.
 - `Hide` is `HRESULT (void* this, uint32_t reason)` on
   twinui.pcshell.dll 26100.9949. The prologue reads `rcx` (this) and `edx`
   (reason), compares `edx` with 7 and returns 0 on success or the negative
@@ -81,27 +86,29 @@ Notes:
  *   CStartExperienceManager::SetAnimationData/Show/Hide; on version.dll for the
  *   build gate; on LoadLibraryExW from kernelbase.dll for the late module load;
  *   on the shared-memory contract in start_gesture_shared.h; on the Start mod's
- *   `hide-abort.txt` last-write time as the cancel marker for a delayed hide.
+ *   `close-mode.txt` last-write time to tell a gesture close from a Windows-key
+ *   close.
  * [OUTPUT]: the `Local\WindhawkStartGestureShared` mapping and its auto-reset
  *   event, holding the edge, the gesture handle and the state under a seqlock;
  *   a `bridge.log` line per state transition; one `retract=1` line in the Start
- *   mod's `debug.txt` followed by a polled wait of up to 350 ms in
+ *   mod's `debug.txt` followed by a 350 ms wait in
  *   CStartExperienceManager::Hide, so a Windows-key close slides the panel out
- *   before the window is hidden; and a `hide aborted` line plus an `S_OK`
- *   return without the original when the Start mod stamped a newer cancel
- *   marker. No exported symbols.
+ *   before the window is hidden; a `hide passed (gesture)` line and an immediate
+ *   hide when the Start mod's close-mode stamp is younger than 800 ms. Every
+ *   path calls the original Hide. No exported symbols.
  * [POS]: explorer-side half of the legacy Start gesture work. It is the only
  *   code that observes the shell's own hide decision; it changes one shell
- *   behaviour (the hide waits up to 350 ms and can be cancelled by the Start
- *   side) and otherwise forwards every hooked call unchanged. The shipping
- *   Start mod does not read the shared memory; the debug line and the abort
- *   marker are the only couplings that are live today.
+ *   behaviour (the hide waits up to 350 ms for a Windows-key close) and
+ *   otherwise forwards every hooked call unchanged. The shipping
+ *   Start mod does not read the shared memory; the debug line and the close-mode
+ *   stamp are the only couplings that are live today.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
 #include <windows.h>
 #include <winver.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
@@ -129,8 +136,7 @@ constexpr unsigned kTwinuiVersion[4] = {10, 0, 26100, 9949};
 // The Windows-key close is animated from the Start side. Hide is where the
 // shell takes the Start window away; the panel needs that long to retract, so
 // the hide waits for it. 350 ms covers the Start mod's 260 ms retract plus two
-// 50 ms poll ticks. The wait polls in 10 ms steps and is cancelled by the
-// Start mod's hide-abort marker, so the ceiling is one poll past this value.
+// 50 ms poll ticks.
 constexpr DWORD kHideLeadMs = 350;
 
 // The Start mod's debug channel. The bridge runs in explorer, so
@@ -141,16 +147,22 @@ constexpr wchar_t kStartDebugFilePath[] =
     L"local@start-menu-legacy-swipe\\debug.txt";
 constexpr char kRetractCommand[] = "retract=1\r\n";
 
-// The Start mod's cancel marker. A new edge pull stamps this file; its
-// last-write time is compared with the `retract=1` write above, never its
-// content. A stamp newer than the retract means the panel is already being
-// pulled out again, so the hide this retract was written for must not run.
-constexpr wchar_t kStartHideAbortFilePath[] =
+// The Start mod's close-mode stamp. A gesture close writes this file when its
+// retract starts, so a fresh stamp means the panel has already left the screen
+// and its own tap is what caused this hide: the hide must run at once instead of
+// waiting for a retract that already happened. Only the last-write time is read.
+constexpr wchar_t kStartCloseModeFilePath[] =
     L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@start-menu-legacy-swipe\\hide-abort.txt";
+    L"local@start-menu-legacy-swipe\\close-mode.txt";
 
-// The hide waits in 10 ms steps, so a pull that starts during the lead cancels
-// it within one step instead of after the whole 350 ms.
+// A gesture close writes the stamp when its retract starts, 290 ms before its
+// tap and this hide. 800 ms covers the tap, the shell's own dispatch of the
+// close and one Windows-timer tick, and stays short enough that a Windows-key
+// close a second later is animated again.
+constexpr DWORD kCloseModeFreshMs = 800;
+
+// The hide waits in 10 ms steps, so the wait can end early when the mod is being
+// disabled under it.
 constexpr DWORD kHidePollMs = 10;
 
 struct Point {
@@ -849,9 +861,9 @@ bool WriteStartRetractCommand() {
     return ok && written == length;
 }
 
-// Last-write time of a file, false when it is missing or a directory. The abort
-// protocol is timestamp-only: the content is a constant marker, so reading it
-// would add a race the file time already answers.
+// Last-write time of a file, false when it is missing or a directory. Both
+// couplings are timestamp-only: the content is a constant marker, so reading it
+// would add a race that the file time already answers.
 bool ReadFileWriteTime(const wchar_t* path, FILETIME* writeTime) {
     WIN32_FILE_ATTRIBUTE_DATA attributes{};
     if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) ||
@@ -861,6 +873,45 @@ bool ReadFileWriteTime(const wchar_t* path, FILETIME* writeTime) {
 
     *writeTime = attributes.ftLastWriteTime;
     return true;
+}
+
+// True when the Start mod stamped a gesture close less than kCloseModeFreshMs
+// ago. A stamp ahead of the local clock counts as fresh: it is the same write,
+// read before the clock caught up.
+bool GestureCloseStampFresh() {
+    FILETIME written{};
+    if (!ReadFileWriteTime(kStartCloseModeFilePath, &written)) {
+        return false;
+    }
+
+    FILETIME nowFileTime{};
+    GetSystemTimeAsFileTime(&nowFileTime);
+
+    ULARGE_INTEGER now{};
+    now.LowPart = nowFileTime.dwLowDateTime;
+    now.HighPart = nowFileTime.dwHighDateTime;
+    ULARGE_INTEGER stamp{};
+    stamp.LowPart = written.dwLowDateTime;
+    stamp.HighPart = written.dwHighDateTime;
+
+    const ULONGLONG age =
+        now.QuadPart > stamp.QuadPart ? now.QuadPart - stamp.QuadPart : 0;
+    return age <= static_cast<ULONGLONG>(kCloseModeFreshMs) * 10000;
+}
+
+// Gives the Start side the time its 260 ms retract needs. The steps stay at
+// 10 ms so a mod that is being disabled mid-wait ends the delay at once instead
+// of holding the hide for a retract nothing will draw.
+void WaitForRetractLead() {
+    const ULONGLONG deadline = GetTickCount64() + kHideLeadMs;
+    while (!g_disabled.load(std::memory_order_relaxed)) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            break;
+        }
+        Sleep(static_cast<DWORD>(
+            std::min<ULONGLONG>(kHidePollMs, deadline - now)));
+    }
 }
 
 // CStartExperienceManager::Hide(void* self, uint32_t reason) -> HRESULT
@@ -888,36 +939,26 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
     g_startPointTick.store(0, std::memory_order_relaxed);
 
     // The Windows-key close is decided here, while the Start panel is still on
-    // screen. The Start side owns the visual, so it retracts first: the debug
-    // line starts its 260 ms slide and the wait covers the poll that reads the
-    // file (measured 13-67 ms, a 50 ms WM_TIMER quantised to 62 ms) with room
-    // for the whole animation. The wait is cancellable: every new edge pull
-    // stamps hide-abort.txt, and a stamp newer than this retract write means
-    // the user is already pulling the menu out again, so the hide belongs to a
-    // close the gesture has overridden. Returning S_OK without the original
-    // leaves the window up; the Start side's follow keeps driving the panel.
+    // screen. The Start side owns the visual. A hide that follows a gesture
+    // close is already animated: the close-mode stamp names it, so the hide runs
+    // at once. Anything else is a Windows-key close: the debug line starts the
+    // panel's 260 ms slide and the wait covers the poll that reads the file
+    // (measured 13-67 ms, a 50 ms WM_TIMER quantised to 62 ms) with room for the
+    // whole animation.
+    //
+    // This hook always calls the original. An earlier version returned S_OK to
+    // cancel a hide when the user pulled the menu open again; measured, the
+    // shell's Start toggle then stayed one close ahead and the Windows key and
+    // the taskbar Start button stopped working until the host restarted. The
+    // cancel belongs on the Start side, where a close is a tap that is simply
+    // not sent.
     if (g_hideDelayEnabled.load(std::memory_order_relaxed) &&
-        !g_disabled.load(std::memory_order_relaxed) &&
-        WriteStartRetractCommand()) {
-        FileLog(L"hide delayed reason=%u", reason);
-
-        FILETIME retractTime{};
-        if (ReadFileWriteTime(kStartDebugFilePath, &retractTime)) {
-            const ULONGLONG deadline = GetTickCount64() + kHideLeadMs;
-            while (GetTickCount64() < deadline) {
-                Sleep(kHidePollMs);
-
-                FILETIME abortTime{};
-                if (ReadFileWriteTime(kStartHideAbortFilePath, &abortTime) &&
-                    CompareFileTime(&abortTime, &retractTime) > 0) {
-                    FileLog(L"hide aborted");
-                    return S_OK;
-                }
-            }
-        } else {
-            // The retract was written but cannot be dated: keep the old
-            // unconditional lead rather than aborting on a guess.
-            Sleep(kHideLeadMs);
+        !g_disabled.load(std::memory_order_relaxed)) {
+        if (GestureCloseStampFresh()) {
+            FileLog(L"hide passed (gesture)");
+        } else if (WriteStartRetractCommand()) {
+            FileLog(L"hide delayed reason=%u", reason);
+            WaitForRetractLead();
         }
     }
 
@@ -1042,7 +1083,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.4.1 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.5.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();
