@@ -75,8 +75,10 @@ What it does:
   the axis shortens it, never lengthens it: the duration is
   `260 * clamp(1 / (1 + velocity * 0.35), 0.45, 1)`, so a finger at rest gets
   the full 260 ms, 0.5 DIP/ms gets 221, 1.5 gets 169, and 3.4 and above reach
-  the 117 ms floor. The committed dismiss and the cancelled reveal call the same
-  planner and the same animation helper. One line per close records it:
+  the 117 ms floor. One retract-and-arm helper serves both gesture families: it
+  plays the animation, records the line, opens the suppression window, stamps
+  `close-mode.txt` and arms the tap for the end of the retract. A close that
+  could not start its retract arms nothing. One line per close records it:
   `retract vel=... dur=...`.
 - The release itself is one idle window plus one tick, so the panel stood still
   for 20-23 ms after the last report before the retract started, and the eye
@@ -86,9 +88,11 @@ What it does:
   ends the coast, pins the interpolated value and inserts the real one, so the
   correction is the few DIP the panel drifted; a release ends it first and
   plans the close from where it got to, so the retract starts from a moving
-  panel. Nothing coasts while the menu is closed, inside the 600 ms suppression
-  window, or in the reveal's first 50 ms. A held finger never coasts: the panel
-  reports at ~170 Hz, so a live contact leaves no 8 ms gap.
+  panel. The idle tick starts the coast before it decides the release, so one
+  late or coalesced tick cannot skip the coast and release from the last
+  report. Nothing coasts while the menu is closed, inside the 600 ms
+  suppression window, or in the reveal's first 50 ms. A held finger never
+  coasts: the panel reports at ~170 Hz, so a live contact leaves no 8 ms gap.
 - A session ends when no report arrives for 18 ms (`kIdleReleaseMs`); the idle
   tick runs every 5 ms, so the release is noticed about 18-23 ms after the
   last report. The tick is a waitable timer created with
@@ -338,10 +342,13 @@ Known risks:
  *   committed dismiss or short reveal, the shell's own Start toggle that performs
  *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
  *   generation exists when it would run, and no request file or re-arm tap
- *   exists; one retract planner and one easing for both
- *   close paths (260 ms at rest, shortened by the release speed to a 117 ms
- *   floor); a linear coast of `Progress` at the finger's smoothed speed while
- *   no report arrives, ended by the next report or by the release, which then
+ *   exists; one retract planner, one easing and one retract-and-arm helper for
+ *   both close paths (260 ms at rest, shortened by the release speed to a 117 ms
+ *   floor), which also owns the suppression window, the close-mode stamp and the
+ *   armed tap, so neither gesture family can skip one; a linear coast of
+ *   `Progress` at the finger's smoothed speed while
+ *   no report arrives, started by the idle tick before that tick decides the
+ *   release, ended by the next report or by the release, which then
  *   plans the close from the value the coast reached; a
  *   0-to-1 progress slide over 260 ms for a closed-to-open transition no reveal
  *   owns, plus a `win close observed` line when the shell hides the window by
@@ -1172,18 +1179,55 @@ const wchar_t* CloseKindName(CloseKind kind) {
     return kind == CloseKind::Dismiss ? L"dismiss" : L"reveal";
 }
 
+// The value a close plans from. The coast carried the panel past the last
+// report, so neither gesture family reads its own last sample: the retract has
+// to start where the panel is, and a coast must never keep running under it.
+// One call for both, and it reads the one value every write to `Progress`
+// records, so a pinned coast or a restored rest value cannot be missed.
+float CoastedProgress() {
+    float value =
+        std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f, 1.0f);
+    if (g_coasting.load(std::memory_order_relaxed)) {
+        StopCoast(value);
+    }
+    return value;
+}
+
+// The tail every close shares: the suppression window, the close-mode stamp the
+// bridge reads, and the tap armed for the end of the retract. The dismiss and
+// the reveal cancel both come through here, so the two families cannot diverge.
+void ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
+    g_suppressRestoreUntil.store(GetTickCount64() + kRestoreSuppressMs,
+                                 std::memory_order_relaxed);
+    if (!WriteCloseMode(kCloseTapDelayMs)) {
+        FileLog(L"close mode write failed kind=%s", CloseKindName(kind));
+    }
+    ScheduleCloseTap(kind, static_cast<uint64_t>(duration.count()));
+}
+
+// The retract every close runs, from the value the coast left. A close exists
+// only once this animation started: the suppression, the stamp and the tap
+// follow the retract, never a failed one. The dismiss wraps this call in its
+// settle batch; the reveal cancel calls it directly.
+bool BeginGestureClose(float from, float velocity, CloseKind kind) {
+    const std::chrono::milliseconds duration = PlanRetract(velocity);
+    if (!AnimateProgressTo(from, 0.0f, duration)) {
+        return false;
+    }
+    LogRetract(duration, velocity);
+    ArmGestureClose(kind, duration);
+    return true;
+}
+
 // The close both gesture paths schedule. The retract runs first; the tap is
 // armed for its end, where RunPendingCloseTap checks the pull generation and
 // either taps or drops the close. No deferral file and no bridge request exist.
 //
-// Committed dismiss: retract on the shared plan, then tap the Windows key, so
-// the shell's own key handler performs the Hide.
-//
-// The animation comes from AnimateProgressTo, the same helper the reveal cancel
-// and the return-to-rest paths use. The scoped batch around it only observes
-// that one animation to know when the panel has left the screen.
+// Committed dismiss: the settle batch observes the retract, the shared close
+// tail arms the tap. The retract itself, the log line, the suppression window,
+// the close-mode stamp and the tap all come from BeginGestureClose, so this path
+// and the reveal cancel cannot diverge.
 bool BeginDismissSettle(float from, float velocity) {
-    const std::chrono::milliseconds duration = PlanRetract(velocity);
     wuc::CompositionScopedBatch batch{nullptr};
     uint32_t serial = 0;
 
@@ -1234,7 +1278,7 @@ bool BeginDismissSettle(float from, float velocity) {
             g_dismissSettling.store(true, std::memory_order_relaxed);
         }
 
-        if (!AnimateProgressTo(from, 0.0f, duration)) {
+        if (!BeginGestureClose(from, velocity, CloseKind::Dismiss)) {
             // No animation, so the batch holds nothing: invalidate the
             // completion first, or its callback would touch a close that never
             // started to retract.
@@ -1256,7 +1300,6 @@ bool BeginDismissSettle(float from, float velocity) {
                 g_dismissBatch = batch;
             }
         }
-        LogRetract(duration, velocity);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Dismiss animation failed: %08X %s", e.code(),
                e.message().c_str());
@@ -1267,20 +1310,6 @@ bool BeginDismissSettle(float from, float velocity) {
         g_dismissSettling.store(false, std::memory_order_relaxed);
         return false;
     }
-
-    // The retract is running. The suppression window starts now: a contact on
-    // the taskbar edge inside it is a new pull, not a drag of the retracting
-    // panel. The tap is armed for the end of the retract, and the stamp is
-    // written now so a Win press during the retract is recognized as this close.
-    const uint64_t now = GetTickCount64();
-    g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
-                                 std::memory_order_relaxed);
-    if (!WriteCloseMode(kCloseTapDelayMs)) {
-        FileLog(L"close mode write failed kind=%s",
-                CloseKindName(CloseKind::Dismiss));
-    }
-    ScheduleCloseTap(CloseKind::Dismiss,
-                     static_cast<uint64_t>(duration.count()));
 
     return true;
 }
@@ -2471,10 +2500,7 @@ void ReleaseRevealSession() {
     // The coast carried the panel past the last report, so both outcomes start
     // from where it got to. `progress` above stays the mapped release position,
     // which is the measurement, not the point the animation starts from.
-    float from = std::clamp(reveal.lastInserted, 0.0f, 1.0f);
-    if (g_coasting.load(std::memory_order_relaxed)) {
-        StopCoast(from);
-    }
+    const float from = CoastedProgress();
 
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
@@ -2485,33 +2511,24 @@ void ReleaseRevealSession() {
         return;
     }
 
-    // Short reveal: the same planner and the same helper the committed dismiss
-    // uses, from the same release speed, so both close paths read identically
-    // from any finger position. The Windows tap is armed for the end of the
-    // retract: it is what makes the shell call Hide, after the panel is gone.
+    // Short reveal: the same retract, the same log line, the same close-mode
+    // stamp, the same suppression window and the same armed tap as the
+    // committed dismiss, from the same release speed. Both close paths read
+    // identically from any finger position.
     //
     // Progress stays at 0 afterwards and is not restored here: the hide takes a
     // moment, and restoring now would flash the fully open menu while the close
     // is in flight. The flag makes the next down restore the resting value once
     // the shell has finished hiding the reused root.
-    //
-    // The suppression window starts at the release, not at the hide: the close
-    // is already running, and a down inside the next 600 ms is a new reveal
-    // attempt, not a drag of the retracting panel.
-    const uint64_t now = GetTickCount64();
-    const std::chrono::milliseconds duration = PlanRetract(velocity);
-    if (AnimateProgressTo(from, 0.0f, duration)) {
-        LogRetract(duration, velocity);
+    if (BeginGestureClose(from, velocity, CloseKind::RevealCancel)) {
+        g_commitNeedsProgressReset = true;
+        return;
     }
-    g_suppressRestoreUntil.store(now + kRestoreSuppressMs,
-                                 std::memory_order_relaxed);
-    if (!WriteCloseMode(kCloseTapDelayMs)) {
-        FileLog(L"close mode write failed kind=%s",
-                CloseKindName(CloseKind::RevealCancel));
-    }
-    ScheduleCloseTap(CloseKind::RevealCancel,
-                     static_cast<uint64_t>(duration.count()));
-    g_commitNeedsProgressReset = true;
+
+    // No retract ran, so no close is owed and no tap may be armed under a panel
+    // that is still on screen. The committed dismiss puts its panel back in the
+    // same case; this one leaves the menu open, fully in.
+    ShowAtRest();
 }
 
 void LogHidRelease(const HidGestureSession& session, float velocity,
@@ -2607,11 +2624,8 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
 
     // The coast continued the drag after the last report; the close has to start
     // from where it got to, not from the last report, or the panel jumps back
-    // before it retracts.
-    float from = std::clamp(session.lastProgress, 0.0f, 1.0f);
-    if (g_coasting.load(std::memory_order_relaxed)) {
-        StopCoast(from);
-    }
+    // before it retracts. Both gesture families read it through the same call.
+    const float from = CoastedProgress();
 
     if (commit) {
         if (BeginDismissSettle(from, velocity)) {
@@ -2834,6 +2848,16 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     HidGestureSession& session = g_hidSession;
     const uint64_t qpcNow = QpcMsNow();
 
+    // First, before any release is decided. The coast has to be running when the
+    // release is planned, and the release is the very next thing this tick does.
+    // On a clean 5 ms tick the coast starts 8-13 ms after the last report and the
+    // release lands 10-16 ms later; a coalesced tick, which a busy input thread
+    // produces, could otherwise cross both thresholds at once and leave the
+    // panel standing still for the whole gap. Starting it here makes that tick
+    // start the coast and then hand it to the release, which stops it and plans
+    // the retract from its value, exactly as on the clean path.
+    MaybeCoast(tickMs, qpcNow);
+
     const bool sessionIdle =
         session.active && qpcNow >= session.lastSampleQpc &&
         qpcNow - session.lastSampleQpc >= kIdleReleaseMs;
@@ -2856,10 +2880,6 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         g_contactDown = false;
         g_openCheckValid = false;
     }
-
-    // Last, so a session this tick released does not also start a coast, and a
-    // coast that reached its end is pinned before this tick returns.
-    MaybeCoast(tickMs, qpcNow);
 }
 
 // The tap both close paths arm. It runs on the input thread at the end of the
