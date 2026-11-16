@@ -71,15 +71,28 @@ What it does:
   places the easing on the keyframe at t=1 and inserts the target as the base
   value before `StartAnimation`.
 - The retract is one animation for every close, the v0.1.0 motion: `Progress`
-  goes to 0 in 260 ms on `cubic-bezier(0.45, 0, 0.55, 1)`. The release speed on
+  goes to 0 in 260 ms. The release speed on
   the axis shortens it, never lengthens it: the duration is
   `260 * clamp(1 / (1 + velocity * 0.35), 0.45, 1)`, so a finger at rest gets
   the full 260 ms, 0.5 DIP/ms gets 221, 1.5 gets 169, and 3.4 and above reach
-  the 117 ms floor. One retract-and-arm helper serves both gesture families: it
+  the 117 ms floor. The curve is picked per close from that same speed, because
+  the fixed `cubic-bezier(0.45, 0, 0.55, 1)` leaves the start at slope 0: the
+  coast hands the panel over while it is still moving, so a zero slope stopped
+  it and re-accelerated it at the seam. With `remaining = max(0.05, from) *
+  Distance`, `avg = remaining / duration` and the setting
+  `RetractStartSpeedPercent` (default 175), the requested slope is
+  `s = clamp(percent / 100 * velocity / max(avg, 0.01), 0, 3)`; the curve is
+  `cubic-bezier(0.35, clamp(s * 0.35, 0.02, 1), 0.55, 1)`. A release at rest
+  gets `s = 0` and `y1 = 0.02`, so it still leaves the start, effectively the old
+  soft curve. The easing is created for that close only; the fixed curve stays
+  the fallback, and the open, return-to-rest and Windows-key close animations
+  keep it. One retract-and-arm helper serves both gesture families: it
   plays the animation, records the line, opens the suppression window, stamps
   `close-mode.txt` and arms the tap for the end of the retract. A close that
   could not start its retract arms nothing. One line per close records it:
-  `retract vel=... dur=...`.
+  `retract vel=... dur=... s=... y1=...`. The gesture's release line is written
+  after the retract started: the file write costs time on the input thread, and
+  before the animation it only made the seam longer.
 - The release itself is one idle window plus one tick, so the panel stood still
   for 20-23 ms after the last report before the retract started, and the eye
   read that as a stop. The panel now coasts through that window: the average
@@ -190,6 +203,16 @@ What it does not do:
   drawn, because the same request is the step that presents the content. The
   switch is therefore off and the open still slides from the shell.
 
+Settings:
+
+- `RetractStartSpeedPercent` (default 175, clamped to 0-300) is how fast the
+  panel leaves a gesture close, as a percentage of the finger's release speed.
+  `Wh_ModInit` reads it once into an atomic and logs `retract start speed=...`;
+  `Wh_ModSettingsChanged` refreshes the atomic, so a change applies to the next
+  close and no close performs a setting lookup. 100 continues at exactly the
+  finger's speed; the curve's slope is still capped at 3, so higher values stop
+  changing the motion once the cap is reached.
+
 Debug channel (kept in the build):
 
 - `debug.txt` in the mod storage directory
@@ -202,9 +225,9 @@ Debug channel (kept in the build):
   - `anim=0` suppresses the shell's open storyboard; `anim=1` restores it. The
     default is `anim=1`, because suppression leaves the pane undrawn.
   - `retract` plays the committed-dismiss retract from the current `Progress`:
-    `AnimateProgressTo(current, 0, PlanRetract(0))`, 260 ms, and logs
-    `debug retract`. The next open restores the scalar, so the command leaves
-    the reuse flag clear. The explorer-side bridge writes this line 350 ms
+    `AnimateProgressTo(current, 0, PlanRetract(0))`, 260 ms on the fixed curve,
+    and logs `debug retract`. The next open restores the scalar, so the command
+    leaves the reuse flag clear. The explorer-side bridge writes this line 350 ms
     before `CStartExperienceManager::Hide` runs, which is what turns a
     Windows-key close into a slide-out. It applies only when the file was
     written within the last second: the file keeps the last command after the
@@ -224,11 +247,12 @@ Debug channel (kept in the build):
 
 Diagnostics:
 
-- `mod init`, `hid init`, `hid reg usage=... ok=... err=...`,
+- `mod init`, `retract start speed=...%`, `hid init`,
+  `hid reg usage=... ok=... err=...`,
   `hid down x=... y=... axis=... dist=...`,
   `hid release src=idle|report|abort delta=... perp=... vel=... commit=...
   n=... relms=...`,
-  `retract vel=... dur=...`,
+  `retract vel=... dur=... s=... y1=...`,
   `win open`, `win close observed`,
   `close tap kind=dismiss|reveal delay=...`,
   `close tap dropped kind=dismiss|reveal`,
@@ -314,6 +338,17 @@ Known risks:
 */
 // ==/WindhawkModReadme==
 
+// ==WindhawkModSettings==
+/*
+- RetractStartSpeedPercent: 175
+  $name: Close animation start speed (% of finger speed)
+  $description: >-
+    How fast the panel leaves when a swipe closes it, as a percentage of the
+    speed the finger had at release. 100 continues at exactly the finger's
+    speed, higher snaps out faster. Values are clamped to 0-300.
+*/
+// ==/WindhawkModSettings==
+
 /*
  * [INPUT]: depends on StartUI::App::PrepareRootElement and
  *   StartUI::SplitViewFrame::OnGlobalAnimationRequested plus its three argument
@@ -328,8 +363,9 @@ Known risks:
  *   idle tick (WM_TIMER stays on the 15.6 ms tick on this build); on
  *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps and
  *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet, the
- *   expression and the one cached cubic-bezier easing (0.45, 0, 0.55, 1)
- *   installed in Setup; on
+ *   expression and one cached cubic-bezier easing (0.45, 0, 0.55, 1)
+ *   installed in Setup, plus the per-close curve the close builds from the
+ *   `RetractStartSpeedPercent` setting; on
  *   VisualTreeHelper and TransformToVisual
  *   from Windows.UI.Xaml.Media to map the panel trail; on `debug.txt` in the
  *   mod storage directory, read by the debug channel; on the fixed
@@ -342,10 +378,15 @@ Known risks:
  *   committed dismiss or short reveal, the shell's own Start toggle that performs
  *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
  *   generation exists when it would run, and no request file or re-arm tap
- *   exists; one retract planner, one easing and one retract-and-arm helper for
+ *   exists; one retract duration planner, one curve planner and one
+ *   retract-and-arm helper for
  *   both close paths (260 ms at rest, shortened by the release speed to a 117 ms
- *   floor), which also owns the suppression window, the close-mode stamp and the
- *   armed tap, so neither gesture family can skip one; a linear coast of
+ *   floor, opening at `RetractStartSpeedPercent` of the finger's speed on a
+ *   curve created for that close), which also owns the suppression window, the
+ *   close-mode stamp and the
+ *   armed tap, so neither gesture family can skip one; the setting is read once
+ *   at init and refreshed on a settings change, logged as
+ *   `retract start speed=...%`; a linear coast of
  *   `Progress` at the finger's smoothed speed while
  *   no report arrives, started by the idle tick before that tick decides the
  *   release, ended by the next report or by the release, which then
@@ -491,12 +532,12 @@ constexpr uint8_t kAnimPrologue[] = {
 };
 
 // The retract is one animation for every close. A release with no speed takes
-// kRetractDuration exactly: 260 ms on cubic-bezier(0.45, 0, 0.55, 1), the motion
-// v0.1.0 shipped. The release speed only shortens it, so a flick does not put a
-// fixed 260 ms of travel behind a panel that is already moving: the duration is
-// scaled by 1 / (1 + v * kRetractVelocityGain) and never drops below
-// kRetractMinScale of it. Measured on the axis velocity: 0 -> 260 ms,
-// 0.5 -> 221, 1.5 -> 169, 3 -> 127, 3.4 and above -> 117.
+// kRetractDuration exactly: 260 ms, the motion v0.1.0 shipped. The release speed
+// only shortens it, so a flick does not put a fixed 260 ms of travel behind a
+// panel that is already moving: the duration is scaled by
+// 1 / (1 + v * kRetractVelocityGain) and never drops below kRetractMinScale of
+// it. Measured on the axis velocity: 0 -> 260 ms, 0.5 -> 221, 1.5 -> 169,
+// 3 -> 127, 3.4 and above -> 117.
 //
 // Both close paths (the dismiss commit and the reveal cancel) call PlanRetract
 // and AnimateProgressTo, so the panel leaves the screen the same way whichever
@@ -504,6 +545,40 @@ constexpr uint8_t kAnimPrologue[] = {
 constexpr std::chrono::milliseconds kRetractDuration{260};
 constexpr float kRetractVelocityGain = 0.35f;  // 1 / (1 + v*0.35)
 constexpr float kRetractMinScale = 0.45f;      // never shorter than 45%
+
+// The retract curve is picked per close from the release speed, because the
+// fixed cubic-bezier(0.45, 0, 0.55, 1) leaves the start at slope 0: the coast
+// hands the panel over at the finger's speed, the curve stops it, then it
+// accelerates again, and the seam reads as a pause. The curve keeps the fixed
+// one's tail (x2, y2) and moves the first control point so the opening slope is
+// the setting's percentage of the finger's speed divided by the animation's own
+// average speed. x1 stays 0.35; y1 = slope * x1, at least kRetractCurveMinY1 so
+// a release at rest still leaves the start; slope is capped at
+// kRetractCurveMaxSlope, and y1's 1.0 ceiling caps it again.
+constexpr float kRetractCurveX1 = 0.35f;
+constexpr float kRetractCurveX2 = 0.55f;
+constexpr float kRetractCurveY2 = 1.0f;
+constexpr float kRetractCurveMinY1 = 0.02f;
+constexpr float kRetractCurveMaxSlope = 3.0f;
+// The remaining travel is at least this fraction of Distance, so a close that
+// starts at Progress 0 still gets a defined average speed.
+constexpr float kRetractMinRemaining = 0.05f;
+// The divisor floor in the slope formula: never divide by a vanishing average.
+constexpr float kRetractAvgFloor = 0.01f;
+
+// The one setting of this mod. The curve multiplies the release speed by it;
+// 175 % makes the panel leave at 1.75x the finger's speed.
+constexpr int kRetractStartSpeedDefault = 175;
+constexpr int kRetractStartSpeedMin = 0;
+constexpr int kRetractStartSpeedMax = 300;
+
+// The curve parameters one gesture close picked. They are plain numbers: the
+// WinRT easing object is created inside AnimateProgressTo, for that close only,
+// because the requested slope changes with every release.
+struct RetractCurve {
+    float slope = 0.0f;  // requested opening slope, in average-speed units
+    float y1 = 0.0f;     // first control point y after the clamp
+};
 
 // A closed-to-open transition that no gesture owns (Windows key, Start button,
 // tray) gets the slide a reveal produces: Progress from 0 to 1 on the same
@@ -770,6 +845,24 @@ std::atomic<bool> g_stopDismissCallback{false};
 std::atomic<bool> g_suppressOpenAnim{false};
 std::atomic<int32_t> g_animLogCount{0};
 
+// The percentage from the mod settings. Wh_ModInit and Wh_ModSettingsChanged
+// write it, every close reads it once; no setting lookup runs per close.
+std::atomic<int> g_retractStartSpeedPercent{kRetractStartSpeedDefault};
+
+// Set when the per-close curve could not be created. The fixed cached curve is
+// the fallback from then on, and the fallback is logged once, not per close.
+std::atomic<bool> g_retractCurveFallbackLogged{false};
+
+// Reads the one setting into the atomic, clamped. Wh_ModInit calls it once and
+// Wh_ModSettingsChanged calls it again, so no close pays for a setting lookup.
+void LoadRetractStartSpeed() {
+    const int percent =
+        std::clamp(Wh_GetIntSetting(L"RetractStartSpeedPercent"),
+                   kRetractStartSpeedMin, kRetractStartSpeedMax);
+    g_retractStartSpeedPercent.store(percent, std::memory_order_relaxed);
+    FileLog(L"retract start speed=%d%%", percent);
+}
+
 // ---------------------------------------------------------------------------
 // Composition state
 //
@@ -787,11 +880,12 @@ wuc::ExpressionAnimation g_translationExpression{nullptr};
 wuc::Visual g_visual{nullptr};
 wuc::CompositionScopedBatch g_dismissBatch{nullptr};
 
-// The one cached curve, created in Setup and cleared with the property set.
-// Every animation reads it under g_compositionMutex, so it never outlives the
+// The fixed curve, created in Setup and cleared with the property set. Every
+// animation reads it under g_compositionMutex, so it never outlives the
 // compositor that created it. cubic-bezier(0.45, 0, 0.55, 1) starts gently and
-// ends gently: both close paths, both return-to-rest animations and the
-// keyboard open use it.
+// ends gently: the return-to-rest animations, the keyboard open and the
+// Windows-key close use it, and it is the fallback when a gesture close cannot
+// create its per-close curve.
 wuc::CompositionEasingFunction g_retractEasing{nullptr};
 
 // The value the renderer currently shows. Composition has no read-back, so every
@@ -1004,16 +1098,47 @@ bool InsertProgress(float progress) {
 // t=1, the one that defines the motion into the target. The t=0 frame carries
 // the start value only; a keyframe pair without an easing curve is linear and
 // starts at its peak speed.
+//
+// `curve` is set only by a gesture close, which picks the opening slope from its
+// release speed. The easing object is created here, under the composition lock,
+// so it never outlives the compositor and nothing is cached per velocity. Every
+// other animation passes nothing and keeps the fixed cached curve.
 bool AnimateProgressTo(float from, float to,
-                       std::chrono::milliseconds duration) {
+                       std::chrono::milliseconds duration,
+                       const RetractCurve* curve = nullptr) {
     std::lock_guard lock(g_compositionMutex);
     if (!g_state || !g_compositor) {
         return false;
     }
 
-    const wuc::CompositionEasingFunction easing = g_retractEasing;
+    wuc::CompositionEasingFunction easing = g_retractEasing;
     if (!easing) {
         return false;
+    }
+
+    if (curve) {
+        // The compositor refuses a curve only in a broken renderer; the fixed
+        // one then keeps the close animating, and the fallback logs once.
+        try {
+            wuc::CompositionEasingFunction created =
+                g_compositor.CreateCubicBezierEasingFunction(
+                    float2{kRetractCurveX1, curve->y1},
+                    float2{kRetractCurveX2, kRetractCurveY2});
+            if (created) {
+                easing = created;
+            } else if (!g_retractCurveFallbackLogged.exchange(true)) {
+                FileLog(L"retract curve unavailable; using the fixed curve");
+            }
+        } catch (winrt::hresult_error const& e) {
+            if (!g_retractCurveFallbackLogged.exchange(true)) {
+                FileLog(L"retract curve failed: %08X; using the fixed curve",
+                        e.code());
+            }
+        } catch (...) {
+            if (!g_retractCurveFallbackLogged.exchange(true)) {
+                FileLog(L"retract curve failed; using the fixed curve");
+            }
+        }
     }
 
     try {
@@ -1157,10 +1282,42 @@ std::chrono::milliseconds PlanRetract(float velocity) {
     return std::chrono::milliseconds(static_cast<int>(ms));
 }
 
+// The curve the retract plays, chosen from the same release speed that picked
+// its duration. `from` is the Progress the close starts at, `distance` the DIP
+// of one full Progress unit, so `max(kRetractMinRemaining, from) * distance` is
+// the travel still ahead. The animation averages `remaining / duration` DIP/ms;
+// the requested slope makes its first frame leave at the setting's percentage of
+// the release speed, so the coast and the retract read as one motion. A release
+// at rest gets slope 0 and y1 = kRetractCurveMinY1: the curve still leaves the
+// start, effectively the old soft one.
+RetractCurve PlanRetractCurve(float velocity, float from, float distance,
+                              std::chrono::milliseconds duration) {
+    const float remaining =
+        std::max(kRetractMinRemaining, std::clamp(from, 0.0f, 1.0f)) *
+        std::max(distance, 0.0f);
+    const float durationMs =
+        static_cast<float>(std::max<int64_t>(duration.count(), 1));
+    const float average = remaining / durationMs;
+    const float startSpeed =
+        static_cast<float>(g_retractStartSpeedPercent.load(
+            std::memory_order_relaxed)) /
+        100.0f;
+
+    RetractCurve curve;
+    curve.slope = std::clamp(startSpeed * velocity /
+                                 std::max(average, kRetractAvgFloor),
+                             0.0f, kRetractCurveMaxSlope);
+    curve.y1 =
+        std::clamp(curve.slope * kRetractCurveX1, kRetractCurveMinY1, 1.0f);
+    return curve;
+}
+
 // One line per close, whatever path started it.
-void LogRetract(std::chrono::milliseconds duration, float velocity) {
-    FileLog(L"retract vel=%.2f dur=%llu", velocity,
-            static_cast<unsigned long long>(duration.count()));
+void LogRetract(std::chrono::milliseconds duration, float velocity,
+                const RetractCurve& curve) {
+    FileLog(L"retract vel=%.2f dur=%llu s=%.2f y1=%.2f", velocity,
+            static_cast<unsigned long long>(duration.count()), curve.slope,
+            curve.y1);
 }
 
 // The one dismissal every close uses. The tap is the shell's own Start toggle:
@@ -1211,10 +1368,13 @@ void ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
 // settle batch; the reveal cancel calls it directly.
 bool BeginGestureClose(float from, float velocity, CloseKind kind) {
     const std::chrono::milliseconds duration = PlanRetract(velocity);
-    if (!AnimateProgressTo(from, 0.0f, duration)) {
+    const float distance = g_distancePub.load(std::memory_order_relaxed);
+    const RetractCurve curve =
+        PlanRetractCurve(velocity, from, distance, duration);
+    if (!AnimateProgressTo(from, 0.0f, duration, &curve)) {
         return false;
     }
-    LogRetract(duration, velocity);
+    LogRetract(duration, velocity, curve);
     ArmGestureClose(kind, duration);
     return true;
 }
@@ -2491,10 +2651,9 @@ void ReleaseRevealSession() {
                         (travel > kCommitDistanceFraction * distance ||
                          velocity > kCommitVelocity);
 
-    FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f vel=%.2f "
-            L"commit=%d panel=%.0f n=%d",
-            travel, reveal.maxTravel, progress, velocity, commit ? 1 : 0,
-            reveal.panelTrail, reveal.samples);
+    // The release line is written after the animation starts: the file write
+    // costs time on the input thread, and every millisecond before the
+    // animation is a frame the panel stands still at the seam.
     EndContactTiming();
 
     // The coast carried the panel past the last report, so both outcomes start
@@ -2505,7 +2664,12 @@ void ReleaseRevealSession() {
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
         // finishes the slide instead of snapping.
-        if (!AnimateProgressTo(from, 1.0f, kRevealCommitDuration)) {
+        const bool started = AnimateProgressTo(from, 1.0f, kRevealCommitDuration);
+        FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f vel=%.2f "
+                L"commit=%d panel=%.0f n=%d",
+                travel, reveal.maxTravel, progress, velocity, commit ? 1 : 0,
+                reveal.panelTrail, reveal.samples);
+        if (!started) {
             ShowAtRest();
         }
         return;
@@ -2520,7 +2684,13 @@ void ReleaseRevealSession() {
     // moment, and restoring now would flash the fully open menu while the close
     // is in flight. The flag makes the next down restore the resting value once
     // the shell has finished hiding the reused root.
-    if (BeginGestureClose(from, velocity, CloseKind::RevealCancel)) {
+    const bool started =
+        BeginGestureClose(from, velocity, CloseKind::RevealCancel);
+    FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f vel=%.2f "
+            L"commit=%d panel=%.0f n=%d",
+            travel, reveal.maxTravel, progress, velocity, commit ? 1 : 0,
+            reveal.panelTrail, reveal.samples);
+    if (started) {
         g_commitNeedsProgressReset = true;
         return;
     }
@@ -2619,7 +2789,7 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
         (finalDelta > kCommitDistanceFraction * distance ||
          velocity > kCommitVelocity);
 
-    LogHidRelease(session, velocity, commit, QpcMsNow(), source);
+    const uint64_t releaseQpc = QpcMsNow();
     EndContactTiming();
 
     // The coast continued the drag after the last report; the close has to start
@@ -2628,7 +2798,12 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
     const float from = CoastedProgress();
 
     if (commit) {
-        if (BeginDismissSettle(from, velocity)) {
+        const bool started = BeginDismissSettle(from, velocity);
+        // The release line is written after the retract started: the file write
+        // costs time on the input thread, and every millisecond before the
+        // animation is a frame the panel stands still at the seam.
+        LogHidRelease(session, velocity, commit, releaseQpc, source);
+        if (started) {
             g_commitNeedsProgressReset = true;
         } else {
             ShowAtRest();
@@ -2643,6 +2818,7 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
     } else {
         ShowAtRest();
     }
+    LogHidRelease(session, velocity, commit, releaseQpc, source);
 }
 
 // Scroll abort: the menu returns to its resting position at once; no
@@ -3677,8 +3853,10 @@ bool Setup(wux::FrameworkElement const& root) {
     state.InsertScalar(L"DirX", dirX);
     state.InsertScalar(L"DirY", dirY);
 
-    // One cached curve, the v0.1.0 one: cubic-bezier(0.45, 0, 0.55, 1) starts
-    // gently and ends gently, and every animation in this file uses it. Without
+    // The fixed curve, the v0.1.0 one: cubic-bezier(0.45, 0, 0.55, 1) starts
+    // gently and ends gently. A gesture close picks a curve of its own from the
+    // release speed (PlanRetractCurve); this one is the fallback and the curve of
+    // the return-to-rest, open and Windows-key animations. Without
     // a curve a keyframe pair is linear and starts at its peak velocity: a
     // short retract then reads as the panel flying away on the first frame.
     const wuc::CompositionEasingFunction retractEasing =
@@ -4204,7 +4382,8 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.10.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.11.0 initializing");
+    LoadRetractStartSpeed();
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.
@@ -4317,4 +4496,10 @@ void Wh_ModUninit() {
     RevokeHandlersOnUiThread();
     ResetComposition();
     Wh_Log(L"Legacy Start Edge Swipe Dismiss uninitialized");
+}
+
+// A settings change only refreshes the atomic: the next close reads it, no
+// renderer state and no cached curve is touched.
+void Wh_ModSettingsChanged() {
+    LoadRetractStartSpeed();
 }
