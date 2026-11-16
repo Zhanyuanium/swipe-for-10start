@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe Dismiss
 // @description     Touch/pen swipe toward the anchored edge to dismiss the legacy Start menu
-// @version         0.3.1
+// @version         0.4.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -1190,6 +1190,7 @@ HidGestureSession g_hidSession;  // input thread only
 // XAML root means the next drag can still see a translated root or a base
 // value of 0, so BeginHidSession restores the resting value first.
 bool g_commitNeedsProgressReset = false;  // input thread only
+bool g_rootWasOpen = false;              // input thread only
 
 float AxisDelta(int32_t axis, const HidGestureSession& session, float x,
                 float y) {
@@ -1429,6 +1430,25 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     }
 }
 
+// The XAML root is reused across menu opens, and PrepareRootElement does not
+// run again, so a committed dismiss leaves Progress at 0. Without this the next
+// open shows a window that is on screen but slid out of view.
+void PollRootVisibility(uint64_t tickMs) {
+    static uint64_t lastPollTick = 0;
+    if (tickMs - lastPollTick < 100) {
+        return;
+    }
+    lastPollTick = tickMs;
+
+    const bool open = StartWindowIsOpen();
+    if (open && !g_rootWasOpen && g_commitNeedsProgressReset) {
+        g_commitNeedsProgressReset = false;
+        ShowAtRest();
+        FileLog(L"hid root restored after reopen");
+    }
+    g_rootWasOpen = open;
+}
+
 void FeedHidReport(HidDevice& device, USHORT reportId, const BYTE* report,
                    ULONG reportLength, uint64_t tickMs) {
     if (!device.ready || !device.preparsed) {
@@ -1642,7 +1662,9 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
             return 0;
         case WM_TIMER:
             if (wParam == kIdleTimerId) {
-                CheckHidIdleRelease(GetTickCount64());
+                const uint64_t now = GetTickCount64();
+    CheckHidIdleRelease(now);
+    PollRootVisibility(now);
             } else if (wParam == kDebugTimerId) {
                 PollDebugFile();
             }
