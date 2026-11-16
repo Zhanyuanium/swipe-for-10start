@@ -45,9 +45,13 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    `(1 - Progress) * Direction * Distance`.
 5. On release it commits when the release position passed 20% of the distance or
    the release speed exceeded 0.45 DIP/ms; a commit animates `Progress` to 0 over
-   150 ms and then taps `VK_LWIN`, which is the only dismissal that works when
-   the menu was opened without keyboard focus. Otherwise `Progress` animates back
-   to 1.
+   220 ms with an ease-out curve (`cubic-bezier(0.2, 0.85, 0.3, 1)`) and then
+   taps `VK_LWIN`, which is the only dismissal that works when the menu was
+   opened without keyboard focus. Otherwise `Progress` animates back to 1 with
+   the same curve.
+
+`Progress` is written whenever the finger moves 0.5 DIP, so the drag is
+continuous rather than stepping on a progress grid.
 
 Release detection: the digitizer keeps reporting while the finger rests
 (measured 255 reports in a 1.5 s hold), so a 35 ms window without a report is a
@@ -79,8 +83,8 @@ Instead the mod takes over after the shell opens the window:
 
   The trailing edge is measured on the UI thread from the root's visible child
   (`StartSizingFrame`, ~1053 DIP here) and published to the input thread. With
-  that anchor the panel edge equals the finger: measured within 4-5 px at 150,
-  450 and 800 DIP.
+  that anchor the panel edge equals the finger: measured within 0.5 DIP residual
+  at 150, 450 and 800 DIP.
 - Release is decided symmetrically with the dismiss gesture: `travel` is how far
   the finger moved away from the edge since the touch began (the release value,
   not the peak), and the menu opens fully when `travel > 20%` of the distance or
@@ -171,8 +175,9 @@ to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
   layout changes (another panel becomes the first visible child) the anchor needs
   revisiting. The XAML island is inset to the monitor work area, not to the
   window rect, which is 95 px of error if the window rect is used instead.
-- The reveal trails the finger by 4-5 px because of the 0.004 progress filter; a
-  finer threshold costs extra property writes on the input thread.
+- Progress is inserted on a 0.5 DIP movement threshold; a finer threshold costs
+  extra property writes on the input thread, but the current one is already
+  sub-pixel at 200% scaling.
 - The contact collection is chosen by proximity to the previous raw position; two
   fingers moving together can confuse which one is tracked.
 - Composition translation does not move XAML hit-testing: while the menu is
