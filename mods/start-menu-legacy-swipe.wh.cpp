@@ -1658,7 +1658,10 @@ void ReleaseRevealSession() {
     Sleep(60);
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
     g_commitNeedsProgressReset = true;
-    ShowAtRest();
+    // Do not restore Progress here: the Windows tap takes a moment to hide the
+    // window, and resetting now would flash the fully open menu first. The menu
+    // is left at the finger's position (mostly off-screen) and the next open
+    // restores the scalar.
 }
 
 void LogHidRelease(const HidGestureSession& session, float velocity,
