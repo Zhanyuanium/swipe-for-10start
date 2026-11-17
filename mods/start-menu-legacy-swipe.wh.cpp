@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.15.0
+// @version         0.16.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -142,7 +142,7 @@ What it does:
     because the samples are the curve.
 
   One settle-and-arm helper serves both gesture families: it plays the
-  animation, opens the suppression window, stamps `close-mode.txt` and arms the
+  animation, opens the suppression window, stamps the close channel and arms the
   tap for the end of the settle, which is that settle's own duration. A close
   whose settle did not start arms nothing. One line records each settle:
   `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
@@ -244,29 +244,28 @@ What it does:
   edge candidate and the 600 ms suppression window both suppress the animation.
   A close the shell performs by itself logs `win close observed`, leaves
   `Progress` where the close left it, and lets the next open animate from 0.
-  The Windows-key close is animated now: the explorer-side bridge writes
-  `retract` to `debug.txt` and holds `CStartExperienceManager::Hide` until the
-  settle it starts has run. Only this process can plan that settle, so it answers
-  with the planned duration in `retract-plan.txt` and the bridge waits exactly
-  that plus a 30 ms margin; the mod runs the selected settle style from rest
-  (409 ms for the full panel at the planned 2.2 DIP/ms) and the panel slides out
-  instead of vanishing. One line per transition.
-- Every gesture close stamps `close-mode.txt` at the release with
-  `gesture=0`. The tap comes at the end of the settle, so the Hide it causes
-  needs no wait; the stamp tells the bridge that this Hide is that tap's and not
-  a keyboard close. A stamp older than the bridge's 800 ms window means a
-  keyboard close and takes the keyboard lead instead.
+  The Windows-key close is animated now: the explorer-side bridge asks this mod
+  for the retract through the shared channel and holds
+  `CStartExperienceManager::Hide` until the settle it starts has run. Only this
+  process can plan that settle, so it answers with the planned duration and the
+  bridge waits exactly that plus a 30 ms margin; the mod runs the selected
+  settle style from rest (409 ms for the full panel at the planned 2.2 DIP/ms)
+  and the panel slides out instead of vanishing. One line per transition.
+- Every gesture close stamps the close channel at the release. The tap comes at
+  the end of the settle, so the Hide it causes needs no wait; the stamp, which
+  carries a sequence number, tells the bridge that this Hide is that tap's and
+  not a keyboard close. A stamp the bridge has already consumed, or one older
+  than its 800 ms window, means a keyboard close and takes the keyboard lead.
 - A new edge pull during the settle cancels the close before the shell is
   touched: the tap is dropped and the pull keeps driving the panel, so no Hide
   runs and the toggle is never advanced. The pull generation is sampled at the
-  release and checked once when the tap would run; the drop overwrites the stamp
-  with `cancelled`, so a later keyboard close uses its own lead.
+  release and checked once when the tap would run; the drop overrides the stamp
+  with the cancelled kind, so a later keyboard close uses its own lead.
 
 What it does not do:
 
-- It does not use the explorer-side bridge's shared memory; the bridge reaches
-  it only through the `retract` line, the `retract-plan.txt` answer and the
-  `close-mode.txt` stamp.
+- It does not read explorer memory or call into explorer. Every word that
+  crosses the process boundary goes through the shared section and its events.
 - It does not attach XAML pointer handlers and has no DirectManipulation
   hook.
 - It does not remove the shell's open storyboard. Measured with `anim=0`:
@@ -295,44 +294,37 @@ Settings:
 
 Debug channel (kept in the build):
 
-- `debug.txt` in the mod storage directory
-  (`C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\`)
-  is polled every 50 ms on the raw input thread and re-read only when its write
-  time or size changes. One command per line:
-  - `p=0.5` inserts `Progress`, clamped to 0..1.
-  - `t=-300,0,0` sets `UIElement.Translation` on the UI thread.
-  - `e=-300,0` sets `Properties["Offset"]` and `Visual.Offset` on the visual.
-  - `anim=0` suppresses the shell's open storyboard; `anim=1` restores it. The
-    default is `anim=1`, because suppression leaves the pane undrawn.
-  - `retract` plays the committed-dismiss settle from the current `Progress`:
-    `BeginGestureSettle(current, 0, 0)` in the selected style from rest, so a
-    full panel takes 409 ms at the planned 2.2 DIP/ms, and logs
-    `debug retract from=... dur=...`. The planned duration is the answer the
-    bridge waits for, so it is written to `retract-plan.txt` before that line;
-    a settle that did not start answers `retract=1` and logs
-    `debug retract failed`. The next open restores the scalar, so the command
-    leaves the reuse flag clear. The explorer-side bridge writes this line right
-    before it holds `CStartExperienceManager::Hide`, which is what turns a
-    Windows-key close into a slide-out. It applies only when the file was
-    written within the last second: the file keeps the last command after the
-    close, and a fresh Start process must not replay it on attach (that logs
-    `debug retract ignored (stale)`).
-  Empty lines and unknown lines are ignored. The channel compares the rendering
-  mechanisms without a gesture; it does nothing before the first
-  `attached root=...` line.
-- `close-mode.txt` in the same directory is not a command file. A gesture close
-  writes `gesture=0` at its release. The tap comes after the settle and causes
-  a Hide that needs no wait; the stamp is what tells the bridge that Hide is not
-  a keyboard close. A dropped close writes `cancelled`, which the bridge cannot
-  parse and treats as a keyboard close. Only a file younger than 800 ms is read;
-  a missing or older stamp means a keyboard close and the bridge falls back to
-  its own 560 ms lead. `CREATE_ALWAYS` creates and overwrites it, so no other
-  setup is needed.
-- `retract-plan.txt` in the same directory is the answer to a `retract` request:
-  `retract=<settleMs>` for the animation that just started, `retract=1` when no
-  animation started. It is written the moment the settle starts and never
-  refreshed, so the bridge can tell a live answer from the previous close's by
-  its write time.
+- The channel is shared memory plus three events, described in
+  `swipe_ipc_shared.h`; no file is involved and nothing polls.
+  `tools/ipc.ps1` writes a command and reads the counters:
+  - `pwsh -File tools\ipc.ps1 p=0.5` inserts `Progress`, clamped to 0..1.
+  - `pwsh -File tools\ipc.ps1 t=-300,0,0` sets `UIElement.Translation` on the UI
+    thread.
+  - `pwsh -File tools\ipc.ps1 e=-300,0` sets `Properties["Offset"]` and
+    `Visual.Offset` on the visual.
+  - `pwsh -File tools\ipc.ps1 anim=0` suppresses the shell's open storyboard;
+    `anim=1` restores it. The default is `anim=1`, because suppression leaves
+    the pane undrawn.
+  - `pwsh -File tools\ipc.ps1 -State` prints the counters: the command sequence,
+    the close stamp, the retract request and the plan.
+  The command event wakes the raw input thread, so a command runs within
+  milliseconds instead of waiting for a poll. The event is manual-reset and this
+  side resets it, so a command published while one is running is not lost.
+- The `retract` request is its own event, not a command: the bridge publishes a
+  sequence number right before it holds `CStartExperienceManager::Hide`, and
+  this side plans the settle from the current `Progress` and answers with its
+  duration on the same channel. `retract=<settleMs>` names the animation that
+  just started; the "no settle" sentinel says that nothing started, so the
+  bridge keeps its own default lead. The answer echoes the request's sequence
+  number, so an answer to an earlier close can never satisfy a later one.
+- The section outlives either process, so both sides record the sequence numbers
+  at attach and act only on what is newer. That is what the one-second freshness
+  check on the old command file did: a request that predates this process
+  belongs to a menu this process never drew (`debug retract ignored (stale)`
+  still names a request that waited more than a second).
+- The files this channel replaced (`debug.txt`, `close-mode.txt`,
+  `retract-plan.txt`) are deleted at init; they are transport, not state, and a
+  leftover would invite a reader that no longer exists.
 
 Diagnostics:
 
@@ -352,7 +344,7 @@ Diagnostics:
   `close tap kind=dismiss|reveal delay=...`,
   `close tap dropped kind=dismiss|reveal`,
   `close tap skipped kind=... (already closed)`,
-  `close mode write failed kind=...`, `close mode cancel write failed`,
+  `close mode stamp failed kind=...`, `close mode cancel stamp failed`,
   `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
   `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`, or
   `reveal panelTrail rejected ...` when the work-area guard kept the previous
@@ -360,8 +352,9 @@ Diagnostics:
   `hid decodefail dev=... err=...`,
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
   `debug e=...`, `debug anim=...`, `debug retract from=... dur=...`,
-  `debug retract failed`, `retract plan write failed dur=...`,
-  `debug retract ignored (stale)`,
+  `debug retract failed`, `retract answer failed dur=...`,
+  `debug retract ignored (stale)`, `ipc open created=... cmd=... retract=...`,
+  `ipc open failed err=...`, `ipc legacy files removed=...`,
   `gesture geometry updated axis=... dist=...` (or
   `gesture geometry axis=... dist=... (unchanged)` once per open),
   `gesture geometry write failed ...`, `gesture geometry queue err=...`,
@@ -445,19 +438,19 @@ Known risks:
   animates it. In practice the window is the hide delay, not the full 600 ms.
 - The tap holds the input thread for 60 ms. It runs after the retract, on the
   input thread, and is global; a new contact's reports queue behind it.
-- `close-mode.txt` is read only inside its 800 ms window. A gesture close stamps
-  `gesture=0` at its release; the tap's Hide arrives at the end of the settle
+- The close stamp is read only inside its 800 ms window. A gesture close stamps
+  it at its release; the tap's Hide arrives at the end of the settle
   (409 ms for a full 900 DIP panel at the planned 2.2 DIP/ms) and runs
-  at once. A dropped close stamps `cancelled`, which the bridge treats as a
-  keyboard close, so a Win press within the window still takes the keyboard lead.
-- A keyboard close's lead is the answer this mod writes to `retract-plan.txt`,
-  plus the bridge's 30 ms margin. The answer can only be written after the
-  bridge's request has been polled for, so the shell hides 30-100 ms after the
-  settle has run to its end, never while it is still moving. When the answer
-  never arrives (the mod is disabled, the file write failed, the settle did not
-  start) the bridge waits its own 560 ms from the request instead: that covers
-  the 409 ms full panel, but a panel resized past 480 DIP of travel, whose settle
-  hits the 520 ms clamp, can lose its last frames behind that fallback.
+  at once. A dropped close stamps the cancelled kind, which the bridge treats as
+  a keyboard close, so a Win press within the window still takes the keyboard lead.
+- A keyboard close's lead is the answer this mod publishes on the channel,
+  plus the bridge's 30 ms margin. The answer can only be sent after the
+  bridge's request has reached this thread, so the shell hides one margin after
+  the settle has run to its end, never while it is still moving. When the answer
+  never arrives (the mod is disabled, the settle did not start) the bridge waits
+  its own 560 ms instead: that covers the 409 ms full panel, but a panel resized
+  past 480 DIP of travel, whose settle hits the 520 ms clamp, can lose its last
+  frames behind that fallback.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -521,12 +514,10 @@ Known risks:
  *   work-area refresh to; on the `WM_SETTINGCHANGE` (`SPI_SETWORKAREA`) and
  *   `WM_DISPLAYCHANGE` broadcasts the hidden top-level input window receives
  *   (a message-only window would not, which is why the window is not
- *   message-only); on `debug.txt` in the
- *   mod storage directory, read by the debug channel; on the fixed
- *   `close-mode.txt` path in the same directory: each gesture close stamps
- *   `gesture=0` at its release, or `cancelled` when a pull drops its tap, and the
- *   bridge uses the stamp to tell the tap's Hide from a keyboard close; on the
- *   fixed `retract-plan.txt` path, which holds the answer the bridge waits for.
+ *   message-only); on the shared IPC channel (`swipe_ipc_shared.h`): the command
+ *   event carries `p`/`t`/`e`/`anim` from `tools/ipc.ps1`, the retract event
+ *   carries the bridge's request, and the section publishes this mod's close
+ *   stamp (gesture or cancelled) and its answer to that request.
  * [OUTPUT]: one hidden top-level window and one worker thread per process; the
  *   Composition `Progress` scalar plus the `Distance`/`DirX`/`DirY` inputs the
  *   expression reads, which the open-time and work-area refresh rewrites when
@@ -550,7 +541,7 @@ Known risks:
  *   per 4 ms or less and each clamped to 0..1 and to its predecessor, plus one
  *   landing keyframe that carries the exact target. The
  *   helper also owns the suppression window, the
- *   close-mode stamp and the
+ *   close stamp and the
  *   armed tap, whose delay is the settle's own duration (160-520 ms), so
  *   neither gesture family can skip one; both settings are read once at init
  *   and refreshed on a settings change, logged as
@@ -575,13 +566,13 @@ Known risks:
  *   window ends as soon as the shell reports the window cloaked; an optional
  *   suppressed open animation request
  *   (type 0, off by default because dropping it leaves the pane undrawn) while
- *   the close request (type 1) always passes through; five file-driven debug
- *   commands (`p`, `t`, `e`, `anim`, `retract`) that apply a Progress value, the
- *   XAML translation, the visual offset, the animation mode or the settle
- *   the explorer-side bridge asks for, and the answer to that request
- *   (`retract=<settleMs>` or the legacy `retract=1`) written to
- *   `retract-plan.txt` the moment the requested settle starts, so the bridge can
- *   hold the shell's Hide for exactly that duration; no exported symbols.
+ *   the close request (type 1) always passes through; four debug commands
+ *   (`p`, `t`, `e`, `anim`) that apply a Progress value, the XAML translation,
+ *   the visual offset or the animation mode, and the
+ *   answer to the bridge's retract request (its planned duration, or the
+ *   no-settle sentinel) published on the same channel the moment the requested
+ *   settle starts, so the bridge can hold the shell's Hide for exactly that
+ *   duration; no exported symbols.
  * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
  *   pointer and DirectManipulation paths with raw HID decoding, owns two
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
@@ -596,7 +587,8 @@ Known risks:
  *   generation checked
  *   at the tap drops it, so a re-pull never touches the shell. The explorer-side
  *   bridge still calls the original Hide; it only skips its keyboard lead when
- *   the stamp names the tap, and otherwise waits the duration the answer names.
+ *   the close stamp names the tap, and otherwise waits the duration the answer
+ *   names.
  *   The composition helpers below it are shared with the root hook above it.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
@@ -631,6 +623,8 @@ Known risks:
 #include <mutex>
 #include <new>
 #include <vector>
+
+#include "swipe_ipc_shared.h"
 
 namespace {
 
@@ -830,7 +824,7 @@ constexpr std::chrono::milliseconds kOpenSlideDuration{260};
 // Every gesture close ends in one Windows tap at the end of its settle. The tap
 // is the shell's own Start toggle: the key handler performs Hide, so no
 // explorer-side request and no re-arm tap exist. The settle runs first, so the
-// panel is already off screen when the window hides; close-mode.txt tells the
+// panel is already off screen when the window hides; the close channel tells the
 // bridge that the Hide belongs to this tap and needs no further delay.
 constexpr uint64_t kCloseTapDelayMs = 0;
 
@@ -896,8 +890,6 @@ constexpr float kEdgeBandDip = 12.0f;
 constexpr uint64_t kIdleReleaseMs = 18;
 constexpr UINT_PTR kIdleTimerId = 1;
 constexpr UINT kIdleTimerMs = 5;  // also the waitable timer period
-constexpr UINT_PTR kDebugTimerId = 2;
-constexpr UINT kDebugTimerMs = 50;
 // The DWM cloaked query is a syscall. The report handler accepts one answer
 // per interval and reuses it for every other report.
 constexpr uint64_t kOpenCheckIntervalMs = 20;
@@ -1438,10 +1430,14 @@ void RefreshGestureGeometry();
 // `Progress`, and the next open restores it anyway.
 extern bool g_commitNeedsProgressReset;
 
-// Defined with the file paths below. A close stamps its retract delay there
-// immediately before the Windows tap, so the bridge can hold the shell's Hide
-// for exactly that long.
-bool WriteCloseMode(uint64_t delayMs);
+// The cross-process channel with the explorer-side bridge and the debug tools.
+// Defined with the channel helpers below; a gesture close stamps its mode
+// through it before the Windows tap.
+SwipeIpcChannel g_ipc;
+
+// The close stamp goes through the shared channel below, which the input thread
+// uses before the Windows tap so the bridge can hold the shell's Hide for
+// exactly that long.
 
 // Defined with the input-thread gesture state below; the close tap needs the
 // kind for its log line.
@@ -1860,14 +1856,14 @@ float CoastedProgress() {
     return value;
 }
 
-// The tail every close shares: the suppression window, the close-mode stamp the
+// The tail every close shares: the suppression window, the close stamp the
 // bridge reads, and the tap armed for the end of the settle. The dismiss and
 // the reveal cancel both come through here, so the two families cannot diverge.
 void ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
     g_suppressRestoreUntil.store(GetTickCount64() + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
-    if (!WriteCloseMode(kCloseTapDelayMs)) {
-        FileLog(L"close mode write failed kind=%s", CloseKindName(kind));
+    if (!SwipeIpcStampClose(&g_ipc, kSwipeCloseKindGesture, kCloseTapDelayMs)) {
+        FileLog(L"close mode stamp failed kind=%s", CloseKindName(kind));
     }
     ScheduleCloseTap(kind, static_cast<uint64_t>(duration.count()));
 }
@@ -1901,7 +1897,7 @@ bool BeginGestureOpen(float from, float velocity) {
 //
 // Committed dismiss: the settle batch observes the settle, the shared close
 // tail arms the tap. The settle itself, the log line, the suppression window,
-// the close-mode stamp and the tap all come from BeginGestureClose, so this path
+// the close stamp and the tap all come from BeginGestureClose, so this path
 // and the reveal cancel cannot diverge.
 bool BeginDismissSettle(float from, float velocity) {
     wuc::CompositionScopedBatch batch{nullptr};
@@ -1991,130 +1987,82 @@ bool BeginDismissSettle(float from, float velocity) {
 }
 
 // ---------------------------------------------------------------------------
-// Debug command channel
+// Cross-process channel
 //
-// Kept in the shipping build. It applies one rendering mechanism at a time so
-// the candidates can be compared without a gesture. The file is
-//   C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\
-//   local@start-menu-legacy-swipe\debug.txt
-// which is the directory Wh_GetModStoragePath returns. One command per line:
-//   p=<progress>        InsertProgress, clamped to 0..1
-//   t=<x>,<y>,<z>       UIElement.Translation, applied on the UI thread (DIP)
-//   e=<x>[,<y>]         visual Properties["Offset"] and Visual.Offset (DIP)
-// The raw input thread polls the file every 50 ms and re-reads it only when
-// its write time or size changes. Nothing is logged per poll.
+// Kept in the shipping build. Both directions run through the one section in
+// swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
+//   Local\SwipeFor10Start_v1_Cmd         p=, t=, e=, anim=   (tools -> here)
+//   Local\SwipeFor10Start_v1_RetractReq  "how long is the retract?"  (bridge)
+//   Local\SwipeFor10Start_v1_RetractPlan that many ms, or "none"     (here)
+//   ..._State.closeSeq                   "this Hide is my own tap"   (here)
+//
+// The section outlives either process, so its sequence numbers start from
+// whatever the other side left. This mod records them at attach and acts only
+// on what is newer, which is what the one-second freshness check on the old
+// command file did: a command or request that predates this process belongs to
+// a menu this process never drew.
 // ---------------------------------------------------------------------------
 
-constexpr wchar_t kDebugFileName[] = L"debug.txt";
-constexpr DWORD kDebugFileMaxBytes = 4096;
+// The highest sequence this process has acted on. Set from the section at
+// attach, advanced by the input thread only.
+LONG64 g_ipcCommandSeq = 0;
+LONG64 g_ipcRetractSeq = 0;
 
-// The explorer-side bridge must know whether a Hide is the Start side's own tap
-// or a keyboard close. A gesture close stamps `gesture=0` at its release; its tap
-// comes after the retract, so the bridge passes that Hide at once. A close
-// dropped before its tap stamps `cancelled`, which the bridge cannot parse and
-// treats as a keyboard close, so that Hide takes the keyboard lead.
-// Only a file younger than 800 ms is used; `CREATE_ALWAYS` creates and
-// overwrites it.
-constexpr wchar_t kCloseModeFileName[] = L"close-mode.txt";
-// Written when a close is dropped before its tap: the stamp is fresh but names
-// no gesture close, so the next Hide takes the keyboard path.
-constexpr char kCloseModeCancelled[] = "cancelled\r\n";
+// A request older than this is not answered: the bridge writes one right before
+// it holds the Hide, so a request that sat unread for a second belongs to a
+// close that has already happened.
+constexpr uint64_t kRetractRequestFreshMs = 1000;
 
-// The answer to the bridge's keyboard-close request. The settle is planned here,
-// from the current `Progress` and the panel travel, so only this process can say
-// how long the shell has to wait for it. The bridge writes `retract` into
-// debug.txt and then reads this file: `retract=<settleMs>` names the animation
-// that just started, and the legacy `retract=1` says that no animation started,
-// so the bridge keeps its own default lead. The bridge anchors its wait on this
-// write's timestamp, which is why it is written the moment the settle starts and
-// never refreshed later.
-constexpr wchar_t kRetractPlanFileName[] = L"retract-plan.txt";
-constexpr uint64_t kRetractPlanUnknownMs = 1;
+void OpenIpcChannel() {
+    bool created = false;
+    DWORD error = 0;
+    if (!SwipeIpcOpen(&g_ipc, &created, &error)) {
+        FileLog(L"ipc open failed err=%u", static_cast<unsigned>(error));
+        return;
+    }
 
-// `retract` is a live signal from the explorer-side bridge, not a state: the
-// bridge writes it right before it delays the hide. The file keeps the last
-// command after the close, so a fresh Start process would otherwise replay it
-// on attach and retract the menu that just opened. One second is far more than
-// the keyboard lead and the poll that reads it.
-constexpr uint64_t kDebugCommandFreshMs = 1000;
+    // Everything published before this attach belongs to an earlier menu.
+    g_ipcCommandSeq = SwipeIpcLoad64(&g_ipc.state->cmdSeq);
+    g_ipcRetractSeq = SwipeIpcLoad64(&g_ipc.state->retractRequestSeq);
+    FileLog(L"ipc open created=%d cmd=%lld retract=%lld", created ? 1 : 0,
+            static_cast<long long>(g_ipcCommandSeq),
+            static_cast<long long>(g_ipcRetractSeq));
+}
 
-struct DebugFileStamp {
-    bool seen = false;
-    DWORD writeLow = 0;
-    DWORD writeHigh = 0;
-    LONGLONG size = 0;
-};
-
-DebugFileStamp g_debugFileStamp;  // input thread only
-
-// One path builder for both files in the mod storage directory.
-bool StorageFilePath(const wchar_t* name, WCHAR* path, size_t count) {
+// Deletes the files this channel used before it moved to shared memory. They
+// carry no state worth keeping, and a leftover retract-plan.txt invites a
+// reader that no longer exists.
+void RemoveLegacyChannelFiles() {
     WCHAR storage[MAX_PATH] = {};
     if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
-        return false;
+        return;
     }
 
-    return swprintf_s(path, count, L"%s\\%s", storage, name) > 0;
-}
-
-// Writes one marker into the mod storage directory with `CREATE_ALWAYS`, which
-// creates the file and touches its last-write time. CloseHandle flushes the
-// cached timestamp, which is what GetFileAttributesExW reports on the other
-// side. The close mode's content is read by the bridge; the debug command is
-// timestamp-only.
-bool WriteStorageMarker(const wchar_t* name, const char* text, size_t length) {
-    WCHAR path[MAX_PATH] = {};
-    if (!StorageFilePath(name, path, ARRAYSIZE(path))) {
-        return false;
+    const wchar_t* names[] = {L"debug.txt", L"close-mode.txt",
+                              L"retract-plan.txt"};
+    int removed = 0;
+    for (const wchar_t* name : names) {
+        WCHAR path[MAX_PATH] = {};
+        if (swprintf_s(path, ARRAYSIZE(path), L"%s\\%s", storage, name) > 0 &&
+            DeleteFileW(path)) {
+            ++removed;
+        }
     }
-
-    HANDLE file = CreateFileW(path, GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
+    if (removed > 0) {
+        FileLog(L"ipc legacy files removed=%d", removed);
     }
-
-    DWORD written = 0;
-    const BOOL ok = WriteFile(file, text, static_cast<DWORD>(length), &written,
-                              nullptr);
-    CloseHandle(file);
-    return ok && written == length;
-}
-
-// Stamps the close mode for the explorer-side bridge. Called on the input thread
-// right before a gesture close taps the Windows key; the write has to finish
-// before the tap, because the shell can call Hide a few milliseconds after it.
-// The value is the tap's own delay (0: the settle has already retracted the
-// panel), so the bridge passes that Hide at once. A failed write only costs an
-// early 350 ms keyboard lead on the bridge side, which still covers the settle.
-bool WriteCloseMode(uint64_t delayMs) {
-    char text[32] = {};
-    const int length = std::snprintf(text, sizeof(text), "gesture=%llu\r\n",
-                                     static_cast<unsigned long long>(delayMs));
-    if (length <= 0 || static_cast<size_t>(length) >= sizeof(text)) {
-        return false;
-    }
-
-    return WriteStorageMarker(kCloseModeFileName, text,
-                              static_cast<size_t>(length));
 }
 
 // Tells the explorer-side bridge how long the settle it asked for lasts, or that
 // no settle started. Called on the input thread right after the animation
 // started: the bridge is holding the shell's Hide until this answer arrives, so
-// the write comes before the diagnostic line. A failed write only costs the
-// bridge's own default lead, never the animation.
-bool WriteRetractPlan(uint64_t settleMs) {
-    char text[32] = {};
-    const int length = std::snprintf(text, sizeof(text), "retract=%llu\r\n",
-                                     static_cast<unsigned long long>(settleMs));
-    if (length <= 0 || static_cast<size_t>(length) >= sizeof(text)) {
-        return false;
-    }
-
-    return WriteStorageMarker(kRetractPlanFileName, text,
-                              static_cast<size_t>(length));
+// the answer comes before the diagnostic line. The answer echoes the request's
+// sequence number, so an answer to an earlier close cannot satisfy a later one.
+// A failed answer only costs the bridge's own fallback lead, never the
+// animation.
+bool AnswerRetract(LONG64 requestSequence, uint64_t settleMs) {
+    return SwipeIpcAnswerRetract(&g_ipc, requestSequence,
+                                 static_cast<int32_t>(settleMs));
 }
 
 // Parses "v[,v...]" up to maxCount values. A missing, partial or trailing
@@ -2214,7 +2162,7 @@ void RequestTranslation(float x, float y, float z) {
     }
 }
 
-void ApplyDebugLine(const char* line, bool fresh) {
+void ApplyDebugLine(const char* line) {
     while (*line == ' ' || *line == '\t' || *line == '\r') {
         ++line;
     }
@@ -2236,49 +2184,6 @@ void ApplyDebugLine(const char* line, bool fresh) {
         const int anim = *value - '0';
         g_suppressOpenAnim.store(anim == 0, std::memory_order_relaxed);
         FileLog(L"debug anim=%d", anim);
-        return;
-    }
-
-    // The explorer-side bridge writes `retract` right before it delays
-    // CStartExperienceManager::Hide. The close is already decided, so the panel
-    // slides out on the same settle a committed dismiss uses while the shell
-    // waits. The bridge cannot know this settle's travel, so it waits for the
-    // answer written to retract-plan.txt: the planned duration, or the legacy
-    // `retract=1` when no animation started. It only ever writes this for a
-    // close the mod did not start itself (see close-mode.txt); a gesture close
-    // taps the Windows key and stamps its own delay instead.
-    if (std::strncmp(line, "retract", 7) == 0) {
-        if (!fresh) {
-            // A leftover command from an earlier close: the panel it belonged to
-            // is already gone, and the menu that is on screen now must stay.
-            FileLog(L"debug retract ignored (stale)");
-            return;
-        }
-
-        const float from =
-            std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
-                       1.0f);
-        // The keyboard close has no release speed of its own, so it settles
-        // from rest: the plain step response of the selected spring.
-        std::chrono::milliseconds duration{0};
-        if (BeginGestureSettle(from, 0.0f, 0.0f, duration)) {
-            // The window is about to be hidden: the next open restores Progress
-            // by itself, so no restore is owed after this retract.
-            g_commitNeedsProgressReset = false;
-            // The bridge is waiting for this answer, so it goes out before the
-            // diagnostic line.
-            if (!WriteRetractPlan(static_cast<uint64_t>(duration.count()))) {
-                FileLog(L"retract plan write failed dur=%llu",
-                        static_cast<unsigned long long>(duration.count()));
-            }
-            FileLog(L"debug retract from=%.3f dur=%llu", from,
-                    static_cast<unsigned long long>(duration.count()));
-        } else {
-            // No animation, so there is no duration to wait for: the legacy
-            // value tells the bridge to use its own default lead.
-            FileLog(L"debug retract failed");
-            WriteRetractPlan(kRetractPlanUnknownMs);
-        }
         return;
     }
 
@@ -2323,14 +2228,14 @@ void ApplyDebugLine(const char* line, bool fresh) {
     }
 }
 
-void ApplyDebugCommands(char* text, bool fresh) {
+void ApplyDebugCommands(char* text) {
     char* cursor = text;
     while (*cursor != '\0') {
         char* newline = std::strchr(cursor, '\n');
         if (newline) {
             *newline = '\0';
         }
-        ApplyDebugLine(cursor, fresh);
+        ApplyDebugLine(cursor);
         if (!newline) {
             return;
         }
@@ -2338,93 +2243,78 @@ void ApplyDebugCommands(char* text, bool fresh) {
     }
 }
 
-// Reads the command file only when its write time or size changed, and only
-// after the renderer exists: before the first Setup neither mechanism has an
-// object to act on.
-void PollDebugFile() {
+// Applies the newest debug command, if one arrived. The command event is
+// manual-reset, so a command published while this runs is not lost: the next
+// pass takes it. Nothing runs before the renderer exists, because before the
+// first Setup neither mechanism has an object to act on; a command that arrives
+// then stays in the section and is replaced by the next one.
+void ApplyPendingCommand() {
+    ResetEvent(g_ipc.commandEvent);
     if (g_unloading.load(std::memory_order_relaxed) ||
         !g_hasRoot.load(std::memory_order_relaxed)) {
         return;
     }
 
-    WCHAR path[MAX_PATH] = {};
-    if (!StorageFilePath(kDebugFileName, path, ARRAYSIZE(path))) {
+    char text[kSwipeIpcCommandMaxBytes] = {};
+    if (!SwipeIpcTakeCommand(&g_ipc, text, sizeof(text), &g_ipcCommandSeq)) {
         return;
     }
-
-    WIN32_FILE_ATTRIBUTE_DATA attributes{};
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) ||
-        (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-        // A missing file is not an error. Forget the stamp so a recreated file
-        // is read even when it keeps the old size.
-        g_debugFileStamp = DebugFileStamp{};
-        return;
-    }
-
-    const LONGLONG size =
-        (static_cast<LONGLONG>(attributes.nFileSizeHigh) << 32) |
-        static_cast<LONGLONG>(attributes.nFileSizeLow);
-
-    if (g_debugFileStamp.seen &&
-        attributes.ftLastWriteTime.dwLowDateTime ==
-            g_debugFileStamp.writeLow &&
-        attributes.ftLastWriteTime.dwHighDateTime ==
-            g_debugFileStamp.writeHigh &&
-        size == g_debugFileStamp.size) {
-        return;
-    }
-
-    g_debugFileStamp.seen = true;
-    g_debugFileStamp.writeLow = attributes.ftLastWriteTime.dwLowDateTime;
-    g_debugFileStamp.writeHigh = attributes.ftLastWriteTime.dwHighDateTime;
-    g_debugFileStamp.size = size;
-
-    // Age of this write, so a live `retract` is told apart from one the file
-    // kept from an earlier close.
-    ULARGE_INTEGER written{};
-    written.LowPart = attributes.ftLastWriteTime.dwLowDateTime;
-    written.HighPart = attributes.ftLastWriteTime.dwHighDateTime;
-    FILETIME nowFileTime{};
-    GetSystemTimeAsFileTime(&nowFileTime);
-    ULARGE_INTEGER now{};
-    now.LowPart = nowFileTime.dwLowDateTime;
-    now.HighPart = nowFileTime.dwHighDateTime;
-    const bool fresh =
-        now.QuadPart >= written.QuadPart &&
-        now.QuadPart - written.QuadPart <= kDebugCommandFreshMs * 10000ULL;
-
-    if (size <= 0 || size > kDebugFileMaxBytes) {
-        return;
-    }
-
-    HANDLE file = CreateFileW(path, GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                  FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    char buffer[kDebugFileMaxBytes + 1] = {};
-    DWORD read = 0;
-    const BOOL ok = ReadFile(file, buffer, kDebugFileMaxBytes, &read, nullptr);
-    CloseHandle(file);
-    if (!ok || read == 0) {
-        return;
-    }
-    buffer[read] = '\0';
-
-    // An editor may prepend a UTF-8 BOM; skip it so the first line parses.
-    char* text = buffer;
-    if (read >= 3 && static_cast<unsigned char>(text[0]) == 0xEF &&
-        static_cast<unsigned char>(text[1]) == 0xBB &&
-        static_cast<unsigned char>(text[2]) == 0xBF) {
-        text += 3;
-    }
-
-    ApplyDebugCommands(text, fresh);
+    ApplyDebugCommands(text);
 }
+
+// The bridge asks how long the retract it just triggered lasts, and holds
+// CStartExperienceManager::Hide until the answer arrives. The close is already
+// decided, so the panel slides out on the same settle a committed dismiss uses.
+// Only this process can plan it: the travel belongs to the panel, not the shell.
+void ApplyRetractRequest() {
+    const int64_t sequence = SwipeIpcLoad64(&g_ipc.state->retractRequestSeq);
+    if (sequence == g_ipcRetractSeq) {
+        return;
+    }
+    g_ipcRetractSeq = sequence;
+
+    const uint64_t written =
+        static_cast<uint64_t>(SwipeIpcLoad64(&g_ipc.state->retractRequestTick));
+    const uint64_t now = GetTickCount64();
+    if (now > written && now - written > kRetractRequestFreshMs) {
+        // A request that sat unread: the menu it belonged to is gone, and the
+        // one on screen now must stay.
+        FileLog(L"debug retract ignored (stale)");
+        AnswerRetract(sequence, kSwipeRetractPlanNone);
+        return;
+    }
+    if (g_unloading.load(std::memory_order_relaxed) ||
+        !g_hasRoot.load(std::memory_order_relaxed)) {
+        AnswerRetract(sequence, kSwipeRetractPlanNone);
+        return;
+    }
+
+    const float from =
+        std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f, 1.0f);
+    // The keyboard close has no release speed of its own, so it settles from
+    // rest: the plain step response of the selected spring.
+    std::chrono::milliseconds duration{0};
+    if (BeginGestureSettle(from, 0.0f, 0.0f, duration)) {
+        // The window is about to be hidden: the next open restores Progress by
+        // itself, so no restore is owed after this retract.
+        g_commitNeedsProgressReset = false;
+        // The bridge is waiting for this answer, so it goes out before the
+        // diagnostic line.
+        if (!AnswerRetract(sequence,
+                           static_cast<uint64_t>(duration.count()))) {
+            FileLog(L"retract answer failed dur=%llu",
+                    static_cast<unsigned long long>(duration.count()));
+        }
+        FileLog(L"debug retract from=%.3f dur=%llu", from,
+                static_cast<unsigned long long>(duration.count()));
+    } else {
+        // No animation, so there is no duration to wait for: the bridge uses
+        // its own lead.
+        FileLog(L"debug retract failed");
+        AnswerRetract(sequence, kSwipeRetractPlanNone);
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Raw HID input
@@ -3310,7 +3200,7 @@ void ReleaseRevealSession() {
         return;
     }
 
-    // Short reveal: the same settle, the same log line, the same close-mode
+    // Short reveal: the same settle, the same log line, the same close
     // stamp, the same suppression window and the same armed tap as the
     // committed dismiss, from the same release speed. Both close paths read
     // identically from any finger position.
@@ -3803,9 +3693,8 @@ void RunPendingCloseTap(uint64_t tickMs) {
     g_pendingTapKind = CloseKind::None;
 
     if (g_pullSerial != pull || g_reveal.active || g_reveal.edgeCandidate) {
-        if (!WriteStorageMarker(kCloseModeFileName, kCloseModeCancelled,
-                                sizeof(kCloseModeCancelled) - 1)) {
-            FileLog(L"close mode cancel write failed");
+        if (!SwipeIpcStampClose(&g_ipc, kSwipeCloseKindCancelled, 0)) {
+            FileLog(L"close mode cancel stamp failed");
         }
         FileLog(L"close tap dropped kind=%s", CloseKindName(kind));
         return;
@@ -4245,8 +4134,6 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
                 RunPendingCloseTap(now);
                 CheckHidIdleRelease(now);
                 PollRootVisibility(now);
-            } else if (wParam == kDebugTimerId) {
-                PollDebugFile();
             }
             return 0;
         // The taskbar moved or the display layout changed: the dismiss axis and
@@ -4331,25 +4218,36 @@ DWORD WINAPI HidInputThread(LPVOID) {
 
     // The idle tick: a high-resolution waitable timer, because WM_TIMER stays on
     // the 15.6 ms tick on this build even while a 1 ms period is held. The
-    // WM_TIMER tick stays as the fallback and is also the debug poll.
+    // WM_TIMER tick stays as the fallback.
     HANDLE idleTimer = CreateIdleWaitableTimer();
     if (!idleTimer) {
         FileLog(L"hid timer fallback err=%u",
                 static_cast<unsigned>(GetLastError()));
         SetTimer(hwnd, kIdleTimerId, kIdleTimerMs, nullptr);
     }
-    SetTimer(hwnd, kDebugTimerId, kDebugTimerMs, nullptr);
+
+    // Object 0 is the idle tick when the waitable timer exists, then the debug
+    // command event and the bridge's retract request, then the message queue.
+    // Both are events, so neither direction costs a poll.
+    HANDLE waits[3] = {};
+    DWORD waitCount = 0;
+    if (idleTimer) {
+        waits[waitCount++] = idleTimer;
+    }
+    if (g_ipc.commandEvent) {
+        waits[waitCount++] = g_ipc.commandEvent;
+    }
+    if (g_ipc.retractRequestEvent) {
+        waits[waitCount++] = g_ipc.retractRequestEvent;
+    }
 
     MSG msg;
     bool running = true;
     while (running) {
-        // With the waitable timer, object 0 is the idle tick and the last index
-        // is the message queue; without it only the queue is waited on.
-        const DWORD objectCount = idleTimer ? 1 : 0;
-        const DWORD wait = MsgWaitForMultipleObjects(objectCount, &idleTimer,
-                                                     FALSE, INFINITE,
-                                                     QS_ALLINPUT);
-        if (wait == WAIT_OBJECT_0 + objectCount) {
+        const DWORD wait =
+            MsgWaitForMultipleObjects(waitCount, waits, FALSE, INFINITE,
+                                      QS_ALLINPUT);
+        if (wait == WAIT_OBJECT_0 + waitCount) {
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 if (msg.message == WM_QUIT) {
                     running = false;
@@ -4360,11 +4258,23 @@ DWORD WINAPI HidInputThread(LPVOID) {
             }
             continue;
         }
-        if (idleTimer && wait == WAIT_OBJECT_0) {
-            const uint64_t now = GetTickCount64();
-            RunPendingCloseTap(now);
-            CheckHidIdleRelease(now);
-            PollRootVisibility(now);
+        if (wait < WAIT_OBJECT_0 + waitCount) {
+            const HANDLE signalled = waits[wait - WAIT_OBJECT_0];
+            if (signalled == idleTimer) {
+                const uint64_t now = GetTickCount64();
+                RunPendingCloseTap(now);
+                CheckHidIdleRelease(now);
+                PollRootVisibility(now);
+                continue;
+            }
+            if (signalled == g_ipc.commandEvent) {
+                ApplyPendingCommand();
+                continue;
+            }
+            if (signalled == g_ipc.retractRequestEvent) {
+                ApplyRetractRequest();
+                continue;
+            }
             continue;
         }
         break;  // WAIT_FAILED, or no timer and no input: leave the loop
@@ -4375,7 +4285,6 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
 
     KillTimer(hwnd, kIdleTimerId);
-    KillTimer(hwnd, kDebugTimerId);
     if (idleTimer) {
         CancelWaitableTimer(idleTimer);
         CloseHandle(idleTimer);
@@ -4394,7 +4303,6 @@ DWORD WINAPI HidInputThread(LPVOID) {
     g_pendingTapKind = CloseKind::None;
     g_coasting.store(false, std::memory_order_relaxed);
     ResetCoastVelocity();
-    g_debugFileStamp = DebugFileStamp{};
     FreeHidDevices();
 
     if (IsWindow(hwnd)) {
@@ -5793,9 +5701,14 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.14.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.16.0 initializing");
     LoadAnimationStyle();
     LoadGestureStartSpeed();
+    // The cross-process channel: without it a gesture close still closes (the
+    // Windows tap is local) but the bridge cannot tell that Hide from a keyboard
+    // close, and a keyboard close cannot be answered with its retract.
+    OpenIpcChannel();
+    RemoveLegacyChannelFiles();
     FileLog(L"settle plan speed=%.2f dip/ms dur=%llu..%llu segment=%.1f ms "
             L"frames=%d..%d",
             static_cast<double>(kSettleSpeedDipPerMs),
@@ -5915,6 +5828,7 @@ void Wh_ModBeforeUninit() {
 void Wh_ModUninit() {
     RevokeHandlersOnUiThread();
     ResetComposition();
+    SwipeIpcClose(&g_ipc);
     Wh_Log(L"Legacy Start Edge Swipe Dismiss uninitialized");
 }
 

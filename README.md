@@ -75,7 +75,7 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    the rest position (measured 0 DIP short) and the polyline stays smooth at
    120 Hz.
 
-   The close's `VK_LWIN` tap is scheduled at `T`, and `close-mode.txt` tells the
+   The close's `VK_LWIN` tap is scheduled at `T`, and the close stamp tells the
    bridge the hide that tap causes needs no retract lead.
 
    Two parameter sets ship, chosen by the **Gesture animation style** setting
@@ -104,14 +104,17 @@ open slides in the way a gesture open does. A Win-key close is animated too:
 menu away, so the explorer-side bridge asks the Start mod to retract and holds
 that call until the retract is over. The request carries no duration — only the
 Start side knows the panel's travel — so the mod answers with the settle it just
-planned (409 ms for the 900 DIP panel at 2.2 DIP/ms) in `retract-plan.txt`, and
-the bridge waits that plus 30 ms. Without an answer it falls back to a fixed
-560 ms. Measured with the menu fully open: the request was written at
+planned (409 ms for the 900 DIP panel at 2.2 DIP/ms) on the same shared channel,
+and the bridge waits that plus 30 ms. Without an answer it falls back to a fixed
+560 ms. Measured with the menu fully open before the channel moved to shared
+memory: the request was written at
 `23:15:09.588` and the answer at `23:15:09.654` (66 ms, one 50 ms debug poll in
 its slow phase), the renderer logged `settle ... dur=409` and
 `debug retract from=1.000 dur=409`, the bridge logged
 `hide delayed reason=1 retract=409 lead=439`, and the window was cloaked 549 ms
-after the key-down, 50 ms after the settle it had answered with ended.
+after the key-down, 50 ms after the settle it had answered with ended. On the
+channel the answer needs no poll: the bridge measured `retract=520 lead=550`
+with the request answered on the same event cycle.
 
 The panel's own travel ends sooner than the settle's clock: its bottom edge went
 1351 → 870 → 640 → 448 → 150 px and left the screen 192 ms after the key-down,
@@ -123,7 +126,7 @@ lead now follows the settle instead of a constant, which is what a menu whose
 panel reaches closer to the screen edge needs.
 
 A gesture close needs no retract command. Its retract starts at the release and
-its tap comes at the end of it; the bridge sees the fresh `close-mode.txt` stamp
+its tap comes at the end of it; the bridge sees the unconsumed close stamp
 and calls the shell's `Hide` at once, because the panel is already off screen.
 The tap is what updates the Start toggle, and it is the only tap: there is no
 programmatic `Hide` and no 120 ms re-arm tap, so a press cannot collide with
@@ -299,18 +302,23 @@ is closed after the down, so the only in-process source is the digitizer itself.
   logic. **Do not enable it together with the shipping mod**: Raw Input allows one
   sink per usage per process, and inputprobe takes the stream for itself.
 - **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`) — hooks
-  `CStartExperienceManager::Hide`. A keyboard close writes the `retract` request
-  to the Start mod's `debug.txt` and then holds the Hide for the settle that mod
-  answers with in `retract-plan.txt`, plus 30 ms (fixed 560 ms when no answer
-  arrives); a gesture close is tapped only after its retract, and its `gesture=0`
-  stamp makes the Hide run at once (`hide passed (gesture)`). A dropped gesture
-  close stamps `cancelled`, which takes the keyboard path. Publishes the
+  `CStartExperienceManager::Hide`. A keyboard close publishes the `retract`
+  request on the shared channel and then holds the Hide for the settle that mod
+  answers with, plus 30 ms (fixed 560 ms when no answer
+  arrives); a gesture close is tapped only after its retract, and its unconsumed
+  close stamp makes the Hide run at once (`hide passed (gesture)`). A dropped
+  gesture close stamps the cancelled kind, which takes the keyboard path.
+  Publishes the
   taskbar-edge gesture handle/state from `twinui.pcshell.dll` to shared memory,
   which the shipping mod does not read. **Enable it together with the Start mod**
   for the slide-out; without it the menu still closes (the tap is the close), but
   instantly.
 - **`mods/start-menu-touch-gesture-probe.wh.cpp`** — Phase 0 diagnostic probe.
-- **`mods/start_gesture_shared.h`** — shared-memory contract for the bridge.
+- **`mods/start_gesture_shared.h`** — shared-memory contract for the bridge's
+  gesture publication.
+- **`mods/swipe_ipc_shared.h`** — the contract between the two shipping mods and
+  the tools: one section plus three events, with every field pinned by an
+  `offsetof` assert.
 
 ## Build and install
 
@@ -360,18 +368,20 @@ The raw tables behind the Windows 11 fit are in `artifacts/`:
 panel's 578 DIP travel), and `settle-trace.csv` is the shipped mod's settle
 trace in both styles for the same half-open hold release.
 
-The mod has a file-driven debug channel for the renderer:
-write `p=0.5`, `t=x,y,z` or `e=x,y` to
-`C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\debug.txt`
-to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
-`retract` plays the committed-dismiss retract from the current `Progress` and
-answers with the duration it planned in `retract-plan.txt` (`retract=409` for the
-900 DIP panel, `retract=1` when no settle started); the explorer-side bridge
-writes the request and holds `CStartExperienceManager::Hide` for that answered
-duration plus 30 ms, which is what animates a Windows-key close. It applies only
-to a file written in the last second, so the leftover command is not replayed by
-the next Start process. A gesture close never asks for `retract`: it retracts,
-then taps the Windows key and stamps `gesture=0` in `close-mode.txt`.
+The mod has a debug channel for the renderer, a session-local shared-memory
+section with an event per direction (`mods/swipe_ipc_shared.h`):
+`pwsh -NoProfile -File tools\ipc.ps1 p=0.5` (also `t=x,y,z`, `e=x,y` and
+`anim=0|1`) drives `Progress`, `UIElement.Translation`, the visual `Offset` or
+the open storyboard directly, and `-State` prints the counters. The command event
+wakes the raw input thread, so nothing polls. The bridge's `retract` request and
+the Start mod's answer share the same section, with the answer echoing the
+request's sequence number: the explorer-side bridge holds
+`CStartExperienceManager::Hide` for that answered duration (409 ms for the
+900 DIP panel, and 560 ms when the answer says no settle started or never
+arrives). Both sides record the sequence numbers they find at attach, so a
+command or request from before the process started is ignored instead of
+replayed. A gesture close never asks for `retract`: it retracts, then taps the
+Windows key and stamps the close channel.
 
 ## Known limits and risks
 
@@ -402,15 +412,16 @@ then taps the Windows key and stamps `gesture=0` in `close-mode.txt`.
 - The bridge holds every `CStartExperienceManager::Hide` that is not a gesture
   close for the settle the Start mod answered with, plus 30 ms, and that wait
   runs on explorer's UI thread: a click-away close slides out too, and the
-  taskbar is blocked for that time (439 ms for the 900 DIP panel, 560 ms plus up
-  to 100 ms of answer poll when the answer never arrives). The `reason` argument
-  is logged (`hide delayed reason=1 retract=409 lead=439`); the Windows-key close
-  reported 1 on this build. The gesture path does not wait.
-- `close-mode.txt` is an 800 ms window. A gesture close stamps `gesture=0` at its
-  release; a dropped close stamps `cancelled`, so a keyboard close inside the
-  window still takes the keyboard lead. A Windows-key close that lands right after
-  a gesture close but before its stamp is replaced is read as a gesture close and
-  hides at once.
+  taskbar is blocked for that time (409 ms for the 900 DIP panel, 560 ms plus up
+  to 100 ms of answer wait when the answer never arrives). The `reason` argument
+  is logged (`hide delayed reason=1 retract=520 lead=550` on the left taskbar of
+  this machine, whose 1440 DIP travel hits the 520 ms clamp); the Windows-key
+  close reported 1 on this build. The gesture path does not wait.
+- The close stamp is an 800 ms window. A gesture close stamps it at its
+  release; a dropped close stamps the cancelled kind, so a keyboard close inside
+  the window still takes the keyboard lead. A Windows-key close that lands right
+  after a gesture close but before its stamp is replaced is read as a gesture
+  close and hides at once.
 - A gesture close that the user cancels by pulling the menu open again drops its
   armed tap before the shell is touched, so no `Hide` runs and the toggle is
   never advanced. The panel is already retracted and is driven purely by the

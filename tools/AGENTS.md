@@ -10,6 +10,7 @@ follow_hold.ps1: the same, but keeps an UPDATE in flight every 10 ms while the s
 inject_swipe_holds.ps1: swipe with pauses at waypoints, for threshold and coast experiments.
 measure_swipe.ps1: band capture around a swipe plus the panel edge per frame; an earlier investigation helper.
 read_shared_gesture.ps1: reads the bridge's shared-memory gesture state; an earlier investigation helper.
+ipc.ps1: the live channel to the Start mod. `pwsh -File tools\ipc.ps1 p=0.5` (also `t=x,y,z`, `e=x,y`, `anim=0|1`) opens `Local\SwipeFor10Start_v1_State`, publishes the command and sets `Local\SwipeFor10Start_v1_Cmd`; `-State` prints the section's counters (command sequence, close stamp, retract request and plan). Its byte offsets are the `offsetof` asserts in `mods/swipe_ipc_shared.h`; it replaced writing into the mod's `debug.txt`.
 native_flyout_frames.ps1: captures the native Quick Settings flyout (`Win+A`) as BMPs at ~9 ms with a reused DIB, and polls `IsWindowVisible` on `ControlCenterWindow` every 1 ms as t=0 (`DWMWA_CLOAKED` stays 0 for that window). On this machine the taskbar is on top, so the flyout is anchored top-right and unfolds downward.
 native_flyout_track.py: fits each captured frame's vertical offset against the settled frame (Pearson r over the card interior) and prints the `t -> dy` table the settle fit consumes.
 fit_settle_spring.py: the two-parameter area fit of the mod's spring (`y0 = 0`) to the measured curve, the residuals per sample, and the initial-slope comparison against the old cubic-bezier.

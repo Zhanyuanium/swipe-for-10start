@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.8.0
+// @version         0.9.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -21,18 +21,18 @@ closes: a keyboard close is the user's Windows tap, a gesture close is a Windows
 tap the Start mod sends at the end of its retract. This mod only decides how
 long the shell's key handler must wait for the panel.
 
-- A gesture close stamps `close-mode.txt` in the Start mod's storage with
-  `gesture=0` at its release. The tap comes after the retract, so when the Hide
-  arrives within 800 ms the panel is already gone; the hook logs
-  `hide passed (gesture)` and calls the original at once.
-- A gesture close that a new edge pull cancels before its tap stamps
-  `cancelled`, which does not parse: the next Hide is a keyboard close.
-- Any other Hide is a keyboard close: the mod writes the `retract` request to
-  the Start mod's `debug.txt` and waits for that mod's answer with the settle it
+- A gesture close stamps the shared channel at its release. The tap comes after
+  the retract, so when the Hide arrives on a stamp this hook has not consumed the
+  panel is already gone; the hook logs `hide passed (gesture)` and calls the
+  original at once.
+- A gesture close that a new edge pull cancels before its tap stamps the
+  cancelled kind: the next Hide is a keyboard close.
+- Any other Hide is a keyboard close: the mod publishes the `retract` request on
+  the channel and waits for the Start mod's answer with the settle it
   just planned, then holds the shell for exactly that duration plus a 30 ms
-  margin. A Start mod that cannot answer costs a 100 ms look and then a fixed
-  560 ms lead. A write that fails skips the wait, because a delay without a
-  retract would only slow the close down.
+  margin. A Start mod that cannot answer costs a 100 ms wait and then a fixed
+  560 ms lead. A request that cannot be published skips the wait, because a delay
+  without a retract would only slow the close down.
 
 Measured on this build, `Hide` is not the whole close: the shell keeps its Start
 toggle in the key handler. Both closes now go through that handler, so the
@@ -49,8 +49,9 @@ edge, the start point and the gesture state to shared memory:
 
 A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
-shipping Start mod does not read it. Its live couplings are `close-mode.txt`, the
-`retract` request and the `retract-plan.txt` answer described below.
+shipping Start mod does not read it. Its live couplings are the close stamp and
+the retract request/answer pair described below, both in
+`Local\SwipeFor10Start_v1_*` (see `swipe_ipc_shared.h`).
 
 Hooked functions are forwarded unchanged except for the keyboard wait described
 below. The mod creates no windows, threads or COM objects.
@@ -73,7 +74,8 @@ Notes:
 - The point is published once per gesture from `ReportEdgeGesture`, in the same
   write as the edge and the handle. There is no per-frame position sampling.
 - Each gesture state transition appends one line to `bridge.log` in the mod
-  storage folder: `state=... edge=... src=... prov=... <reason>`.
+  storage folder: `state=... edge=... src=... prov=... <reason>`. The channel to
+  the Start mod logs one `ipc open created=... close=...` at init.
 
 The delayed Hide:
 
@@ -81,25 +83,27 @@ The delayed Hide:
   shell's own key handler. No manager pointer is cached, no worker exists, and no
   call is made on the shell's behalf. Every Show and Hide logs one line
   (`show a=... b=... c=...`, `hide reason=...`) before the delay decision.
-- A gesture close stamps `close-mode.txt` with `gesture=0` at its release; its
+- A gesture close publishes its stamp on the shared channel at its release; its
   tap comes at the end of the retract, so the panel is already off screen when
-  the Hide arrives. A stamp younger than 800 ms names that case: the hook logs
-  `hide passed (gesture)` and calls the original at once. A nonzero value is
-  only for a hand-written stamp and waits that long (capped at 600 ms).
-- A stamp that does not parse means the Start side dropped the close before its
+  the Hide arrives. A stamp this hook has not consumed yet and that is younger
+  than 800 ms names that case: the hook logs `hide passed (gesture)` and calls
+  the original at once. A nonzero delay is only for a future stamp and waits
+  that long (capped at 600 ms).
+- A stamp of the cancelled kind means the Start side dropped the close before its
   tap; the next Hide is a keyboard close. The same applies when the stamp is
-  older than 800 ms or already handled once.
-- A keyboard close writes the `retract` request to the Start mod's `debug.txt`.
-  That mod plans its settle from the panel's current `Progress` and the panel
-  travel, starts it, and answers with the duration in `retract-plan.txt`
-  (`retract=<ms>`, or the legacy `retract=1` when no settle started). The hook
-  waits for that answer, logs `hide delayed reason=... retract=... lead=...` and
+  older than 800 ms or was already consumed once.
+- A keyboard close publishes the `retract` request on the same channel and wakes
+  the Start mod through its request event. That mod plans its settle from the
+  panel's current `Progress` and the panel travel, starts it, and answers with
+  the duration (or the no-settle sentinel) under the request's sequence number.
+  The hook waits for that answer, logs
+  `hide delayed reason=... retract=... lead=...` and
   holds the original for the answered duration plus 30 ms, so the shell hides
-  after the slide has landed instead of cutting it. The look for the answer is
-  bounded at 100 ms; a missing answer, the legacy value or an unparseable one
-  falls back to the fixed 560 ms lead. Both waits poll in 10 ms steps. When the
-  request write fails the hide runs immediately: a delay without a retract would
-  only slow the close down.
+  after the slide has landed instead of cutting it. The wait for the answer is
+  bounded at 100 ms; a missing answer or the sentinel falls back to the fixed
+  560 ms lead. Both waits step in 10 ms so a mod being disabled ends them at
+  once. When the request cannot be published the hide runs immediately: a delay
+  without a retract would only slow the close down.
 - The original always runs. An earlier version returned `S_OK` without it;
   measured, the shell's Start toggle then stayed one close ahead and the Windows
   key and the taskbar Start button stopped working until
@@ -117,21 +121,19 @@ The delayed Hide:
  *   EdgeAnimationRelationshipManager::ReportEdgeGesture,
  *   CStartExperienceManager::SetAnimationData/Show/Hide; on version.dll for the
  *   build gate; on LoadLibraryExW from kernelbase.dll for the late module load;
- *   on the shared-memory contract in start_gesture_shared.h; on the Start mod's
- *   `close-mode.txt` content and last-write time, which name a gesture close
- *   (`gesture=0`) and a close dropped before its tap (`cancelled`); on the Start
- *   mod's `debug.txt` for the `retract` request a keyboard close needs; on its
- *   `retract-plan.txt` content and last-write time, which carry the settle
- *   duration that request produced.
+ *   on the shared-memory contract in start_gesture_shared.h; on the channel in
+ *   swipe_ipc_shared.h, whose close stamp names a gesture close (or one dropped
+ *   before its tap) and whose retract request/answer pair carries the settle
+ *   duration a keyboard close needs.
  * [OUTPUT]: the `Local\WindhawkStartGestureShared` mapping and its auto-reset
  *   event, holding the edge, the gesture handle and the state under a seqlock;
- *   a `bridge.log` line per state transition; one `retract` request in the Start
- *   mod's `debug.txt` and a wait in
+ *   a `bridge.log` line per state transition; one `retract` request on the Start
+ *   mod's channel and a wait in
  *   CStartExperienceManager::Hide for the settle duration the Start mod answers
  *   with plus a 30 ms margin, so a Windows-key close slides the panel out before
  *   the window is hidden; a `hide delayed reason=... retract=... lead=...` line
  *   per keyboard close; a `hide passed (gesture)` line and the original
- *   call at once for a Hide inside 800 ms of a `gesture=0` stamp, because the
+ *   call at once for a Hide on an unconsumed gesture stamp, because the
  *   Start side taps after its retract. Every path calls the original Hide;
  *   nothing is pressed and no hide is requested. No exported symbols.
  * [POS]: explorer-side half of the legacy Start gesture work. It observes the
@@ -140,8 +142,8 @@ The delayed Hide:
  *   a gesture close is tapped only after its retract; the shell's Start toggle is
  *   always updated by its key handler, so this mod needs no manager pointer,
  *   worker thread, timer or re-arm tap. The shipping Start mod does not read the
- *   shared memory; the debug request, the plan answer and the close-mode stamp
- *   are the couplings that are live today.
+ *   shared memory; the close stamp and the retract request/answer pair in the
+ *   swipe_ipc_shared.h channel are the couplings that are live today.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -157,6 +159,7 @@ The delayed Hide:
 #include <cstring>
 
 #include "start_gesture_shared.h"
+#include "swipe_ipc_shared.h"
 
 namespace {
 
@@ -177,61 +180,28 @@ constexpr unsigned kTwinuiVersion[4] = {10, 0, 26100, 9949};
 
 // A keyboard close is a Windows tap by the user. Hide is where the shell takes
 // the Start window away; the panel needs time to retract, so the hide waits for
-// it. The wait is normally the duration the Start side answers with (see
-// kStartRetractPlanFilePath); this fixed lead is what remains when that answer
-// cannot be had: a Start mod that is not running, a failed write, a settle that
-// did not start. A full 900+ DIP panel needs 409 ms at the 2.2 DIP/ms the Start
-// mod plans with, and its settle cannot start before the request has been polled
-// for, so the old 350 ms, measured from the request, was shorter than the
-// animation it was meant to cover.
+// it. The wait is normally the duration the Start side answers with; this fixed
+// lead is what remains when no answer arrives: a Start mod that is not running,
+// a broken channel, a settle that did not start. A full 900+ DIP panel needs
+// 409 ms at the 2.2 DIP/ms the Start mod plans with.
 constexpr uint64_t kHideLeadMs = 560;
 
-// The Start mod's debug channel. The bridge runs in explorer, so
-// Wh_GetModStoragePath would resolve to its own storage directory: the Start
-// mod's paths are fixed by its id.
-constexpr wchar_t kStartDebugFilePath[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@start-menu-legacy-swipe\\debug.txt";
-// The request. Only the `retract` word is read by the Start mod: a request
-// carries no duration, the answer does.
-constexpr char kRetractCommand[] = "retract=1\r\n";
-
-// The Start mod's answer to that request: `retract=<settleMs>` for the animation
-// it just planned, or the legacy `retract=1` when no animation started. The wait
-// is anchored on this write, not on the request, because only the Start side
-// knows the panel's travel and it can only plan after it read the request.
-constexpr wchar_t kStartRetractPlanFilePath[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@start-menu-legacy-swipe\\retract-plan.txt";
-
-// How long the answer may take. The Start mod reads its debug file on a 50 ms
-// WM_TIMER (measured 13-67 ms from write to read) and writes the answer from
-// there, so two quanta cover the trip; a Start mod that is not running costs
-// exactly this and then the fixed lead.
+// How long the answer may take. The request wakes the Start mod's input thread
+// through an event, so an answer normally arrives in a few milliseconds; this
+// bound only covers a Start side that is busy or gone.
 constexpr uint64_t kRetractPlanWaitMs = 100;
-// Added to the answered duration. The answer is written a few milliseconds after
-// the animation starts, and the 10 ms poll of the wait can add one step.
+// Added to the answered duration: the answer is published a moment after the
+// animation starts, and the wait's 10 ms slicing can add one step.
 constexpr uint64_t kHideLeadMarginMs = 30;
-// The legacy answer means the settle did not start; a value above the Start
-// mod's own 2000 ms guard is corrupt. Both take the fixed lead.
-constexpr uint64_t kRetractPlanLegacyMs = 1;
+// The Start side's "no settle started" answer, and the corrupt-value cap.
+constexpr int32_t kRetractPlanNoSettleMs = 1;
 constexpr uint64_t kRetractPlanMaxMs = 2000;
 
-// The Start mod's close-mode file. A gesture close writes `gesture=0` just
-// before its Windows tap; the tap comes after the retract, so the Hide needs no
-// wait. Only a file younger than kCloseModeFreshMs is read. A value that does
-// not parse (the Start mod writes `cancelled` when a new pull drops the close)
-// means the next Hide is a keyboard close.
-constexpr wchar_t kStartCloseModeFilePath[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@start-menu-legacy-swipe\\close-mode.txt";
-
-// The stamp is written at the release and read after the tap's Hide, up to a
-// 550 ms retract later. 800 ms covers the retract, the key dispatch, the shell's
-// own handling and the read, and stays short enough that a Windows-key close a
-// second later uses its own lead again.
-constexpr DWORD kCloseModeFreshMs = 800;
-
+// A gesture close stamp is consumed by exactly one Hide. The Start side
+// publishes it at the release and taps the Windows key at the end of the
+// retract, so a Hide that arrives on that stamp is the tap's own and needs no
+// wait. A stamp older than this window belongs to a close that is over.
+constexpr uint64_t kCloseStampFreshMs = 800;
 // The delay is a safety valve for a future nonzero stamp; the shipping value is
 // 0. The cap keeps a corrupt value from holding the shell's UI thread.
 constexpr uint64_t kGestureHideDelayCapMs = 600;
@@ -239,6 +209,15 @@ constexpr uint64_t kGestureHideDelayCapMs = 600;
 // The hide waits in 10 ms steps, so the wait can end early when the mod is being
 // disabled under it. The shipping gesture path waits 0.
 constexpr DWORD kHidePollMs = 10;
+
+// The cross-process channel (swipe_ipc_shared.h). Opened once at init; its
+// handles stay for the life of the process, like the gesture mapping, because a
+// Hide may still be in flight while the mod unloads.
+SwipeIpcChannel g_ipc;
+// The highest close stamp this hook has consumed. Seeded from the channel at
+// attach, so a stamp written before this process belongs to someone else's
+// close.
+LONG64 g_handledCloseSeq = 0;
 
 struct Point {
     float x;
@@ -940,172 +919,6 @@ void ClearSharedGestureState(const wchar_t* reason) {
     g_startPointTick.store(0, std::memory_order_relaxed);
 }
 
-// Writes one command line the Start mod polls for. The write is what makes the
-// delay meaningful: when the retract write fails, the panel will not retract and
-// the hide runs at once instead of being late for nothing.
-bool WriteStartCommand(const char* command, size_t length) {
-    HANDLE file = CreateFileW(kStartDebugFilePath, GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    DWORD written = 0;
-    const BOOL ok =
-        WriteFile(file, command, static_cast<DWORD>(length), &written, nullptr);
-    CloseHandle(file);
-    return ok && written == length;
-}
-
-bool WriteStartRetractCommand(FILETIME* requestStamp) {
-    // The stamp is taken before the write: the answer is only accepted when its
-    // own write time is at or after this instant.
-    GetSystemTimeAsFileTime(requestStamp);
-    return WriteStartCommand(kRetractCommand, sizeof(kRetractCommand) - 1);
-}
-
-// Last-write time of a file, false when it is missing or a directory.
-bool ReadFileWriteTime(const wchar_t* path, FILETIME* writeTime) {
-    WIN32_FILE_ATTRIBUTE_DATA attributes{};
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attributes) ||
-        (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-        return false;
-    }
-
-    *writeTime = attributes.ftLastWriteTime;
-    return true;
-}
-
-// True when the Start mod stamped a gesture close less than kCloseModeFreshMs
-// ago, and returns the stamp so the hook can tell the same stamp from a later
-// one. A stamp ahead of the local clock counts as fresh: it is the same write,
-// read before the clock caught up.
-bool GestureCloseStampFresh(FILETIME* written) {
-    if (!ReadFileWriteTime(kStartCloseModeFilePath, written)) {
-        return false;
-    }
-
-    FILETIME nowFileTime{};
-    GetSystemTimeAsFileTime(&nowFileTime);
-
-    ULARGE_INTEGER now{};
-    now.LowPart = nowFileTime.dwLowDateTime;
-    now.HighPart = nowFileTime.dwHighDateTime;
-    ULARGE_INTEGER stamp{};
-    stamp.LowPart = written->dwLowDateTime;
-    stamp.HighPart = written->dwHighDateTime;
-
-    const ULONGLONG age =
-        now.QuadPart > stamp.QuadPart ? now.QuadPart - stamp.QuadPart : 0;
-    return age <= static_cast<ULONGLONG>(kCloseModeFreshMs) * 10000;
-}
-
-// Reads the delay a gesture close stamped into close-mode.txt. The content is
-// `gesture=<milliseconds>`; the shipping Start mod writes 0 because its tap comes
-// after the retract. Only a file that passed GestureCloseStampFresh is read.
-bool ReadGestureCloseDelayMs(uint64_t* delayMs) {
-    HANDLE file = CreateFileW(kStartCloseModeFilePath, GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                  FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    char buffer[32] = {};
-    DWORD read = 0;
-    const BOOL ok = ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr);
-    CloseHandle(file);
-    if (!ok || read == 0) {
-        return false;
-    }
-    buffer[read] = '\0';
-
-    constexpr char kPrefix[] = "gesture=";
-    constexpr size_t kPrefixLength = sizeof(kPrefix) - 1;
-    if (std::strncmp(buffer, kPrefix, kPrefixLength) != 0) {
-        return false;
-    }
-
-    const char* value = buffer + kPrefixLength;
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value) {
-        return false;
-    }
-
-    *delayMs = static_cast<uint64_t>(parsed);
-    return true;
-}
-
-// Reads the duration the Start mod planned for the settle it just started:
-// `retract=<milliseconds>` in retract-plan.txt. A missing file, a different
-// prefix, a non-number or a value above kRetractPlanMaxMs rejects the answer, and
-// the caller keeps the fixed lead.
-bool ReadRetractPlanMs(uint64_t* settleMs) {
-    HANDLE file = CreateFileW(kStartRetractPlanFilePath, GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                  FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    char buffer[32] = {};
-    DWORD read = 0;
-    const BOOL ok = ReadFile(file, buffer, sizeof(buffer) - 1, &read, nullptr);
-    CloseHandle(file);
-    if (!ok || read == 0) {
-        return false;
-    }
-    buffer[read] = '\0';
-
-    constexpr char kPrefix[] = "retract=";
-    constexpr size_t kPrefixLength = sizeof(kPrefix) - 1;
-    if (std::strncmp(buffer, kPrefix, kPrefixLength) != 0) {
-        return false;
-    }
-
-    const char* value = buffer + kPrefixLength;
-    char* end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (end == value || parsed > kRetractPlanMaxMs) {
-        return false;
-    }
-
-    *settleMs = static_cast<uint64_t>(parsed);
-    return true;
-}
-
-// Waits for that answer. Only a file written at or after the request counts, so
-// a leftover answer from an earlier close cannot satisfy this request. The look
-// is bounded by kRetractPlanWaitMs and keeps the 10 ms step, so a close whose
-// Start side never answers costs that wait and then the fixed lead.
-bool WaitForRetractPlan(const FILETIME& requestStamp, uint64_t* settleMs) {
-    const ULONGLONG deadline = GetTickCount64() + kRetractPlanWaitMs;
-    for (;;) {
-        FILETIME stamp{};
-        if (ReadFileWriteTime(kStartRetractPlanFilePath, &stamp) &&
-            CompareFileTime(&stamp, &requestStamp) >= 0 &&
-            ReadRetractPlanMs(settleMs)) {
-            return true;
-        }
-
-        if (g_disabled.load(std::memory_order_relaxed)) {
-            return false;
-        }
-        const ULONGLONG now = GetTickCount64();
-        if (now >= deadline) {
-            return false;
-        }
-        Sleep(static_cast<DWORD>(
-            std::min<ULONGLONG>(kHidePollMs, deadline - now)));
-    }
-}
-
 // Gives the Start side the time its retract needs. The steps stay at 10 ms so a
 // mod that is being disabled mid-wait ends the delay at once instead of holding
 // the hide for a retract nothing will draw.
@@ -1121,28 +934,94 @@ void WaitForRetractLead(uint64_t leadMs) {
     }
 }
 
-// The stamp handled as a gesture close. A later Hide that still sees the same
-// stamp is a keyboard close, not a second gesture close, and uses its own lead.
-FILETIME g_handledStamp{};
-bool g_hasHandledStamp = false;
+// Consumes the Start side's close stamp when it belongs to this Hide. The
+// sequence number is the whole protocol: a stamp this hook has not seen is a
+// gesture close whose tap has already retracted the panel, and a stamp it has
+// seen is a later keyboard close under the same stamp. Only a gesture stamp
+// passes; a cancelled one (a new pull dropped the close before its tap) never
+// causes a Hide of its own.
+bool ConsumeGestureStamp(uint64_t* delayMs) {
+    if (!g_ipc.state) {
+        return false;
+    }
 
-bool StampAlreadyHandled(const FILETIME& stamp) {
-    return g_hasHandledStamp && CompareFileTime(&stamp, &g_handledStamp) == 0;
+    const LONG64 sequence = SwipeIpcLoad64(&g_ipc.state->closeSeq);
+    if (sequence == 0 || sequence == g_handledCloseSeq) {
+        return false;
+    }
+
+    const uint64_t published =
+        static_cast<uint64_t>(SwipeIpcLoad64(&g_ipc.state->closeTick));
+    const uint64_t now = GetTickCount64();
+    if (now > published && now - published > kCloseStampFreshMs) {
+        // The close that wrote this is long over; the Hide in hand is a
+        // keyboard close and gets its own lead.
+        return false;
+    }
+
+    g_handledCloseSeq = sequence;
+    const LONG kind = InterlockedCompareExchange(&g_ipc.state->closeKind, 0, 0);
+    if (kind != kSwipeCloseKindGesture) {
+        return false;
+    }
+
+    const LONG delay =
+        InterlockedCompareExchange(&g_ipc.state->closeDelayMs, 0, 0);
+    *delayMs = delay > 0 ? static_cast<uint64_t>(delay) : 0;
+    return true;
 }
 
-void MarkStampHandled(const FILETIME& stamp) {
-    g_handledStamp = stamp;
-    g_hasHandledStamp = true;
-}
+// Waits for the Start side's answer to this request. Only an answer whose
+// sequence number echoes the request counts, so an answer to an earlier close
+// can never satisfy this one, and no timestamp is involved. Returns false when
+// no answer arrived inside kRetractPlanWaitMs; `settleMs` is left at the
+// no-settle sentinel when the Start side answered that nothing started.
+bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
+    if (!g_ipc.state || !g_ipc.retractPlanEvent) {
+        return false;
+    }
 
+    const ULONGLONG deadline = GetTickCount64() + kRetractPlanWaitMs;
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            return false;
+        }
+
+        // Slices keep the disabled check: a mod that is being unloaded must not
+        // hold the shell's UI thread.
+        const DWORD wait = WaitForSingleObject(
+            g_ipc.retractPlanEvent,
+            static_cast<DWORD>(
+                std::min<ULONGLONG>(kHidePollMs, deadline - now)));
+        if (wait == WAIT_OBJECT_0) {
+            if (SwipeIpcLoad64(&g_ipc.state->retractPlanSeq) != request) {
+                continue;  // an answer to an earlier request
+            }
+            const LONG plan =
+                InterlockedCompareExchange(&g_ipc.state->retractPlanMs, 0, 0);
+            *settleMs = plan > 0 && static_cast<uint64_t>(plan) <=
+                                       kRetractPlanMaxMs
+                            ? plan
+                            : kRetractPlanNoSettleMs;
+            return true;
+        }
+        if (g_disabled.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        if (wait != WAIT_TIMEOUT) {
+            return false;
+        }
+    }
+}
 // ---------------------------------------------------------------------------
 // Delayed Hide
 //
 // A gesture close taps the Windows key at the end of its retract, so the Hide
-// that tap causes needs no wait: the panel is already gone. close-mode.txt names
-// that case. A keyboard close writes the `retract` request and then waits for the
-// Start mod's answer: that mod plans the settle from the panel's travel and
-// writes its duration, so the shell is held for exactly as long as the slide
+// that tap causes needs no wait: the panel is already gone. The close stamp names
+// that case. A keyboard close publishes the `retract` request and then waits for
+// the Start mod's answer: that mod plans the settle from the panel's travel and
+// publishes its duration, so the shell is held for exactly as long as the slide
 // takes. Without an answer the fixed lead applies. No worker, manager pointer,
 // timer or re-arm tap is involved: every Hide is the shell's own call, on its own
 // thread.
@@ -1160,15 +1039,14 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
     ClearSharedGestureState(L"Hide");
 
     // The shell's key handler decided this hide from a Windows tap. A gesture
-    // close stamps `gesture=0` at its release, after it has retracted the panel:
-    // the tap comes at the end of that retract, so this Hide is already too late
-    // to cut the animation and runs at once. A keyboard close (no usable stamp,
-    // a dropped gesture close, or a second Hide under the same stamp) writes the
-    // `retract` request and waits for the Start mod's answer. Only that mod knows
-    // the panel's travel, so the wait is its planned settle plus one margin;
-    // an answer that never arrives falls back to the fixed lead, which covers
-    // the poll that reads the request (measured 13-67 ms, a 50 ms WM_TIMER
-    // quantised to 62 ms) and the full 409 ms slide.
+    // close publishes its stamp at the release, after it has retracted the
+    // panel: the tap comes at the end of that retract, so this Hide is already
+    // too late to cut the animation and runs at once. A keyboard close (no
+    // stamp, a stamp this hook already consumed, a cancelled one) requests the
+    // retract through the channel and waits for the Start mod's answer. Only
+    // that mod knows the panel's travel, so the wait is its planned settle plus
+    // one margin; no answer at all falls back to the fixed lead, which covers
+    // the full 409 ms slide.
     //
     // This hook always calls the original. An earlier version returned S_OK to
     // cancel a hide when the user pulled the menu open again; measured, the
@@ -1177,42 +1055,44 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
     // is cancelled on the Start side instead, by not sending its tap.
     if (g_hideDelayEnabled.load(std::memory_order_relaxed) &&
         !g_disabled.load(std::memory_order_relaxed)) {
-        FILETIME stamp{};
-        FILETIME requestStamp{};
         uint64_t delayMs = 0;
 
-        if (GestureCloseStampFresh(&stamp) && !StampAlreadyHandled(stamp) &&
-            ReadGestureCloseDelayMs(&delayMs)) {
+        if (ConsumeGestureStamp(&delayMs)) {
             delayMs = std::min(delayMs, kGestureHideDelayCapMs);
-            MarkStampHandled(stamp);
             if (delayMs == 0) {
                 FileLog(L"hide passed (gesture)");
             } else {
-                // A nonzero value is only for a hand-written stamp; the shipping
-                // Start mod writes 0 because it taps after the retract.
+                // A nonzero value is only for a future stamp; the shipping Start
+                // mod writes 0 because it taps after the retract.
                 FileLog(L"hide delayed (gesture) ms=%llu",
                         static_cast<unsigned long long>(delayMs));
                 WaitForRetractLead(delayMs);
             }
-        } else if (WriteStartRetractCommand(&requestStamp)) {
-            uint64_t settleMs = 0;
-            const bool answered = WaitForRetractPlan(requestStamp, &settleMs);
-            const bool planned = answered && settleMs > kRetractPlanLegacyMs;
-            const uint64_t lead =
-                planned ? settleMs + kHideLeadMarginMs : kHideLeadMs;
-
-            if (planned) {
-                FileLog(L"hide delayed reason=%u retract=%llu lead=%llu", reason,
-                        static_cast<unsigned long long>(settleMs),
-                        static_cast<unsigned long long>(lead));
-            } else {
-                FileLog(L"hide delayed reason=%u retract=%s lead=%llu", reason,
-                        answered ? L"legacy" : L"none",
-                        static_cast<unsigned long long>(lead));
-            }
-            WaitForRetractLead(lead);
         } else {
-            FileLog(L"hide retract write failed");
+            const LONG64 request = SwipeIpcRequestRetract(&g_ipc);
+            if (request != 0) {
+                int32_t settleMs = kRetractPlanNoSettleMs;
+                const bool answered = WaitForRetractPlan(request, &settleMs);
+                const bool planned = answered &&
+                                     settleMs > kRetractPlanNoSettleMs;
+                const uint64_t lead =
+                    planned ? static_cast<uint64_t>(settleMs) +
+                                  kHideLeadMarginMs
+                            : kHideLeadMs;
+
+                if (planned) {
+                    FileLog(L"hide delayed reason=%u retract=%d lead=%llu",
+                            reason, settleMs,
+                            static_cast<unsigned long long>(lead));
+                } else {
+                    FileLog(L"hide delayed reason=%u retract=%s lead=%llu",
+                            reason, answered ? L"none" : L"unanswered",
+                            static_cast<unsigned long long>(lead));
+                }
+                WaitForRetractLead(lead);
+            } else {
+                FileLog(L"hide retract request failed");
+            }
         }
     }
 
@@ -1337,10 +1217,25 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.8.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.9.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();
+
+    // The channel to the Start side. Opening it here means the section and its
+    // events exist before the first Hide, and a Start mod that attaches later
+    // joins the same ones.
+    bool created = false;
+    DWORD ipcError = 0;
+    if (!SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
+        Wh_Log(L"Swipe IPC channel unavailable (%u); a keyboard close takes the "
+               L"fixed lead",
+               static_cast<unsigned>(ipcError));
+    } else {
+        g_handledCloseSeq = SwipeIpcLoad64(&g_ipc.state->closeSeq);
+        FileLog(L"ipc open created=%d close=%lld", created ? 1 : 0,
+                static_cast<long long>(g_handledCloseSeq));
+    }
 
     HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
     auto loadLibraryExW = kernelBase

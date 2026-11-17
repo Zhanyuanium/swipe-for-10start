@@ -2,8 +2,8 @@
 
 C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
-mods/ - Windhawk mod sources (7 files: start-menu-legacy-swipe, msgprobe, inputprobe, touch-gesture-bridge, touch-gesture-probe, touch-gesture-consumer, start_gesture_shared.h)
-tools/ - PowerShell probes, injectors and animation harnesses (screenshot, start_menu, inject_swipe, touch_hold, follow_hold, inject_swipe_holds, measure_swipe, read_shared_gesture, native_flyout_frames, native_flyout_track, fit_settle_spring, settle_track)
+mods/ - Windhawk mod sources (8 files: start-menu-legacy-swipe, msgprobe, inputprobe, touch-gesture-bridge, touch-gesture-probe, touch-gesture-consumer, start_gesture_shared.h, swipe_ipc_shared.h)
+tools/ - PowerShell probes, injectors and animation harnesses (screenshot, start_menu, inject_swipe, touch_hold, follow_hold, inject_swipe_holds, measure_swipe, read_shared_gesture, ipc, native_flyout_frames, native_flyout_track, fit_settle_spring, settle_track)
 artifacts/ - captured measurements (raw input samples, cursor probe, window geometry, native flyout displacement curves, shipped settle trace)
 </directory>
 <config>
@@ -23,11 +23,15 @@ a hold starts at zero speed instead of jumping. Both close paths then tap
 `VK_LWIN` at the end of that settle: the shell's own key handler performs the
 hide, so the Start toggle stays in step and no re-arm tap exists. A new pull
 during the settle drops the tap before the shell is touched. The Start mod stamps
-`close-mode.txt` with `gesture=0` (or `cancelled` when the tap is dropped) and
-answers a bridge `retract` request with the duration it just planned in
-`retract-plan.txt`; `mods/start-menu-touch-gesture-bridge.wh.cpp` runs in
-`explorer.exe`, passes the Hide at once for the stamp and otherwise holds it for
-that answered duration plus 30 ms, or 560 ms when no answer arrives. Everything
+the close channel with the gesture kind (or the cancelled kind when the tap is
+dropped) and answers a bridge `retract` request with the duration it just planned;
+`mods/start-menu-touch-gesture-bridge.wh.cpp` runs in
+`explorer.exe`, passes the Hide at once for an unconsumed stamp and otherwise holds it for
+that answered duration plus 30 ms, or 560 ms when no answer arrives. The two
+processes talk only through `mods/swipe_ipc_shared.h`: one session-local section
+plus a command event, a retract request event and a plan event, each with a
+sequence number, so nothing polls and an answer cannot be mistaken for an earlier
+one. Everything
 else in `mods/` is diagnosis.
 
 Laws: measure before designing · one data source per claim · docs and code move together
