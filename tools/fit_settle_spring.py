@@ -1,117 +1,453 @@
-"""Fit the mod's spring (y0 = 0) to the measured Quick Settings motion.
+"""Fit a model to the captured native Quick Settings motion.
 
-Vectorised: the measured curve is resampled on a 1 ms grid, the spring is
-evaluated on that grid for each parameter pair, and the area residual is the
-sum of |y - d|.
+What this is: an area comparison of a model against the samples in
+artifacts/native-flyout-open.csv (or any CSV in that format). It fits a model to
+captured data. It does not validate the shipping build's animation, and it does
+not measure the mod: the numbers below describe how well a model reproduces the
+native flyout curve, nothing more.
+
+Two models, and the report names the one that produced each number:
+
+  shipped (default)
+      The settle this mod runs today, implemented exactly: the duration is the
+      panel travel at 2.2 DIP/ms clamped to 160..520 ms; omega is picked so five
+      time constants of the spring's slowest root land on that duration; every
+      sample is the curve divided by its own value at T (endValue); the frame
+      list is clamped to 0..1 and to the previous sample. The damping is the
+      shipped Windows 11 value by default; --damping evaluates another and --fit
+      searches for the area-optimal one. y0 = 0 everywhere: a hold release has no
+      finger speed, while the native curve starts with the shell's own velocity.
+
+  legacy (--model legacy)
+      The fit this file used to report. A free period and damping ratio, with
+      the settle duration read as 5/(zeta*omega). That is the wrong time
+      constant for an overdamped spring, which the shipping style is, so the
+      duration it printed was not the one the mod uses. Kept only for the
+      historical comparison.
+
+Residual: the model's frame list is interpolated on a 1 ms grid between the
+first and the last sample, so `area` is ms of displacement (the metric the
+README quotes) and `mean` is its average. The native curve's first 30 ms are
+faster than any y0 = 0 spring at this duration, so that part is not what the fit
+identifies; the report prints the residual after 90 ms next to the overall one.
+
+The model's t = 0 is the CSV's t = 0, the window becoming visible. The start is
+not free: moving it only lets the fit hide the early mismatch.
+
+This file needs only the standard library:
+
+    python tools/fit_settle_spring.py
+    python tools/fit_settle_spring.py --damping 2.0
+    python tools/fit_settle_spring.py --fit
+    python tools/fit_settle_spring.py --model legacy
+
+A close capture (artifacts/native-flyout-close.csv) counts its t from the window
+hiding, so its samples are negative; it needs --time-offset with that capture's
+key-down time, printed as KEY in its .txt. Without it the tool refuses rather
+than fit a curve to samples the model never reaches.
+
+[PROTOCOL]: Update this header on change, then check AGENTS.md
 """
+import argparse
 import math
-import numpy as np
+import os
+import sys
 
-DY_HIDDEN = 1156.0
-DIST = 1440.0
+# The shipping settle's constants, copied from mods/start-menu-legacy-swipe.wh.cpp.
+WIN11_DAMPING = 1.72   # kWin11SpringDamping, the default AnimationStyle
+SPEED_DIP_PER_MS = 2.2
+MIN_MS = 160
+MAX_MS = 520
+TIME_CONSTANTS = 5.0
+SEGMENT_MS = 4.0
+MIN_STEPS = 12
+MAX_STEPS = 128
+# The native flyout's own travel, the number in the CSV header and the one the
+# mod's duration formula would use for this panel.
+TRAVEL_DIP = 578.0
+TRAVEL_PX = 1156.0
+# The left taskbar's Start travel, used by the initial-slope comparison only.
+DISTANCE_DIP = 1440.0
 
-OPEN = [(29.71, 527), (37.49, 458), (45.73, 402), (55.91, 355), (72.08, 278),
-        (89.82, 218), (104.69, 170), (120.43, 130), (129.17, 114),
-        (137.60, 98), (145.28, 85), (153.90, 72), (162.47, 61), (171.40, 51),
-        (179.08, 42), (187.16, 34), (195.41, 28), (204.07, 22), (212.14, 16),
-        (220.12, 12), (228.81, 8), (236.96, 5), (245.20, 3), (253.03, 1),
-        (261.64, 0)]
 
-CLOSE = [(88.41, 17), (96.84, 29), (105.41, 44), (122.45, 84), (139.05, 140),
-         (154.96, 216), (163.33, 263), (171.65, 319), (179.44, 384),
-         (187.21, 463), (195.26, 559), (203.22, 681), (210.74, 853)]
+def shipped_duration(travel_dip):
+    """T = clamp(remaining / 2.2 DIP/ms, 160, 520) ms, as the mod rounds it."""
+    ms = math.floor(travel_dip / SPEED_DIP_PER_MS + 0.5)
+    return min(max(ms, MIN_MS), MAX_MS)
 
-def grid_of(data, sign, t_end):
-    """d(t) on a 1 ms grid; linear between samples, 0 before the first."""
-    ts = np.array([p[0] for p in data], dtype=float)
-    ds = np.array([(1.0 - p[1] / DY_HIDDEN) if sign > 0 else (p[1] / DY_HIDDEN)
-                   for p in data], dtype=float)
-    g = np.arange(0.0, t_end + 1e-9, 1.0)
-    d = np.zeros_like(g)
-    ok = g >= ts[0]
-    d[ok] = np.interp(g[ok], ts, ds)
-    return g, d
 
-def y_spring(t, period, zeta):
-    """Vectorised spring step response, clamped to 0..1, t in ms."""
-    t = np.maximum(t, 0.0)
+def curve_at(t, zeta, omega, y0=0.0):
+    """The mod's analytic spring, y(0) = 0, y(inf) = 1, y'(0) = y0, t in ms."""
+    t = max(t, 0.0)
+    decay = zeta * omega
+    envelope = math.exp(-decay * t)
+    if zeta > 1.0:
+        wd = omega * math.sqrt(zeta * zeta - 1.0)
+        return 1.0 - envelope * (
+            math.cosh(wd * t) + ((decay - y0) / wd) * math.sinh(wd * t))
+    if abs(zeta - 1.0) <= 1e-9:
+        return 1.0 - envelope * (1.0 + (omega - y0) * t)
+    wd = omega * math.sqrt(max(0.0, 1.0 - zeta * zeta))
+    return 1.0 - envelope * (
+        math.cos(wd * t) + ((decay - y0) / wd) * math.sin(wd * t))
+
+
+def settle_frames(zeta, t_total, y0=0.0):
+    """The mod's frame list: (times, values), start 0, target 1.
+
+    Mirrors BeginGestureSettle: omega from the slowest root, endValue from the
+    curve at T, each sample clamped to 0..1 and to the previous one, and the
+    last frame the exact target.
+    """
+    slowest = zeta - math.sqrt(zeta * zeta - 1.0) if zeta > 1.0 else zeta
+    omega = TIME_CONSTANTS / (slowest * t_total)
+    end_value = min(max(curve_at(t_total, zeta, omega, y0), 0.5), 1.0)
+    steps = min(max(int(math.ceil(t_total / SEGMENT_MS)), MIN_STEPS), MAX_STEPS)
+    times = [0.0]
+    values = [0.0]
+    previous = 0.0
+    for i in range(1, steps):
+        t = t_total * i / steps
+        y = min(max(curve_at(t, zeta, omega, y0) / end_value, 0.0), 1.0)
+        previous = max(previous, y)
+        times.append(t)
+        values.append(previous)
+    times.append(t_total)
+    values.append(1.0)
+    return times, values, omega, end_value, steps
+
+
+def legacy_curve(t, zeta, period):
+    """The historical model: a free period, no endValue normalisation."""
+    t = max(t, 0.0)
     w = 2.0 * math.pi / period
     if zeta < 1.0:
         wd = w * math.sqrt(1.0 - zeta * zeta)
-        v = 1.0 - np.exp(-zeta * w * t) * (
-            np.cos(wd * t) + (zeta * w / wd) * np.sin(wd * t))
+        v = 1.0 - math.exp(-zeta * w * t) * (
+            math.cos(wd * t) + (zeta * w / wd) * math.sin(wd * t))
     elif abs(zeta - 1.0) < 1e-9:
-        v = 1.0 - np.exp(-w * t) * (1.0 + w * t)
+        v = 1.0 - math.exp(-w * t) * (1.0 + w * t)
     else:
         wd = w * math.sqrt(zeta * zeta - 1.0)
-        v = 1.0 - np.exp(-zeta * w * t) * (
-            np.cosh(wd * t) + (zeta * w / wd) * np.sinh(wd * t))
-    return np.clip(v, 0.0, 1.0)
+        v = 1.0 - math.exp(-zeta * w * t) * (
+            math.cosh(wd * t) + (zeta * w / wd) * math.sinh(wd * t))
+    return min(max(v, 0.0), 1.0)
 
-def fit(g, d, start_lo, start_hi, step=1.0):
+
+def load_csv(path, travel_px):
+    """(t_ms, d) from the CSV; `d` is used when present, else dy/travel."""
+    samples = []
+    header = None
+    with open(path, encoding='utf-8-sig') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = [p.strip() for p in line.split(',')]
+            if header is None:
+                header = [p.lower() for p in parts]
+                if not any(h in header for h in ('t_ms', 't')):
+                    raise SystemExit('%s: no t_ms column' % path)
+                continue
+            row = dict(zip(header, parts))
+            t = float(row.get('t_ms', row.get('t')))
+            if 'd' in row and row['d'] != '':
+                d = float(row['d'])
+            elif 'dy_px' in row:
+                d = 1.0 - float(row['dy_px']) / travel_px
+            else:
+                raise SystemExit('%s: no d or dy_px column' % path)
+            samples.append((t, d))
+    if len(samples) < 4:
+        raise SystemExit('%s: too few samples' % path)
+    samples.sort()
+    return samples
+
+
+def grid_of(samples, step=1.0):
+    """d(t) on a 1 ms grid, linear between the samples."""
+    t0 = samples[0][0]
+    t1 = samples[-1][0]
+    count = int(round((t1 - t0) / step)) + 1
+    grid = [t0 + i * step for i in range(count)]
+    values = []
+    k = 0
+    for g in grid:
+        while k + 1 < len(samples) and samples[k + 1][0] <= g:
+            k += 1
+        if k + 1 >= len(samples):
+            values.append(samples[-1][1])
+        else:
+            (ta, da), (tb, db) = samples[k], samples[k + 1]
+            span = tb - ta
+            values.append(da if span <= 0 else da + (db - da) * (g - ta) / span)
+    return grid, values
+
+
+def model_value(times, values, t):
+    """The shipped frame list, interpolated the way the animation is."""
+    if t <= times[0]:
+        return values[0]
+    if t >= times[-1]:
+        return values[-1]
+    lo, hi = 0, len(times) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if times[mid] <= t:
+            lo = mid
+        else:
+            hi = mid
+    span = times[hi] - times[lo]
+    if span <= 0:
+        return values[hi]
+    return values[lo] + (values[hi] - values[lo]) * ((t - times[lo]) / span)
+
+
+def area_between(times, values, grid, measured):
+    total = 0.0
+    j = 0
+    n = len(times)
+    for k, g in enumerate(grid):
+        if g <= times[0]:
+            y = values[0]
+        elif g >= times[-1]:
+            y = values[-1]
+        else:
+            while j + 1 < n and times[j + 1] <= g:
+                j += 1
+            span = times[j + 1] - times[j]
+            y = values[j] if span <= 0 else values[j] + (
+                values[j + 1] - values[j]) * ((g - times[j]) / span)
+        total += abs(y - measured[k])
+    return total
+
+
+def residual_after(samples, times, values, since_ms):
+    late = [(t, d) for t, d in samples if t >= since_ms]
+    if not late:
+        return 0.0, 0.0
+    errors = [abs(model_value(times, values, t) - d) for t, d in late]
+    return sum(errors) / len(errors), max(errors)
+
+
+def search_damping(t_total, grid, measured, lo=0.60, hi=6.00):
+    """Coarse then fine area search for the shipped model's damping."""
+    def area_at(zeta):
+        times, values, _, _, _ = settle_frames(zeta, t_total)
+        return area_between(times, values, grid, measured)
+
     best = None
-    for period in np.arange(80, 701, 2.0):
-        for zeta in np.arange(0.60, 2.51, 0.02):
-            for start in np.arange(start_lo, start_hi + 1e-9, step):
-                y = y_spring(g - start, period, zeta)
-                a = np.abs(y - d).sum() * 1.0  # 1 ms bins
-                if best is None or a < best[0]:
-                    best = (a, period, zeta, start)
-    return best
+    zeta = lo
+    while zeta <= hi + 1e-9:
+        area = area_at(zeta)
+        if best is None or area < best[0]:
+            best = (area, zeta)
+        zeta = round(zeta + 0.05, 4)
+    coarse = best[1]
+    for i in range(-10, 11):
+        zeta = round(coarse + 0.005 * i, 4)
+        if zeta < lo or zeta > hi:
+            continue
+        area = area_at(zeta)
+        if area < best[0]:
+            best = (area, zeta)
+    return best, lo, hi
 
-def report(name, data, sign, t_end, best):
-    a, period, zeta, start = best
-    g, d = grid_of(data, sign, t_end)
-    y = y_spring(g - start, period, zeta)
-    dur = 5.0 * period / (2 * math.pi * zeta)
-    print(f'\n== {name}')
-    print(f'   area = {a:.1f} ms of displacement; mean |y-d| = {a/len(g):.4f}; '
-          f'rms = {np.sqrt(((y-d)**2).mean()):.4f}')
-    print(f'   period = {period:.0f} ms, zeta = {zeta:.2f}, start = {start:+.0f} ms '
-          f'relative to the measured t=0')
-    print(f'   settle duration 5/(zeta*omega) = {dur:.0f} ms')
-    print(f'   {"t":>7} {"y":>6} {"d":>6} {"err":>7}')
-    for t, dy in data:
-        dd = (1.0 - dy / DY_HIDDEN) if sign > 0 else (dy / DY_HIDDEN)
-        yy = float(y_spring(np.array([t - start]), period, zeta)[0])
-        print(f'   {t:7.1f} {yy:6.3f} {dd:6.3f} {yy - dd:+7.3f}')
-    return period, zeta, start, a
 
-g_open, d_open = grid_of(OPEN, +1, 306.0)
-f1 = fit(g_open, d_open, 0, 0)
-p1 = report('OPEN, y0=0, start pinned at the visibility flip (2 parameters)',
-            OPEN, +1, 306.0, f1)
+def print_samples(path, samples, travel_dip):
+    print('\n== samples')
+    print('   file      %s' % path)
+    print('   samples   %d, t %.1f .. %.1f ms, travel %.0f DIP'
+          % (len(samples), samples[0][0], samples[-1][0], travel_dip))
+    print('   read from the CSV: this is the captured curve, not the mod')
 
-f2 = fit(g_open, d_open, -60, 30)
-p2 = report('OPEN, y0=0, start free (3 parameters)', OPEN, +1, 306.0, f2)
 
-g_close, d_close = grid_of(CLOSE, -1, 215.0)
-f3 = fit(g_close, d_close, 60, 115)
-p3 = report('CLOSE, y0=0, start free (3 parameters)', CLOSE, -1, 215.0, f3)
+def print_table(samples, model_at):
+    print('   %7s %6s %6s %7s' % ('t', 'y', 'd', 'err'))
+    for t, d in samples:
+        y = model_at(t)
+        print('   %7.1f %6.3f %6.3f %+7.3f' % (t, y, d, y - d))
 
-# What does the native open curve look like as a bezier? 2-parameter family
-# with the classic Fluent shape ((x1,y1),(0.5,1)).
-def bez_y(x1, y1, n=401):
-    u = np.linspace(0, 1, n)
-    x = 3 * u * (1 - u) ** 2 * x1 + 3 * u * u * (1 - u) * 0.5 + u ** 3
-    y = 3 * u * (1 - u) ** 2 * y1 + 3 * u * u * (1 - u) * 1.0 + u ** 3
-    return x, y
 
-best = None
-for T in np.arange(240, 341, 10.0):
-    for x1 in np.arange(0.04, 0.61, 0.02):
-        for y1 in np.arange(0.20, 1.61, 0.05):
-            x, y = bez_y(x1, y1)
-            model = np.interp(g_open / T, x, y)
-            a = np.abs(model - d_open).sum()
-            if best is None or a < best[0]:
-                best = (a, T, x1, y1)
-a, T, x1, y1 = best
-print(f'\n== OPEN as cubic-bezier(({x1:.2f},{y1:.2f}),(0.5,1)) over {T:.0f} ms: '
-      f'area {a:.0f} ms, mean {a/307:.3f}, initial slope {y1/x1:.2f}x average')
+def report_shipped(args, samples, grid, measured, travel_dip):
+    t_total = shipped_duration(travel_dip)
+    zeta = args.damping if args.damping is not None else WIN11_DAMPING
+    times, values, omega, end_value, steps = settle_frames(zeta, t_total)
+    area = area_between(times, values, grid, measured)
+    rms = math.sqrt(sum(
+        (model_value(times, values, g) - measured[k]) ** 2
+        for k, g in enumerate(grid)) / len(grid))
+    late_mean, late_max = residual_after(samples, times, values, 90.0)
+    slowest = zeta - math.sqrt(zeta * zeta - 1.0) if zeta > 1.0 else zeta
 
-print('\n== initial slope at a half-open release (Distance 1440 DIP, finger 0.4 DIP/ms)')
-print('   Win10 spring, and the fitted Win11 spring, y0 = v/remaining = '
-      f'{0.4/(0.5*DIST)*1000:.3f} 1/s -> 0.40 DIP/ms, 4.0 DIP in the first 10 ms')
-print(f'   old Win11 bezier(0.1,0.9,0.2,1)/300 ms -> 9 x average = '
-      f'{9*(0.5*DIST)/300:.2f} DIP/ms, {9*(0.5*DIST)/300*10:.0f} DIP in the first 10 ms')
+    print('\n== shipped model (the settle this mod runs)')
+    print('   duration  T = %d ms (%.0f DIP / %.1f DIP/ms, clamped %d..%d)'
+          % (t_total, travel_dip, SPEED_DIP_PER_MS, MIN_MS, MAX_MS))
+    print('   omega     %.5f 1/ms, slowest root %.4f, %g time constants in T'
+          % (omega, slowest, TIME_CONSTANTS))
+    print('   endValue  curve(T) = %.4f, the shipped normalisation' % end_value)
+    print('   frames    %d samples at %.0f ms per segment' % (steps + 1, SEGMENT_MS))
+    print('   damping   %.2f%s, y0 = 0'
+          % (zeta, ' (kWin11SpringDamping)' if args.damping is None else ' (--damping)'))
+    print('   residual  area %.1f ms, mean |y-d| %.4f, rms %.4f'
+          % (area, area / len(grid), rms))
+    print('   after 90 ms: mean |y-d| %.4f, max %.4f' % (late_mean, late_max))
+    if samples[0][1] > 0.30:
+        print('   note      the native curve is faster than any y0 = 0 spring in its')
+        print('             first 30 ms (%.3f of the travel at %.1f ms); the decay'
+              % (samples[0][1], samples[0][0]))
+        print('             after 90 ms is what this curve identifies.')
+
+    if args.fit:
+        (best_area, best_zeta), lo, hi = search_damping(t_total, grid, measured)
+        print('\n== damping search (--fit, area over the observed window)')
+        print('   best zeta %.3f, area %.1f ms (shipped %.2f: %.1f ms)'
+              % (best_zeta, best_area, zeta, area))
+        if best_zeta <= lo + 0.051 or best_zeta >= hi - 0.051:
+            print('   the optimum sits on the search bound %.2f..%.2f: the'
+                  % (lo, hi))
+            print('   objective is monotone here, so this curve does not')
+            print('   identify the damping. The shipped value comes from the')
+            print('   free-period fit, which --model legacy repeats.')
+        else:
+            print('   the optimum is inside the search range; compare it with the')
+            print('   shipped value above before changing anything.')
+
+    print_table(samples, lambda t: model_value(times, values, t))
+    return zeta, area
+
+
+def legacy_grid(samples):
+    """The historical domain: 0..last sample on a 1 ms grid, d = 0 before the
+    first visible frame. The old file sampled this way (and stopped at 306 ms),
+    which is why it reached period 102 ms / zeta 1.72. The shipped comparison
+    above does not assume anything before the first frame."""
+    ts = [p[0] for p in samples]
+    ds = [p[1] for p in samples]
+    grid = [float(i) for i in range(int(ts[-1]) + 1)]
+    measured = []
+    k = 0
+    for g in grid:
+        if g < ts[0]:
+            measured.append(0.0)
+            continue
+        while k + 1 < len(ts) and ts[k + 1] <= g:
+            k += 1
+        if k + 1 >= len(ts):
+            measured.append(ds[-1])
+        else:
+            span = ts[k + 1] - ts[k]
+            measured.append(ds[k] if span <= 0 else
+                            ds[k] + (ds[k + 1] - ds[k]) * (g - ts[k]) / span)
+    return grid, measured
+
+
+def report_legacy(samples):
+    grid, measured = legacy_grid(samples)
+    best = None
+    for period in range(80, 701, 10):
+        for zi in range(20):
+            zeta = 0.60 + 0.10 * zi
+            area = sum(abs(legacy_curve(g, zeta, period) - measured[k])
+                       for k, g in enumerate(grid))
+            if best is None or area < best[0]:
+                best = (area, float(period), zeta)
+    _, period0, zeta0 = best
+    for period in range(int(period0) - 10, int(period0) + 11):
+        for zi in range(-10, 11):
+            zeta = round(zeta0 + 0.01 * zi, 4)
+            if zeta <= 0:
+                continue
+            area = sum(abs(legacy_curve(g, zeta, period) - measured[k])
+                       for k, g in enumerate(grid))
+            if area < best[0]:
+                best = (area, float(period), zeta)
+    area, period, zeta = best
+    omega = 2.0 * math.pi / period
+    duration = TIME_CONSTANTS / (zeta * omega)
+    rms = math.sqrt(sum(
+        (legacy_curve(g, zeta, period) - measured[k]) ** 2
+        for k, g in enumerate(grid)) / len(grid))
+    late = [abs(legacy_curve(t, zeta, period) - d) for t, d in samples if t >= 90]
+
+    print('\n== legacy model (historical only; the mod does not run this)')
+    print('   domain    0..%d ms on a 1 ms grid, d = 0 before the first visible'
+          % int(grid[-1]))
+    print('             frame: the old file\'s domain (it stopped at 306 ms and')
+    print('             printed 102 ms / 1.72)')
+    print('   period    %.0f ms, zeta %.2f, start pinned at the visibility flip'
+          % (period, zeta))
+    print('   duration  5/(zeta*omega) = %.0f ms (the old, wrong time constant)'
+          % duration)
+    print('   residual  area %.1f ms, mean |y-d| %.4f, rms %.4f'
+          % (area, area / len(grid), rms))
+    if late:
+        print('   after 90 ms: mean |y-d| %.4f, max %.4f'
+              % (sum(late) / len(late), max(late)))
+    print_table(samples, lambda t: legacy_curve(t, zeta, period))
+    return zeta, area
+
+
+def report_initial_slope():
+    velocity = 0.4
+    remaining = 0.5 * DISTANCE_DIP
+    print('\n== shipping settle, analytic (not measured)')
+    print('   half-open release: Distance %.0f DIP, finger %.1f DIP/ms'
+          % (DISTANCE_DIP, velocity))
+    print('   y0 = v/remaining = %.3f 1/ms -> %.2f DIP/ms, %.1f DIP in the first 10 ms'
+          % (velocity / remaining, velocity, velocity * 10.0))
+    old = 9.0 * remaining / 300.0
+    print('   old Windows 11 bezier(0.1,0.9,0.2,1)/300 ms: 9x average = '
+          '%.2f DIP/ms, %.0f DIP in the first 10 ms' % (old, old * 10.0))
+
+
+def main(argv):
+    here = os.path.dirname(os.path.abspath(__file__))
+    parser = argparse.ArgumentParser(
+        description='Fit a model to the captured native flyout curve. '
+                    'This is a fit to data, not a validation of the shipping build.')
+    parser.add_argument('--model', choices=('shipped', 'legacy'), default='shipped',
+                        help='which model to report (default: shipped)')
+    parser.add_argument('--csv', default=os.path.join(
+        here, '..', 'artifacts', 'native-flyout-open.csv'),
+        help='samples to fit (default: artifacts/native-flyout-open.csv)')
+    parser.add_argument('--damping', type=float, default=None,
+                        help='shipped model: evaluate this damping (default %.2f)'
+                             % WIN11_DAMPING)
+    parser.add_argument('--fit', action='store_true',
+                        help='shipped model: also search the area-optimal damping')
+    parser.add_argument('--travel-dip', type=float, default=TRAVEL_DIP,
+                        help='panel travel in DIP for the duration formula (default: 578)')
+    parser.add_argument('--travel-px', type=float, default=TRAVEL_PX,
+                        help='panel travel in px for files without a d column (default: 1156)')
+    parser.add_argument('--time-offset', type=float, default=0.0,
+                        help='ms added to every sample t, for a capture whose t=0 is '
+                             'not the animation start (the close CSV needs its KEY time)')
+    args = parser.parse_args(argv)
+    if args.model == 'legacy' and (args.fit or args.damping is not None):
+        parser.error('--damping and --fit are shipped-model options')
+
+    path = os.path.abspath(args.csv)
+    samples = load_csv(path, args.travel_px)
+    if args.time_offset:
+        samples = [(t + args.time_offset, d) for t, d in samples]
+    if samples[0][0] < 0:
+        parser.error('%s: the first sample is at t=%.1f ms. The model starts at '
+                     't=0, so the samples need the animation start as their '
+                     'origin; use --time-offset for a capture counted from '
+                     'something else.' % (path, samples[0][0]))
+
+    print('model: %s - a fit to captured data, not a validation of the shipping build'
+          % args.model)
+    print_samples(path, samples, args.travel_dip)
+    if args.model == 'shipped':
+        grid, measured = grid_of(samples)
+        report_shipped(args, samples, grid, measured, args.travel_dip)
+    else:
+        report_legacy(samples)
+    report_initial_slope()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

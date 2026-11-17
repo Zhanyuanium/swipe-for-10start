@@ -1,6 +1,7 @@
 # Settle trace of the shipped mod, top taskbar, injected pull from the screen edge.
 # `edge` is the panel's bottom edge in screen px (fresh menu: 96 top, 1350 bottom).
-# t is ms from the touch UP, measured at the start of a 2880x1020 BitBlt.
+# t is ms from the touch UP, stamped after the BitBlt and before the read-back,
+# so it is late by the UP injection and the BitBlt, not the capture start.
 # The mod detects the release at ~20 ms (relms) and the composition animation
 # reaches the screen ~50 ms after the UP, so the panel is still at the held
 # position at t=41 in both runs: no jump.

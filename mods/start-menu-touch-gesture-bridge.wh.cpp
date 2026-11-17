@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.9.0
+// @version         0.11.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -21,18 +21,36 @@ closes: a keyboard close is the user's Windows tap, a gesture close is a Windows
 tap the Start mod sends at the end of its retract. This mod only decides how
 long the shell's key handler must wait for the panel.
 
-- A gesture close stamps the shared channel at its release. The tap comes after
-  the retract, so when the Hide arrives on a stamp this hook has not consumed the
-  panel is already gone; the hook logs `hide passed (gesture)` and calls the
-  original at once.
-- A gesture close that a new edge pull cancels before its tap stamps the
-  cancelled kind: the next Hide is a keyboard close.
+- A gesture close publishes a plan at its release, and a fresh record marked
+  `tapped` immediately before it sends the Windows key. Only the tapped record
+  names the Hide that needs no wait, because only it proves the tap is already
+  on its way. When that Hide arrives on a tapped record this hook has not
+  consumed, the panel is already gone; the hook logs
+  `hide passed (gesture)` and calls the original at once. A Hide that arrives
+  while only the plan is current is the user's own Windows press during the
+  settle, a keyboard close, and gets the lead below.
+- A gesture close that a new edge pull cancels before its tap publishes the
+  cancelled kind at once, so no Hide in between is ever mistaken for the tap's.
+- The close record names no menu, so a tapped record is accepted only when it is
+  newer than the sequence this process seeded at attach and was stamped at or
+  after the newest open generation it has seen. That alone keeps a tap whose Hide
+  never came from passing an unrelated Hide under the next menu; the channel also
+  asks the Start side to cancel its stamp when it publishes a new open. Both
+  ticks come from one clock, so only a tap and an open inside the same ~16 ms
+  tick cannot be ordered: an unconsumed fresh stamp is evidence of correlation,
+  not proof of cause, and the plan-versus-tapped distinction is what carries the
+  correctness.
 - Any other Hide is a keyboard close: the mod publishes the `retract` request on
   the channel and waits for the Start mod's answer with the settle it
   just planned, then holds the shell for exactly that duration plus a 30 ms
-  margin. A Start mod that cannot answer costs a 100 ms wait and then a fixed
-  560 ms lead. A request that cannot be published skips the wait, because a delay
-  without a retract would only slow the close down.
+  margin. The request carries the menu-open generation the hook saw and a
+  deadline, so a request that reaches the Start side late cannot start a settle
+  under the menu the user opened next; the hook marks the request done when the
+  Hide it held completes. A menu with no published generation sends 0, which is
+  never a valid generation and which the Start side refuses. A Start mod that
+  cannot answer costs a 100 ms wait and then a fixed 560 ms lead. A request that
+  cannot be published skips the wait, because a delay without a retract would
+  only slow the close down.
 
 Measured on this build, `Hide` is not the whole close: the shell keeps its Start
 toggle in the key handler. Both closes now go through that handler, so the
@@ -51,7 +69,7 @@ A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
 shipping Start mod does not read it. Its live couplings are the close stamp and
 the retract request/answer pair described below, both in
-`Local\SwipeFor10Start_v1_*` (see `swipe_ipc_shared.h`).
+`Local\SwipeFor10Start_v2_*` (see `swipe_ipc_shared.h`).
 
 Hooked functions are forwarded unchanged except for the keyboard wait described
 below. The mod creates no windows, threads or COM objects.
@@ -67,7 +85,9 @@ Notes:
 - Hooks are installed only after `twinui.pcshell.dll` is loaded, via a
   `LoadLibraryExW` hook plus the module check in `Wh_ModAfterInit`.
 - The sequence field is a seqlock: a reader must retry when it is odd or when
-  it changed between two reads.
+  it changed between two reads. The IPC channel uses the same rule per record; a
+  single section-wide counter would not work because the two sides write
+  different records.
 - `edge` is written verbatim from the shell. In the Phase 0 log, a swipe that
   started at (45, 900) on a 1440x900 screen (taskbar on the left) reported
   edge 0, matching `StartGestureEdge::Left`.
@@ -75,7 +95,9 @@ Notes:
   write as the edge and the handle. There is no per-frame position sampling.
 - Each gesture state transition appends one line to `bridge.log` in the mod
   storage folder: `state=... edge=... src=... prov=... <reason>`. The channel to
-  the Start mod logs one `ipc open created=... close=...` at init.
+  the Start mod logs one `ipc open created=... close=...` at init, and one
+  `hide open generation unavailable err=...` for a Hide that found no published
+  open generation (0 is never a generation).
 
 The delayed Hide:
 
@@ -83,20 +105,24 @@ The delayed Hide:
   shell's own key handler. No manager pointer is cached, no worker exists, and no
   call is made on the shell's behalf. Every Show and Hide logs one line
   (`show a=... b=... c=...`, `hide reason=...`) before the delay decision.
-- A gesture close publishes its stamp on the shared channel at its release; its
-  tap comes at the end of the retract, so the panel is already off screen when
-  the Hide arrives. A stamp this hook has not consumed yet and that is younger
-  than 800 ms names that case: the hook logs `hide passed (gesture)` and calls
-  the original at once. A nonzero delay is only for a future stamp and waits
-  that long (capped at 600 ms).
-- A stamp of the cancelled kind means the Start side dropped the close before its
-  tap; the next Hide is a keyboard close. The same applies when the stamp is
-  older than 800 ms or was already consumed once.
+- A gesture close publishes its plan at its release and a tapped record the
+  moment its Windows tap goes down; only the tapped one names the tap's own Hide,
+  so the hook logs `hide passed (gesture)` and calls the original at once for it.
+  A tapped Hide never waits: no publisher in this repository writes a nonzero
+  close delay, and the lead that remains is the keyboard close's alone.
+- A plan or a cancel never passes a Hide: the tap is the record that carries
+  `tapped`, and the plan stays current for the whole settle. A user's Windows
+  press during that settle is therefore a keyboard close and gets its own lead,
+  and a close a new pull cancels publishes the cancelled kind at once, not at the
+  tap's deadline.
 - A keyboard close publishes the `retract` request on the same channel and wakes
-  the Start mod through its request event. That mod plans its settle from the
-  panel's current `Progress` and the panel travel, starts it, and answers with
-  the duration (or the no-settle sentinel) under the request's sequence number.
-  The hook waits for that answer, logs
+  the Start mod through its request event. The request names the menu-open
+  generation this hook read and a deadline; that mod plans its settle from the
+  panel's current `Progress` only while that generation is current and the
+  deadline has not passed, then answers with the duration (or the no-settle
+  sentinel) under the request's sequence number. When this hook's Hide completes
+  it marks the request done, so a request whose close is over cannot start a
+  settle under the next menu. The hook waits for that answer, logs
   `hide delayed reason=... retract=... lead=...` and
   holds the original for the answered duration plus 30 ms, so the shell hides
   after the slide has landed instead of cutting it. The wait for the answer is
@@ -122,28 +148,37 @@ The delayed Hide:
  *   CStartExperienceManager::SetAnimationData/Show/Hide; on version.dll for the
  *   build gate; on LoadLibraryExW from kernelbase.dll for the late module load;
  *   on the shared-memory contract in start_gesture_shared.h; on the channel in
- *   swipe_ipc_shared.h, whose close stamp names a gesture close (or one dropped
- *   before its tap) and whose retract request/answer pair carries the settle
- *   duration a keyboard close needs.
+ *   swipe_ipc_shared.h, whose close record carries a tapped gesture stamp (the
+ *   tap's own Hide) and whose retract request/answer pair carries the settle
+ *   duration a keyboard close needs, bound to the menu-open generation the
+ *   request was written for. A generation of 0 means the Start side published no
+ *   open, so no request may name it and no close stamp can be bound; both then
+ *   fall back to the fixed lead.
  * [OUTPUT]: the `Local\WindhawkStartGestureShared` mapping and its auto-reset
  *   event, holding the edge, the gesture handle and the state under a seqlock;
  *   a `bridge.log` line per state transition; one `retract` request on the Start
- *   mod's channel and a wait in
+ *   mod's channel, marked done when its Hide completes, and a wait in
  *   CStartExperienceManager::Hide for the settle duration the Start mod answers
  *   with plus a 30 ms margin, so a Windows-key close slides the panel out before
  *   the window is hidden; a `hide delayed reason=... retract=... lead=...` line
  *   per keyboard close; a `hide passed (gesture)` line and the original
- *   call at once for a Hide on an unconsumed gesture stamp, because the
- *   Start side taps after its retract. Every path calls the original Hide;
- *   nothing is pressed and no hide is requested. No exported symbols.
+ *   call at once for a Hide on a tapped stamp that is newer than the attach
+ *   watermark and not older than the newest open generation, because the Start
+ *   side taps before the shell's key handler hides. Every path calls the
+ *   original Hide; nothing is pressed and no hide is requested. No exported
+ *   symbols.
  * [POS]: explorer-side half of the legacy Start gesture work. It observes the
  *   shell's own hide decision and decides whether that Hide still needs the
  *   retract lead. Both closes are Windows taps performed by the Start side, and
  *   a gesture close is tapped only after its retract; the shell's Start toggle is
  *   always updated by its key handler, so this mod needs no manager pointer,
  *   worker thread, timer or re-arm tap. The shipping Start mod does not read the
- *   shared memory; the close stamp and the retract request/answer pair in the
- *   swipe_ipc_shared.h channel are the couplings that are live today.
+ *   shared gesture memory; the close record, the open generation and the
+ *   retract request/answer pair in the swipe_ipc_shared.h channel are the
+ *   couplings that are live today. An unconsumed fresh stamp is evidence of
+ *   correlation, not proof of cause: the plan-versus-tapped distinction is what
+ *   makes the gesture path correct, and the binding only keeps a stamp of a menu
+ *   that is gone from passing a later Hide.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -197,26 +232,31 @@ constexpr uint64_t kHideLeadMarginMs = 30;
 constexpr int32_t kRetractPlanNoSettleMs = 1;
 constexpr uint64_t kRetractPlanMaxMs = 2000;
 
-// A gesture close stamp is consumed by exactly one Hide. The Start side
-// publishes it at the release and taps the Windows key at the end of the
-// retract, so a Hide that arrives on that stamp is the tap's own and needs no
-// wait. A stamp older than this window belongs to a close that is over.
+// How long a published retract request stays valid for the Start side. The
+// bridge's own hold after publishing is at most kRetractPlanWaitMs plus the
+// fixed lead (650 ms), and it marks the request done when that Hide completes,
+// so this deadline is the backstop for a lost marker, not the usual end: a
+// request can never reach a settle after the close it was written for is over.
+constexpr uint64_t kRetractRequestWindowMs = 700;
+
+// A tapped close is consumed by exactly one Hide. The Start side publishes the
+// plan at the release, marks the same record `tapped` with a fresh sequence
+// immediately before it sends the Windows key, so the Hide that follows is the
+// tap's own and needs no wait. A tapped record older than this window belongs to
+// a close that is over, and a tap whose Hide never came leaves its record valid
+// for this window and no longer; the plan alone never passes a Hide.
 constexpr uint64_t kCloseStampFreshMs = 800;
-// The delay is a safety valve for a future nonzero stamp; the shipping value is
-// 0. The cap keeps a corrupt value from holding the shell's UI thread.
-constexpr uint64_t kGestureHideDelayCapMs = 600;
 
 // The hide waits in 10 ms steps, so the wait can end early when the mod is being
-// disabled under it. The shipping gesture path waits 0.
+// disabled under it.
 constexpr DWORD kHidePollMs = 10;
 
 // The cross-process channel (swipe_ipc_shared.h). Opened once at init; its
 // handles stay for the life of the process, like the gesture mapping, because a
 // Hide may still be in flight while the mod unloads.
 SwipeIpcChannel g_ipc;
-// The highest close stamp this hook has consumed. Seeded from the channel at
-// attach, so a stamp written before this process belongs to someone else's
-// close.
+// The highest tapped close this hook has consumed. Seeded from the channel at
+// attach, so a tap written before this process belongs to someone else's close.
 LONG64 g_handledCloseSeq = 0;
 
 struct Point {
@@ -934,40 +974,53 @@ void WaitForRetractLead(uint64_t leadMs) {
     }
 }
 
-// Consumes the Start side's close stamp when it belongs to this Hide. The
-// sequence number is the whole protocol: a stamp this hook has not seen is a
-// gesture close whose tap has already retracted the panel, and a stamp it has
-// seen is a later keyboard close under the same stamp. Only a gesture stamp
-// passes; a cancelled one (a new pull dropped the close before its tap) never
-// causes a Hide of its own.
-bool ConsumeGestureStamp(uint64_t* delayMs) {
-    if (!g_ipc.state) {
+// Consumes the Start side's tapped record when it belongs to this Hide. The
+// sequence number is the whole protocol: a tapped record this hook has not seen
+// is a gesture close whose Windows tap is going down right now, so this Hide is
+// that tap's and needs no wait; a tapped record it has seen is a later keyboard
+// close. The plan alone never passes: it is published at the release, up to a
+// full settle before the tap exists, so a Hide during that settle is the user's
+// own Windows press and gets its own lead. A cancelled record never taps at all.
+//
+// The record names no menu, so two more tests bind it to one. It must be newer
+// than the sequence this process seeded at attach, and it must not be older than
+// the newest open generation this hook has seen: a stamp written before that
+// open belongs to a menu that is gone, and would otherwise pass an unrelated
+// Hide under the menu the user has since opened. The channel also asks the Start
+// side to cancel its stamp when it publishes a new open; the test above does not
+// depend on it. With no known open generation nothing can be bound, so the stamp
+// is refused and the Hide takes the keyboard path.
+bool ConsumeGestureStamp(bool openKnown, uint64_t openTick) {
+    if (!g_ipc.state || !openKnown) {
         return false;
     }
 
-    const LONG64 sequence = SwipeIpcLoad64(&g_ipc.state->closeSeq);
-    if (sequence == 0 || sequence == g_handledCloseSeq) {
+    // One snapshot, so the kind, the tapped flag and the tick can never come
+    // from two different publishes.
+    SwipeIpcCloseSnapshot close{};
+    if (!SwipeIpcReadClose(&g_ipc, &close)) {
+        return false;
+    }
+    if (close.seq == 0 || close.seq == g_handledCloseSeq) {
+        return false;
+    }
+    if (close.tapped == 0 || close.kind != kSwipeCloseKindGesture) {
         return false;
     }
 
-    const uint64_t published =
-        static_cast<uint64_t>(SwipeIpcLoad64(&g_ipc.state->closeTick));
     const uint64_t now = GetTickCount64();
-    if (now > published && now - published > kCloseStampFreshMs) {
-        // The close that wrote this is long over; the Hide in hand is a
-        // keyboard close and gets its own lead.
+    if (now > close.tick && now - close.tick > kCloseStampFreshMs) {
+        // The tap that wrote this is long over; the Hide in hand is a keyboard
+        // close and gets its own lead.
+        return false;
+    }
+    if (close.tick < openTick) {
+        // Stamped before the menu now on screen was published: a tap whose Hide
+        // never came. The current menu's own tap is always newer than its open.
         return false;
     }
 
-    g_handledCloseSeq = sequence;
-    const LONG kind = InterlockedCompareExchange(&g_ipc.state->closeKind, 0, 0);
-    if (kind != kSwipeCloseKindGesture) {
-        return false;
-    }
-
-    const LONG delay =
-        InterlockedCompareExchange(&g_ipc.state->closeDelayMs, 0, 0);
-    *delayMs = delay > 0 ? static_cast<uint64_t>(delay) : 0;
+    g_handledCloseSeq = close.seq;
     return true;
 }
 
@@ -995,15 +1048,21 @@ bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
             static_cast<DWORD>(
                 std::min<ULONGLONG>(kHidePollMs, deadline - now)));
         if (wait == WAIT_OBJECT_0) {
-            if (SwipeIpcLoad64(&g_ipc.state->retractPlanSeq) != request) {
+            // The plan is copied as one seqlock record and accepted only when it
+            // echoes this request, so an answer to an earlier close can never
+            // satisfy this one and no half-written plan is read.
+            SwipeIpcRetractPlan plan{};
+            if (!SwipeIpcReadRetractPlan(&g_ipc, &plan)) {
+                continue;
+            }
+            if (plan.request != request) {
                 continue;  // an answer to an earlier request
             }
-            const LONG plan =
-                InterlockedCompareExchange(&g_ipc.state->retractPlanMs, 0, 0);
-            *settleMs = plan > 0 && static_cast<uint64_t>(plan) <=
-                                       kRetractPlanMaxMs
-                            ? plan
-                            : kRetractPlanNoSettleMs;
+            *settleMs =
+                plan.settleMs > 0 &&
+                        static_cast<uint64_t>(plan.settleMs) <= kRetractPlanMaxMs
+                    ? plan.settleMs
+                    : kRetractPlanNoSettleMs;
             return true;
         }
         if (g_disabled.load(std::memory_order_relaxed)) {
@@ -1018,13 +1077,13 @@ bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
 // Delayed Hide
 //
 // A gesture close taps the Windows key at the end of its retract, so the Hide
-// that tap causes needs no wait: the panel is already gone. The close stamp names
-// that case. A keyboard close publishes the `retract` request and then waits for
-// the Start mod's answer: that mod plans the settle from the panel's travel and
-// publishes its duration, so the shell is held for exactly as long as the slide
-// takes. Without an answer the fixed lead applies. No worker, manager pointer,
-// timer or re-arm tap is involved: every Hide is the shell's own call, on its own
-// thread.
+// that tap causes needs no wait: the panel is already gone. The tapped record
+// names that case, and only the tap publishes it. A keyboard close publishes the
+// `retract` request and then waits for the Start mod's answer: that mod plans the
+// settle from the panel's travel and publishes its duration, so the shell is held
+// for exactly as long as the slide takes. Without an answer the fixed lead
+// applies. No worker, manager pointer, timer or re-arm tap is involved: every
+// Hide is the shell's own call, on its own thread.
 // ---------------------------------------------------------------------------
 
 // CStartExperienceManager::Hide(void* self, uint32_t reason) -> HRESULT
@@ -1039,14 +1098,15 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
     ClearSharedGestureState(L"Hide");
 
     // The shell's key handler decided this hide from a Windows tap. A gesture
-    // close publishes its stamp at the release, after it has retracted the
-    // panel: the tap comes at the end of that retract, so this Hide is already
-    // too late to cut the animation and runs at once. A keyboard close (no
-    // stamp, a stamp this hook already consumed, a cancelled one) requests the
-    // retract through the channel and waits for the Start mod's answer. Only
-    // that mod knows the panel's travel, so the wait is its planned settle plus
-    // one margin; no answer at all falls back to the fixed lead, which covers
-    // the full 409 ms slide.
+    // close publishes its plan at the release and marks the same record tapped
+    // immediately before its own Windows tap, so the Hide that tap causes is
+    // already too late to cut the animation and runs at once. A keyboard close
+    // (no record, a plan or a cancel, a record this hook already consumed, one
+    // older than the window, one stamped before the menu now open) requests the
+    // retract through the channel and waits for the Start mod's answer. Only that
+    // mod knows the panel's travel, so the wait is its planned settle plus one
+    // margin; no answer at all falls back to the fixed lead, which covers the
+    // full 409 ms slide.
     //
     // This hook always calls the original. An earlier version returned S_OK to
     // cancel a hide when the user pulled the menu open again; measured, the
@@ -1055,21 +1115,36 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
     // is cancelled on the Start side instead, by not sending its tap.
     if (g_hideDelayEnabled.load(std::memory_order_relaxed) &&
         !g_disabled.load(std::memory_order_relaxed)) {
-        uint64_t delayMs = 0;
-
-        if (ConsumeGestureStamp(&delayMs)) {
-            delayMs = std::min(delayMs, kGestureHideDelayCapMs);
-            if (delayMs == 0) {
-                FileLog(L"hide passed (gesture)");
-            } else {
-                // A nonzero value is only for a future stamp; the shipping Start
-                // mod writes 0 because it taps after the retract.
-                FileLog(L"hide delayed (gesture) ms=%llu",
-                        static_cast<unsigned long long>(delayMs));
-                WaitForRetractLead(delayMs);
+        // The newest menu open this hook has seen, read once and used by both
+        // paths: the stamped Hide is bound to it, and the keyboard path sends it
+        // with its request. No published generation (ERROR_NOT_READY), no stable
+        // copy, or no channel at all leaves both at 0: the request then carries
+        // 0, which the Start side refuses, and no close stamp can pass either,
+        // so this Hide takes the fixed lead.
+        uint64_t openGeneration = 0;
+        uint64_t openTick = 0;
+        DWORD openError = 0;
+        const bool openKnown =
+            SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick, &openError);
+        if (!openKnown) {
+            openGeneration = 0;
+            openTick = 0;
+            if (g_ipc.state) {
+                // Only a channel that exists can have a record problem worth
+                // naming; without one, `hide retract request failed` already
+                // says why this Hide takes the fixed lead.
+                FileLog(L"hide open generation unavailable err=%u",
+                        static_cast<unsigned int>(openError));
             }
+        }
+
+        if (ConsumeGestureStamp(openKnown, openTick)) {
+            // The Start side tapped after its retract, so the panel is already
+            // gone: no wait belongs to this Hide.
+            FileLog(L"hide passed (gesture)");
         } else {
-            const LONG64 request = SwipeIpcRequestRetract(&g_ipc);
+            const LONG64 request = SwipeIpcRequestRetract(
+                &g_ipc, openGeneration, kRetractRequestWindowMs);
             if (request != 0) {
                 int32_t settleMs = kRetractPlanNoSettleMs;
                 const bool answered = WaitForRetractPlan(request, &settleMs);
@@ -1090,6 +1165,10 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
                             static_cast<unsigned long long>(lead));
                 }
                 WaitForRetractLead(lead);
+                // This Hide is over. A request the Start side reads from now on
+                // belongs to no close of this menu and is marked done here, so it
+                // cannot start a settle later.
+                SwipeIpcClearRetractRequest(&g_ipc, request);
             } else {
                 FileLog(L"hide retract request failed");
             }
@@ -1217,14 +1296,18 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.9.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.11.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();
 
     // The channel to the Start side. Opening it here means the section and its
     // events exist before the first Hide, and a Start mod that attaches later
-    // joins the same ones.
+    // joins the same ones. This is the only call: SwipeIpcOpen may sleep for its
+    // init budget while the other side finishes a claim, so it must not run on
+    // a hook. A failure here means every Hide takes the fixed lead for the life
+    // of this attachment, which the budget makes reachable only for a section
+    // that cannot be initialised at all.
     bool created = false;
     DWORD ipcError = 0;
     if (!SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
@@ -1232,7 +1315,12 @@ BOOL Wh_ModInit() {
                L"fixed lead",
                static_cast<unsigned>(ipcError));
     } else {
-        g_handledCloseSeq = SwipeIpcLoad64(&g_ipc.state->closeSeq);
+        // A tap published before this process attached belongs to a close this
+        // hook never saw: seed the watermark so only a later tap can pass.
+        SwipeIpcCloseSnapshot close{};
+        g_handledCloseSeq = SwipeIpcReadClose(&g_ipc, &close)
+                                ? close.seq
+                                : SwipeIpcLoad64(&g_ipc.state->closeSeq);
         FileLog(L"ipc open created=%d close=%lld", created ? 1 : 0,
                 static_cast<long long>(g_handledCloseSeq));
     }
