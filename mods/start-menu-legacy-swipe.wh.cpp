@@ -680,8 +680,6 @@ constexpr std::chrono::milliseconds kOpenSlideDuration{260};
 // The return-to-rest animations keep the durations they always had: a
 // cancelled dismiss springs back from a short drag, and a reveal commit
 // finishes the slide to the open position.
-constexpr std::chrono::milliseconds kDismissCancelDuration{120};
-constexpr std::chrono::milliseconds kRevealCommitDuration{220};
 
 // Every gesture close ends in one Windows tap at the end of its retract. The tap
 // is the shell's own Start toggle: the key handler performs Hide, so no
@@ -1619,6 +1617,24 @@ bool BeginGestureClose(float from, float velocity, CloseKind kind) {
     }
     LogRetract(duration, velocity, curve);
     ArmGestureClose(kind, duration);
+    return true;
+}
+
+// The open counterpart of BeginGestureClose: the same planner and the same
+// velocity-matched curve, mirrored, so a pull that is released and a drag that
+// is cancelled settle with one mechanism and only the target differs. The curve
+// planner expects the travel still to cover, which for an opening is 1 - from.
+bool BeginGestureOpen(float from, float velocity) {
+    const std::chrono::milliseconds duration = PlanRetract(velocity);
+    const float distance = g_distancePub.load(std::memory_order_relaxed);
+    const RetractCurve curve = PlanRetractCurve(
+        velocity, std::clamp(1.0f - from, 0.0f, 1.0f), distance, duration);
+    if (!AnimateProgressTo(from, 1.0f, duration, &curve)) {
+        return false;
+    }
+    FileLog(L"open settle vel=%.2f dur=%llu s=%.2f y1=%.2f", velocity,
+            static_cast<unsigned long long>(duration.count()), curve.slope,
+            curve.y1);
     return true;
 }
 
@@ -2984,7 +3000,7 @@ void ReleaseRevealSession() {
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
         // finishes the slide instead of snapping.
-        const bool started = AnimateProgressTo(from, 1.0f, kRevealCommitDuration);
+        const bool started = BeginGestureOpen(from, velocity);
         FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f vel=%.2f "
                 L"commit=%d panel=%.0f n=%d",
                 travel, reveal.maxTravel, progress, velocity, commit ? 1 : 0,
@@ -3165,7 +3181,7 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
 
     session.active = false;
     if (distance > 0.0f) {
-        AnimateProgressTo(from, 1.0f, kDismissCancelDuration);
+        BeginGestureOpen(from, velocity);
     } else {
         ShowAtRest();
     }
