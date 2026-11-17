@@ -724,7 +724,10 @@ constexpr float kWindowMarginDip = 4.0f;
 // the fraction of a DIP a viewport leaves at its end; `kScrollerAxisSlopDip`
 // decides which viewer counts as scrollable at all (the wrapper ScrollViewer
 // reports a horizontal extent of 8380 and must never be picked).
-constexpr float kScrollerEndSlopDip = 2.0f;
+// The list rarely stops exactly at its end after a fling, so the end test is
+// generous; the panel-band test keeps a tight tolerance.
+constexpr float kScrollerEndSlopDip = 24.0f;
+constexpr float kPanelBandSlopDip = 2.0f;
 constexpr float kScrollerAxisSlopDip = 0.5f;
 constexpr uint32_t kScrollerScanMaxDepth = 32;
 // The reject line is diagnostic, not a per-sample measurement: the digitizer
@@ -2735,9 +2738,9 @@ bool VerticalDismissAllowed(int32_t axis, float x, float y, uint64_t tickMs) {
             const bool insidePanel =
                 trail > 0.0f && distance > 0.0f &&
                 (axis == static_cast<int32_t>(DismissAxis::Bottom)
-                     ? (y >= trail - kScrollerEndSlopDip &&
+                     ? (y >= trail - kPanelBandSlopDip &&
                         y <= trail + distance)
-                     : (y <= trail + kScrollerEndSlopDip &&
+                     : (y <= trail + kPanelBandSlopDip &&
                         y >= trail - distance));
             return !insidePanel;
         }
