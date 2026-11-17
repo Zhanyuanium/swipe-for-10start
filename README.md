@@ -254,7 +254,7 @@ the Windows key and stamps `gesture=0` in `close-mode.txt`.
 
 ## Known limits and risks
 
-- The left and bottom taskbars are verified. `UpdateDismissAxis` maps the taskbar
+- The left, bottom and top taskbars are verified. `UpdateDismissAxis` maps the taskbar
   edge to a dismiss direction and both the translation and the reveal anchor are
   axis-aware, but the other three sides are untested.
 - The reveal and the dismiss share the 20% / 0.45 DIP/ms thresholds, but their
