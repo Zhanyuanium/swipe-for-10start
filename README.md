@@ -68,8 +68,8 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    slide. At the release the mod writes `gesture=0` to `close-mode.txt`, so the
    bridge knows the Hide its tap causes needs no retract lead.
 
-   The gain is a mod setting: **Close animation start speed (% of finger
-   speed)** (`RetractStartSpeedPercent`, default 175, clamped 0-300). 100 leaves
+   The gain is a mod setting: **Gesture animation start speed (% of finger
+   speed)** (`GestureStartSpeedPercent`, default 175, clamped 0-300). 100 leaves
    at exactly the finger's speed, 0 gives the old flat-start curve.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is

@@ -113,7 +113,7 @@ What it does:
   coast hands the panel over while it is still moving, so a zero slope stopped
   it and re-accelerated it at the seam. With `remaining = max(0.05, from) *
   Distance`, `avg = remaining / duration` and the setting
-  `RetractStartSpeedPercent` (default 175), the requested slope is
+  `GestureStartSpeedPercent` (default 175), the requested slope is
   `s = clamp(percent / 100 * velocity / max(avg, 0.01), 0, 3)`; the curve is
   `cubic-bezier(0.35, clamp(s * 0.35, 0.02, 1), 0.55, 1)`. A release at rest
   gets `s = 0` and `y1 = 0.02`, so it still leaves the start, effectively the old
@@ -248,7 +248,7 @@ What it does not do:
 
 Settings:
 
-- `RetractStartSpeedPercent` (default 175, clamped to 0-300) is how fast the
+- `GestureStartSpeedPercent` (default 175, clamped to 0-300) is how fast the
   panel leaves a gesture close, as a percentage of the finger's release speed.
   `Wh_ModInit` reads it once into an atomic and logs `retract start speed=...`;
   `Wh_ModSettingsChanged` refreshes the atomic, so a change applies to the next
@@ -407,12 +407,13 @@ Known risks:
 
 // ==WindhawkModSettings==
 /*
-- RetractStartSpeedPercent: 175
-  $name: Close animation start speed (% of finger speed)
+- GestureStartSpeedPercent: 175
+  $name: Gesture animation start speed (% of finger speed)
   $description: >-
-    How fast the panel leaves when a swipe closes it, as a percentage of the
-    speed the finger had at release. 100 continues at exactly the finger's
-    speed, higher snaps out faster. Values are clamped to 0-300.
+    How fast the panel starts moving when a swipe opens or closes the menu, as a
+    percentage of the speed the finger had at release. 100 continues at exactly
+    the finger's speed, higher starts faster; 0 gives the old slow start. Values
+    are clamped to 0-300.
 */
 // ==/WindhawkModSettings==
 
@@ -432,7 +433,7 @@ Known risks:
  *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet, the
  *   expression and one cached cubic-bezier easing (0.45, 0, 0.55, 1)
  *   installed in Setup, plus the per-close curve the close builds from the
- *   `RetractStartSpeedPercent` setting; on
+ *   `GestureStartSpeedPercent` setting; on
  *   VisualTreeHelper, TransformToVisual and LayoutUpdated
  *   from Windows.UI.Xaml.Media to map the panel trail and to follow the layout;
  *   on ScrollViewer, its ScrollableWidth/ScrollableHeight/VerticalOffset and its
@@ -463,7 +464,7 @@ Known risks:
  *   exists; one retract duration planner, one curve planner and one
  *   retract-and-arm helper for
  *   both close paths (260 ms at rest, shortened by the release speed to a 117 ms
- *   floor, opening at `RetractStartSpeedPercent` of the finger's speed on a
+ *   floor, opening at `GestureStartSpeedPercent` of the finger's speed on a
  *   curve created for that close), which also owns the suppression window, the
  *   close-mode stamp and the
  *   armed tap, so neither gesture family can skip one; the setting is read once
@@ -1002,7 +1003,7 @@ std::atomic<bool> g_retractCurveFallbackLogged{false};
 // Wh_ModSettingsChanged calls it again, so no close pays for a setting lookup.
 void LoadRetractStartSpeed() {
     const int percent =
-        std::clamp(Wh_GetIntSetting(L"RetractStartSpeedPercent"),
+        std::clamp(Wh_GetIntSetting(L"GestureStartSpeedPercent"),
                    kRetractStartSpeedMin, kRetractStartSpeedMax);
     g_retractStartSpeedPercent.store(percent, std::memory_order_relaxed);
     FileLog(L"retract start speed=%d%%", percent);
