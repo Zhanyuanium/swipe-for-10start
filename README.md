@@ -60,14 +60,20 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    y0   = (gain * velocity) / remaining      wd = omega * sqrt(1 - zeta^2)
    ```
 
-   `y` is the normalised travel from the release position to the target, `y0`
-   its initial slope, and the settle's duration is five time constants of the
-   spring's slowest root, `T = clamp(5/tau, 180, 400)` ms. Twelve segments
-   (thirteen keyframes from t=0 to t=T) are sampled from that curve and clamped
-   to `[0, 1]`. Because the spring starts at the finger's speed and only
-   decelerates, opening and closing are the same mechanism with the sign
-   flipped; a bezier with a fixed duration could not do that, since matching the
-   finger's speed forced it to accelerate.
+   `y` is the normalised travel from the release position to the target and `y0`
+   its initial slope. The duration is planned from a **speed**, not fitted as a
+   time, so a larger panel takes longer instead of moving faster:
+
+   ```
+   T = clamp(remaining / 2.2 DIP/ms, 160 ms, 520 ms)
+   ```
+
+   with `remaining = |target - start| * distance`. The spring's frequency is
+   derived from `T` (`omega = 5 / (slowest root factor * T)`), so the curve keeps
+   its shape and reaches the target exactly at `T`. Segments are sampled at most
+   every 4 ms and the final keyframe is the exact target, so the panel lands on
+   the rest position (measured 0 DIP short) and the polyline stays smooth at
+   120 Hz.
 
    The close's `VK_LWIN` tap is scheduled at `T`, and `close-mode.txt` tells the
    bridge the hide that tap causes needs no retract lead.
@@ -76,11 +82,12 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    (`AnimationStyle`, default `Windows 11`). Both run the same generator, so
    neither style can drift from the other in mechanism:
 
-   - `Windows 11`: period 0.102 s, damping ratio 1.72, 253 ms. Fitted on this
-     machine to the native Quick Settings flyout (`Win+A`), which uses the same
-     Fluent motion; see "How the Windows 11 numbers were measured" below.
-   - `Windows 10`: period 0.25 s, damping ratio 0.9, 221 ms. The spring this mod
-     shipped with, unchanged.
+   - `Windows 11`: damping ratio 1.72, fitted on this machine to the native
+     Quick Settings flyout (`Win+A`), which uses the same Fluent motion; the
+     curve is stretched to the panel's travel, so the fit supplies the shape and
+     the speed supplies the time. See "How the Windows 11 numbers were
+     measured" below.
+   - `Windows 10`: damping ratio 0.9, the spring this mod shipped with.
 
    **Gesture animation start speed (% of finger speed)**
    (`GestureStartSpeedPercent`, default 100, clamped 0-300) scales the settle's

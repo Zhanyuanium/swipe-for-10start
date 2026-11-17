@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.13.0
+// @version         0.14.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -112,26 +112,41 @@ What it does:
   divided by the travel left. Open and close therefore mirror exactly, and a
   release from a finger held still (`vel=0`) starts the settle at zero speed
   instead of jumping.
-  - Windows 10: period `0.25 s`, damping ratio `0.9`, duration 221 ms. This is
-    the spring the mod shipped with, unchanged.
-  - Windows 11 (the default): period `0.102 s`, damping ratio `1.72`, duration
-    253 ms. Fitted on this machine to the native Quick Settings flyout
-    (`Win+A`), whose show motion this style copies: mean `|y - d|` 0.034 over
-    the 306 ms measured, and at most 0.012 after the first 90 ms.
-  - The duration is five time constants of the spring's slowest root,
-    `T = clamp(5 / tau, 180, 400)`, where `tau = 1/(zeta*omega)` while the
-    spring oscillates and `tau = 1/(omega*(zeta - sqrt(zeta^2 - 1)))` once it
-    is overdamped. Thirteen keyframes (12 equal segments) sample the response,
-    with every value clamped to 0..1: a flick faster than the remaining travel
-    can absorb flattens at the rest position instead of translating past it.
-    The keyframes are linear and no easing function is attached, because the
-    samples are the curve.
+  - Windows 10: damping ratio `0.9`, the spring this mod shipped with.
+  - Windows 11 (the default): damping ratio `1.72`. Fitted on this machine to
+    the native Quick Settings flyout (`Win+A`), whose show motion this style
+    copies: mean `|y - d|` 0.034 over the 306 ms measured, and at most 0.012
+    after the first 90 ms.
+  - The duration comes from the travel, not from a fitted time. The native
+    flyout covers its 578 DIP in 262 ms, an average of 2.2 DIP/ms; the Start
+    menu is 900+ DIP and resizable, so copying the flyout's time would make the
+    larger panel move faster and change the feel with the menu size.
+    `remaining = |to - from| * Distance` is the travel in DIP and
+    `T = clamp(remaining / 2.2, 160, 520)` ms, so a 900 DIP close takes 409 ms
+    and a close from half open 205 ms.
+  - The spring's frequency is derived from `T`, not from a fixed period: omega
+    is chosen so five time constants of its slowest root land on `T`. That root
+    is `zeta*omega` while the spring oscillates, and `omega*(zeta -
+    sqrt(zeta^2 - 1))` once it is overdamped; applying `zeta*omega` to the
+    fitted Windows 11 damping of 1.72 would put 0.93 time constants in `T` and
+    leave 44% of the travel for the last frame. The style picks the shape, the
+    travel picks the timescale.
+  - The curve is sampled by 12-128 equal segments, one per 4 ms or less, so at
+    120 Hz no corner can fall inside a displayed frame. Every sample is clamped
+    to 0..1 and to the sample before it: a flick faster than the remaining
+    travel can absorb flattens at the rest position instead of translating past
+    it, and convergence stays monotonic. One final keyframe at `T` carries the
+    exact target, because the curve is still 0.7% short at five time constants,
+    which is 6 DIP on a 900 DIP panel and reads as a menu that never finished
+    opening. The keyframes are linear and no easing function is attached,
+    because the samples are the curve.
 
   One settle-and-arm helper serves both gesture families: it plays the
   animation, opens the suppression window, stamps `close-mode.txt` and arms the
   tap for the end of the settle, which is that settle's own duration. A close
   whose settle did not start arms nothing. One line records each settle:
-  `settle style=win11|win10 dir=open|close vel=... dur=... period=... zeta=...`.
+  `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
+  frames=... zeta=...`.
   The gesture's release line is written after the settle started: the file
   write costs time on the input thread, and before the animation it only made
   the seam longer.
@@ -231,9 +246,9 @@ What it does:
   `Progress` where the close left it, and lets the next open animate from 0.
   The Windows-key close is animated now: the explorer-side bridge delays
   `CStartExperienceManager::Hide` by 350 ms and writes `retract=1` to
-  `debug.txt`, so the mod runs the selected settle style from rest (221 ms
-  Windows 10, 253 ms Windows 11) while the shell waits and the panel slides out
-  instead of vanishing. One line per transition.
+  `debug.txt`, so the mod runs the selected settle style from rest (409 ms for
+  the full panel at the planned 2.2 DIP/ms) while the shell waits and the panel
+  slides out instead of vanishing. One line per transition.
 - Every gesture close stamps `close-mode.txt` at the release with
   `gesture=0`. The tap comes at the end of the settle, so the Hide it causes
   needs no wait; the stamp tells the bridge that this Hide is that tap's and not
@@ -287,8 +302,8 @@ Debug channel (kept in the build):
   - `anim=0` suppresses the shell's open storyboard; `anim=1` restores it. The
     default is `anim=1`, because suppression leaves the pane undrawn.
   - `retract` plays the committed-dismiss settle from the current `Progress`:
-    `BeginGestureSettle(current, 0, 0)` in the selected style from rest (the
-    221 ms Windows 10 spring or the 253 ms Windows 11 spring), and logs
+    `BeginGestureSettle(current, 0, 0)` in the selected style from rest, so a
+    full panel takes 409 ms at the planned 2.2 DIP/ms, and logs
     `debug retract`.
     The next open restores the scalar, so the command
     leaves the reuse flag clear. The explorer-side bridge writes this line 350 ms
@@ -313,13 +328,16 @@ Diagnostics:
 
 - `mod init`, `settle style selected=... setting=...`,
   `settle start speed=...%`,
-  `settle spring win10 period=... zeta=...`,
-  `settle spring win11 period=... zeta=...`, `hid init`,
+  `settle plan speed=... dip/ms dur=160..520 segment=4.0 ms frames=13..129`,
+  `settle spring win10 zeta=...`,
+  `settle spring win11 zeta=...`, `hid init`,
   `hid reg usage=... ok=... err=...`,
   `hid down x=... y=... axis=... dist=...`,
   `hid release src=idle|report|abort delta=... perp=... vel=... commit=...
   n=... relms=...`,
-  `settle style=win11|win10 dir=open|close vel=... dur=... period=... zeta=...`,
+  `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
+  frames=... zeta=...` (`frames` counts keyframes, so the segment count is one
+  less),
   `win open`, `win close observed`,
   `close tap kind=dismiss|reveal delay=...`,
   `close tap dropped kind=dismiss|reveal`,
@@ -418,9 +436,12 @@ Known risks:
   input thread, and is global; a new contact's reports queue behind it.
 - `close-mode.txt` is read only inside its 800 ms window. A gesture close stamps
   `gesture=0` at its release; the tap's Hide arrives at the end of the settle
-  (253 ms on Windows 11, 221 ms on Windows 10) and runs
+  (409 ms for a full 900 DIP panel at the planned 2.2 DIP/ms) and runs
   at once. A dropped close stamps `cancelled`, which the bridge treats as a
   keyboard close, so a Win press within the window still gets the 350 ms lead.
+  That lead covers 770 DIP of retract at 2.2 DIP/ms; a keyboard close of a
+  taller panel hides it 1.5% short of rest, so the bridge's lead has to follow
+  the settle's own duration.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -436,12 +457,14 @@ Known risks:
   $name: Gesture animation style
   $description: >-
     Both styles are one damped spring that starts at the finger's release speed,
-    scaled by GestureStartSpeedPercent. Windows 11 is fitted to the native
-    Quick Settings flyout (period 0.102 s, damping 1.72, 253 ms); Windows 10 is
-    the spring this mod shipped with (0.25 s, 0.9, 221 ms).
+    scaled by GestureStartSpeedPercent. The duration comes from the travel at the
+    native panel speed of 2.2 DIP/ms, so a bigger menu takes longer instead of
+    moving faster. Windows 11 keeps the damping fitted to the native Quick
+    Settings flyout (1.72); Windows 10 keeps the damping this mod shipped with
+    (0.9).
   $options:
-  - Windows 11: Fitted to the native flyout, 253 ms
-  - Windows 10: The 0.25 s / 0.9 spring, 221 ms
+  - Windows 11: Flyout damping 1.72, speed planned
+  - Windows 10: Shipped damping 0.9, speed planned
 - GestureStartSpeedPercent: 100
   $name: Gesture settle initial velocity (% of finger speed)
   $description: >-
@@ -501,14 +524,17 @@ Known risks:
  *   settle-and-arm helper for all four gesture outcomes. Both styles are the
  *   same spring generator, so open and close mirror exactly and both start at
  *   `GestureStartSpeedPercent` of the finger's release speed scaled by the
- *   travel left: `Windows 11` (the default) is period 0.102 s and damping 1.72
- *   (253 ms), fitted on this machine to the native Quick Settings flyout;
- *   `Windows 10` is period 0.25 s and damping 0.9 (221 ms), the spring this mod
- *   shipped with. The response is sampled by 13 linear keyframes clamped to
- *   0..1, and the duration is five time constants of the slowest root. The
+ *   travel left: `Windows 11` (the default) keeps damping 1.72, fitted on this
+ *   machine to the native Quick Settings flyout; `Windows 10` keeps damping 0.9,
+ *   the spring this mod shipped with. The duration is the panel travel divided
+ *   by 2.2 DIP/ms, the native flyout's own speed, clamped to 160-520 ms, and the
+ *   frequency is derived from it so five time constants of the slowest root land
+ *   on that duration. The response is sampled by 12-128 linear keyframes, one
+ *   per 4 ms or less and each clamped to 0..1 and to its predecessor, plus one
+ *   landing keyframe that carries the exact target. The
  *   helper also owns the suppression window, the
  *   close-mode stamp and the
- *   armed tap, whose delay is the settle's own duration (253 ms or 221 ms), so
+ *   armed tap, whose delay is the settle's own duration (160-520 ms), so
  *   neither gesture family can skip one; both settings are read once at init
  *   and refreshed on a settings change, logged as
  *   `settle style selected=... setting=...` and
@@ -545,8 +571,8 @@ Known risks:
  *   can drop the
  *   shell's open storyboard for experiments. It also owns the close decision:
  *   the settle runs first, then the tap at its end; both settle styles are the
- *   same spring generator and differ only in period and damping, so a style
- *   switch can never change how the release velocity enters the motion; a pull
+ *   same spring generator and differ only in damping, so a style switch can
+ *   never change how the release velocity enters the motion; a pull
  *   generation checked
  *   at the tap drops it, so a re-pull never touches the shell. The explorer-side
  *   bridge still calls the original Hide; it only skips its keyboard lead when
@@ -701,46 +727,67 @@ constexpr uint8_t kAnimPrologue[] = {
 //                 * (cosh(wd*t) + ((decay - y0) / wd) * sinh(wd*t))
 //
 // y0 = y'(0) is the scaled release speed divided by the travel left in DIP.
-// The sign of the panel velocity cancels in the normalized slope, because
-// (to - from) carries it too: the spring always relaxes from 0 toward 1. The
-// panel velocity keeps the sign for the reader, so a close reports a negative
-// DIP/ms velocity and an open a positive one.
+// The gesture reports that speed as a magnitude (DIP/ms along the axis, away
+// from the release point), so y0 is positive and the spring always relaxes from
+// 0 toward 1; `(to - from)` carries the direction of the panel.
 //
-// The duration is five time constants of the SLOWEST root, which is 1/(zeta*omega)
-// while the spring oscillates and 1/(omega*(zeta - sqrt(zeta^2-1))) once it is
-// overdamped; the latter is much longer than 1/(zeta*omega) and is the reason
-// the overdamped Windows 11 set still needs 253 ms. The clamp is 180-400 ms.
-// The tail is below 1% by then, so the last samples sit on the target. The
-// settle is a polyline of 12 equal segments sampled from that curve; the
-// keyframes are linear and no easing function is attached, because the samples
-// are the curve.
+// The duration comes from the speed, not from a fitted time. The native Quick
+// Settings flyout is 578 DIP tall and travels it in 262 ms, an average of
+// 2.2 DIP/ms. Copying its 253 ms instead made the 900+ DIP Start menu race and
+// made the feel follow the panel's size, so every settle lasts the time its own
+// travel needs at that speed:
 //
-// Windows 10 keeps the period and damping this mod shipped with: 0.25 s, 0.9,
-// 221 ms.
+//   remaining = |to - from| * Distance                DIP of panel travel
+//   T         = clamp(remaining / 2.2 DIP/ms, 160, 520)  ms
+//   omega     = 5 / (time constant of the slowest root * T)
+//
+// The frequency follows from T, not from a period. Five time constants of the
+// slowest root land exactly on T. That root is zeta*omega while the spring
+// oscillates, so omega = 5/(zeta*T) there, and omega*(zeta - sqrt(zeta^2-1))
+// once it is overdamped: applying zeta*omega to the overdamped Windows 11 set
+// would put only 0.93 time constants in T and leave 44% of the travel for the
+// last frame. Either way the curve is one shape stretched in time: the damping
+// ratio is the style, T is the travel.
+//
+// The tail is 0.7% of the travel at T, but 0.7% of a 900 DIP panel is 6 DIP the
+// eye reads as "never quite open", so the frames land on `to` exactly: the
+// samples stop one segment short of T and the final keyframe at T carries the
+// target itself.
+// One segment is at most 4 ms, so at 120 Hz (8.3 ms per frame) no corner can
+// fall inside a displayed frame; the floor of 12 segments keeps the shape of
+// the shortest settle, and 128 caps the keyframe count.
+//
+// Windows 10 keeps the damping this mod shipped with: 0.9.
 //
 // Windows 11 is fitted to the native flyout on this machine. Measured with
 // Win+A (Quick Settings, the same Fluent motion), 9 ms per frame, panel offset
 // tracked against its settled frame: the native show travels its 578 DIP in
-// 262 ms and is still 1 px off at 253 ms. The area-minimizing spring with
-// y0 = 0 is period 0.102 s, damping 1.72: mean |y - d| = 0.034 over the
-// 306 ms measured, at most 0.012 after the first 90 ms, and 253 ms to settle.
-// The native curve is faster than that spring in its first 30 ms (0.54 of the
-// travel against 0.38), because the shell starts that animation with its own
-// initial velocity; a settle that must continue the finger cannot copy that,
-// and this fit deliberately matches the duration and the deceleration after
-// the first frames instead.
+// 262 ms. The area-minimizing spring with y0 = 0 over that curve is damping
+// 1.72, period 0.102 s at 578 DIP: mean |y - d| = 0.034 over the 306 ms
+// measured, at most 0.012 after the first 90 ms. The damping is what the fit
+// keeps; the period is derived from the travel now, so the 900 DIP panel takes
+// 409 ms and moves at the flyout's 2.2 DIP/ms. The native curve is faster than
+// that spring in its first 30 ms (0.54 of the travel against 0.38), because the
+// shell starts that animation with its own initial velocity; a settle that must
+// continue the finger cannot copy that, and this fit deliberately matches the
+// deceleration after the first frames instead.
 // ---------------------------------------------------------------------------
-constexpr double kWin10SpringPeriodSeconds = 0.25;
 constexpr double kWin10SpringDamping = 0.9;
-constexpr double kWin11SpringPeriodSeconds = 0.102;
 constexpr double kWin11SpringDamping = 1.72;
 constexpr double kSettleTimeConstants = 5.0;
-constexpr std::chrono::milliseconds kSettleMinDuration{180};
-constexpr std::chrono::milliseconds kSettleMaxDuration{400};
-// 12 segments, so 13 keyframes: both the release position and the target are
-// sampled, and the animation cannot stop one segment short of its destination.
-constexpr int kSettleSteps = 12;
-constexpr int kSettleSampleCount = kSettleSteps + 1;
+// The native panel's average speed: 578 DIP in 262 ms. Duration is travel
+// divided by this, so the 900 DIP menu takes 409 ms and a half-open one 205 ms,
+// whatever the panel measures.
+constexpr float kSettleSpeedDipPerMs = 2.2f;
+constexpr std::chrono::milliseconds kSettleMinDuration{160};
+constexpr std::chrono::milliseconds kSettleMaxDuration{520};
+// One segment per 4 ms: at 120 Hz a segment is shorter than one compositor
+// frame, so a corner never lands inside a displayed frame.
+constexpr double kSettleSegmentMs = 4.0;
+constexpr int kSettleMinSteps = 12;
+constexpr int kSettleMaxSteps = 128;
+// The samples plus the exact landing frame at T.
+constexpr int kSettleMaxFrames = kSettleMaxSteps + 1;
 
 // The Windows 11 style used to be one eased pair on the Fluent decelerate
 // curve over a fixed 300 ms. That curve is gone: it starts at 9x its average
@@ -1460,7 +1507,8 @@ bool InsertProgress(float progress) {
 // - a sampled polyline for both gesture settle styles. Every keyframe is linear
 //   and no easing function is attached, because the spring samples are the
 //   curve. An easing function on a segment would zero or reshape the initial
-//   slope the spring exists to keep.
+//   slope the spring exists to keep. The frame count is 13-129: one segment per
+//   4 ms of the settle plus the landing frame that carries the exact target.
 //
 // Every shape inserts the target as the base value *before* StartAnimation, so a
 // cancelled or interrupted animation still lands on the intended end state
@@ -1621,8 +1669,8 @@ bool StopCoast(float& value) {
 // release speed on the gesture axis in DIP/ms. `duration` is the animation's
 // length, which is also what the close tap is armed with.
 //
-// One generator, two parameter sets. The style setting only picks the period
-// and damping ratio; everything below runs once for both:
+// One generator, two parameter sets. The style setting only picks the damping
+// ratio; everything below runs once for both:
 //
 // - Open and close are exact mirrors, because the spring works in normalized
 //   travel: y(0) = 0, y(inf) = 1, and y'(0) = y0 is the scaled release speed
@@ -1633,52 +1681,57 @@ bool StopCoast(float& value) {
 //   A release faster than the remaining travel can absorb overshoots the
 //   target, and the 0..1 clamp turns that overshoot into a plateau at the rest
 //   position instead of a translation past it.
-// - The duration is five time constants of the spring's slowest root (see the
-//   constant block), clamped to 180-400 ms.
+// - The duration is the travel divided by kSettleSpeedDipPerMs, clamped to
+//   160-520 ms, so the panel moves at one speed whatever its size is. The
+//   frequency is derived from that duration (see the constant block), so five
+//   time constants of the spring's slowest root land on T.
+// - The frames are a polyline of 12-128 equal segments, at most 4 ms each, plus
+//   one landing frame at T that carries the exact target. Each sample is
+//   clamped to 0..1 and to the previous sample, so convergence is monotonic.
 // - Both sets are overdamped or near it; the sampler therefore carries the
 //   underdamped, critically damped and overdamped forms of the same response.
+
+// At most 4 ms per segment, at least 12, at most 128. The samples take one
+// segment less than the frames: the last frame is the exact target.
+int SettleStepsFor(int64_t durationMs) {
+    const double steps =
+        std::ceil(static_cast<double>(durationMs) / kSettleSegmentMs);
+    return std::clamp(static_cast<int>(steps), kSettleMinSteps,
+                      kSettleMaxSteps);
+}
+
 bool BeginGestureSettle(float from, float to, float velocity,
                         std::chrono::milliseconds& duration) {
     const float start = std::clamp(from, 0.0f, 1.0f);
     const float target = std::clamp(to, 0.0f, 1.0f);
 
     const SettleStyle style = g_settleStyle.load(std::memory_order_relaxed);
-    const bool win11 = style == SettleStyle::Win11;
-    const double periodSeconds = win11 ? kWin11SpringPeriodSeconds
-                                       : kWin10SpringPeriodSeconds;
-    const double zeta = win11 ? kWin11SpringDamping : kWin10SpringDamping;
+    const double zeta =
+        style == SettleStyle::Win11 ? kWin11SpringDamping : kWin10SpringDamping;
 
-    const float distance = g_distancePub.load(std::memory_order_relaxed);
-    const float remaining =
-        std::fabs(target - start) * std::max(distance, 0.0f);
+    // Plan from the travel, not from a time: the native flyout crosses its 578
+    // DIP in 262 ms and this keeps that speed, so a 900 DIP panel takes 409 ms
+    // and a resized one takes what its own travel needs.
+    const float distance =
+        std::max(g_distancePub.load(std::memory_order_relaxed), 0.0f);
+    const float remaining = std::fabs(target - start) * distance;
+    const int64_t durationMs = std::clamp(
+        static_cast<int64_t>(std::llround(
+            static_cast<double>(remaining) /
+            static_cast<double>(kSettleSpeedDipPerMs))),
+        static_cast<int64_t>(kSettleMinDuration.count()),
+        static_cast<int64_t>(kSettleMaxDuration.count()));
+    duration = std::chrono::milliseconds(durationMs);
+
     const float startScale =
         static_cast<float>(g_gestureStartSpeedPercent.load(
             std::memory_order_relaxed)) /
         100.0f;
 
     // Work in milliseconds throughout: `velocity` is DIP/ms, the duration is in
-    // ms, and y0 is 1/ms. The period constant is seconds, so omega converts it
-    // once here; keeping y0 in seconds would make the initial slope 1000x too
-    // small and leave the seam without the finger's velocity.
-    constexpr double kPi = 3.14159265358979323846;
-    const double omega = 2.0 * kPi / (periodSeconds * 1000.0);  // 1/ms
-    const double decay = zeta * omega;                          // 1/ms
-    // The oscillating and the overdamped forms share `decay * t` in the
-    // exponent, but only the oscillating one decays at `decay`: an overdamped
-    // spring's slowest root is omega*(zeta - sqrt(zeta^2 - 1)), which is what
-    // the five-time-constant duration has to follow.
-    const bool overdamped = zeta > 1.0;
-    const bool critical = std::fabs(zeta - 1.0) <= 1e-9;
-    const double wd = overdamped
-                          ? omega * std::sqrt(zeta * zeta - 1.0)
-                          : omega * std::sqrt(std::max(0.0, 1.0 - zeta * zeta));
-    const double slowest =
-        overdamped ? omega * (zeta - std::sqrt(zeta * zeta - 1.0)) : decay;
-    const int64_t durationMs = std::clamp(
-        static_cast<int64_t>(std::llround(kSettleTimeConstants / slowest)),
-        static_cast<int64_t>(kSettleMinDuration.count()),
-        static_cast<int64_t>(kSettleMaxDuration.count()));
-    duration = std::chrono::milliseconds(durationMs);
+    // ms, and y0 is 1/ms. Keeping y0 in seconds would make the initial slope
+    // 1000x too small and leave the seam without the finger's velocity.
+    const double tTotal = static_cast<double>(durationMs);  // ms
 
     // Normalized initial slope, 1/ms. The sign cancels against (to - from), so
     // this is always positive: the spring leaves the release position toward
@@ -1689,10 +1742,31 @@ bool BeginGestureSettle(float from, float to, float velocity,
                   static_cast<double>(remaining)
             : 0.0;
 
-    float samples[kSettleSampleCount] = {};
-    for (int i = 0; i < kSettleSampleCount; ++i) {
-        const double t = static_cast<double>(durationMs) * i /
-                         static_cast<double>(kSettleSampleCount - 1);
+    // Pick omega so that five time constants of the slowest root land on T.
+    // That root is zeta*omega while the spring oscillates; once it is
+    // overdamped the slow pole is omega*(zeta - sqrt(zeta^2-1)), which is why
+    // the ratio is normalized by the slowest root instead of by zeta.
+    const bool overdamped = zeta > 1.0;
+    const bool critical = std::fabs(zeta - 1.0) <= 1e-9;
+    const double slowestFactor =
+        overdamped ? zeta - std::sqrt(zeta * zeta - 1.0) : zeta;
+    const double omega = kSettleTimeConstants / (slowestFactor * tTotal);
+    const double decay = zeta * omega;  // 1/ms
+    const double wd =
+        overdamped
+            ? omega * std::sqrt(zeta * zeta - 1.0)
+            : omega * std::sqrt(std::max(0.0, 1.0 - zeta * zeta));
+
+    // The samples stop one segment short of T; the frame after them is the
+    // exact target. A curve 5 time constants out is still 0.7% short, which is
+    // 6 DIP on a 900 DIP panel and reads as a menu that never finished opening.
+    const int steps = SettleStepsFor(durationMs);
+    const int frameCount = steps + 1;
+    float samples[kSettleMaxFrames] = {};
+    samples[0] = start;
+    float previous = start;
+    for (int i = 1; i < steps; ++i) {
+        const double t = tTotal * i / static_cast<double>(steps);
         const double envelope = std::exp(-decay * t);
         double y = 0.0;
         if (overdamped) {
@@ -1706,19 +1780,27 @@ bool BeginGestureSettle(float from, float to, float velocity,
                           (std::cos(wd * t) +
                            ((decay - y0) / wd) * std::sin(wd * t));
         }
-        samples[i] = std::clamp(
+        float value = std::clamp(
             start + (target - start) * static_cast<float>(y), 0.0f, 1.0f);
+        // Monotonic convergence: a sample never moves the panel back past one
+        // it already showed, so an overshoot reads as a stop at rest and a
+        // ringing curve never rebounds on screen.
+        value = target >= start ? std::max(value, previous)
+                                : std::min(value, previous);
+        samples[i] = value;
+        previous = value;
     }
+    samples[steps] = target;
 
-    if (!AnimateProgressTo(start, target, duration, samples,
-                           kSettleSampleCount)) {
+    if (!AnimateProgressTo(start, target, duration, samples, frameCount)) {
         return false;
     }
 
-    FileLog(L"settle style=%s dir=%s vel=%.2f dur=%llu period=%.3f zeta=%.2f",
+    FileLog(L"settle style=%s dir=%s vel=%.2f dur=%llu remaining=%.0f "
+            L"frames=%d zeta=%.2f",
             SettleStyleName(style), target >= start ? L"open" : L"close",
             velocity, static_cast<unsigned long long>(duration.count()),
-            periodSeconds, zeta);
+            remaining, frameCount, zeta);
     return true;
 }
 
@@ -5586,13 +5668,17 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.13.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.14.0 initializing");
     LoadAnimationStyle();
     LoadGestureStartSpeed();
-    FileLog(L"settle spring win10 period=%.3f zeta=%.2f",
-            kWin10SpringPeriodSeconds, kWin10SpringDamping);
-    FileLog(L"settle spring win11 period=%.3f zeta=%.2f",
-            kWin11SpringPeriodSeconds, kWin11SpringDamping);
+    FileLog(L"settle plan speed=%.2f dip/ms dur=%llu..%llu segment=%.1f ms "
+            L"frames=%d..%d",
+            static_cast<double>(kSettleSpeedDipPerMs),
+            static_cast<unsigned long long>(kSettleMinDuration.count()),
+            static_cast<unsigned long long>(kSettleMaxDuration.count()),
+            kSettleSegmentMs, kSettleMinSteps + 1, kSettleMaxFrames);
+    FileLog(L"settle spring win10 zeta=%.2f", kWin10SpringDamping);
+    FileLog(L"settle spring win11 zeta=%.2f", kWin11SpringDamping);
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.
