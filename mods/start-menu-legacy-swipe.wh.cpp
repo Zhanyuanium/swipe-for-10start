@@ -1185,6 +1185,9 @@ std::atomic<float> g_distancePub{0.0f};
 // second layout pass, and after the open storyboard there may not be one until
 // the user touches the menu.
 std::atomic<uint64_t> g_settleDueTick{0};
+// Diagnostics for a dismiss that did not start: one line per second, not per
+// report, because a deferred scroll produces a sample every ~6 ms.
+uint64_t g_skipLogTick = 0;
 void PostUiSettledMeasurement(bool trailIdle);
 bool g_settleTrailIdle = false;
 std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
@@ -3035,13 +3038,19 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // The previous commit is still sliding out; the shell's Hide for it is still
     // ahead, so this down belongs to the same menu.
     if (g_dismissSettling.load(std::memory_order_relaxed)) {
-        FileLog(L"dismiss skipped settling");
+        if (tickMs > g_skipLogTick + 1000) {
+            g_skipLogTick = tickMs;
+            FileLog(L"dismiss skipped settling");
+        }
         return;
     }
 
     const float distance = g_distancePub.load(std::memory_order_relaxed);
     if (!(distance > 0.0f)) {
-        FileLog(L"dismiss skipped distance=0");
+        if (tickMs > g_skipLogTick + 1000) {
+            g_skipLogTick = tickMs;
+            FileLog(L"dismiss skipped distance=0");
+        }
         return;
     }
 
@@ -3050,8 +3059,11 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // cloaked attribute answers this.
     if (!g_hasRoot.load(std::memory_order_relaxed) ||
         !StartWindowIsOpenThrottled(tickMs)) {
-        FileLog(L"dismiss skipped closed root=%d",
-                g_hasRoot.load(std::memory_order_relaxed) ? 1 : 0);
+        if (tickMs > g_skipLogTick + 1000) {
+            g_skipLogTick = tickMs;
+            FileLog(L"dismiss skipped closed root=%d",
+                    g_hasRoot.load(std::memory_order_relaxed) ? 1 : 0);
+        }
         return;
     }
 
@@ -3063,7 +3075,11 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // contact latch itself is left untouched: it only tracks that a finger is
     // down, and the lift path clears it, so the next down is unaffected.
     if (!VerticalDismissAllowed(axis, x, y, tickMs)) {
-        FileLog(L"dismiss skipped vertical axis=%d x=%.0f y=%.0f", axis, x, y);
+        if (tickMs > g_skipLogTick + 1000) {
+            g_skipLogTick = tickMs;
+            FileLog(L"dismiss skipped vertical axis=%d x=%.0f y=%.0f", axis,
+                    x, y);
+        }
         return;
     }
 
