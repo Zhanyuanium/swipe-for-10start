@@ -136,9 +136,17 @@ What it does:
   contact passes its own edge threshold; the first report that sees the menu
   open takes `Progress` over. The follow works in absolute screen DIP against
   the panel edge that faces the taskbar (`panelTrail`), which the UI thread maps
-  from the first visible child of the root (`StartSizingFrame`) and translates
-  by the work area origin: `Progress = 1 - (finger - panelTrail) / (dir *
-  Distance)`. The panel edge therefore meets the finger at every sample, and the
+  from the largest visible child of the root that does not fill it
+  (`StartSizingFrame`) and translates by the work area origin:
+  `Progress = 1 - (finger - panelTrail) / (dir * Distance)`. The edge is
+  published at setup, on every root `SizeChanged`, and re-measured every 400 ms
+  while the menu is open and no gesture owns the panel: setup runs while the
+  shell's open storyboard still has the frame out of place (measured on a bottom
+  taskbar: panel top -12 DIP, settled 200), so the periodic re-check is what
+  publishes the settled edge. It logs only when the value moves by more than
+  1 DIP, and a value outside the monitor work area by more than 24 DIP is
+  rejected in favour of the last good one (`reveal panelTrail rejected ...`).
+  The panel edge therefore meets the finger at every sample, and the
   panel is exactly off screen at the screen edge (Progress 0.269 for a 1052 DIP
   trail on a 1440 DIP root). That mapping drives the visual only. The release
   decision mirrors the dismiss path: it judges the travel away from the edge at
@@ -259,7 +267,9 @@ Diagnostics:
   `close tap skipped kind=... (already closed)`,
   `close mode write failed kind=...`, `close mode cancel write failed`,
   `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
-  `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`),
+  `reveal panelTrail=...` (or `reveal panelTrail=... (fallback)`, or
+  `reveal panelTrail rejected ...` when the work-area guard kept the previous
+  value),
   `hid decodefail dev=... err=...`,
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
   `debug e=...`, `debug anim=...`, `debug retract`,
@@ -289,18 +299,25 @@ Known risks:
 - The reveal takes `Progress` over on the first report that sees the menu open,
   so the menu drops to the computed progress at that instant (0.269 at the
   screen edge on this layout) and then follows. The mapping needs the panel
-  trail: it is the first visible child of the root with a width. If that child
-  is missing or unlaid when `Setup` and `SizeChanged` run, the trail falls back
-  to the root extent and the follow lags the finger again (log
+  trail: it is the largest visible child of the root that does not fill it. If
+  that child is missing or unlaid when `Setup` and `SizeChanged` run, the trail
+  falls back to the root extent and the follow lags the finger again (log
   `reveal panelTrail=... (fallback)`).
+- The first trail of an open is measured too early to be trusted: `Setup` runs
+  while the shell's open storyboard is still growing the frame into place, and
+  on a bottom taskbar that read -12 DIP where the settled panel starts at 200.
+  The periodic re-check publishes the correct value about 400 ms after the open.
+  A gesture that starts inside those 400 ms still follows against the early
+  value, and a follow that began on it keeps the value it read at takeover.
 - The trail assumes the XAML island sits at the work area origin. Measured on
   this build: the CoreWindow is full screen and `GetWindowRect` returns
   `0,0,2880,1800`, yet the panel's border lands 48 DIP right of the mapped
   transform because the island is inset by the taskbar. A shell that lays the
   island out at the screen origin would read 48 DIP high on a left taskbar.
-- `panelTrail` is republished on every root `SizeChanged`. A panel resize during
-  a follow moves the mapping, so the panel edge jumps to the new trail under the
-  same finger.
+- `panelTrail` is republished on every root `SizeChanged` and by the 400 ms
+  re-check. A panel resize during a follow moves the mapping, so the panel edge
+  jumps to the new trail under the same finger. The re-check itself is skipped
+  while a gesture session is active, so a stable open is what it measures.
 - `Distance` is sampled at takeover. A layout change during the follow keeps
   the old extent until the contact lifts.
 - Composition calls and the settle batch run from the input thread. The batch
@@ -367,14 +384,18 @@ Known risks:
  *   installed in Setup, plus the per-close curve the close builds from the
  *   `RetractStartSpeedPercent` setting; on
  *   VisualTreeHelper and TransformToVisual
- *   from Windows.UI.Xaml.Media to map the panel trail; on `debug.txt` in the
+ *   from Windows.UI.Xaml.Media to map the panel trail; on the CoreDispatcher
+ *   captured in Setup, which the input thread posts the settled trail re-check
+ *   to; on `debug.txt` in the
  *   mod storage directory, read by the debug channel; on the fixed
  *   `close-mode.txt` path in the same directory: each gesture close stamps
  *   `gesture=0` at its release, or `cancelled` when a pull drops its tap, and the
  *   bridge uses the stamp to tell the tap's Hide from a keyboard close.
  * [OUTPUT]: one message-only window and one worker thread per process; the
  *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
- *   published for the reveal follow; one `VK_LWIN` tap armed for the end of every
+ *   published for the reveal follow by Setup and SizeChanged and re-measured
+ *   every 400 ms while the menu is open and no gesture owns it, with a value
+ *   outside the monitor work area rejected; one `VK_LWIN` tap armed for the end of every
  *   committed dismiss or short reveal, the shell's own Start toggle that performs
  *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
  *   generation exists when it would run, and no request file or re-arm tap
@@ -644,6 +665,17 @@ constexpr UINT kDebugTimerMs = 50;
 // The DWM cloaked query is a syscall. The report handler accepts one answer
 // per interval and reuses it for every other report.
 constexpr uint64_t kOpenCheckIntervalMs = 20;
+
+// The panel trail is mapped from the XAML frame, and the shell's open storyboard
+// moves that frame into place over about 260 ms: Setup reads it before it has
+// arrived. The input thread therefore asks for a re-measure at this interval
+// while the menu is open, and the published value settles once the layout has.
+constexpr uint64_t kTrailCheckIntervalMs = 400;
+
+// A trail outside the monitor work area cannot be the panel's edge. 24 DIP of
+// tolerance keeps a panel border that overhangs the work area accepted, and a
+// frame still mid-animation rejected.
+constexpr float kPanelTrailToleranceDip = 24.0f;
 
 // ---------------------------------------------------------------------------
 // Coast between reports
@@ -986,12 +1018,24 @@ std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
 // (~993 DIP), so the reveal must be measured against this edge, not against the
 // root extent. 0 means "not known yet"; the input thread then uses
 // g_distancePub, which restores the old root-width travel.
+//
+// Setup publishes the first value, but it runs while the shell's open
+// storyboard still has the frame out of place: on a bottom taskbar that read a
+// panel top of -12 DIP where the settled panel starts at 200. The input thread
+// therefore asks for a re-measure while the menu is open once the layout has
+// settled, at most every kTrailCheckIntervalMs.
 std::atomic<float> g_panelTrailDip{0.0f};
+// The coarse tick at which the input thread may post the next re-measure. 0
+// allows one on the first open-polled tick.
+std::atomic<uint64_t> g_nextTrailCheckTick{0};
 
 // UI thread only. Setup resets the open log; a failed mapping logs its fallback
-// once per process so a missing panel does not flood the log every resize.
+// once per process so a missing panel does not flood the log every resize. A
+// trail rejected by the work-area guard logs once, and the last good value
+// stays published.
 bool g_panelTrailLogged = false;
 bool g_panelTrailFallbackLogged = false;
+bool g_panelTrailRejectedLogged = false;
 
 HANDLE g_hidThread = nullptr;
 std::atomic<HWND> g_hidHwnd{nullptr};
@@ -1002,6 +1046,11 @@ void RevokeHandlers();
 void ResetComposition();
 void ResetRenderer();
 HWND FindStartCoreWindow();
+
+// Defined with the UI-thread publication below. The input-thread tick posts it
+// to re-measure the panel trail once the open animation has settled the layout;
+// `logOnChange` keeps a stable layout silent.
+void PublishPanelTrailDip(bool logOnChange);
 
 // Defined with the input-thread gesture state below. The debug `retract` command
 // clears it: the shell is about to hide the window, so nothing needs to restore
@@ -3139,6 +3188,42 @@ void PollRootVisibility(uint64_t tickMs) {
         g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
         FileLog(L"win close observed");
     }
+
+    // Setup measured the trail before the open storyboard had moved the frame
+    // into place, so the value it published is only the initial anchor. Once
+    // the menu is open and no gesture owns the panel, ask the UI thread for the
+    // settled layout at most every kTrailCheckIntervalMs. A live follow reads
+    // the trail every sample, so it is never moved under a finger, and a close
+    // still in flight is never measured: its panel is on its way out.
+    if (open && !closeInFlight && !g_hidSession.active && !g_reveal.active &&
+        tickMs >= g_nextTrailCheckTick.load(std::memory_order_relaxed)) {
+        g_nextTrailCheckTick.store(tickMs + kTrailCheckIntervalMs,
+                                   std::memory_order_relaxed);
+        wucore::CoreDispatcher dispatcher = g_dispatcher;
+        if (dispatcher && !g_unloading.load(std::memory_order_relaxed)) {
+            try {
+                dispatcher.TryRunAsync(
+                    wucore::CoreDispatcherPriority::Normal,
+                    []() {
+                        try {
+                            if (g_unloading.load(std::memory_order_relaxed)) {
+                                return;
+                            }
+                            PublishPanelTrailDip(true);
+                        } catch (...) {
+                            // Never let an exception escape the dispatcher
+                            // callback.
+                        }
+                    });
+            } catch (winrt::hresult_error const& e) {
+                FileLog(L"panel trail check queue err=%08X",
+                        static_cast<unsigned>(e.code()));
+            } catch (...) {
+                FileLog(L"panel trail check queue err=unknown");
+            }
+        }
+    }
+
     g_rootWasOpen = open;
 }
 
@@ -3570,6 +3655,17 @@ bool ComputePanelTrailDip(float& trail) {
     float frameRight = 0.0f;
     float frameBottom = 0.0f;
     bool measured = false;
+    float bestArea = -1.0f;
+    bool haveNonFilling = false;
+    float nonFillingArea = -1.0f;
+    float nfLeft = 0.0f, nfTop = 0.0f, nfRight = 0.0f, nfBottom = 0.0f;
+
+    // The visible panel is the largest child that actually lies inside the
+    // root. Taking the first visible child picked a wrapper that sits 12 DIP
+    // above the root on a bottom taskbar, which put the reveal anchor outside
+    // the screen.
+    const float rootWidth = static_cast<float>(root.ActualWidth());
+    const float rootHeight = static_cast<float>(root.ActualHeight());
 
     const int32_t childCount =
         wux::Media::VisualTreeHelper::GetChildrenCount(root);
@@ -3581,7 +3677,8 @@ bool ComputePanelTrailDip(float& trail) {
             continue;
         }
         const float width = static_cast<float>(child.ActualWidth());
-        if (!(width > 0.0f) ||
+        const float height = static_cast<float>(child.ActualHeight());
+        if (!(width > 0.0f) || !(height > 0.0f) ||
             child.Visibility() != wux::Visibility::Visible) {
             continue;
         }
@@ -3591,16 +3688,48 @@ bool ComputePanelTrailDip(float& trail) {
         wux::Media::GeneralTransform transform = child.TransformToVisual(nullptr);
         const winrt::Windows::Foundation::Point topLeft =
             transform.TransformPoint({0.0f, 0.0f});
-        frameLeft = topLeft.X;
-        frameTop = topLeft.Y;
-        frameRight = transform.TransformPoint({width, 0.0f}).X;
-        frameBottom =
-            transform
-                .TransformPoint(
-                    {0.0f, static_cast<float>(child.ActualHeight())})
-                .Y;
-        measured = true;
-        break;
+        const float left = topLeft.X;
+        const float top = topLeft.Y;
+        const float right = transform.TransformPoint({width, 0.0f}).X;
+        const float bottom = transform.TransformPoint({0.0f, height}).Y;
+
+        const float overlapWidth =
+            std::max(0.0f, std::min(right, rootWidth) - std::max(left, 0.0f));
+        const float overlapHeight =
+            std::max(0.0f, std::min(bottom, rootHeight) - std::max(top, 0.0f));
+        const float area = overlapWidth * overlapHeight;
+        if (!(area > 0.0f)) {
+            continue;
+        }
+
+        // A child that fills the root is the hosting wrapper, not the panel, so
+        // it is only a fallback when nothing smaller is visible.
+        const float rootArea = rootWidth * rootHeight;
+        if (rootArea <= 0.0f || area < 0.98f * rootArea) {
+            if (area > nonFillingArea) {
+                nonFillingArea = area;
+                nfLeft = left;
+                nfTop = top;
+                nfRight = right;
+                nfBottom = bottom;
+                haveNonFilling = true;
+            }
+        }
+        if (area > bestArea) {
+            bestArea = area;
+            frameLeft = left;
+            frameTop = top;
+            frameRight = right;
+            frameBottom = bottom;
+            measured = true;
+        }
+    }
+
+    if (haveNonFilling) {
+        frameLeft = nfLeft;
+        frameTop = nfTop;
+        frameRight = nfRight;
+        frameBottom = nfBottom;
     }
 
     if (!measured) {
@@ -3641,9 +3770,48 @@ bool ComputePanelTrailDip(float& trail) {
     return true;
 }
 
+// A trail has to land inside the monitor's work area, where the panel lives.
+// The open storyboard starts the frame at a small, offset rect and grows it into
+// place, so a measurement taken during it can name an edge above the work area
+// (measured on a bottom taskbar: panel top -12 DIP while the settled panel
+// starts at 200). Such a value is not the panel edge the follow maps against.
+bool TrailInsideWorkArea(float trail) {
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!hwnd) {
+        return false;
+    }
+
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) {
+        return false;
+    }
+
+    const float scale = DpiScaleForWindow(hwnd);
+    if (!(scale > 0.0f)) {
+        return false;
+    }
+
+    // The trail is an x coordinate on a left or right taskbar and a y
+    // coordinate on a top or bottom one, in the same DIP space as rcWork.
+    const bool horizontal = IsHorizontalAxis(g_dismissAxis);
+    const float low =
+        (horizontal ? info.rcWork.left : info.rcWork.top) / scale;
+    const float high =
+        (horizontal ? info.rcWork.right : info.rcWork.bottom) / scale;
+    return trail >= low - kPanelTrailToleranceDip &&
+           trail <= high + kPanelTrailToleranceDip;
+}
+
 // Publishes the panel trail for the reveal follow. Falls back to the root
 // extent, which reproduces the earlier root-width travel, and says so once.
-void PublishPanelTrailDip() {
+//
+// `logOnChange` is the settled-layout re-check the input thread posts while the
+// menu is open: it speaks only when the value moved, so a layout that has
+// settled does not repeat the line every kTrailCheckIntervalMs. Setup and
+// SizeChanged keep the one line per open.
+void PublishPanelTrailDip(bool logOnChange) {
     const float distance = g_dismissDistance;
     if (!(distance > 0.0f)) {
         return;
@@ -3659,6 +3827,25 @@ void PublishPanelTrailDip() {
         // A tree mid-teardown must not break Setup or SizeChanged.
     }
 
+    if (computed && !TrailInsideWorkArea(trail)) {
+        // Keep the value the last good measurement published: the follow maps
+        // against it, and an edge outside the work area would place the panel
+        // off screen at every finger position.
+        if (!g_panelTrailRejectedLogged) {
+            g_panelTrailRejectedLogged = true;
+            FileLog(L"reveal panelTrail rejected %.0f", trail);
+        }
+        return;
+    }
+
+    if (!computed && logOnChange) {
+        // A re-check never downgrades a measured trail to the root extent: the
+        // tree can be mid-layout for a frame, and the follow would lag the
+        // finger until the next open. The previous value stays.
+        return;
+    }
+
+    const float previous = g_panelTrailDip.load(std::memory_order_relaxed);
     if (!computed) {
         trail = distance;
     }
@@ -3669,6 +3856,14 @@ void PublishPanelTrailDip() {
             g_panelTrailFallbackLogged = true;
             FileLog(L"reveal panelTrail=%.0f (fallback)", trail);
         }
+        return;
+    }
+
+    if (logOnChange) {
+        if (std::fabs(trail - previous) <= 1.0f) {
+            return;
+        }
+        FileLog(L"reveal panelTrail=%.0f", trail);
         return;
     }
 
@@ -3908,7 +4103,7 @@ bool Setup(wux::FrameworkElement const& root) {
                 PublishGestureGeometry();
                 // The root may have been resized by the panel layout, so the
                 // trail is remapped with the new extent in force.
-                PublishPanelTrailDip();
+                PublishPanelTrailDip(false);
             } catch (winrt::hresult_error const& e) {
                 Wh_Log(L"SizeChanged update failed: %08X", e.code());
             } catch (...) {
@@ -3917,8 +4112,11 @@ bool Setup(wux::FrameworkElement const& root) {
         });
 
     // Everything the input thread reads is published before the root opens.
+    // This trail is the initial anchor: the frame is still off its settled
+    // position here, so the input thread re-measures it once the open animation
+    // has finished.
     PublishGestureGeometry();
-    PublishPanelTrailDip();
+    PublishPanelTrailDip(false);
     g_hasRoot.store(true, std::memory_order_release);
 
     const winrt::hstring rootClassName = winrt::get_class_name(root);
@@ -4366,6 +4564,7 @@ void ResetComposition() {
 
     g_distancePub.store(0.0f, std::memory_order_relaxed);
     g_panelTrailDip.store(0.0f, std::memory_order_relaxed);
+    g_nextTrailCheckTick.store(0, std::memory_order_relaxed);
 
     // Invalidate a stale Loaded handler from the previous root.
     g_setupGeneration.fetch_add(1, std::memory_order_relaxed);

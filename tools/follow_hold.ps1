@@ -107,6 +107,20 @@ public static class TouchFollowHold {
         return Send(x, y, UPDATE | INRANGE | INCONTACT);
     }
 
+    // The move loop must live in C#: PowerShell's Start-Sleep between steps
+    // takes 15-25 ms, which exceeds the mod's 18 ms idle window and splits the
+    // gesture into several sessions.
+    public static string Glide(int x0, int y0, int x1, int y1, int steps, int delayMs) {
+        for (int i = 1; i <= steps; i++) {
+            int x = x0 + (x1 - x0) * i / steps;
+            int y = y0 + (y1 - y0) * i / steps;
+            string r = Send(x, y, UPDATE | INRANGE | INCONTACT);
+            if (r != "OK") return "glide " + i + ": " + r;
+            Thread.Sleep(delayMs);
+        }
+        return "OK";
+    }
+
     public static string End(int x, int y) {
         return Send(x, y, UP | INRANGE);
     }
@@ -158,13 +172,8 @@ Add-Type -TypeDefinition $code -Language CSharp
 $r = [TouchFollowHold]::Begin($StartX, $StartY)
 if ($r -ne 'OK') { throw "begin: $r" }
 
-for ($i = 1; $i -le $Steps; $i++) {
-    $x = $StartX + ($HoldX - $StartX) * $i / $Steps
-    $y = $StartY + ($HoldY - $StartY) * $i / $Steps
-    $r = [TouchFollowHold]::MoveTo([int]$x, [int]$y)
-    if ($r -ne 'OK') { throw "move $i`: $r" }
-    Start-Sleep -Milliseconds $StepDelayMs
-}
+$r = [TouchFollowHold]::Glide($StartX, $StartY, $HoldX, $HoldY, $Steps, $StepDelayMs)
+if ($r -ne 'OK') { throw "glide: $r" }
 
 try {
     $r = [TouchFollowHold]::StartKeepAlive($HoldX, $HoldY)

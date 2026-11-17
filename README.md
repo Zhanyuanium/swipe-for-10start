@@ -143,9 +143,12 @@ Instead the mod takes over after the shell opens the window:
   ```
 
   The trailing edge is measured on the UI thread from the root's visible child
-  (`StartSizingFrame`, ~1053 DIP here) and published to the input thread. With
-  that anchor the panel edge equals the finger: measured within 0.5 DIP residual
-  at 150, 450 and 800 DIP.
+  (`StartSizingFrame`; ~1053 DIP on a left taskbar, ~200 DIP from the bottom) and
+  published to the input thread. The first measurement lands while the shell is
+  still animating the panel in, so the value is re-measured 400 ms after the
+  menu settles and rejected if it falls outside the work area. With that anchor
+  the panel edge equals the finger: measured within 0.5 DIP residual at 150, 450
+  and 800 DIP on the left taskbar, and within 5 DIP of the finger on the bottom.
 - Release is decided symmetrically with the dismiss gesture: `travel` is how far
   the finger moved away from the edge since the touch began (the release value,
   not the peak), and the menu opens fully when `travel > 20%` of the distance or
@@ -243,7 +246,7 @@ the Windows key and stamps `gesture=0` in `close-mode.txt`.
 
 ## Known limits and risks
 
-- Only the left-taskbar case is verified. `UpdateDismissAxis` maps the taskbar
+- The left and bottom taskbars are verified. `UpdateDismissAxis` maps the taskbar
   edge to a dismiss direction and both the translation and the reveal anchor are
   axis-aware, but the other three sides are untested.
 - The reveal and the dismiss share the 20% / 0.45 DIP/ms thresholds, but their
