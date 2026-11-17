@@ -72,10 +72,18 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    The close's `VK_LWIN` tap is scheduled at `T`, and `close-mode.txt` tells the
    bridge the hide that tap causes needs no retract lead.
 
-   The gain is a mod setting: **Gesture animation start speed (% of finger
-   speed)** (`GestureStartSpeedPercent`, default 100, clamped 0-300). It scales
-   the spring's initial velocity: 100 starts at exactly the finger's speed,
-   higher snaps away faster, 0 starts from rest.
+   Two settle styles ship, chosen by the **Gesture animation style** setting
+   (`AnimationStyle`, default `Windows 11`):
+
+   - `Windows 11`: the Fluent decelerate curve
+     `cubic-bezier(0.1, 0.9, 0.2, 1)` over 300 ms from rest, the same shape the
+     shell's own menus use.
+   - `Windows 10`: the damped spring above.
+
+   With the spring, **Gesture animation start speed (% of finger speed)**
+   (`GestureStartSpeedPercent`, default 100, clamped 0-300) scales its initial
+   velocity: 100 starts at exactly the finger's speed, higher snaps away faster,
+   0 starts from rest. The Win11 curve ignores it.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.

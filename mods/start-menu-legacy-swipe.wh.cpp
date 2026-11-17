@@ -84,12 +84,12 @@ What it does:
   axis travel and keeps the axis travel below 60 DIP is a scroll, not a
   dismiss: it restores `Progress = 1` without animation.
 - Release commits when the axis travel exceeds 20% of `Distance` or the average
-  velocity exceeds 0.45 DIP/ms. Both outcomes settle with one damped spring:
-  a commit retracts `Progress` to 0, a cancel returns it to 1, and the spring's
-  initial velocity is the release speed (scaled by the setting) in either
-  direction. The tap that closes is armed for the end of that settle. Every
-  Progress animation inserts the target as the base value before
-  `StartAnimation`.
+  velocity exceeds 0.45 DIP/ms. Both outcomes settle with the style the setting
+  selects: a commit retracts `Progress` to 0, a cancel returns it to 1, and the
+  Windows 10 spring's initial velocity is the release speed (scaled by the
+  setting) in either direction, while the Windows 11 curve starts at rest. The
+  tap that closes is armed for the end of that settle. Every Progress animation
+  inserts the target as the base value before `StartAnimation`.
 - A vertical dismiss competes with the app list's own scroll: dragging toward
   the taskbar is how the list scrolls back, and that drag used to close the
   menu. The element that scrolls is measured per open on the UI thread: the
@@ -104,28 +104,35 @@ What it does:
   starts no session, so the same contact becomes a dismiss as soon as its
   scrolling reaches the end; the contact latch is untouched and the next down
   starts from a clean state. `Left`/`Right` are unchanged.
-- The settle is one damped spring shared by all four outcomes: the dismiss
-  commit and cancel, the reveal commit and cancel. Open and close mirror
-  exactly because the spring runs in normalized travel
-  `y = (Progress - from) / (to - from)`: `y(0) = 0`, `y(inf) = 1`, and `y'(0)`
-  is the release speed scaled by `GestureStartSpeedPercent` (default 100)
-  divided by the travel left. The natural frequency is `2*pi / 0.25 s`, the
-  damping ratio 0.9, and the duration is five time constants,
-  `T = clamp(5 / (zeta*omega), 180, 400)` = 221 ms at those values. Thirteen
-  keyframes (12 equal segments) sample
-  `y(t) = 1 - exp(-zeta*omega*t) * (cos(wd*t) + ((zeta*omega - y0)/wd) *
-  sin(wd*t))`, with every value clamped to 0..1: a flick faster than the
-  remaining travel can absorb flattens at the rest position instead of
-  translating past it. The keyframes are linear and no easing function is
-  attached, because the samples are the curve. One settle-and-arm helper
-  serves both gesture families: it plays the animation, opens the suppression
-  window, stamps `close-mode.txt` and arms the tap for the end of the settle.
-  A close whose settle did not start arms nothing. One line records each
-  settle: `settle dir=open|close vel=... v0=... dur=... n=...`, where `v0` is
-  the initial panel velocity in DIP/s (negative on a close, positive on an
-  open). The gesture's release line is written after the settle started: the
-  file write costs time on the input thread, and before the animation it only
-  made the seam longer.
+- The settle has two styles, and one setting picks the style for all four
+  outcomes: the dismiss commit and cancel, the reveal commit and cancel.
+  - Windows 10 (the spring): open and close mirror exactly because it runs in
+    normalized travel `y = (Progress - from) / (to - from)`: `y(0) = 0`,
+    `y(inf) = 1`, and `y'(0)` is the release speed scaled by
+    `GestureStartSpeedPercent` (default 100) divided by the travel left. The
+    natural frequency is `2*pi / 0.25 s`, the damping ratio 0.9, and the
+    duration is five time constants,
+    `T = clamp(5 / (zeta*omega), 180, 400)` = 221 ms at those values. Thirteen
+    keyframes (12 equal segments) sample
+    `y(t) = 1 - exp(-zeta*omega*t) * (cos(wd*t) + ((zeta*omega - y0)/wd) *
+    sin(wd*t))`, with every value clamped to 0..1: a flick faster than the
+    remaining travel can absorb flattens at the rest position instead of
+    translating past it. The keyframes are linear and no easing function is
+    attached, because the samples are the curve.
+  - Windows 11 (the default): one `ScalarKeyFrameAnimation` over 300 ms,
+    `InsertKeyFrame(0, from)` and `InsertKeyFrame(1, to, easing)`, where the
+    easing is the cached `cubic-bezier(0.1, 0.9, 0.2, 1)` that Setup builds
+    once. It carries no release velocity: the motion starts at rest and
+    decelerates into the target. `from` and `to` are clamped the same way.
+
+  One settle-and-arm helper serves both gesture families: it plays the
+  animation, opens the suppression window, stamps `close-mode.txt` and arms the
+  tap for the end of the settle, which is 300 ms on Windows 11 and `T` on the
+  spring. A close whose settle did not start arms nothing. One line records
+  each settle: `settle style=win11|win10 dir=open|close vel=... dur=...`. The
+  gesture's release line is written after the settle started: the file write
+  costs time on the input thread, and before the animation it only made the
+  seam longer.
 - The release itself is one idle window plus one tick, so the panel stood still
   for 20-23 ms after the last report before the retract started, and the eye
   read that as a stop. The panel now coasts through that window: the average
@@ -189,10 +196,11 @@ What it does:
   `openingSign` is +1 for a left or top taskbar and -1 for right or bottom. A
   release past 20% of `Distance`, or one whose average velocity
   `travel / max(elapsed, 1)` exceeds 0.45 DIP/ms, settles `Progress` to 1 with
-  the same spring and keeps the menu. Anything else is a cancel: `Progress`
-  settles to 0 with that same spring, so both close paths read the same from any
-  finger position. The Windows tap that closes the menu is armed for the end of
-  the settle, so the panel is already off screen when the shell hides it. `Progress`
+  the selected settle style and keeps the menu. Anything else is a cancel:
+  `Progress` settles to 0 with that same style, so both close paths read the
+  same from any finger position. The Windows tap that closes the menu is armed
+  for the end of the settle, so the panel is already off screen when the shell
+  hides it. `Progress`
   stays 0; a later
   open restores it, unless an edge contact is already driving that open. Pulling
   out and pushing back therefore cancels, as it does inside the open menu. The
@@ -221,8 +229,9 @@ What it does:
   `Progress` where the close left it, and lets the next open animate from 0.
   The Windows-key close is animated now: the explorer-side bridge delays
   `CStartExperienceManager::Hide` by 350 ms and writes `retract=1` to
-  `debug.txt`, so the mod runs the same spring from rest (221 ms) while the shell
-  waits and the panel slides out instead of vanishing. One line per transition.
+  `debug.txt`, so the mod runs the selected settle style from rest (221 ms
+  spring, 300 ms Windows 11) while the shell waits and the panel slides out
+  instead of vanishing. One line per transition.
 - Every gesture close stamps `close-mode.txt` at the release with
   `gesture=0`. The tap comes at the end of the settle, so the Hide it causes
   needs no wait; the stamp tells the bridge that this Hide is that tap's and not
@@ -247,13 +256,21 @@ What it does not do:
 
 Settings:
 
+- `AnimationStyle` (default `Windows 11`) picks the settle mechanism. The value
+  is the display label: exactly `Windows 10` selects the damped spring, and
+  every other value (including the default) selects the Windows 11 Fluent
+  curve. `Wh_ModInit` reads it once into an atomic enum and logs
+  `settle style selected=... setting=...`; `Wh_ModSettingsChanged` refreshes
+  the atomic, so a change applies to the next settle and no settle performs a
+  setting lookup.
 - `GestureStartSpeedPercent` (default 100, clamped to 0-300) is the initial
-  velocity of the settle animation, as a percentage of the finger's release
+  velocity of the Windows 10 spring, as a percentage of the finger's release
   speed. `Wh_ModInit` reads it once into an atomic and logs
   `settle start speed=...`; `Wh_ModSettingsChanged` refreshes the atomic, so a
   change applies to the next settle and no settle performs a setting lookup.
   100 continues at exactly the finger's speed, so an open and a close leave the
-  seam at the same velocity the finger had; higher values snap away faster.
+  seam at the same velocity the finger had; higher values snap away faster. The
+  Windows 11 curve starts at rest and ignores this value.
 
 Debug channel (kept in the build):
 
@@ -267,8 +284,9 @@ Debug channel (kept in the build):
   - `anim=0` suppresses the shell's open storyboard; `anim=1` restores it. The
     default is `anim=1`, because suppression leaves the pane undrawn.
   - `retract` plays the committed-dismiss settle from the current `Progress`:
-    `BeginGestureSettle(current, 0, 0)`, the same 221 ms spring from rest, and
-    logs `debug retract`. The next open restores the scalar, so the command
+    `BeginGestureSettle(current, 0, 0)` in the selected style from rest (the
+    221 ms spring or the 300 ms Windows 11 curve), and logs `debug retract`.
+    The next open restores the scalar, so the command
     leaves the reuse flag clear. The explorer-side bridge writes this line 350 ms
     before `CStartExperienceManager::Hide` runs, which is what turns a
     Windows-key close into a slide-out. It applies only when the file was
@@ -289,13 +307,14 @@ Debug channel (kept in the build):
 
 Diagnostics:
 
-- `mod init`, `settle start speed=...%`,
+- `mod init`, `settle style selected=... setting=...`,
+  `settle start speed=...%`,
   `settle spring period=... zeta=...`, `hid init`,
   `hid reg usage=... ok=... err=...`,
   `hid down x=... y=... axis=... dist=...`,
   `hid release src=idle|report|abort delta=... perp=... vel=... commit=...
   n=... relms=...`,
-  `settle dir=open|close vel=... v0=... dur=... n=...`,
+  `settle style=win11|win10 dir=open|close vel=... dur=...`,
   `win open`, `win close observed`,
   `close tap kind=dismiss|reveal delay=...`,
   `close tap dropped kind=dismiss|reveal`,
@@ -393,7 +412,8 @@ Known risks:
 - The tap holds the input thread for 60 ms. It runs after the retract, on the
   input thread, and is global; a new contact's reports queue behind it.
 - `close-mode.txt` is read only inside its 800 ms window. A gesture close stamps
-  `gesture=0` at its release; the tap's Hide arrives about 221 ms later and runs
+  `gesture=0` at its release; the tap's Hide arrives at the end of the settle
+  (300 ms on Windows 11, 221 ms on the spring) and runs
   at once. A dropped close stamps `cancelled`, which the bridge treats as a
   keyboard close, so a Win press within the window still gets the 350 ms lead.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
@@ -407,12 +427,21 @@ Known risks:
 
 // ==WindhawkModSettings==
 /*
+- AnimationStyle: Windows 11
+  $name: Gesture animation style
+  $description: >-
+    Windows 11 uses the Fluent decelerate curve (cubic-bezier(0.1, 0.9, 0.2,
+    1)) over 300 ms from rest. Windows 10 uses a damped spring that starts at
+    the finger's release speed, scaled by GestureStartSpeedPercent.
+  $options:
+  - Windows 11: Fluent decelerate curve, 300 ms from rest
+  - Windows 10: Damped spring that continues the release speed
 - GestureStartSpeedPercent: 100
   $name: Gesture settle initial velocity (% of finger speed)
   $description: >-
-    Initial velocity of the settle animation, as a percentage of the finger's
+    Initial velocity of the Windows 10 spring, as a percentage of the finger's
     speed at release. 100 continues at exactly the finger's speed; higher snaps
-    away faster.
+    away faster. The Windows 11 curve starts at rest and ignores this value.
 */
 // ==/WindhawkModSettings==
 
@@ -430,10 +459,11 @@ Known risks:
  *   idle tick (WM_TIMER stays on the 15.6 ms tick on this build); on
  *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps and
  *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet, the
- *   expression and one cached cubic-bezier easing (0.45, 0, 0.55, 1)
- *   installed in Setup for the keyboard open, plus
- *   the damped-spring settle the gesture paths sample at
- *   `GestureStartSpeedPercent` of the release speed; on
+ *   expression and two cached cubic-bezier easings installed in Setup
+ *   ((0.45, 0, 0.55, 1) for the keyboard open, (0.1, 0.9, 0.2, 1) for the
+ *   Windows 11 settle), plus the damped-spring settle the gesture paths sample
+ *   at `GestureStartSpeedPercent` of the release speed when the style setting
+ *   selects `Windows 10`; on
  *   VisualTreeHelper, TransformToVisual and LayoutUpdated
  *   from Windows.UI.Xaml.Media to map the panel trail and to follow the layout;
  *   on ScrollViewer, its ScrollableWidth/ScrollableHeight/VerticalOffset and its
@@ -461,15 +491,19 @@ Known risks:
  *   committed dismiss or short reveal, the shell's own Start toggle that performs
  *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
  *   generation exists when it would run, and no request file or re-arm tap
- *   exists; one damped-spring settle and one settle-and-arm helper for
- *   all four gesture outcomes (open and close mirror exactly: the initial
- *   velocity is `GestureStartSpeedPercent` of the finger's release speed,
- *   scaled by the travel left, with the natural period 0.25 s, damping 0.9 and
- *   a 221 ms duration; 13 linear keyframes sample the curve, clamped to 0..1),
- *   which also owns the suppression window, the
+ *   exists; one settle in the style `AnimationStyle` selects, and one
+ *   settle-and-arm helper for all four gesture outcomes. `Windows 11` (the
+ *   default) is one eased pair over 300 ms from rest on the cached
+ *   cubic-bezier(0.1, 0.9, 0.2, 1); `Windows 10` is the spring (open and close
+ *   mirror exactly: the initial velocity is `GestureStartSpeedPercent` of the
+ *   finger's release speed, scaled by the travel left, with the natural period
+ *   0.25 s, damping 0.9 and a 221 ms duration, sampled by 13 linear keyframes
+ *   clamped to 0..1). The helper also owns the suppression window, the
  *   close-mode stamp and the
- *   armed tap, so neither gesture family can skip one; the setting is read once
- *   at init and refreshed on a settings change, logged as
+ *   armed tap, whose delay is the settle's own duration (300 ms or 221 ms), so
+ *   neither gesture family can skip one; both settings are read once at init
+ *   and refreshed on a settings change, logged as
+ *   `settle style selected=... setting=...` and
  *   `settle start speed=...%`; a linear coast of
  *   `Progress` at the finger's smoothed speed while
  *   no report arrives, started by the idle tick before that tick decides the
@@ -536,6 +570,7 @@ Known risks:
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -625,14 +660,20 @@ constexpr uint8_t kAnimPrologue[] = {
 };
 
 // ---------------------------------------------------------------------------
-// The gesture settle: one damped spring for all four outcomes
+// The gesture settle: two selectable styles for all four outcomes
 //
-// Open and close are exact mirrors. A cubic-bezier with a fixed duration
-// cannot do that: its initial slope is only a multiple of the animation's own
-// average speed, and covering the remaining travel in a fixed time forces the
-// curve to accelerate, which contradicts an opening that should slow down. A
-// spring's initial velocity is the finger's release speed (scaled by the
-// setting) in either direction, and its damping supplies the deceleration.
+// The setting picks the style; every outcome uses the picked one: the dismiss
+// commit and cancel, the reveal commit and cancel. Windows 10 is the damped
+// spring this mod shipped from the start, Windows 11 is the Fluent decelerate
+// curve.
+//
+// Spring (Windows 10). Open and close are exact mirrors. A cubic-bezier with a
+// fixed duration cannot do that: its initial slope is only a multiple of the
+// animation's own average speed, and covering the remaining travel in a fixed
+// time forces the curve to accelerate, which contradicts an opening that should
+// slow down. A spring's initial velocity is the finger's release speed (scaled
+// by the setting) in either direction, and its damping supplies the
+// deceleration.
 //
 // The spring works in normalized travel `y = (p - from) / (to - from)`, so
 // y(0) = 0 and y(inf) = 1. With natural frequency omega, damping ratio zeta and
@@ -643,15 +684,21 @@ constexpr uint8_t kAnimPrologue[] = {
 //
 // y0 = y'(0) is the scaled release speed divided by the travel left in DIP.
 // The sign of the panel velocity cancels in the normalized slope, because
-// (to - from) carries it too: the spring always relaxes from 0 toward 1. v0
-// keeps the sign for the log, so a close reports a negative DIP/s velocity and
-// an open a positive one.
+// (to - from) carries it too: the spring always relaxes from 0 toward 1. The
+// panel velocity keeps the sign for the reader, so a close reports a negative
+// DIP/s velocity and an open a positive one.
 //
 // The duration is five time constants, 1/(zeta*omega), which is ~221 ms at
 // these values, clamped to 180-400 ms. The tail is below 1% by then, so the
 // last samples sit on the target. The settle is a polyline of 12 equal
 // segments sampled from that curve; the keyframes are linear and no easing
 // function is attached, because the samples are the curve.
+//
+// Fluent (Windows 11). One eased pair: `from` at t=0 and `to` at t=1 on
+// cubic-bezier(0.1, 0.9, 0.2, 1) over 300 ms. It carries no release velocity:
+// the motion starts at rest and decelerates into the target, which is how the
+// shell's own Fluent transitions move. The fixed duration is what the close
+// tap is armed with as well.
 // ---------------------------------------------------------------------------
 constexpr double kSpringPeriodSeconds = 0.25;
 constexpr double kSpringDamping = 0.9;
@@ -663,8 +710,18 @@ constexpr std::chrono::milliseconds kSettleMaxDuration{400};
 constexpr int kSettleSteps = 12;
 constexpr int kSettleSampleCount = kSettleSteps + 1;
 
-// The one setting of this mod: the settle's initial velocity as a percentage of
-// the finger's release speed. 100 continues at exactly that speed.
+// The Windows 11 style: one eased pair over 300 ms on the Fluent decelerate
+// curve. The four numbers are cubic-bezier's two control points; Setup builds
+// the cached easing function from them once.
+constexpr std::chrono::milliseconds kWin11SettleDuration{300};
+constexpr float kWin11SettleControl1X = 0.1f;
+constexpr float kWin11SettleControl1Y = 0.9f;
+constexpr float kWin11SettleControl2X = 0.2f;
+constexpr float kWin11SettleControl2Y = 1.0f;
+
+// The spring setting: the settle's initial velocity as a percentage of the
+// finger's release speed. 100 continues at exactly that speed. The Windows 11
+// curve starts at rest, so it reads no value from here.
 constexpr int kGestureStartSpeedDefault = 100;
 constexpr int kGestureStartSpeedMin = 0;
 constexpr int kGestureStartSpeedMax = 300;
@@ -688,11 +745,15 @@ constexpr uint64_t kCloseTapDelayMs = 0;
 constexpr uint64_t kRestoreSuppressMs = 600;
 
 // The tap has to run inside that window, or the poll reads the still-open window
-// as a fresh open and restores Progress while the close is in flight. The
-// longest settle is kSettleMaxDuration, so even a clamped one lands inside it.
+// as a fresh open and restores Progress while the close is in flight. Both
+// styles must land inside it; the spring's clamp is the longer of the two.
 static_assert(static_cast<uint64_t>(kSettleMaxDuration.count()) <=
                   kRestoreSuppressMs,
               "the close tap must run inside the restore suppression");
+static_assert(static_cast<uint64_t>(kWin11SettleDuration.count()) <=
+                  kRestoreSuppressMs,
+              "the Windows 11 close tap must run inside the restore "
+              "suppression");
 
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
 constexpr float kCommitDistanceFraction = 0.20f;
@@ -984,13 +1045,50 @@ std::atomic<bool> g_stopDismissCallback{false};
 std::atomic<bool> g_suppressOpenAnim{false};
 std::atomic<int32_t> g_animLogCount{0};
 
-// The percentage from the mod settings: the settle's initial velocity as a
-// percentage of the finger's release speed. Wh_ModInit and
-// Wh_ModSettingsChanged write it, every settle reads it once; no setting lookup
-// runs per settle.
+// ---------------------------------------------------------------------------
+// The settle style setting
+//
+// The setting stores its display label, so the label the user picks is the
+// value the code compares: exactly "Windows 10" selects the spring, and every
+// other value (including the default "Windows 11") selects the Fluent curve. A
+// missing or unrecognized value therefore lands on the default behaviour
+// instead of inventing a third one.
+// ---------------------------------------------------------------------------
+enum class SettleStyle : int32_t {
+    Win11 = 0,
+    Win10 = 1,
+};
+
+constexpr wchar_t kAnimationStyleWin10[] = L"Windows 10";
+
+// Read once at init and once per settings change; every settle reads this
+// atomic instead of the setting string.
+std::atomic<SettleStyle> g_settleStyle{SettleStyle::Win11};
+
+const wchar_t* SettleStyleName(SettleStyle style) {
+    return style == SettleStyle::Win10 ? L"win10" : L"win11";
+}
+
+// Reads the style setting into the atomic. Wh_ModInit calls it once and
+// Wh_ModSettingsChanged calls it again, so no settle pays for a string lookup.
+void LoadAnimationStyle() {
+    PCWSTR value = Wh_GetStringSetting(L"AnimationStyle");
+    const SettleStyle style =
+        wcscmp(value, kAnimationStyleWin10) == 0 ? SettleStyle::Win10
+                                                 : SettleStyle::Win11;
+    FileLog(L"settle style selected=%s setting=%s", SettleStyleName(style),
+            value);
+    Wh_FreeStringSetting(value);
+    g_settleStyle.store(style, std::memory_order_relaxed);
+}
+
+// The percentage from the mod settings: the Windows 10 spring's initial
+// velocity as a percentage of the finger's release speed. Wh_ModInit and
+// Wh_ModSettingsChanged write it, every spring settle reads it once; no setting
+// lookup runs per settle.
 std::atomic<int> g_gestureStartSpeedPercent{kGestureStartSpeedDefault};
 
-// Reads the one setting into the atomic, clamped. Wh_ModInit calls it once and
+// Reads the setting into the atomic, clamped. Wh_ModInit calls it once and
 // Wh_ModSettingsChanged calls it again, so no settle pays for a setting lookup.
 void LoadGestureStartSpeed() {
     const int percent =
@@ -1017,12 +1115,18 @@ wuc::ExpressionAnimation g_translationExpression{nullptr};
 wuc::Visual g_visual{nullptr};
 wuc::CompositionScopedBatch g_dismissBatch{nullptr};
 
-// The fixed curve, created in Setup and cleared with the property set. Every
-// animation reads it under g_compositionMutex, so it never outlives the
-// compositor that created it. cubic-bezier(0.45, 0, 0.55, 1) starts gently and
-// ends gently: the keyboard open uses it. A gesture settle does not: its sampled
-// spring is the curve.
+// The two fixed curves, created in Setup and cleared with the property set.
+// Every animation reads one under g_compositionMutex, so neither outlives the
+// compositor that created it.
+//
+// - g_retractEasing: cubic-bezier(0.45, 0, 0.55, 1) starts gently and ends
+//   gently; the keyboard open uses it.
+// - g_win11SettleEasing: cubic-bezier(0.1, 0.9, 0.2, 1), the Fluent decelerate
+//   curve; the Windows 11 settle uses it.
+//
+// The Windows 10 settle uses neither: its sampled spring is the curve.
 wuc::CompositionEasingFunction g_retractEasing{nullptr};
+wuc::CompositionEasingFunction g_win11SettleEasing{nullptr};
 
 // The value the renderer currently shows. Composition has no read-back, so every
 // write to `Progress` records it here; the debug `retract` command starts its
@@ -1326,14 +1430,23 @@ bool InsertProgress(float progress) {
     return true;
 }
 
+// The fixed-curve shape of AnimateProgressTo, when the caller has no sampled
+// polyline to hand it.
+enum class ProgressCurve : int32_t {
+    Retract = 0,      // the keyboard open: cubic-bezier(0.45, 0, 0.55, 1)
+    Win11Settle = 1,  // the Windows 11 settle: cubic-bezier(0.1, 0.9, 0.2, 1)
+};
+
 // The one Progress animation in this file. It has two shapes:
 //
-// - the fixed eased pair for the keyboard open. The easing sits on the keyframe
-//   at t=1, the one that defines the motion into the target; the t=0 frame
-//   carries the start value only.
-// - a sampled polyline for a gesture settle. Every keyframe is linear and no
-//   easing function is attached, because the spring samples are the curve. An
-//   easing function on a segment would zero or reshape the initial slope the
+// - the fixed eased pair for the keyboard open and the Windows 11 settle. The
+//   easing sits on the keyframe at t=1, the one that defines the motion into
+//   the target; the t=0 frame carries the start value only. Which curve is
+//   attached comes from the caller: the keyboard open takes the retract curve,
+//   the Windows 11 settle the Fluent decelerate curve.
+// - a sampled polyline for the Windows 10 spring. Every keyframe is linear and
+//   no easing function is attached, because the spring samples are the curve.
+//   An easing function on a segment would zero or reshape the initial slope the
 //   spring exists to keep.
 //
 // Every shape inserts the target as the base value *before* StartAnimation, so a
@@ -1342,14 +1455,18 @@ bool InsertProgress(float progress) {
 bool AnimateProgressTo(float from, float to,
                        std::chrono::milliseconds duration,
                        const float* settleSamples = nullptr,
-                       int settleSampleCount = 0) {
+                       int settleSampleCount = 0,
+                       ProgressCurve curve = ProgressCurve::Retract) {
     std::lock_guard lock(g_compositionMutex);
     if (!g_state || !g_compositor) {
         return false;
     }
 
     const bool polyline = settleSamples != nullptr && settleSampleCount > 1;
-    if (!polyline && !g_retractEasing) {
+    const wuc::CompositionEasingFunction& easing =
+        curve == ProgressCurve::Win11Settle ? g_win11SettleEasing
+                                            : g_retractEasing;
+    if (!polyline && !easing) {
         return false;
     }
 
@@ -1368,7 +1485,7 @@ bool AnimateProgressTo(float from, float to,
         } else {
             animation.InsertKeyFrame(0.0f, std::clamp(from, 0.0f, 1.0f));
             animation.InsertKeyFrame(1.0f, std::clamp(to, 0.0f, 1.0f),
-                                     g_retractEasing);
+                                     easing);
         }
         animation.Duration(duration);
 
@@ -1489,27 +1606,43 @@ bool StopCoast(float& value) {
     return true;
 }
 
-// One damped spring for all four gesture outcomes: the dismiss commit, the
-// dismiss cancel, the reveal commit and the reveal cancel. `from` is where the
-// panel is at release, `to` is 0 for a close and 1 for an open, and `velocity`
-// is the release speed on the gesture axis in DIP/ms.
+// The settle every gesture outcome runs: the dismiss commit, the dismiss
+// cancel, the reveal commit and the reveal cancel. `from` is where the panel is
+// at release, `to` is 0 for a close and 1 for an open, and `velocity` is the
+// release speed on the gesture axis in DIP/ms. `duration` is the animation's
+// length, which is also what the close tap is armed with.
 //
-// Open and close are exact mirrors because the spring works in normalized
-// travel: y(0) = 0, y(inf) = 1, and y'(0) is the scaled release speed divided
-// by the travel left. The sign of the settle direction cancels there, because
-// (to - from) carries it; the spring always relaxes toward its target. `v0`
-// keeps the panel-direction sign only for the log (negative on a close,
-// positive on an open).
+// The style setting picks the mechanism:
 //
-// A release at rest gets y0 = 0: the plain step response of the same spring.
-// A release faster than the remaining travel can absorb overshoots the target,
-// and the 0..1 clamp turns that overshoot into a plateau at the rest position
-// instead of a translation past it.
+// - Windows 11: one eased pair on the Fluent decelerate curve over a fixed
+//   300 ms. It carries no release velocity: the motion starts at rest and
+//   decelerates into the target.
+// - Windows 10: the damped spring. Open and close are exact mirrors because it
+//   works in normalized travel: y(0) = 0, y(inf) = 1, and y'(0) is the scaled
+//   release speed divided by the travel left. The sign of the settle direction
+//   cancels there, because (to - from) carries it; the spring always relaxes
+//   toward its target. A release at rest gets y0 = 0, the plain step response.
+//   A release faster than the remaining travel can absorb overshoots the
+//   target, and the 0..1 clamp turns that overshoot into a plateau at the rest
+//   position instead of a translation past it.
 bool BeginGestureSettle(float from, float to, float velocity,
                         std::chrono::milliseconds& duration) {
     const float start = std::clamp(from, 0.0f, 1.0f);
     const float target = std::clamp(to, 0.0f, 1.0f);
-    const float sign = target >= start ? 1.0f : -1.0f;
+
+    if (g_settleStyle.load(std::memory_order_relaxed) == SettleStyle::Win11) {
+        duration = kWin11SettleDuration;
+        if (!AnimateProgressTo(start, target, duration, nullptr, 0,
+                               ProgressCurve::Win11Settle)) {
+            return false;
+        }
+
+        FileLog(L"settle style=win11 dir=%s vel=%.2f dur=%llu",
+                target >= start ? L"open" : L"close", velocity,
+                static_cast<unsigned long long>(duration.count()));
+        return true;
+    }
+
     const float distance = g_distancePub.load(std::memory_order_relaxed);
     const float remaining =
         std::fabs(target - start) * std::max(distance, 0.0f);
@@ -1517,11 +1650,6 @@ bool BeginGestureSettle(float from, float to, float velocity,
         static_cast<float>(g_gestureStartSpeedPercent.load(
             std::memory_order_relaxed)) /
         100.0f;
-    // Panel velocity at the seam, DIP/ms. The log prints it in DIP/s; a release
-    // at rest prints +0, not the -0 that sign * 0 would produce.
-    const float v0 = sign * startScale * velocity;
-    const float v0DipPerSecond =
-        velocity > 0.0f ? v0 * 1000.0f : 0.0f;
 
     // Work in milliseconds throughout: `velocity` is DIP/ms, the duration is in
     // ms, and y0 is 1/ms. The period constant is seconds, so omega converts it
@@ -1564,10 +1692,9 @@ bool BeginGestureSettle(float from, float to, float velocity,
         return false;
     }
 
-    FileLog(L"settle dir=%s vel=%.2f v0=%.0f dur=%llu n=%d",
-            target >= start ? L"open" : L"close", velocity, v0DipPerSecond,
-            static_cast<unsigned long long>(duration.count()),
-            kSettleSampleCount);
+    FileLog(L"settle style=win10 dir=%s vel=%.2f dur=%llu",
+            target >= start ? L"open" : L"close", velocity,
+            static_cast<unsigned long long>(duration.count()));
     return true;
 }
 
@@ -1628,7 +1755,7 @@ bool BeginGestureClose(float from, float velocity, CloseKind kind) {
     return true;
 }
 
-// The open counterpart of BeginGestureClose: the same spring and the same
+// The open counterpart of BeginGestureClose: the same settle style and the same
 // release velocity, mirrored. A reveal commit and a cancelled dismiss
 // therefore settle with one mechanism and only the target differs.
 bool BeginGestureOpen(float from, float velocity) {
@@ -1971,7 +2098,8 @@ void ApplyDebugLine(const char* line, bool fresh) {
             std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
                        1.0f);
         // The keyboard close has no release speed of its own, so it settles
-        // from rest: y0 = 0, the spring's plain step response.
+        // from rest: the spring's plain step response, or the Windows 11 curve,
+        // which always starts at rest.
         std::chrono::milliseconds duration{0};
         if (BeginGestureSettle(from, 0.0f, 0.0f, duration)) {
             // The window is about to be hidden: the next open restores Progress
@@ -4919,12 +5047,18 @@ bool Setup(wux::FrameworkElement const& root) {
     state.InsertScalar(L"DirY", dirY);
 
     // The fixed curve, the v0.1.0 one: cubic-bezier(0.45, 0, 0.55, 1) starts
-    // gently and ends gently. The keyboard open uses it. A gesture settle does
-    // not: its sampled spring is the curve, because this curve's zero initial
-    // slope is exactly the stop the settle removes.
+    // gently and ends gently. The keyboard open uses it.
     const wuc::CompositionEasingFunction retractEasing =
         compositor.CreateCubicBezierEasingFunction(float2{0.45f, 0.0f},
                                                    float2{0.55f, 1.0f});
+
+    // The Windows 11 settle curve: cubic-bezier(0.1, 0.9, 0.2, 1). It starts
+    // almost flat and decelerates hard into the target, the Fluent motion the
+    // Windows 11 style asks for. It is cached here, so no settle creates one.
+    const wuc::CompositionEasingFunction win11SettleEasing =
+        compositor.CreateCubicBezierEasingFunction(
+            float2{kWin11SettleControl1X, kWin11SettleControl1Y},
+            float2{kWin11SettleControl2X, kWin11SettleControl2Y});
 
     // The translation property must exist before the expression is started.
     visual.Properties().InsertVector3(L"Translation",
@@ -4943,6 +5077,7 @@ bool Setup(wux::FrameworkElement const& root) {
         g_state = state;
         g_translationExpression = translation;
         g_retractEasing = retractEasing;
+        g_win11SettleEasing = win11SettleEasing;
     }
 
     // A resize changes the extent the expression slides by, and it may be the
@@ -5418,6 +5553,7 @@ void ResetComposition() {
     g_state = nullptr;
     g_visual = nullptr;
     g_retractEasing = nullptr;
+    g_win11SettleEasing = nullptr;
 
     g_distancePub.store(0.0f, std::memory_order_relaxed);
     g_panelTrailDip.store(0.0f, std::memory_order_relaxed);
@@ -5438,6 +5574,7 @@ void ResetRenderer() {
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
     Wh_Log(L"Legacy Start Edge Swipe 0.12.0 initializing");
+    LoadAnimationStyle();
     LoadGestureStartSpeed();
     FileLog(L"settle spring period=%.3f zeta=%.2f", kSpringPeriodSeconds,
             kSpringDamping);
@@ -5555,8 +5692,9 @@ void Wh_ModUninit() {
     Wh_Log(L"Legacy Start Edge Swipe Dismiss uninitialized");
 }
 
-// A settings change only refreshes the atomic: the next settle reads it, no
+// A settings change only refreshes the atomics: the next settle reads them, no
 // renderer state and no cached curve is touched.
 void Wh_ModSettingsChanged() {
+    LoadAnimationStyle();
     LoadGestureStartSpeed();
 }
