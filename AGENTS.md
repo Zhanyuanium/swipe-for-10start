@@ -18,8 +18,11 @@ gesture outcome settles on one damped spring whose shape `AnimationStyle` picks
 (`Windows 11`, damping 1.72, fitted to the native Quick Settings flyout on this
 machine; `Windows 10`, damping 0.9) and whose duration the travel plans:
 `T = clamp(remaining / 2.2 DIP/ms, 160, 520)`, so the 900 DIP panel takes 409 ms.
-Both start at the finger's release speed over the travel left, so a release from
-a hold starts at zero speed instead of jumping. Both close paths then tap
+That settle is the only `Progress` animation: a keyboard open runs it from rest
+(`vel=0.00`), and the curve is scaled by its own value at `T`, so it lands on the
+target with no step. Both styles start at the finger's release speed over the
+travel left, so a release from a hold starts at zero speed instead of jumping.
+Both close paths then tap
 `VK_LWIN` at the end of that settle: the shell's own key handler performs the
 hide, so the Start toggle stays in step and no re-arm tap exists. A new pull
 during the settle drops the tap before the shell is touched. The Start mod stamps

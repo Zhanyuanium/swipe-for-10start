@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.16.0
+// @version         0.17.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -135,11 +135,13 @@ What it does:
     120 Hz no corner can fall inside a displayed frame. Every sample is clamped
     to 0..1 and to the sample before it: a flick faster than the remaining
     travel can absorb flattens at the rest position instead of translating past
-    it, and convergence stays monotonic. One final keyframe at `T` carries the
-    exact target, because the curve is still 0.7% short at five time constants,
-    which is 6 DIP on a 900 DIP panel and reads as a menu that never finished
-    opening. The keyframes are linear and no easing function is attached,
-    because the samples are the curve.
+    it, and convergence stays monotonic. The analytic spring stops
+    `1 - exp(-5)`, about 0.7%, short of the target at `T`; writing the exact
+    target on one last keyframe made the panel hop that remainder (3.8 DIP on a
+    501 DIP travel, after a frame that had moved under 0.1 DIP). The whole curve
+    is therefore scaled by its own value at `T`, so the samples converge on the
+    target and the landing has no step. The keyframes are linear and no easing
+    function is attached, because the samples are the curve.
 
   One settle-and-arm helper serves both gesture families: it plays the
   animation, opens the suppression window, stamps the close channel and arms the
@@ -237,20 +239,26 @@ What it does:
   cached answer is dropped on every lift, so each contact starts from a fresh
   query.
 - A closed-to-open transition that no reveal owns (a Windows-key, Start-button
-  or tray open) is animated by the mod: `Progress` is set to 0 and eases to 1
-  over 260 ms on `cubic-bezier(0.45, 0, 0.55, 1)`, so a keyboard open slides the
-  same way a gesture open does. `PollRootVisibility` polls the cloaked attribute
-  at most once per 20 ms on the 5 ms idle tick and sees the transition; a live
-  edge candidate and the 600 ms suppression window both suppress the animation.
-  A close the shell performs by itself logs `win close observed`, leaves
-  `Progress` where the close left it, and lets the next open animate from 0.
+  or tray open) runs the settle a gesture open runs:
+  `BeginGestureSettle(0, 1, 0, ...)` starts from rest, the travel plans the
+  duration and the style picks the damping, so a keyboard open and an edge pull
+  are one motion and there is no second curve. The settle needs the measured
+  travel: an open that lands before the first geometry publish (`Distance`
+  still 0) restores the resting value instead and lets the shell's own
+  storyboard run. `PollRootVisibility` polls the
+  cloaked attribute at most once per 20 ms on the 5 ms idle tick and sees the
+  transition; a live edge candidate and the 600 ms suppression window both
+  suppress the animation. A close the shell performs by itself logs
+  `win close observed`, leaves `Progress` where the close left it, and lets the
+  next open animate from 0.
   The Windows-key close is animated now: the explorer-side bridge asks this mod
   for the retract through the shared channel and holds
   `CStartExperienceManager::Hide` until the settle it starts has run. Only this
   process can plan that settle, so it answers with the planned duration and the
   bridge waits exactly that plus a 30 ms margin; the mod runs the selected
-  settle style from rest (409 ms for the full panel at the planned 2.2 DIP/ms)
-  and the panel slides out instead of vanishing. One line per transition.
+  settle style from rest (520 ms at this layout's 1440 DIP travel, 409 ms for
+  the 900 DIP panel) and the panel slides out instead of vanishing. One line
+  per transition.
 - Every gesture close stamps the close channel at the release. The tap comes at
   the end of the settle, so the Hide it causes needs no wait; the stamp, which
   carries a sequence number, tells the bridge that this Hide is that tap's and
@@ -340,7 +348,7 @@ Diagnostics:
   `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
   frames=... zeta=...` (`frames` counts keyframes, so the segment count is one
   less),
-  `win open`, `win close observed`,
+  `win open dur=...`, `win open restore (no geometry)`, `win close observed`,
   `close tap kind=dismiss|reveal delay=...`,
   `close tap dropped kind=dismiss|reveal`,
   `close tap skipped kind=... (already closed)`,
@@ -448,9 +456,8 @@ Known risks:
   bridge's request has reached this thread, so the shell hides one margin after
   the settle has run to its end, never while it is still moving. When the answer
   never arrives (the mod is disabled, the settle did not start) the bridge waits
-  its own 560 ms instead: that covers the 409 ms full panel, but a panel resized
-  past 480 DIP of travel, whose settle hits the 520 ms clamp, can lose its last
-  frames behind that fallback.
+  its own 560 ms instead: that covers the 520 ms clamp plus the 30 ms margin, so
+  even a panel whose whole travel hits the clamp keeps its last frames.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -498,10 +505,10 @@ Known risks:
  *   idle tick (WM_TIMER stays on the 15.6 ms tick on this build); on
  *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps and
  *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet, the
- *   expression and one cached cubic-bezier easing installed in Setup
- *   ((0.45, 0, 0.55, 1) for the keyboard open, the one curve no gesture uses),
- *   plus the damped-spring settle both gesture styles sample at
- *   `GestureStartSpeedPercent` of the release speed; on
+ *   expression and one damped-spring curve sampled into keyframes, which every
+ *   `Progress` animation runs: the gesture opens and closes and the keyboard
+ *   open, at `GestureStartSpeedPercent` of the release speed (zero for the
+ *   keyboard open); on
  *   VisualTreeHelper, TransformToVisual and LayoutUpdated
  *   from Windows.UI.Xaml.Media to map the panel trail and to follow the layout;
  *   on ScrollViewer, its ScrollableWidth/ScrollableHeight/VerticalOffset and its
@@ -538,8 +545,9 @@ Known risks:
  *   by 2.2 DIP/ms, the native flyout's own speed, clamped to 160-520 ms, and the
  *   frequency is derived from it so five time constants of the slowest root land
  *   on that duration. The response is sampled by 12-128 linear keyframes, one
- *   per 4 ms or less and each clamped to 0..1 and to its predecessor, plus one
- *   landing keyframe that carries the exact target. The
+ *   per 4 ms or less and each clamped to 0..1 and to its predecessor; the whole
+ *   curve is scaled by its own value at the duration, so the last sample is the
+ *   target and the panel lands without a step. The
  *   helper also owns the suppression window, the
  *   close stamp and the
  *   armed tap, whose delay is the settle's own duration (160-520 ms), so
@@ -556,8 +564,9 @@ Known risks:
  *   input thread and refreshed from its `ViewChanged` event, which rejects a
  *   vertical dismiss that would only scroll the list and logs
  *   `dismiss deferred to scroll`; a
- *   0-to-1 progress slide over 260 ms for a closed-to-open transition no reveal
- *   owns, plus a `win close observed` line when the shell hides the window by
+ *   0-to-1 settle from rest for a closed-to-open transition no reveal owns, with
+ *   the same curve and the travel-planned duration a gesture open uses, plus a
+ *   `win close observed` line when the shell hides the window by
  *   itself; a 1 ms timer period (timeBeginPeriod/timeEndPeriod) held exactly
  *   while a contact is down and one 5 ms high-resolution idle tick that detects
  *   the release; a suppression window, at most 600 ms, after either close in
@@ -583,7 +592,8 @@ Known risks:
  *   shell's open storyboard for experiments. It also owns the close decision:
  *   the settle runs first, then the tap at its end; both settle styles are the
  *   same spring generator and differ only in damping, so a style switch can
- *   never change how the release velocity enters the motion; a pull
+ *   never change how the release velocity enters the motion; the keyboard open
+ *   is that settle started from rest, so no second open curve exists; a pull
  *   generation checked
  *   at the tap drops it, so a re-pull never touches the shell. The explorer-side
  *   bridge still calls the original Hide; it only skips its keyboard lead when
@@ -763,10 +773,11 @@ constexpr uint8_t kAnimPrologue[] = {
 // last frame. Either way the curve is one shape stretched in time: the damping
 // ratio is the style, T is the travel.
 //
-// The tail is 0.7% of the travel at T, but 0.7% of a 900 DIP panel is 6 DIP the
-// eye reads as "never quite open", so the frames land on `to` exactly: the
-// samples stop one segment short of T and the final keyframe at T carries the
-// target itself.
+// The analytic curve is 1 - exp(-5) ~ 0.7% short of the target at T. Writing
+// the exact target on a final keyframe made the panel hop that remainder after
+// a frame that had moved under 0.1 DIP (3.8 DIP on a 501 DIP travel), so the
+// whole curve is scaled by its own value at T instead: every sample rises by the
+// same fraction and the last one reaches the target with no step of its own.
 // One segment is at most 4 ms, so at 120 Hz (8.3 ms per frame) no corner can
 // fall inside a displayed frame; the floor of 12 segments keeps the shape of
 // the shortest settle, and 128 caps the keyframe count.
@@ -800,7 +811,7 @@ constexpr std::chrono::milliseconds kSettleMaxDuration{520};
 constexpr double kSettleSegmentMs = 4.0;
 constexpr int kSettleMinSteps = 12;
 constexpr int kSettleMaxSteps = 128;
-// The samples plus the exact landing frame at T.
+// The frames: the segments plus the landing frame at T.
 constexpr int kSettleMaxFrames = kSettleMaxSteps + 1;
 
 // The Windows 11 style used to be one eased pair on the Fluent decelerate
@@ -814,12 +825,6 @@ constexpr int kSettleMaxFrames = kSettleMaxSteps + 1;
 constexpr int kGestureStartSpeedDefault = 100;
 constexpr int kGestureStartSpeedMin = 0;
 constexpr int kGestureStartSpeedMax = 300;
-
-// A closed-to-open transition that no gesture owns (Windows key, Start button,
-// tray) gets a slide a reveal produces: Progress from 0 to 1 on
-// cubic-bezier(0.45, 0, 0.55, 1). The keyboard open is not a gesture settle: it
-// has no release speed to continue, so it keeps its fixed duration and curve.
-constexpr std::chrono::milliseconds kOpenSlideDuration{260};
 
 // Every gesture close ends in one Windows tap at the end of its settle. The tap
 // is the shell's own Start toggle: the key handler performs Hide, so no
@@ -1198,16 +1203,6 @@ wuc::ExpressionAnimation g_translationExpression{nullptr};
 wuc::Visual g_visual{nullptr};
 wuc::CompositionScopedBatch g_dismissBatch{nullptr};
 
-// The one fixed curve, created in Setup and cleared with the property set. Every
-// animation reads it under g_compositionMutex, so it does not outlive the
-// compositor that created it.
-//
-// - g_retractEasing: cubic-bezier(0.45, 0, 0.55, 1) starts gently and ends
-//   gently; the keyboard open uses it.
-//
-// Both gesture settles use neither: their sampled spring is the curve.
-wuc::CompositionEasingFunction g_retractEasing{nullptr};
-
 // The value the renderer currently shows. Composition has no read-back, so every
 // write to `Progress` records it here; the debug `retract` command starts its
 // animation from this value instead of from a gesture session that may be gone.
@@ -1520,51 +1515,38 @@ bool InsertProgress(float progress) {
     return true;
 }
 
-// The one Progress animation in this file. It has two shapes:
+// The one Progress animation in this file: a sampled polyline. Every keyframe is
+// linear and no easing function is attached, because the spring samples are the
+// curve. An easing function on a segment would zero or reshape the initial slope
+// the spring exists to keep. The frame count is 13-129: one segment per 4 ms of
+// the settle plus the landing frame at T, where the scaled curve is the target.
 //
-// - a fixed eased pair for the keyboard open. The easing sits on the keyframe
-//   at t=1, the one that defines the motion into the target; the t=0 frame
-//   carries the start value only. That transition has no finger speed to
-//   continue, so it keeps its own curve.
-// - a sampled polyline for both gesture settle styles. Every keyframe is linear
-//   and no easing function is attached, because the spring samples are the
-//   curve. An easing function on a segment would zero or reshape the initial
-//   slope the spring exists to keep. The frame count is 13-129: one segment per
-//   4 ms of the settle plus the landing frame that carries the exact target.
+// Every open and every close comes through here, from a gesture and from the
+// Windows key alike, so there is one motion and no second curve to drift from it.
 //
-// Every shape inserts the target as the base value *before* StartAnimation, so a
+// The sample list starts at the current position, so the animation needs no
+// separate start value: `samples[0]` is where the panel is.
+//
+// The target is inserted as the base value *before* StartAnimation, so a
 // cancelled or interrupted animation still lands on the intended end state
 // instead of snapping back to the drag position.
-bool AnimateProgressTo(float from, float to,
-                       std::chrono::milliseconds duration,
-                       const float* settleSamples = nullptr,
-                       int settleSampleCount = 0) {
+bool AnimateProgressTo(float to, std::chrono::milliseconds duration,
+                       const float* settleSamples, int settleSampleCount) {
     std::lock_guard lock(g_compositionMutex);
-    if (!g_state || !g_compositor) {
-        return false;
-    }
-
-    const bool polyline = settleSamples != nullptr && settleSampleCount > 1;
-    if (!polyline && !g_retractEasing) {
+    if (!g_state || !g_compositor || !settleSamples || settleSampleCount < 2) {
         return false;
     }
 
     try {
         wuc::ScalarKeyFrameAnimation animation =
             g_compositor.CreateScalarKeyFrameAnimation();
-        if (polyline) {
-            // Equal steps across the duration; the first sample is the release
-            // position and the last is the target.
-            const float last = static_cast<float>(settleSampleCount - 1);
-            for (int i = 0; i < settleSampleCount; ++i) {
-                animation.InsertKeyFrame(static_cast<float>(i) / last,
-                                         std::clamp(settleSamples[i], 0.0f,
-                                                    1.0f));
-            }
-        } else {
-            animation.InsertKeyFrame(0.0f, std::clamp(from, 0.0f, 1.0f));
-            animation.InsertKeyFrame(1.0f, std::clamp(to, 0.0f, 1.0f),
-                                     g_retractEasing);
+        // Equal steps across the duration; the first sample is the release
+        // position and the last is the target.
+        const float last = static_cast<float>(settleSampleCount - 1);
+        for (int i = 0; i < settleSampleCount; ++i) {
+            animation.InsertKeyFrame(
+                static_cast<float>(i) / last,
+                std::clamp(settleSamples[i], 0.0f, 1.0f));
         }
         animation.Duration(duration);
 
@@ -1708,13 +1690,15 @@ bool StopCoast(float& value) {
 //   frequency is derived from that duration (see the constant block), so five
 //   time constants of the spring's slowest root land on T.
 // - The frames are a polyline of 12-128 equal segments, at most 4 ms each, plus
-//   one landing frame at T that carries the exact target. Each sample is
-//   clamped to 0..1 and to the previous sample, so convergence is monotonic.
+//   one landing frame at T. The whole curve is scaled by its own value at T, so
+//   the samples converge on the target with no step at the landing. Each sample
+//   is clamped to 0..1 and to the previous sample, so convergence is monotonic.
 // - Both sets are overdamped or near it; the sampler therefore carries the
 //   underdamped, critically damped and overdamped forms of the same response.
 
 // At most 4 ms per segment, at least 12, at most 128. The samples take one
-// segment less than the frames: the last frame is the exact target.
+// segment less than the frames: the last frame is the scaled curve at T, which is
+// the target.
 int SettleStepsFor(int64_t durationMs) {
     const double steps =
         std::ceil(static_cast<double>(durationMs) / kSettleSegmentMs);
@@ -1780,8 +1764,30 @@ bool BeginGestureSettle(float from, float to, float velocity,
             : omega * std::sqrt(std::max(0.0, 1.0 - zeta * zeta));
 
     // The samples stop one segment short of T; the frame after them is the
-    // exact target. A curve 5 time constants out is still 0.7% short, which is
-    // 6 DIP on a 900 DIP panel and reads as a menu that never finished opening.
+    // landing at T. The analytic curve is still short of the target at T:
+    // five time constants of the slowest root leave 1 - exp(-5) ~ 0.7%, which is
+    // 3.8 DIP on a 501 DIP travel and read as one small hop when the landing
+    // frame carried the target itself. Scaling the whole curve by its own value
+    // at T makes every sample 0.7% larger instead, so the samples converge on the
+    // target with no step at all.
+    const auto curveAt = [&](double t) -> double {
+        const double envelope = std::exp(-decay * t);
+        if (overdamped) {
+            return 1.0 - envelope *
+                             (std::cosh(wd * t) +
+                              ((decay - y0) / wd) * std::sinh(wd * t));
+        }
+        if (critical) {
+            return 1.0 - envelope * (1.0 + (omega - y0) * t);
+        }
+        return 1.0 - envelope *
+                         (std::cos(wd * t) +
+                          ((decay - y0) / wd) * std::sin(wd * t));
+    };
+    // A curve that already reaches the target before T is left alone: it is
+    // clamped to 1 there and the landing frame adds nothing.
+    const double endValue = std::clamp(curveAt(tTotal), 0.5, 1.0);
+
     const int steps = SettleStepsFor(durationMs);
     const int frameCount = steps + 1;
     float samples[kSettleMaxFrames] = {};
@@ -1789,19 +1795,7 @@ bool BeginGestureSettle(float from, float to, float velocity,
     float previous = start;
     for (int i = 1; i < steps; ++i) {
         const double t = tTotal * i / static_cast<double>(steps);
-        const double envelope = std::exp(-decay * t);
-        double y = 0.0;
-        if (overdamped) {
-            y = 1.0 - envelope *
-                          (std::cosh(wd * t) +
-                           ((decay - y0) / wd) * std::sinh(wd * t));
-        } else if (critical) {
-            y = 1.0 - envelope * (1.0 + (omega - y0) * t);
-        } else {
-            y = 1.0 - envelope *
-                          (std::cos(wd * t) +
-                           ((decay - y0) / wd) * std::sin(wd * t));
-        }
+        const double y = std::clamp(curveAt(t) / endValue, 0.0, 1.0);
         float value = std::clamp(
             start + (target - start) * static_cast<float>(y), 0.0f, 1.0f);
         // Monotonic convergence: a sample never moves the panel back past one
@@ -1814,7 +1808,7 @@ bool BeginGestureSettle(float from, float to, float velocity,
     }
     samples[steps] = target;
 
-    if (!AnimateProgressTo(start, target, duration, samples, frameCount)) {
+    if (!AnimateProgressTo(target, duration, samples, frameCount)) {
         return false;
     }
 
@@ -3841,8 +3835,11 @@ void PostUiOpenWatchRelease() {
 // Two things happen here. A closed-to-open transition that no reveal owns is a
 // keyboard, Start-button or tray open: the shell slides its own storyboard and
 // the mod makes `Progress` follow from 0, so the same root slides the same way a
-// gesture open does. A close the shell performs by itself (Windows key) is not
-// fought: nothing is inserted, and the next open starts from 0 again.
+// gesture open does. The settle needs the measured travel, so an open that lands
+// before the first geometry publish restores the resting value and lets the
+// shell's storyboard run instead. A close the shell performs by itself (Windows
+// key) is not fought: nothing is inserted, and the next open starts from 0
+// again.
 //
 // The poll runs on the 5 ms idle tick but accepts one cloaked answer per 20 ms;
 // it used 100 ms for the restore check alone. Measured against the uncloak, a
@@ -3875,12 +3872,28 @@ void PollRootVisibility(uint64_t tickMs) {
     // it.
     const bool gestureOwnsProgress = g_reveal.edgeCandidate;
     if (justOpened) {
-        if (!closeInFlight && !gestureOwnsProgress &&
-            AnimateProgressTo(0.0f, 1.0f, kOpenSlideDuration)) {
-            // The animation now owns Progress, so no later path needs to
-            // restore the resting value for this open.
-            g_commitNeedsProgressReset = false;
-            FileLog(L"win open");
+        // The keyboard open is the gesture open from rest: one curve for every
+        // open, so a Windows press and an edge pull cannot look different, and
+        // the travel plans the duration exactly as it does there.
+        if (!closeInFlight && !gestureOwnsProgress) {
+            // The settle needs the measured travel. The open-time geometry
+            // refresh is posted on the UI thread below and runs after this poll,
+            // so an open that lands before the first publish still has Distance
+            // 0: a settle planned from it would run the 160 ms floor. Restore
+            // the resting value instead and let the shell's own storyboard run.
+            if (g_distancePub.load(std::memory_order_relaxed) > 0.0f) {
+                std::chrono::milliseconds duration{0};
+                if (BeginGestureSettle(0.0f, 1.0f, 0.0f, duration)) {
+                    // The animation now owns Progress, so no later path needs to
+                    // restore the resting value for this open.
+                    g_commitNeedsProgressReset = false;
+                    FileLog(L"win open dur=%llu",
+                            static_cast<unsigned long long>(duration.count()));
+                }
+            } else {
+                ShowAtRest();
+                FileLog(L"win open restore (no geometry)");
+            }
         }
 
         // One refresh per open, before the first dismiss of this open can start.
@@ -5184,12 +5197,6 @@ bool Setup(wux::FrameworkElement const& root) {
     state.InsertScalar(L"DirX", dirX);
     state.InsertScalar(L"DirY", dirY);
 
-    // The fixed curve, the v0.1.0 one: cubic-bezier(0.45, 0, 0.55, 1) starts
-    // gently and ends gently. The keyboard open uses it.
-    const wuc::CompositionEasingFunction retractEasing =
-        compositor.CreateCubicBezierEasingFunction(float2{0.45f, 0.0f},
-                                                   float2{0.55f, 1.0f});
-
     // The translation property must exist before the expression is started.
     visual.Properties().InsertVector3(L"Translation",
                                       float3{0.0f, 0.0f, 0.0f});
@@ -5206,7 +5213,6 @@ bool Setup(wux::FrameworkElement const& root) {
         g_visual = visual;
         g_state = state;
         g_translationExpression = translation;
-        g_retractEasing = retractEasing;
     }
 
     // A resize changes the extent the expression slides by, and it may be the
@@ -5681,7 +5687,6 @@ void ResetComposition() {
     g_compositor = nullptr;
     g_state = nullptr;
     g_visual = nullptr;
-    g_retractEasing = nullptr;
 
     g_distancePub.store(0.0f, std::memory_order_relaxed);
     g_panelTrailDip.store(0.0f, std::memory_order_relaxed);
@@ -5701,7 +5706,7 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.16.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.17.0 initializing");
     LoadAnimationStyle();
     LoadGestureStartSpeed();
     // The cross-process channel: without it a gesture close still closes (the

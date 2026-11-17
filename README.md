@@ -70,10 +70,13 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 
    with `remaining = |target - start| * distance`. The spring's frequency is
    derived from `T` (`omega = 5 / (slowest root factor * T)`), so the curve keeps
-   its shape and reaches the target exactly at `T`. Segments are sampled at most
-   every 4 ms and the final keyframe is the exact target, so the panel lands on
-   the rest position (measured 0 DIP short) and the polyline stays smooth at
-   120 Hz.
+   its shape; the curve is then scaled by its own value at `T`, because five time
+   constants leave the analytic curve `1 - e^-5`, about 0.7%, short of the
+   target. That remainder spreads over the whole animation: the samples converge,
+   the motion is 0.7% larger, there is no step, and the final position is still
+   exact. Writing the target on the last keyframe hopped 3.8 DIP (7.6 px) after a
+   frame that had moved under 0.1 DIP, on a 501 DIP travel. Segments are sampled
+   at most every 4 ms, so the polyline stays smooth at 120 Hz.
 
    The close's `VK_LWIN` tap is scheduled at `T`, and the close stamp tells the
    bridge the hide that tap causes needs no retract lead.
@@ -97,9 +100,14 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.
 
-The keyboard path uses the same machinery: a closed→open transition that no
-gesture owns sets `Progress = 0` and animates it to 1 over 260 ms, so a Win-key
-open slides in the way a gesture open does. A Win-key close is animated too:
+The keyboard path runs the same settle: a closed→open transition that no gesture
+owns calls `BeginGestureSettle(0, 1, 0)`, the gesture open from rest, so a Win-key
+open logs `settle style=... dir=open vel=0.00 dur=...` and then
+`win open dur=...`. One curve serves every open and every close, and the travel
+plans the keyboard open's duration exactly as it does a gesture's: 520 ms at the
+1440 DIP travel of this layout, 409 ms for the 900 DIP panel. `AnimationStyle`
+and `GestureStartSpeedPercent` apply to it unchanged, so a Win press cannot look
+different from an edge pull. A Win-key close is animated too:
 `twinui.pcshell.dll` `CStartExperienceManager::Hide` is where the shell takes the
 menu away, so the explorer-side bridge asks the Start mod to retract and holds
 that call until the retract is over. The request carries no duration — only the
@@ -218,9 +226,10 @@ that must continue the finger cannot copy.
 
 Initial slope at a release half open (`Distance` 1440 DIP, finger 0.4 DIP/ms):
 the spring (either style) moves the panel at 0.4 DIP/ms, 4.0 DIP in the first
-10 ms. The `cubic-bezier(0.1, 0.9, 0.2, 1)` the Windows 11 style used before had
-an initial slope of `0.9/0.1 = 9x` its average, i.e. 21.6 DIP/ms and 216 DIP in
-the first 10 ms — that is the jump a release at half open produced.
+10 ms. The Windows 11 style's earlier fixed 300 ms eased pair had an initial
+slope of 9x its average, i.e. 21.6 DIP/ms and 216 DIP in the first 10 ms — that
+is the jump a release at half open produced, and the reason that style now runs
+the spring.
 
 ## Opening follows the finger too
 
