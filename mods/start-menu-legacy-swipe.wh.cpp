@@ -704,6 +704,10 @@ static_assert(static_cast<uint64_t>(kRetractDuration.count()) <=
 
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
 constexpr float kCommitDistanceFraction = 0.20f;
+// A vertical dismiss starts counting only once the list underneath has reached
+// its end, so the remaining drag is short by nature; 20% of the panel would ask
+// for a drag most people never make.
+constexpr float kCommitDistanceFractionVertical = 0.10f;
 constexpr float kCommitVelocity = 0.45f;
 constexpr float kScrollAbortPerp = 120.0f;
 constexpr float kScrollAbortRatio = 1.5f;
@@ -1219,7 +1223,7 @@ void PublishPanelTrailDip(bool logOnChange);
 // Defined with the UI-thread publication below. The open transition arms this
 // watch, which re-measures the panel edge on the second layout pass, when the
 // shell's open storyboard has placed the panel. The close teardown disarms it.
-void ArmSettledTrailWatch();
+void ArmSettledTrailWatch(bool trailIdle);
 void StopSettledTrailWatch();
 
 // Defined with the scroller cache below. Measures the scrolling element an open
@@ -2950,8 +2954,12 @@ void ReleaseRevealSession() {
         travel / static_cast<float>(elapsed > 0 ? elapsed : 1);
     const float distance = reveal.distance;
     const float progress = std::clamp(reveal.progress, 0.0f, 1.0f);
+    const float threshold = IsHorizontalAxis(
+                                g_axisPub.load(std::memory_order_relaxed))
+                                ? kCommitDistanceFraction
+                                : kCommitDistanceFractionVertical;
     const bool commit = distance > 0.0f &&
-                        (travel > kCommitDistanceFraction * distance ||
+                        (travel > threshold * distance ||
                          velocity > kCommitVelocity);
 
     // The release line is written after the animation starts: the file write
@@ -3021,11 +3029,13 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // The previous commit is still sliding out; the shell's Hide for it is still
     // ahead, so this down belongs to the same menu.
     if (g_dismissSettling.load(std::memory_order_relaxed)) {
+        FileLog(L"dismiss skipped settling");
         return;
     }
 
     const float distance = g_distancePub.load(std::memory_order_relaxed);
     if (!(distance > 0.0f)) {
+        FileLog(L"dismiss skipped distance=0");
         return;
     }
 
@@ -3034,6 +3044,8 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // cloaked attribute answers this.
     if (!g_hasRoot.load(std::memory_order_relaxed) ||
         !StartWindowIsOpenThrottled(tickMs)) {
+        FileLog(L"dismiss skipped closed root=%d",
+                g_hasRoot.load(std::memory_order_relaxed) ? 1 : 0);
         return;
     }
 
@@ -3045,6 +3057,7 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // contact latch itself is left untouched: it only tracks that a finger is
     // down, and the lift path clears it, so the next down is unaffected.
     if (!VerticalDismissAllowed(axis, x, y, tickMs)) {
+        FileLog(L"dismiss skipped vertical axis=%d x=%.0f y=%.0f", axis, x, y);
         return;
     }
 
@@ -3097,10 +3110,13 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
     const float finalDelta = std::max(0.0f, session.curDelta);
     const float velocity = finalDelta / static_cast<float>(elapsed > 0 ? elapsed : 1);
     const float distance = g_distancePub.load(std::memory_order_relaxed);
+    const float threshold = IsHorizontalAxis(
+                                g_axisPub.load(std::memory_order_relaxed))
+                                ? kCommitDistanceFraction
+                                : kCommitDistanceFractionVertical;
     const bool commit =
         allowCommit && distance > 0.0f &&
-        (finalDelta > kCommitDistanceFraction * distance ||
-         velocity > kCommitVelocity);
+        (finalDelta > threshold * distance || velocity > kCommitVelocity);
 
     const uint64_t releaseQpc = QpcMsNow();
     EndContactTiming();
@@ -3186,6 +3202,8 @@ void UpdateHidSession(float x, float y, uint64_t tickMs) {
     if (session.maxPerp > kScrollAbortPerp &&
         session.maxPerp > kScrollAbortRatio * session.maxDelta &&
         session.maxDelta < kScrollAbortMaxDelta) {
+        FileLog(L"dismiss aborted perpendicular perp=%.0f delta=%.0f",
+                session.maxPerp, session.maxDelta);
         AbortHidSession(tickMs);
         return;
     }
@@ -3437,10 +3455,12 @@ void PostUiGeometryRefresh(bool trailIdle) {
                     RefreshGestureGeometry();
                     if (trailIdle) {
                         PublishPanelTrailDip(true);
-                        // This measurement can still belong to the open
-                        // storyboard, so the layout watch re-measures it once
-                        // the panel is placed and then detaches itself.
-                        ArmSettledTrailWatch();
+                    }
+                    // The scroller cache must settle even when a reveal owns
+                    // the open: without it every vertical dismiss waits for a
+                    // measurement that never comes.
+                    ArmSettledTrailWatch(trailIdle);
+                    {
                         // The dismiss gate needs the scrolling element of this
                         // open; the settled pass measures it again, when the
                         // list has its final extent.
@@ -4261,6 +4281,8 @@ void PublishPanelTrailDip(bool logOnChange) {
 // The close path and the renderer teardown revoke it too, because a menu that
 // closed before the second pass must not measure anything later.
 // ---------------------------------------------------------------------------
+bool g_layoutMeasureTrail = false;  // UI thread only
+
 void StopSettledTrailWatch() {
     wux::FrameworkElement root = g_root;
     if (g_layoutToken.value && root) {
@@ -4277,7 +4299,7 @@ void StopSettledTrailWatch() {
     g_layoutTicksLeft = 0;
 }
 
-void ArmSettledTrailWatch() {
+void ArmSettledTrailWatch(bool trailIdle) {
     wux::FrameworkElement root = g_root;
     if (!root) {
         return;  // no root, no layout to wait for
@@ -4287,6 +4309,7 @@ void ArmSettledTrailWatch() {
     // previous watch would otherwise measure the same settled layout twice.
     StopSettledTrailWatch();
     g_layoutTicksLeft = 2;
+    g_layoutMeasureTrail = trailIdle;
 
     try {
         g_layoutToken = root.LayoutUpdated([](
@@ -4299,10 +4322,13 @@ void ArmSettledTrailWatch() {
                 if (--g_layoutTicksLeft > 0) {
                     return;  // the first pass precedes the panel placement
                 }
-                RefreshGestureGeometry();
-                PublishPanelTrailDip(true);
+                if (g_layoutMeasureTrail) {
+                    RefreshGestureGeometry();
+                    PublishPanelTrailDip(true);
+                }
                 // The list has its final extent now, so the dismiss gate is
-                // re-armed against the settled rect and offsets.
+                // re-armed against the settled rect and offsets even when a
+                // reveal owned the open and skipped the trail measurement.
                 CacheScrollableElement(true);
             } catch (winrt::hresult_error const& e) {
                 Wh_Log(L"Settled trail failed: %08X", e.code());
