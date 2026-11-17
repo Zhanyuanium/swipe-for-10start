@@ -1181,6 +1181,12 @@ float g_dismissDistance = 0.0f;
 std::atomic<bool> g_hasRoot{false};
 std::atomic<int32_t> g_axisPub{static_cast<int32_t>(DismissAxis::Left)};
 std::atomic<float> g_distancePub{0.0f};
+// A one-shot settle deadline (see the open transition): the layout watch needs a
+// second layout pass, and after the open storyboard there may not be one until
+// the user touches the menu.
+std::atomic<uint64_t> g_settleDueTick{0};
+void PostUiSettledMeasurement(bool trailIdle);
+bool g_settleTrailIdle = false;
 std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
 
 // The panel edge that faces the taskbar, in absolute screen DIP. The root
@@ -3365,6 +3371,14 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     // the retract from its value, exactly as on the clean path.
     MaybeCoast(tickMs, qpcNow);
 
+    // The one-shot settle: the layout watch needs a second layout pass, and one
+    // may never come after the open storyboard finishes.
+    const uint64_t settleDue = g_settleDueTick.load(std::memory_order_relaxed);
+    if (settleDue != 0 && tickMs >= settleDue) {
+        g_settleDueTick.store(0, std::memory_order_relaxed);
+        PostUiSettledMeasurement(g_settleTrailIdle);
+    }
+
     const bool sessionIdle =
         session.active && qpcNow >= session.lastSampleQpc &&
         qpcNow - session.lastSampleQpc >= kIdleReleaseMs;
@@ -3434,6 +3448,38 @@ void RunPendingCloseTap(uint64_t tickMs) {
 // `trailIdle` is decided here, on the thread that owns the gesture state: a live
 // follow reads the panel edge every sample, so the edge must not be re-measured
 // under the finger. A root that is not attached is skipped inside the refresh.
+// One-shot, 400 ms after an open: XAML may not produce a second LayoutUpdated
+// while nothing moves, so the layout watch alone would leave the scroller cache
+// unarmed until the user touches the menu.
+void MeasureSettledNow(bool trailIdle) {
+    if (g_unloading.load(std::memory_order_relaxed)) {
+        return;
+    }
+    try {
+        if (trailIdle) {
+            RefreshGestureGeometry();
+            PublishPanelTrailDip(true);
+        }
+        CacheScrollableElement(true);
+    } catch (...) {
+        // A closing menu must not break the settle.
+    }
+}
+
+void PostUiSettledMeasurement(bool trailIdle) {
+    if (g_unloading.load(std::memory_order_relaxed)) {
+        return;
+    }
+    wucore::CoreDispatcher dispatcher = g_dispatcher;
+    if (!dispatcher) {
+        return;
+    }
+    try {
+        dispatcher.TryRunAsync(wucore::CoreDispatcherPriority::Normal,
+                               [trailIdle]() { MeasureSettledNow(trailIdle); });
+    } catch (...) {
+    }
+}
 void PostUiGeometryRefresh(bool trailIdle) {
     if (g_unloading.load(std::memory_order_relaxed)) {
         return;
@@ -3460,6 +3506,11 @@ void PostUiGeometryRefresh(bool trailIdle) {
                     // the open: without it every vertical dismiss waits for a
                     // measurement that never comes.
                     ArmSettledTrailWatch(trailIdle);
+                    // The layout watch needs a second pass that may never come;
+                    // arm a single 400 ms settle as the guaranteed path.
+                    g_settleTrailIdle = trailIdle;
+                    g_settleDueTick.store(GetTickCount64() + 400,
+                                          std::memory_order_relaxed);
                     {
                         // The dismiss gate needs the scrolling element of this
                         // open; the settled pass measures it again, when the
