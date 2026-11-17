@@ -3344,9 +3344,11 @@ void LogHidRelease(const HidGestureSession& session, float velocity,
 }
 
 void BeginHidSession(float x, float y, uint64_t tickMs) {
-    // The previous commit is still sliding out; the shell's Hide for it is still
-    // ahead, so this down belongs to the same menu.
-    if (g_dismissSettling.load(std::memory_order_relaxed)) {
+    // A close this mod started is still in flight: the panel is leaving, the
+    // shell's Hide is ahead, and a session here would drag Progress back to rest
+    // and flash the menu while it is being hidden.
+    if (g_dismissSettling.load(std::memory_order_relaxed) ||
+        tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
         if (tickMs > g_skipLogTick + 1000) {
             g_skipLogTick = tickMs;
             FileLog(L"dismiss skipped settling");
@@ -3377,6 +3379,34 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     }
 
     const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
+
+    // A press outside the panel belongs to the desktop, not to the menu. The
+    // Start window is full-screen, so PointInStartWindow alone accepted a click
+    // on the desktop next to the panel; on release that session animated
+    // Progress back to 1 and flashed the menu while the shell was hiding it.
+    {
+        const float trail = g_panelTrailDip.load(std::memory_order_relaxed);
+        if (trail > 0.0f) {
+            const bool insidePanel =
+                axis == static_cast<int32_t>(DismissAxis::Left)
+                    ? (x <= trail + kPanelBandSlopDip)
+                    : axis == static_cast<int32_t>(DismissAxis::Top)
+                          ? (y <= trail + kPanelBandSlopDip)
+                          : axis == static_cast<int32_t>(DismissAxis::Right)
+                                ? (x >= trail - kPanelBandSlopDip)
+                                : (y >= trail - kPanelBandSlopDip);
+            if (!insidePanel) {
+                if (tickMs > g_skipLogTick + 1000) {
+                    g_skipLogTick = tickMs;
+                    FileLog(L"dismiss skipped outside panel axis=%d x=%.0f "
+                            L"y=%.0f trail=%.0f",
+                            axis, x, y, trail);
+                }
+                return;
+            }
+        }
+    }
+
     // A vertical drag on the app list belongs to the list while it can still
     // scroll that way. The rejection starts no session, and this function runs
     // again on the next sample of the same contact, so a drag that scrolls the
