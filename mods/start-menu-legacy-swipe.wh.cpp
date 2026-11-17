@@ -1386,6 +1386,12 @@ std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
 // change the system announces, never on a timer: the layout only moves when one
 // of those events says it did.
 std::atomic<float> g_panelTrailDip{0.0f};
+// The whole panel rect in screen DIP, published with the trail: a press outside
+// it belongs to the desktop even when it sits inside the axis band.
+std::atomic<float> g_panelLeft{0.0f};
+std::atomic<float> g_panelTop{0.0f};
+std::atomic<float> g_panelRight{0.0f};
+std::atomic<float> g_panelBottom{0.0f};
 
 // UI thread only. Setup resets the open log; a failed mapping logs its fallback
 // once per process so a missing panel does not flood the log every resize. A
@@ -3386,24 +3392,38 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
     // Progress back to 1 and flashed the menu while the shell was hiding it.
     {
         const float trail = g_panelTrailDip.load(std::memory_order_relaxed);
+        const float left = g_panelLeft.load(std::memory_order_relaxed);
+        const float top = g_panelTop.load(std::memory_order_relaxed);
+        const float right = g_panelRight.load(std::memory_order_relaxed);
+        const float bottom = g_panelBottom.load(std::memory_order_relaxed);
+        bool insidePanel = true;
         if (trail > 0.0f) {
-            const bool insidePanel =
-                axis == static_cast<int32_t>(DismissAxis::Left)
-                    ? (x <= trail + kPanelBandSlopDip)
-                    : axis == static_cast<int32_t>(DismissAxis::Top)
-                          ? (y <= trail + kPanelBandSlopDip)
-                          : axis == static_cast<int32_t>(DismissAxis::Right)
-                                ? (x >= trail - kPanelBandSlopDip)
-                                : (y >= trail - kPanelBandSlopDip);
-            if (!insidePanel) {
-                if (tickMs > g_skipLogTick + 1000) {
-                    g_skipLogTick = tickMs;
-                    FileLog(L"dismiss skipped outside panel axis=%d x=%.0f "
-                            L"y=%.0f trail=%.0f",
-                            axis, x, y, trail);
-                }
-                return;
+            if (right > left && bottom > top) {
+                // The whole rect: a press beside the panel (same axis band, no
+                // panel) is a desktop click too.
+                insidePanel = x >= left - kPanelBandSlopDip &&
+                              x <= right + kPanelBandSlopDip &&
+                              y >= top - kPanelBandSlopDip &&
+                              y <= bottom + kPanelBandSlopDip;
+            } else {
+                insidePanel =
+                    axis == static_cast<int32_t>(DismissAxis::Left)
+                        ? (x <= trail + kPanelBandSlopDip)
+                        : axis == static_cast<int32_t>(DismissAxis::Top)
+                              ? (y <= trail + kPanelBandSlopDip)
+                              : axis == static_cast<int32_t>(DismissAxis::Right)
+                                    ? (x >= trail - kPanelBandSlopDip)
+                                    : (y >= trail - kPanelBandSlopDip);
             }
+        }
+        if (!insidePanel) {
+            if (tickMs > g_skipLogTick + 1000) {
+                g_skipLogTick = tickMs;
+                FileLog(L"dismiss skipped outside panel axis=%d x=%.0f y=%.0f "
+                        L"rect=%.0f,%.0f,%.0f,%.0f trail=%.0f",
+                        axis, x, y, left, top, right, bottom, trail);
+            }
+            return;
         }
     }
 
@@ -3503,6 +3523,16 @@ void ReleaseHidSession(bool allowCommit, const wchar_t* source) {
     }
 
     session.active = false;
+    // A close started by the shell (a click outside, a Windows-key press) hides
+    // the window while this contact is still up. Animating Progress back to rest
+    // then replays the panel over a window that is being hidden, which is the
+    // flash the user reported. Leave Progress to the close.
+    if (g_dismissSettling.load(std::memory_order_relaxed) ||
+        GetTickCount64() <
+            g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+        FileLog(L"cancel animation skipped (close in flight)");
+        return;
+    }
     if (distance > 0.0f) {
         BeginGestureOpen(from, velocity);
     } else {
@@ -4549,6 +4579,11 @@ bool ComputePanelTrailDip(float& trail) {
     if (!XamlOriginDip(originX, originY)) {
         return false;
     }
+
+    g_panelLeft.store(originX + frameLeft, std::memory_order_relaxed);
+    g_panelTop.store(originY + frameTop, std::memory_order_relaxed);
+    g_panelRight.store(originX + frameRight, std::memory_order_relaxed);
+    g_panelBottom.store(originY + frameBottom, std::memory_order_relaxed);
 
     switch (static_cast<DismissAxis>(g_dismissAxis)) {
         case DismissAxis::Left:
