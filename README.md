@@ -25,7 +25,7 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 | Taskbar on top / right / bottom | axis logic present, only left verified |
 | Mouse drag to dismiss | deliberately not enabled |
 | Reveal (edge swipe to open) following the finger | working, anchored to the panel edge |
-| Windows-key close | animated slide-out, 350 ms hide lead from the explorer-side bridge |
+| Windows-key close | animated slide-out; the bridge holds the Hide for the settle the Start mod answers with |
 | Gesture close | retract, then one Windows tap at its end; the bridge skips its keyboard lead for the stamped Hide |
 | Reopen during a close | a new edge pull drops the armed tap, so the shell never sees that close |
 
@@ -100,14 +100,27 @@ continuous rather than stepping on a progress grid.
 The keyboard path uses the same machinery: a closed→open transition that no
 gesture owns sets `Progress = 0` and animates it to 1 over 260 ms, so a Win-key
 open slides in the way a gesture open does. A Win-key close is animated too:
-`twinui.pcshell.dll` `CStartExperienceManager::Hide` is where the shell takes
-the menu away, so the explorer-side bridge delays that call by 350 ms and writes
-`retract=1` to the mod's debug file first; the mod retracts `Progress` with the
-selected settle style (253 ms on Windows 11, 221 ms on Windows 10) while the
-shell waits. Measured with the menu open (one
-run, frames at ~123 ms and ~189 ms after the key-down): the panel's right edge
-moved 0 → 119 → 344 DIP left and was gone by ~260 ms, instead of vanishing on
-the first frame.
+`twinui.pcshell.dll` `CStartExperienceManager::Hide` is where the shell takes the
+menu away, so the explorer-side bridge asks the Start mod to retract and holds
+that call until the retract is over. The request carries no duration — only the
+Start side knows the panel's travel — so the mod answers with the settle it just
+planned (409 ms for the 900 DIP panel at 2.2 DIP/ms) in `retract-plan.txt`, and
+the bridge waits that plus 30 ms. Without an answer it falls back to a fixed
+560 ms. Measured with the menu fully open: the request was written at
+`23:15:09.588` and the answer at `23:15:09.654` (66 ms, one 50 ms debug poll in
+its slow phase), the renderer logged `settle ... dur=409` and
+`debug retract from=1.000 dur=409`, the bridge logged
+`hide delayed reason=1 retract=409 lead=439`, and the window was cloaked 549 ms
+after the key-down, 50 ms after the settle it had answered with ended.
+
+The panel's own travel ends sooner than the settle's clock: its bottom edge went
+1351 → 870 → 640 → 448 → 150 px and left the screen 192 ms after the key-down,
+100 ms into the settle, because the fitted spring covers 70% of the travel in
+105 ms. Frames taken 350 ms after the key-down — before the old 350 ms lead
+expired — and at 500 ms are therefore pixel-identical to the closed desktop: at
+the old hide instant nothing of the panel was left to cut on this layout. The
+lead now follows the settle instead of a constant, which is what a menu whose
+panel reaches closer to the screen edge needs.
 
 A gesture close needs no retract command. Its retract starts at the release and
 its tap comes at the end of it; the bridge sees the fresh `close-mode.txt` stamp
@@ -286,14 +299,16 @@ is closed after the down, so the only in-process source is the digitizer itself.
   logic. **Do not enable it together with the shipping mod**: Raw Input allows one
   sink per usage per process, and inputprobe takes the stream for itself.
 - **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`) — hooks
-  `CStartExperienceManager::Hide`. A keyboard close gets the 350 ms retract lead
-  after `retract=1`; a gesture close is tapped only after its retract, and its
-  `gesture=0` stamp makes the Hide run at once (`hide passed (gesture)`). A
-  dropped gesture close stamps `cancelled`, which takes the keyboard path.
-  Publishes the taskbar-edge gesture handle/state from `twinui.pcshell.dll` to
-  shared memory, which the shipping mod does not read. **Enable it together with
-  the Start mod** for the slide-out; without it the menu still closes (the tap is
-  the close), but instantly.
+  `CStartExperienceManager::Hide`. A keyboard close writes the `retract` request
+  to the Start mod's `debug.txt` and then holds the Hide for the settle that mod
+  answers with in `retract-plan.txt`, plus 30 ms (fixed 560 ms when no answer
+  arrives); a gesture close is tapped only after its retract, and its `gesture=0`
+  stamp makes the Hide run at once (`hide passed (gesture)`). A dropped gesture
+  close stamps `cancelled`, which takes the keyboard path. Publishes the
+  taskbar-edge gesture handle/state from `twinui.pcshell.dll` to shared memory,
+  which the shipping mod does not read. **Enable it together with the Start mod**
+  for the slide-out; without it the menu still closes (the tap is the close), but
+  instantly.
 - **`mods/start-menu-touch-gesture-probe.wh.cpp`** — Phase 0 diagnostic probe.
 - **`mods/start_gesture_shared.h`** — shared-memory contract for the bridge.
 
@@ -349,12 +364,14 @@ The mod has a file-driven debug channel for the renderer:
 write `p=0.5`, `t=x,y,z` or `e=x,y` to
 `C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\debug.txt`
 to drive `Progress`, `UIElement.Translation` or the visual `Offset` directly.
-`retract` plays the committed-dismiss retract from the current `Progress`; the
-explorer-side bridge writes it 350 ms before it lets `CStartExperienceManager::Hide`
-run, which is what animates a Windows-key close. It applies only to a file
-written in the last second, so the leftover command is not replayed by the next
-Start process. A gesture close never asks for `retract`: it retracts, then taps
-the Windows key and stamps `gesture=0` in `close-mode.txt`.
+`retract` plays the committed-dismiss retract from the current `Progress` and
+answers with the duration it planned in `retract-plan.txt` (`retract=409` for the
+900 DIP panel, `retract=1` when no settle started); the explorer-side bridge
+writes the request and holds `CStartExperienceManager::Hide` for that answered
+duration plus 30 ms, which is what animates a Windows-key close. It applies only
+to a file written in the last second, so the leftover command is not replayed by
+the next Start process. A gesture close never asks for `retract`: it retracts,
+then taps the Windows key and stamps `gesture=0` in `close-mode.txt`.
 
 ## Known limits and risks
 
@@ -382,14 +399,16 @@ the Windows key and stamps `gesture=0` in `close-mode.txt`.
   shell's own settle and is ignored; the toggle is not advanced, and the next
   press opens the menu. A press 50 ms after the menu reports closed opens it and
   animates the panel in.
-- The bridge delays every `CStartExperienceManager::Hide` that is not a gesture
-  close by 350 ms, and that wait runs on explorer's UI thread: a click-away close
-  slides out too, and the taskbar is blocked for those 350 ms. The `reason`
-  argument is logged (`hide delayed reason=...`); the Windows-key close reported
-  1 on this build. The gesture path does not wait.
+- The bridge holds every `CStartExperienceManager::Hide` that is not a gesture
+  close for the settle the Start mod answered with, plus 30 ms, and that wait
+  runs on explorer's UI thread: a click-away close slides out too, and the
+  taskbar is blocked for that time (439 ms for the 900 DIP panel, 560 ms plus up
+  to 100 ms of answer poll when the answer never arrives). The `reason` argument
+  is logged (`hide delayed reason=1 retract=409 lead=439`); the Windows-key close
+  reported 1 on this build. The gesture path does not wait.
 - `close-mode.txt` is an 800 ms window. A gesture close stamps `gesture=0` at its
   release; a dropped close stamps `cancelled`, so a keyboard close inside the
-  window still takes the 350 ms lead. A Windows-key close that lands right after
+  window still takes the keyboard lead. A Windows-key close that lands right after
   a gesture close but before its stamp is replaced is read as a gesture close and
   hides at once.
 - A gesture close that the user cancels by pulling the menu open again drops its

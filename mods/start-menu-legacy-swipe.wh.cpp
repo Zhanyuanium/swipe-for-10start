@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.14.0
+// @version         0.15.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -244,16 +244,18 @@ What it does:
   edge candidate and the 600 ms suppression window both suppress the animation.
   A close the shell performs by itself logs `win close observed`, leaves
   `Progress` where the close left it, and lets the next open animate from 0.
-  The Windows-key close is animated now: the explorer-side bridge delays
-  `CStartExperienceManager::Hide` by 350 ms and writes `retract=1` to
-  `debug.txt`, so the mod runs the selected settle style from rest (409 ms for
-  the full panel at the planned 2.2 DIP/ms) while the shell waits and the panel
-  slides out instead of vanishing. One line per transition.
+  The Windows-key close is animated now: the explorer-side bridge writes
+  `retract` to `debug.txt` and holds `CStartExperienceManager::Hide` until the
+  settle it starts has run. Only this process can plan that settle, so it answers
+  with the planned duration in `retract-plan.txt` and the bridge waits exactly
+  that plus a 30 ms margin; the mod runs the selected settle style from rest
+  (409 ms for the full panel at the planned 2.2 DIP/ms) and the panel slides out
+  instead of vanishing. One line per transition.
 - Every gesture close stamps `close-mode.txt` at the release with
   `gesture=0`. The tap comes at the end of the settle, so the Hide it causes
   needs no wait; the stamp tells the bridge that this Hide is that tap's and not
   a keyboard close. A stamp older than the bridge's 800 ms window means a
-  keyboard close and gets the fixed 350 ms lead instead.
+  keyboard close and takes the keyboard lead instead.
 - A new edge pull during the settle cancels the close before the shell is
   touched: the tap is dropped and the pull keeps driving the panel, so no Hide
   runs and the toggle is never advanced. The pull generation is sampled at the
@@ -263,7 +265,8 @@ What it does:
 What it does not do:
 
 - It does not use the explorer-side bridge's shared memory; the bridge reaches
-  it only through the `retract` line and the `close-mode.txt` stamp.
+  it only through the `retract` line, the `retract-plan.txt` answer and the
+  `close-mode.txt` stamp.
 - It does not attach XAML pointer handlers and has no DirectManipulation
   hook.
 - It does not remove the shell's open storyboard. Measured with `anim=0`:
@@ -304,10 +307,12 @@ Debug channel (kept in the build):
   - `retract` plays the committed-dismiss settle from the current `Progress`:
     `BeginGestureSettle(current, 0, 0)` in the selected style from rest, so a
     full panel takes 409 ms at the planned 2.2 DIP/ms, and logs
-    `debug retract`.
-    The next open restores the scalar, so the command
-    leaves the reuse flag clear. The explorer-side bridge writes this line 350 ms
-    before `CStartExperienceManager::Hide` runs, which is what turns a
+    `debug retract from=... dur=...`. The planned duration is the answer the
+    bridge waits for, so it is written to `retract-plan.txt` before that line;
+    a settle that did not start answers `retract=1` and logs
+    `debug retract failed`. The next open restores the scalar, so the command
+    leaves the reuse flag clear. The explorer-side bridge writes this line right
+    before it holds `CStartExperienceManager::Hide`, which is what turns a
     Windows-key close into a slide-out. It applies only when the file was
     written within the last second: the file keeps the last command after the
     close, and a fresh Start process must not replay it on attach (that logs
@@ -320,9 +325,14 @@ Debug channel (kept in the build):
   a Hide that needs no wait; the stamp is what tells the bridge that Hide is not
   a keyboard close. A dropped close writes `cancelled`, which the bridge cannot
   parse and treats as a keyboard close. Only a file younger than 800 ms is read;
-  a missing or older stamp means a keyboard close and the bridge uses its fixed
-  350 ms lead. `CREATE_ALWAYS` creates and overwrites it, so no other setup is
-  needed.
+  a missing or older stamp means a keyboard close and the bridge falls back to
+  its own 560 ms lead. `CREATE_ALWAYS` creates and overwrites it, so no other
+  setup is needed.
+- `retract-plan.txt` in the same directory is the answer to a `retract` request:
+  `retract=<settleMs>` for the animation that just started, `retract=1` when no
+  animation started. It is written the moment the settle starts and never
+  refreshed, so the bridge can tell a live answer from the previous close's by
+  its write time.
 
 Diagnostics:
 
@@ -349,7 +359,8 @@ Diagnostics:
   value),
   `hid decodefail dev=... err=...`,
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
-  `debug e=...`, `debug anim=...`, `debug retract`,
+  `debug e=...`, `debug anim=...`, `debug retract from=... dur=...`,
+  `debug retract failed`, `retract plan write failed dur=...`,
   `debug retract ignored (stale)`,
   `gesture geometry updated axis=... dist=...` (or
   `gesture geometry axis=... dist=... (unchanged)` once per open),
@@ -438,10 +449,15 @@ Known risks:
   `gesture=0` at its release; the tap's Hide arrives at the end of the settle
   (409 ms for a full 900 DIP panel at the planned 2.2 DIP/ms) and runs
   at once. A dropped close stamps `cancelled`, which the bridge treats as a
-  keyboard close, so a Win press within the window still gets the 350 ms lead.
-  That lead covers 770 DIP of retract at 2.2 DIP/ms; a keyboard close of a
-  taller panel hides it 1.5% short of rest, so the bridge's lead has to follow
-  the settle's own duration.
+  keyboard close, so a Win press within the window still takes the keyboard lead.
+- A keyboard close's lead is the answer this mod writes to `retract-plan.txt`,
+  plus the bridge's 30 ms margin. The answer can only be written after the
+  bridge's request has been polled for, so the shell hides 30-100 ms after the
+  settle has run to its end, never while it is still moving. When the answer
+  never arrives (the mod is disabled, the file write failed, the settle did not
+  start) the bridge waits its own 560 ms from the request instead: that covers
+  the 409 ms full panel, but a panel resized past 480 DIP of travel, whose settle
+  hits the 520 ms clamp, can lose its last frames behind that fallback.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -509,7 +525,8 @@ Known risks:
  *   mod storage directory, read by the debug channel; on the fixed
  *   `close-mode.txt` path in the same directory: each gesture close stamps
  *   `gesture=0` at its release, or `cancelled` when a pull drops its tap, and the
- *   bridge uses the stamp to tell the tap's Hide from a keyboard close.
+ *   bridge uses the stamp to tell the tap's Hide from a keyboard close; on the
+ *   fixed `retract-plan.txt` path, which holds the answer the bridge waits for.
  * [OUTPUT]: one hidden top-level window and one worker thread per process; the
  *   Composition `Progress` scalar plus the `Distance`/`DirX`/`DirY` inputs the
  *   expression reads, which the open-time and work-area refresh rewrites when
@@ -561,7 +578,10 @@ Known risks:
  *   the close request (type 1) always passes through; five file-driven debug
  *   commands (`p`, `t`, `e`, `anim`, `retract`) that apply a Progress value, the
  *   XAML translation, the visual offset, the animation mode or the settle
- *   the explorer-side bridge asks for; no exported symbols.
+ *   the explorer-side bridge asks for, and the answer to that request
+ *   (`retract=<settleMs>` or the legacy `retract=1`) written to
+ *   `retract-plan.txt` the moment the requested settle starts, so the bridge can
+ *   hold the shell's Hide for exactly that duration; no exported symbols.
  * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
  *   pointer and DirectManipulation paths with raw HID decoding, owns two
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
@@ -576,7 +596,7 @@ Known risks:
  *   generation checked
  *   at the tap drops it, so a re-pull never touches the shell. The explorer-side
  *   bridge still calls the original Hide; it only skips its keyboard lead when
- *   the stamp names the tap.
+ *   the stamp names the tap, and otherwise waits the duration the answer names.
  *   The composition helpers below it are shared with the root hook above it.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
@@ -1986,7 +2006,7 @@ constexpr DWORD kDebugFileMaxBytes = 4096;
 // or a keyboard close. A gesture close stamps `gesture=0` at its release; its tap
 // comes after the retract, so the bridge passes that Hide at once. A close
 // dropped before its tap stamps `cancelled`, which the bridge cannot parse and
-// treats as a keyboard close, so that Hide still gets the 350 ms retract lead.
+// treats as a keyboard close, so that Hide takes the keyboard lead.
 // Only a file younger than 800 ms is used; `CREATE_ALWAYS` creates and
 // overwrites it.
 constexpr wchar_t kCloseModeFileName[] = L"close-mode.txt";
@@ -1994,11 +2014,22 @@ constexpr wchar_t kCloseModeFileName[] = L"close-mode.txt";
 // no gesture close, so the next Hide takes the keyboard path.
 constexpr char kCloseModeCancelled[] = "cancelled\r\n";
 
+// The answer to the bridge's keyboard-close request. The settle is planned here,
+// from the current `Progress` and the panel travel, so only this process can say
+// how long the shell has to wait for it. The bridge writes `retract` into
+// debug.txt and then reads this file: `retract=<settleMs>` names the animation
+// that just started, and the legacy `retract=1` says that no animation started,
+// so the bridge keeps its own default lead. The bridge anchors its wait on this
+// write's timestamp, which is why it is written the moment the settle starts and
+// never refreshed later.
+constexpr wchar_t kRetractPlanFileName[] = L"retract-plan.txt";
+constexpr uint64_t kRetractPlanUnknownMs = 1;
+
 // `retract` is a live signal from the explorer-side bridge, not a state: the
 // bridge writes it right before it delays the hide. The file keeps the last
 // command after the close, so a fresh Start process would otherwise replay it
 // on attach and retract the menu that just opened. One second is far more than
-// the 350 ms lead and the poll that reads it.
+// the keyboard lead and the poll that reads it.
 constexpr uint64_t kDebugCommandFreshMs = 1000;
 
 struct DebugFileStamp {
@@ -2060,6 +2091,23 @@ bool WriteCloseMode(uint64_t delayMs) {
     }
 
     return WriteStorageMarker(kCloseModeFileName, text,
+                              static_cast<size_t>(length));
+}
+
+// Tells the explorer-side bridge how long the settle it asked for lasts, or that
+// no settle started. Called on the input thread right after the animation
+// started: the bridge is holding the shell's Hide until this answer arrives, so
+// the write comes before the diagnostic line. A failed write only costs the
+// bridge's own default lead, never the animation.
+bool WriteRetractPlan(uint64_t settleMs) {
+    char text[32] = {};
+    const int length = std::snprintf(text, sizeof(text), "retract=%llu\r\n",
+                                     static_cast<unsigned long long>(settleMs));
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(text)) {
+        return false;
+    }
+
+    return WriteStorageMarker(kRetractPlanFileName, text,
                               static_cast<size_t>(length));
 }
 
@@ -2185,13 +2233,14 @@ void ApplyDebugLine(const char* line, bool fresh) {
         return;
     }
 
-    // The explorer-side bridge writes `retract=1` right before it delays
+    // The explorer-side bridge writes `retract` right before it delays
     // CStartExperienceManager::Hide. The close is already decided, so the panel
     // slides out on the same settle a committed dismiss uses while the shell
-    // waits. The value after `=` is ignored today; the bridge may carry the lead
-    // time there later. It only ever writes this for a close the mod did not
-    // start itself (see close-mode.txt); a gesture close taps the Windows key
-    // and stamps its own delay instead.
+    // waits. The bridge cannot know this settle's travel, so it waits for the
+    // answer written to retract-plan.txt: the planned duration, or the legacy
+    // `retract=1` when no animation started. It only ever writes this for a
+    // close the mod did not start itself (see close-mode.txt); a gesture close
+    // taps the Windows key and stamps its own delay instead.
     if (std::strncmp(line, "retract", 7) == 0) {
         if (!fresh) {
             // A leftover command from an earlier close: the panel it belonged to
@@ -2210,8 +2259,19 @@ void ApplyDebugLine(const char* line, bool fresh) {
             // The window is about to be hidden: the next open restores Progress
             // by itself, so no restore is owed after this retract.
             g_commitNeedsProgressReset = false;
+            // The bridge is waiting for this answer, so it goes out before the
+            // diagnostic line.
+            if (!WriteRetractPlan(static_cast<uint64_t>(duration.count()))) {
+                FileLog(L"retract plan write failed dur=%llu",
+                        static_cast<unsigned long long>(duration.count()));
+            }
             FileLog(L"debug retract from=%.3f dur=%llu", from,
                     static_cast<unsigned long long>(duration.count()));
+        } else {
+            // No animation, so there is no duration to wait for: the legacy
+            // value tells the bridge to use its own default lead.
+            FileLog(L"debug retract failed");
+            WriteRetractPlan(kRetractPlanUnknownMs);
         }
         return;
     }
