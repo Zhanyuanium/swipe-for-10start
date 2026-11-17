@@ -149,6 +149,14 @@ Instead the mod takes over after the shell opens the window:
   menu settles and rejected if it falls outside the work area. With that anchor
   the panel edge equals the finger: measured within 0.5 DIP residual at 150, 450
   and 800 DIP on the left taskbar, and within 5 DIP of the finger on the bottom.
+- A vertical dismiss (top or bottom taskbar) yields to the menu's own
+  scrolling. The mod caches the innermost ScrollViewer under the panel
+  (StartUI.AllAppsGridListView, ScrollableHeight 3664, offsets refreshed on
+  ViewChanged) plus its screen rect, and on a downward press inside that rect
+  it only starts a dismiss when the list is already at its end
+  (VerticalOffset <= 2 for a bottom taskbar, mirrored for a top one). Presses
+  outside the scroller, or with no scroller measured yet, always dismiss. The
+  same contact starts the dismiss as soon as its scrolling reaches the end.
 - Release is decided symmetrically with the dismiss gesture: `travel` is how far
   the finger moved away from the edge since the touch began (the release value,
   not the peak), and the menu opens fully when `travel > 20%` of the distance or

@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch/pen edge swipe to open and to dismiss the legacy Start menu
-// @version         0.11.0
+// @version         0.12.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -35,15 +35,34 @@ What it does:
   direction: left if the window is anchored to the work-area left, then top,
   then right, then bottom. It logs `dismiss axis=...` once and publishes the
   axis, the window width/height and the window bounds in DIP for the input
-  thread.
+  thread. Setup is not per open: the root is reused, so the same axis is
+  refreshed on every menu open and on every work-area or display change (see
+  below).
 - Installs a `CompositionPropertySet` with `Progress` (animatable),
-  `Distance` (static window width or height), `DirX` and `DirY`, plus the
+  `Distance` (window width or height), `DirX` and `DirY`, plus the
   expression
   `Vector3((1 - state.Progress) * state.DirX * state.Distance, (1 - state.Progress) * state.DirY * state.Distance, 0)`.
-- `Wh_ModAfterInit` starts one input thread. The thread owns a message-only
-  window and registers `RAWINPUTDEVICE{0x0D, 0x04}` (touch) and
-  `{0x0D, 0x02}` (pen) with `RIDEV_INPUTSINK`, so it still receives reports
-  while the Start menu is in front.
+  `Distance`, `DirX` and `DirY` are rewritten in place when the taskbar moves.
+- `Wh_ModAfterInit` starts one input thread. The thread owns one window and
+  registers `RAWINPUTDEVICE{0x0D, 0x04}` (touch) and `{0x0D, 0x02}` (pen) with
+  `RIDEV_INPUTSINK`, so it still receives reports while the Start menu is in
+  front. The window is hidden and top-level rather than message-only, because
+  message-only windows do not receive broadcasts: `WM_SETTINGCHANGE` with
+  `SPI_SETWORKAREA` and `WM_DISPLAYCHANGE` are the events that move the
+  taskbar.
+- A taskbar move while the menu is open is caught by those two messages: the
+  input thread logs `work area changed` and posts one UI-thread task that
+  re-reads the dismiss axis, rewrites `Distance`/`DirX`/`DirY` when either the
+  axis or the extent moved, and re-measures the panel edge. Nothing polls; a
+  layout that has settled is never re-measured.
+- The gesture geometry is refreshed on the menu's own closed-to-open
+  transition too. `StartUI::App::PrepareRootElement` does not fire on every
+  open (the XAML root is reused), so without this the axis, `Distance` and the
+  direction baked into the expression would keep the previous taskbar's layout.
+  One refresh per open writes the three scalars and logs
+  `gesture geometry updated axis=... dist=...`, or
+  `gesture geometry axis=... dist=... (unchanged)` when the values read the
+  same.
 - Each device is decoded from its `RIDI_PREPARSEDDATA` blob, never by opening
   the device. Contact collections are the `0x0D/0x05` and `0x0D/0x22` link
   nodes. `contacts` is the top-level Contact Count (`0x0D/0x54`); X and Y come
@@ -70,6 +89,20 @@ What it does:
   1 over 120 ms on `cubic-bezier(0.45, 0, 0.55, 1)`. Every Progress animation
   places the easing on the keyframe at t=1 and inserts the target as the base
   value before `StartAnimation`.
+- A vertical dismiss competes with the app list's own scroll: dragging toward
+  the taskbar is how the list scrolls back, and that drag used to close the
+  menu. The element that scrolls is measured per open on the UI thread: the
+  innermost `ScrollViewer` with `ScrollableWidth` 0 and `ScrollableHeight` above
+  0, whose screen rect (XAML rect plus the client origin) and
+  `VerticalOffset`/`ScrollableHeight` are published for the input thread. Inside
+  that rect a `Top`/`Bottom` dismiss starts only when the list is already at the
+  end the drag would scroll away from (offset 0 on a bottom taskbar, offset ==
+  `ScrollableHeight` on a top one); otherwise the press is no dismiss and logs
+  `dismiss deferred to scroll vo=... sh=...` at most once per 500 ms. Outside
+  the rect, and when nothing was measured, the plain drag stays. The rejection
+  starts no session, so the same contact becomes a dismiss as soon as its
+  scrolling reaches the end; the contact latch is untouched and the next down
+  starts from a clean state. `Left`/`Right` are unchanged.
 - The retract is one animation for every close, the v0.1.0 motion: `Progress`
   goes to 0 in 260 ms. The release speed on
   the axis shortens it, never lengthens it: the duration is
@@ -137,13 +170,15 @@ What it does:
   open takes `Progress` over. The follow works in absolute screen DIP against
   the panel edge that faces the taskbar (`panelTrail`), which the UI thread maps
   from the largest visible child of the root that does not fill it
-  (`StartSizingFrame`) and translates by the work area origin:
+  (`StartSizingFrame`) and translates by the XAML origin, the client origin of
+  the host window in DIP (`ClientToScreen`), not the work-area origin:
   `Progress = 1 - (finger - panelTrail) / (dir * Distance)`. The edge is
-  published at setup, on every root `SizeChanged`, and re-measured every 400 ms
-  while the menu is open and no gesture owns the panel: setup runs while the
-  shell's open storyboard still has the frame out of place (measured on a bottom
-  taskbar: panel top -12 DIP, settled 200), so the periodic re-check is what
-  publishes the settled edge. It logs only when the value moves by more than
+  published at setup, on every root `SizeChanged`, on every menu open, on the
+  second layout pass of that open and on every work-area or display change:
+  setup runs while the shell's open
+  storyboard still has the frame out of place (measured on a bottom taskbar:
+  panel top -12 DIP, settled 200), so the open, layout and event refreshes are
+  what publish the settled edge. It logs only when the value moves by more than
   1 DIP, and a value outside the monitor work area by more than 24 DIP is
   rejected in favour of the last good one (`reveal panelTrail rejected ...`).
   The panel edge therefore meets the finger at every sample, and the
@@ -274,6 +309,13 @@ Diagnostics:
   `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
   `debug e=...`, `debug anim=...`, `debug retract`,
   `debug retract ignored (stale)`,
+  `gesture geometry updated axis=... dist=...` (or
+  `gesture geometry axis=... dist=... (unchanged)` once per open),
+  `gesture geometry write failed ...`, `gesture geometry queue err=...`,
+  `work area changed`,
+  `scroller rect=...,...,...,... vo=... sh=...` (once per open, when the
+  scrolling element was measured, and again only if the settled pass moved it),
+  `dismiss deferred to scroll vo=... sh=...` (at most once per 500 ms),
   `startui anim hooked`,
   `startui anim hook skipped` and the first four
   `startui anim type=... edge=... trans=... suppress=...` calls go to
@@ -304,20 +346,28 @@ Known risks:
   falls back to the root extent and the follow lags the finger again (log
   `reveal panelTrail=... (fallback)`).
 - The first trail of an open is measured too early to be trusted: `Setup` runs
-  while the shell's open storyboard is still growing the frame into place, and
-  on a bottom taskbar that read -12 DIP where the settled panel starts at 200.
-  The periodic re-check publishes the correct value about 400 ms after the open.
-  A gesture that starts inside those 400 ms still follows against the early
-  value, and a follow that began on it keeps the value it read at takeover.
-- The trail assumes the XAML island sits at the work area origin. Measured on
-  this build: the CoreWindow is full screen and `GetWindowRect` returns
-  `0,0,2880,1800`, yet the panel's border lands 48 DIP right of the mapped
-  transform because the island is inset by the taskbar. A shell that lays the
-  island out at the screen origin would read 48 DIP high on a left taskbar.
-- `panelTrail` is republished on every root `SizeChanged` and by the 400 ms
-  re-check. A panel resize during a follow moves the mapping, so the panel edge
-  jumps to the new trail under the same finger. The re-check itself is skipped
-  while a gesture session is active, so a stable open is what it measures.
+  while the shell's open storyboard is still growing the frame
+  into place, and on a bottom taskbar that read -12 DIP where the settled panel
+  starts at 200. The open transition re-measures it, and the layout watch
+  re-measures it again on the second `LayoutUpdated` of that open, so the settled
+  anchor is what a follow started after the open uses; a gesture that begins
+  inside those first two layout passes still maps against the earlier value.
+  Setup's value is the one that survives when every later measurement is
+  rejected by the work-area guard.
+- The trail assumes the XAML coordinate space starts at the host window's client
+  origin, which is what `ClientToScreen` returns. Measured on this build with a
+  bottom taskbar: the CoreWindow sits at x=447 px while the work area starts at
+  0, so the panel's frame right of 1005 DIP is drawn at 1228.5 DIP. A host that
+  lays its content out somewhere else than its client area would move the trail
+  by that difference.
+- `panelTrail` is republished on every root `SizeChanged`, on every open and on
+  every work-area or display change. A panel resize during a follow moves the
+  mapping, so the panel edge jumps to the new trail under the same finger. The
+  event refresh measures only when no gesture owns the panel, so a live follow
+  never has its anchor moved.
+- A taskbar move is noticed only through `WM_SETTINGCHANGE`
+  (`SPI_SETWORKAREA`) or `WM_DISPLAYCHANGE`; an arrangement change that raises
+  neither keeps the old axis until the next open, which always refreshes it.
 - `Distance` is sampled at takeover. A layout change during the follow keeps
   the old extent until the contact lifts.
 - Composition calls and the settle batch run from the input thread. The batch
@@ -383,19 +433,30 @@ Known risks:
  *   expression and one cached cubic-bezier easing (0.45, 0, 0.55, 1)
  *   installed in Setup, plus the per-close curve the close builds from the
  *   `RetractStartSpeedPercent` setting; on
- *   VisualTreeHelper and TransformToVisual
- *   from Windows.UI.Xaml.Media to map the panel trail; on the CoreDispatcher
- *   captured in Setup, which the input thread posts the settled trail re-check
- *   to; on `debug.txt` in the
+ *   VisualTreeHelper, TransformToVisual and LayoutUpdated
+ *   from Windows.UI.Xaml.Media to map the panel trail and to follow the layout;
+ *   on ScrollViewer, its ScrollableWidth/ScrollableHeight/VerticalOffset and its
+ *   ViewChanged event from Windows.UI.Xaml.Controls, which name the element the
+ *   app list scrolls with; on
+ *   ClientToScreen, which turns the host window's client origin into the screen
+ *   offset of the XAML coordinate space; on the
+ *   CoreDispatcher
+ *   captured in Setup, which the input thread posts the open-time and
+ *   work-area refresh to; on the `WM_SETTINGCHANGE` (`SPI_SETWORKAREA`) and
+ *   `WM_DISPLAYCHANGE` broadcasts the hidden top-level input window receives
+ *   (a message-only window would not, which is why the window is not
+ *   message-only); on `debug.txt` in the
  *   mod storage directory, read by the debug channel; on the fixed
  *   `close-mode.txt` path in the same directory: each gesture close stamps
  *   `gesture=0` at its release, or `cancelled` when a pull drops its tap, and the
  *   bridge uses the stamp to tell the tap's Hide from a keyboard close.
- * [OUTPUT]: one message-only window and one worker thread per process; the
- *   Composition `Progress` scalar; the panel trail in absolute screen DIP,
- *   published for the reveal follow by Setup and SizeChanged and re-measured
- *   every 400 ms while the menu is open and no gesture owns it, with a value
- *   outside the monitor work area rejected; one `VK_LWIN` tap armed for the end of every
+ * [OUTPUT]: one hidden top-level window and one worker thread per process; the
+ *   Composition `Progress` scalar plus the `Distance`/`DirX`/`DirY` inputs the
+ *   expression reads, which the open-time and work-area refresh rewrites when
+ *   the taskbar moves; the panel trail in absolute screen DIP, published for the
+ *   reveal follow by Setup, SizeChanged, every menu open and every work-area or
+ *   display change, never by a timer, with a value outside the monitor work area
+ *   rejected; one `VK_LWIN` tap armed for the end of every
  *   committed dismiss or short reveal, the shell's own Start toggle that performs
  *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
  *   generation exists when it would run, and no request file or re-arm tap
@@ -411,7 +472,12 @@ Known risks:
  *   `Progress` at the finger's smoothed speed while
  *   no report arrives, started by the idle tick before that tick decides the
  *   release, ended by the next report or by the release, which then
- *   plans the close from the value the coast reached; a
+ *   plans the close from the value the coast reached; one cached scroller per
+ *   open (the innermost vertically scrollable element the app list uses), with
+ *   its screen rect and its `VerticalOffset`/`ScrollableHeight` published for the
+ *   input thread and refreshed from its `ViewChanged` event, which rejects a
+ *   vertical dismiss that would only scroll the list and logs
+ *   `dismiss deferred to scroll`; a
  *   0-to-1 progress slide over 260 ms for a closed-to-open transition no reveal
  *   owns, plus a `win close observed` line when the shell hides the window by
  *   itself; a 1 ms timer period (timeBeginPeriod/timeEndPeriod) held exactly
@@ -430,7 +496,9 @@ Known risks:
  *   pointer and DirectManipulation paths with raw HID decoding, owns two
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
  *   takes the menu's own open over from the taskbar edge and pins the panel's
- *   trailing edge to the finger) and carries the switch that can drop the
+ *   trailing edge to the finger), and re-reads the taskbar edge behind both on
+ *   every open and on every work-area broadcast. It also carries the switch that
+ *   can drop the
  *   shell's open storyboard for experiments. It also owns the close decision:
  *   the retract runs first, then the tap at its end; a pull generation checked
  *   at the tap drops it, so a re-pull never touches the shell. The explorer-side
@@ -453,6 +521,7 @@ Known risks:
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
@@ -474,6 +543,7 @@ namespace {
 namespace wuc = winrt::Windows::UI::Composition;
 namespace wucore = winrt::Windows::UI::Core;
 namespace wux = winrt::Windows::UI::Xaml;
+namespace wuxc = winrt::Windows::UI::Xaml::Controls;
 namespace wuxh = winrt::Windows::UI::Xaml::Hosting;
 
 using winrt::Windows::Foundation::Numerics::float2;
@@ -646,6 +716,21 @@ constexpr float kScrollAbortMaxDelta = 60.0f;
 constexpr float kProgressEpsilonDip = 0.5f;
 constexpr float kWindowMarginDip = 4.0f;
 
+// A vertical dismiss and the app list's own scroll are the same downward drag.
+// The element that actually scrolls the app list is cached per open, and a
+// dismiss may only start on it when it is already at the end the drag would
+// scroll away from: a list at its top cannot scroll further up, so the drag has
+// nothing left to do and belongs to the dismiss. `kScrollerEndSlopDip` absorbs
+// the fraction of a DIP a viewport leaves at its end; `kScrollerAxisSlopDip`
+// decides which viewer counts as scrollable at all (the wrapper ScrollViewer
+// reports a horizontal extent of 8380 and must never be picked).
+constexpr float kScrollerEndSlopDip = 2.0f;
+constexpr float kScrollerAxisSlopDip = 0.5f;
+constexpr uint32_t kScrollerScanMaxDepth = 32;
+// The reject line is diagnostic, not a per-sample measurement: the digitizer
+// reports at ~170 Hz, so it speaks at most once per window.
+constexpr uint64_t kDismissRejectLogMs = 500;
+
 // Reveal follow (edge swipe to open). A contact that starts inside the edge
 // band on the taskbar side can drive the menu's own open. The release decision
 // uses the dismiss thresholds on the travel away from the edge, not on the
@@ -665,12 +750,6 @@ constexpr UINT kDebugTimerMs = 50;
 // The DWM cloaked query is a syscall. The report handler accepts one answer
 // per interval and reuses it for every other report.
 constexpr uint64_t kOpenCheckIntervalMs = 20;
-
-// The panel trail is mapped from the XAML frame, and the shell's open storyboard
-// moves that frame into place over about 260 ms: Setup reads it before it has
-// arrived. The input thread therefore asks for a re-measure at this interval
-// while the menu is open, and the published value settles once the layout has.
-constexpr uint64_t kTrailCheckIntervalMs = 400;
 
 // A trail outside the monitor work area cannot be the panel's edge. 24 DIP of
 // tolerance keeps a panel border that overhangs the work area accepted, and a
@@ -865,6 +944,35 @@ bool IsHorizontalAxis(int32_t axis) {
            axis == static_cast<int32_t>(DismissAxis::Right);
 }
 
+// The translation the composition expression applies at Progress 0: the
+// direction the panel leaves along and the root extent it travels. Setup bakes
+// these in, and the event-driven refresh rewrites them when the taskbar moves.
+void AxisTranslation(int32_t axis, float width, float height, float& dirX,
+                     float& dirY, float& distance) {
+    switch (static_cast<DismissAxis>(axis)) {
+        case DismissAxis::Left:
+            dirX = -1.0f;
+            dirY = 0.0f;
+            distance = width;
+            break;
+        case DismissAxis::Top:
+            dirX = 0.0f;
+            dirY = -1.0f;
+            distance = height;
+            break;
+        case DismissAxis::Right:
+            dirX = 1.0f;
+            dirY = 0.0f;
+            distance = width;
+            break;
+        case DismissAxis::Bottom:
+            dirX = 0.0f;
+            dirY = 1.0f;
+            distance = height;
+            break;
+    }
+}
+
 std::atomic<bool> g_disabled{false};
 std::atomic<bool> g_unloading{false};
 std::atomic<bool> g_stopDismissCallback{false};
@@ -941,6 +1049,61 @@ wux::FrameworkElement g_root{nullptr};  // UI thread only
 wucore::CoreDispatcher g_dispatcher{nullptr};
 std::atomic<DWORD> g_uiThreadId{0};
 std::atomic<uint32_t> g_setupGeneration{0};
+
+// The settled-trail watch. The open transition re-measures the panel edge once,
+// but that measurement can land while the shell's open storyboard is still
+// growing the frame into place (measured on a bottom taskbar: panel top -12 DIP
+// where the settled panel starts at 200). The layout event is the only signal
+// that says the panel has been placed, so the watch counts layout passes and
+// corrects the trail on the second one, then detaches itself.
+//
+// `g_layoutTicksLeft` is 0 when no watch is armed, which is also what the close
+// teardown leaves behind; both fields are UI thread only.
+winrt::event_token g_layoutToken{};
+uint32_t g_layoutTicksLeft = 0;
+
+// ---------------------------------------------------------------------------
+// The scrolling element of the open menu
+//
+// A vertical dismiss and the app list's own scroll are the same downward drag,
+// so the dismiss needs to know whether the element under the press point can
+// still scroll away from it. Measured on this build, exactly one element does
+// that: the ScrollViewer inside StartUI.AllAppsGridListView, XAML
+// 85,230-345,839, ScrollableHeight 3664, VerticalOffset 0 on every open. Its
+// screen rect, offset and extent are cached per open and published as plain
+// values; the input thread reads them once per down and never touches XAML.
+//
+// The five numbers belong together, so they are one POD behind a mutex instead
+// of five atomics: a torn rect/offset pair could allow or reject the wrong
+// press. The lock is taken once per down on the input side and only when the
+// cache is measured or scrolled on the UI side, so it is never contended.
+// ---------------------------------------------------------------------------
+struct ScrollerCache {
+    bool valid = false;
+    bool settled = false;  // false until the post-storyboard layout pass
+    float left = 0.0f;    // screen DIP, all four from the XAML origin
+    float top = 0.0f;
+    float right = 0.0f;
+    float bottom = 0.0f;
+    float verticalOffset = 0.0f;
+    float scrollableHeight = 0.0f;
+};
+
+std::mutex g_scrollerMutex;
+ScrollerCache g_scroller;
+
+// UI thread only: the element the cache describes and its ViewChanged handler.
+// A stale handler is revoked before the next element replaces it.
+wuxc::ScrollViewer g_scrollerViewer{nullptr};
+winrt::event_token g_scrollerToken{};
+// The rect line speaks once per open, not once per measurement: the open
+// transition and the settled pass both measure the same element, and only a
+// rect that actually moved is worth a second line.
+bool g_scrollerLogged = false;
+float g_scrollerLoggedRect[4] = {};
+// Coarse tick of the last `dismiss deferred to scroll` line. The digitizer
+// reports at ~170 Hz, so the rejection is rate limited; input thread only.
+uint64_t g_scrollerRejectLogTick = 0;
 
 winrt::event_token g_loadedToken{};
 winrt::event_token g_sizeToken{};
@@ -1021,13 +1184,11 @@ std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
 //
 // Setup publishes the first value, but it runs while the shell's open
 // storyboard still has the frame out of place: on a bottom taskbar that read a
-// panel top of -12 DIP where the settled panel starts at 200. The input thread
-// therefore asks for a re-measure while the menu is open once the layout has
-// settled, at most every kTrailCheckIntervalMs.
+// panel top of -12 DIP where the settled panel starts at 200. The value is
+// therefore re-measured on every menu open and on every work-area or display
+// change the system announces, never on a timer: the layout only moves when one
+// of those events says it did.
 std::atomic<float> g_panelTrailDip{0.0f};
-// The coarse tick at which the input thread may post the next re-measure. 0
-// allows one on the first open-polled tick.
-std::atomic<uint64_t> g_nextTrailCheckTick{0};
 
 // UI thread only. Setup resets the open log; a failed mapping logs its fallback
 // once per process so a missing panel does not flood the log every resize. A
@@ -1047,10 +1208,27 @@ void ResetComposition();
 void ResetRenderer();
 HWND FindStartCoreWindow();
 
-// Defined with the UI-thread publication below. The input-thread tick posts it
-// to re-measure the panel trail once the open animation has settled the layout;
+// Defined with the UI-thread publication below. The input thread posts it when
+// the menu opens and when the system announces a work-area or display change;
 // `logOnChange` keeps a stable layout silent.
 void PublishPanelTrailDip(bool logOnChange);
+
+// Defined with the UI-thread publication below. The open transition arms this
+// watch, which re-measures the panel edge on the second layout pass, when the
+// shell's open storyboard has placed the panel. The close teardown disarms it.
+void ArmSettledTrailWatch();
+void StopSettledTrailWatch();
+
+// Defined with the scroller cache below. Measures the scrolling element an open
+// menu scrolls with, publishes its screen rect and offsets for the input thread,
+// and drops the cached element and its ViewChanged handler on close/teardown.
+void CacheScrollableElement(bool settled);
+void ReleaseScrollableElement();
+
+// Defined with the UI-thread publication below. Recomputes the dismiss axis and
+// the translation the composition expression bakes in, and rewrites the
+// composition scalars when either moved.
+void RefreshGestureGeometry();
 
 // Defined with the input-thread gesture state below. The debug `retract` command
 // clears it: the shell is about to hide the window, so nothing needs to restore
@@ -2518,6 +2696,66 @@ float AxisOpeningSign(int32_t axis) {
     return -AxisDirection(axis);
 }
 
+// Whether a vertical dismiss may start here. A vertical drag competes with the
+// content's own scrolling: dragging toward the taskbar is how the app list
+// scrolls back, and a dismiss started on that drag closed the menu instead.
+// Measured on this build, the list is at VerticalOffset 0 on every open and moves
+// exactly with its content, so the rule is the scroll position, not a guess at
+// the user's intent:
+//
+// - the press is outside the cached scroller (tiles, rail, panel background) or
+//   nothing was measured: the drag has no content to scroll, allow it;
+// - the press is inside it and the list is already at the end the drag would
+//   scroll away from (offset 0 for a bottom taskbar, offset == scrollable height
+//   for a top one): there is nothing left to scroll, allow it;
+// - otherwise the same drag would scroll the list, so the dismiss waits. The
+//   contact is not consumed: BeginHidSession runs again on every later sample,
+//   so once the user has scrolled the list to its end the rest of that same drag
+//   becomes a dismiss.
+//
+// Left and right keep the plain drag: a sideways drag does not scroll a vertical
+// list.
+bool VerticalDismissAllowed(int32_t axis, float x, float y, uint64_t tickMs) {
+    if (IsHorizontalAxis(axis)) {
+        return true;
+    }
+
+    ScrollerCache scroller{};
+    {
+        std::lock_guard lock(g_scrollerMutex);
+        if (!g_scroller.valid || !g_scroller.settled) {
+            // Nothing measured for this open, or only the transitional rect
+            // seen while the shell was still moving the window: fail open.
+            return true;
+        }
+        scroller = g_scroller;
+    }
+
+    if (x < scroller.left || x > scroller.right || y < scroller.top ||
+        y > scroller.bottom) {
+        return true;  // the press is not on the scrolling content
+    }
+
+    const bool atEnd =
+        axis == static_cast<int32_t>(DismissAxis::Bottom)
+            ? scroller.verticalOffset <= kScrollerEndSlopDip
+            : scroller.verticalOffset >=
+                  scroller.scrollableHeight - kScrollerEndSlopDip;
+    if (atEnd) {
+        return true;
+    }
+
+    // At most one line per window: the digitizer keeps reporting while the
+    // finger rests, and each report asks again.
+    if (tickMs >= g_scrollerRejectLogTick &&
+        tickMs - g_scrollerRejectLogTick >= kDismissRejectLogMs) {
+        g_scrollerRejectLogTick = tickMs;
+        FileLog(L"dismiss deferred to scroll vo=%.0f sh=%.0f",
+                scroller.verticalOffset, scroller.scrollableHeight);
+    }
+    return false;
+}
+
 // Runs on the first report of a contact. A contact that starts on the taskbar
 // edge while the menu is closed can own the menu's own open; anything else is
 // left to the dismiss path. A touch on the edge of an *open* menu is a dismiss
@@ -2783,6 +3021,17 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
         return;
     }
 
+    const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
+    // A vertical drag on the app list belongs to the list while it can still
+    // scroll that way. The rejection starts no session, and this function runs
+    // again on the next sample of the same contact, so a drag that scrolls the
+    // list to its end still turns into a dismiss without a new contact. The
+    // contact latch itself is left untouched: it only tracks that a finger is
+    // down, and the lift path clears it, so the next down is unaffected.
+    if (!VerticalDismissAllowed(axis, x, y, tickMs)) {
+        return;
+    }
+
     HidGestureSession& session = g_hidSession;
     session = HidGestureSession{};
     session.active = true;
@@ -2811,7 +3060,6 @@ void BeginHidSession(float x, float y, uint64_t tickMs) {
         InsertProgress(1.0f);
     }
 
-    const int32_t axis = g_axisPub.load(std::memory_order_relaxed);
     FileLog(L"hid down x=%.1f y=%.1f axis=%d dist=%.0f", x, y, axis,
             distance);
 }
@@ -3143,6 +3391,92 @@ void RunPendingCloseTap(uint64_t tickMs) {
             static_cast<unsigned long long>(kCloseTapDelayMs));
 }
 
+// Posts the gesture-geometry refresh to the UI thread. The XAML root and the
+// property set are UI-thread objects, so the input thread only dispatches the
+// work and keeps reading the published atomics. The refresh is event driven: it
+// runs when the menu opens and when the system announces a work-area or display
+// change, never on a timer.
+//
+// `trailIdle` is decided here, on the thread that owns the gesture state: a live
+// follow reads the panel edge every sample, so the edge must not be re-measured
+// under the finger. A root that is not attached is skipped inside the refresh.
+void PostUiGeometryRefresh(bool trailIdle) {
+    if (g_unloading.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    wucore::CoreDispatcher dispatcher = g_dispatcher;
+    if (!dispatcher) {
+        return;
+    }
+
+    try {
+        dispatcher.TryRunAsync(
+            wucore::CoreDispatcherPriority::Normal,
+            [trailIdle]() {
+                try {
+                    if (g_unloading.load(std::memory_order_relaxed)) {
+                        return;
+                    }
+                    RefreshGestureGeometry();
+                    if (trailIdle) {
+                        PublishPanelTrailDip(true);
+                        // This measurement can still belong to the open
+                        // storyboard, so the layout watch re-measures it once
+                        // the panel is placed and then detaches itself.
+                        ArmSettledTrailWatch();
+                        // The dismiss gate needs the scrolling element of this
+                        // open; the settled pass measures it again, when the
+                        // list has its final extent.
+                        CacheScrollableElement(false);
+                    }
+                } catch (...) {
+                    // Never let an exception escape the dispatcher callback.
+                }
+            });
+    } catch (winrt::hresult_error const& e) {
+        FileLog(L"gesture geometry queue err=%08X",
+                static_cast<unsigned>(e.code()));
+    } catch (...) {
+        FileLog(L"gesture geometry queue err=unknown");
+    }
+}
+
+// Posted by the input thread when the shell reports the window cloaked. Both
+// watches belong to the open that just ended: the settled-trail watch would
+// measure a layout of a menu that is no longer on screen, and a cached scroller
+// would gate the next open against the old rect and offsets. The UI thread
+// releases them.
+void PostUiOpenWatchRelease() {
+    if (g_unloading.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    wucore::CoreDispatcher dispatcher = g_dispatcher;
+    if (!dispatcher) {
+        return;
+    }
+
+    try {
+        dispatcher.TryRunAsync(
+            wucore::CoreDispatcherPriority::Normal, []() {
+                try {
+                    if (g_unloading.load(std::memory_order_relaxed)) {
+                        return;
+                    }
+                    StopSettledTrailWatch();
+                    ReleaseScrollableElement();
+                } catch (...) {
+                    // Never let an exception escape the dispatcher callback.
+                }
+            });
+    } catch (winrt::hresult_error const& e) {
+        FileLog(L"open watch release err=%08X", static_cast<unsigned>(e.code()));
+    } catch (...) {
+        FileLog(L"open watch release err=unknown");
+    }
+}
+
 // Two things happen here. A closed-to-open transition that no reveal owns is a
 // keyboard, Start-button or tray open: the shell slides its own storyboard and
 // the mod makes `Progress` follow from 0, so the same root slides the same way a
@@ -3155,6 +3489,11 @@ void RunPendingCloseTap(uint64_t tickMs) {
 // rest first and then jumped out and slid back in. 20 ms keeps the start within
 // one compositor frame of the shell's own open, which is what makes the two read
 // as one animation.
+//
+// The open transition is also the one place the gesture geometry is refreshed
+// without a system event: the XAML root is reused between opens, so
+// PrepareRootElement does not fire again and the axis, Distance and DirX/DirY
+// captured by Setup can belong to a taskbar that has moved since.
 void PollRootVisibility(uint64_t tickMs) {
     static uint64_t lastPollTick = 0;
     if (tickMs - lastPollTick < kOpenCheckIntervalMs) {
@@ -3163,6 +3502,7 @@ void PollRootVisibility(uint64_t tickMs) {
     lastPollTick = tickMs;
 
     const bool open = StartWindowIsOpen();
+    const bool justOpened = open && !g_rootWasOpen;
     // A close this mod started reports the window open until the shell has run
     // the Hide its tap caused. Reading that as a reopen restored Progress 1
     // while the close was still in flight, so a follow that began in that window
@@ -3173,7 +3513,7 @@ void PollRootVisibility(uint64_t tickMs) {
     // scalar from the finger, and inserting a fully open frame here would fight
     // it.
     const bool gestureOwnsProgress = g_reveal.edgeCandidate;
-    if (open && !g_rootWasOpen) {
+    if (justOpened) {
         if (!closeInFlight && !gestureOwnsProgress &&
             AnimateProgressTo(0.0f, 1.0f, kOpenSlideDuration)) {
             // The animation now owns Progress, so no later path needs to
@@ -3181,47 +3521,21 @@ void PollRootVisibility(uint64_t tickMs) {
             g_commitNeedsProgressReset = false;
             FileLog(L"win open");
         }
+
+        // One refresh per open, before the first dismiss of this open can start.
+        // Re-measuring the trail is skipped while a gesture owns the panel: the
+        // follow already reads the edge every sample.
+        PostUiGeometryRefresh(!closeInFlight && !g_hidSession.active &&
+                              !g_reveal.active);
     } else if (!open && g_rootWasOpen) {
         // The close has landed, so its suppression no longer applies. Without
         // this a Win press right after the hide opened the window with Progress
         // still at 0, and the panel was invisible until the next open.
         g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
         FileLog(L"win close observed");
-    }
-
-    // Setup measured the trail before the open storyboard had moved the frame
-    // into place, so the value it published is only the initial anchor. Once
-    // the menu is open and no gesture owns the panel, ask the UI thread for the
-    // settled layout at most every kTrailCheckIntervalMs. A live follow reads
-    // the trail every sample, so it is never moved under a finger, and a close
-    // still in flight is never measured: its panel is on its way out.
-    if (open && !closeInFlight && !g_hidSession.active && !g_reveal.active &&
-        tickMs >= g_nextTrailCheckTick.load(std::memory_order_relaxed)) {
-        g_nextTrailCheckTick.store(tickMs + kTrailCheckIntervalMs,
-                                   std::memory_order_relaxed);
-        wucore::CoreDispatcher dispatcher = g_dispatcher;
-        if (dispatcher && !g_unloading.load(std::memory_order_relaxed)) {
-            try {
-                dispatcher.TryRunAsync(
-                    wucore::CoreDispatcherPriority::Normal,
-                    []() {
-                        try {
-                            if (g_unloading.load(std::memory_order_relaxed)) {
-                                return;
-                            }
-                            PublishPanelTrailDip(true);
-                        } catch (...) {
-                            // Never let an exception escape the dispatcher
-                            // callback.
-                        }
-                    });
-            } catch (winrt::hresult_error const& e) {
-                FileLog(L"panel trail check queue err=%08X",
-                        static_cast<unsigned>(e.code()));
-            } catch (...) {
-                FileLog(L"panel trail check queue err=unknown");
-            }
-        }
+        // The layout watch and the cached scroller belong to the open that just
+        // ended; the UI thread releases both.
+        PostUiOpenWatchRelease();
     }
 
     g_rootWasOpen = open;
@@ -3463,6 +3777,22 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
                 PollDebugFile();
             }
             return 0;
+        // The taskbar moved or the display layout changed: the dismiss axis and
+        // the translation baked into the composition expression are stale, and
+        // the panel trail was measured against the old work area. This is the
+        // event that replaces any polling for both. The message arrives on this
+        // thread; the refresh is posted to the UI thread, which owns the XAML
+        // root and the property set.
+        case WM_SETTINGCHANGE:
+            if (wParam == SPI_SETWORKAREA) {
+                FileLog(L"work area changed");
+                PostUiGeometryRefresh(!g_hidSession.active && !g_reveal.active);
+            }
+            return 0;
+        case WM_DISPLAYCHANGE:
+            FileLog(L"work area changed");
+            PostUiGeometryRefresh(!g_hidSession.active && !g_reveal.active);
+            return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
             return 0;
@@ -3507,9 +3837,14 @@ DWORD WINAPI HidInputThread(LPVOID) {
         return 0;
     }
 
-    HWND hwnd = CreateWindowExW(0, kHidWindowClass, L"", 0, 0, 0, 0, 0,
-                                HWND_MESSAGE, nullptr, windowClass.hInstance,
-                                nullptr);
+    // A hidden top-level window, not a message-only one: message-only windows
+    // are documented not to receive broadcast messages, and WM_SETTINGCHANGE
+    // (SPI_SETWORKAREA) and WM_DISPLAYCHANGE are broadcasts. That is the whole
+    // event-driven axis refresh. The window is never shown, has no size and no
+    // extended style, so it does not appear in Alt-Tab or the taskbar; Raw Input
+    // with RIDEV_INPUTSINK targets it exactly as it did a message-only window.
+    HWND hwnd = CreateWindowExW(0, kHidWindowClass, L"", 0, 0, 0, 0, 0, nullptr,
+                                nullptr, windowClass.hInstance, nullptr);
     if (!hwnd) {
         FileLog(L"hid thread fail err=%u",
                 static_cast<unsigned>(GetLastError()));
@@ -3643,6 +3978,35 @@ void PublishGestureGeometry() {
 // The edge that faces the taskbar is the right edge on a left taskbar, the
 // bottom on top, the left on right and the top on bottom. Runs on the UI thread
 // and returns false while that child is not laid out yet.
+// The screen origin of the XAML coordinate space, in DIP. The content is laid
+// out in the host window's client area, and that area does not start at the
+// work-area origin: measured on a bottom taskbar, the CoreWindow sits at x=447
+// px while the work area starts at 0, so the panel's frame right of 1005 DIP is
+// drawn at 1228.5 DIP, not 1005. The work area only matched on a left taskbar
+// because the island was inset by exactly the taskbar width; the client origin
+// holds for every axis and every layout. Both the panel trail and the cached
+// scroller rect are mapped through it, so it lives in one place.
+bool XamlOriginDip(float& originX, float& originY) {
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!hwnd) {
+        return false;
+    }
+
+    POINT clientOrigin{0, 0};
+    if (!ClientToScreen(hwnd, &clientOrigin)) {
+        return false;
+    }
+
+    const float scale = DpiScaleForWindow(hwnd);
+    if (!(scale > 0.0f)) {
+        return false;
+    }
+
+    originX = static_cast<float>(clientOrigin.x) / scale;
+    originY = static_cast<float>(clientOrigin.y) / scale;
+    return true;
+}
+
 bool ComputePanelTrailDip(float& trail) {
     wux::FrameworkElement root = g_root;
     HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
@@ -3736,21 +4100,13 @@ bool ComputePanelTrailDip(float& trail) {
         return false;
     }
 
-    // The Start CoreWindow spans the whole screen, but its XAML island is laid
-    // out in the work area: the mapped frame comes out 48 DIP left of where the
-    // pixels are when the taskbar is on the left. GetWindowRect returns the
-    // full-screen rect, so the work area origin is the offset the XAML
-    // coordinates are measured from. Measured: frame right 1005 DIP + work
-    // left 48 DIP = 1053 DIP, the panel's border at 2105 physical px.
-    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitorInfo{};
-    monitorInfo.cbSize = sizeof(monitorInfo);
-    if (!monitor || !GetMonitorInfoW(monitor, &monitorInfo)) {
+    // The frame is in XAML root coordinates; the origin turns it into a screen
+    // edge for whichever side the taskbar is on.
+    float originX = 0.0f;
+    float originY = 0.0f;
+    if (!XamlOriginDip(originX, originY)) {
         return false;
     }
-    const float scale = DpiScaleForWindow(hwnd);
-    const float originX = monitorInfo.rcWork.left / scale;
-    const float originY = monitorInfo.rcWork.top / scale;
 
     switch (static_cast<DismissAxis>(g_dismissAxis)) {
         case DismissAxis::Left:
@@ -3807,10 +4163,10 @@ bool TrailInsideWorkArea(float trail) {
 // Publishes the panel trail for the reveal follow. Falls back to the root
 // extent, which reproduces the earlier root-width travel, and says so once.
 //
-// `logOnChange` is the settled-layout re-check the input thread posts while the
-// menu is open: it speaks only when the value moved, so a layout that has
-// settled does not repeat the line every kTrailCheckIntervalMs. Setup and
-// SizeChanged keep the one line per open.
+// `logOnChange` is the refresh the input thread posts when the menu opens and
+// when the system announces a work-area or display change: it speaks only when
+// the value moved, so a layout that did not move does not repeat the line. Setup
+// and SizeChanged keep the one line per open.
 void PublishPanelTrailDip(bool logOnChange) {
     const float distance = g_dismissDistance;
     if (!(distance > 0.0f)) {
@@ -3873,6 +4229,336 @@ void PublishPanelTrailDip(bool logOnChange) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Settled panel trail (layout event, no timer)
+//
+// The open transition re-measures the panel edge once, but that measurement can
+// land while the shell's own open storyboard is still growing the frame into
+// place: on a bottom taskbar it read a panel top of -12 DIP where the settled
+// panel starts at 200. The reveal follow maps `Progress` against this value, so
+// an early measurement anchors the panel 212 DIP off for that whole open.
+//
+// LayoutUpdated is the one signal that arrives when XAML has placed the panel,
+// and it costs nothing while no watch is armed. The watch skips the first pass
+// (it usually precedes the placement), re-measures on the second, then revokes
+// its own token, so at most one watch ever exists and no handler is left behind.
+// The close path and the renderer teardown revoke it too, because a menu that
+// closed before the second pass must not measure anything later.
+// ---------------------------------------------------------------------------
+void StopSettledTrailWatch() {
+    wux::FrameworkElement root = g_root;
+    if (g_layoutToken.value && root) {
+        try {
+            root.LayoutUpdated(g_layoutToken);
+        } catch (winrt::hresult_error const& e) {
+            Wh_Log(L"LayoutUpdated revoke failed: %08X", e.code());
+        } catch (...) {
+            // A root mid-teardown cannot revoke; the generation guard in the
+            // handler keeps a stale callback from measuring the next open.
+        }
+    }
+    g_layoutToken = {};
+    g_layoutTicksLeft = 0;
+}
+
+void ArmSettledTrailWatch() {
+    wux::FrameworkElement root = g_root;
+    if (!root) {
+        return;  // no root, no layout to wait for
+    }
+
+    // One watch per open: a work-area broadcast re-posts the refresh, and the
+    // previous watch would otherwise measure the same settled layout twice.
+    StopSettledTrailWatch();
+    g_layoutTicksLeft = 2;
+
+    try {
+        g_layoutToken = root.LayoutUpdated([](
+            winrt::Windows::Foundation::IInspectable const&,
+            winrt::Windows::Foundation::IInspectable const&) {
+            try {
+                if (g_layoutTicksLeft == 0) {
+                    return;  // a callback that outlived its revoke
+                }
+                if (--g_layoutTicksLeft > 0) {
+                    return;  // the first pass precedes the panel placement
+                }
+                RefreshGestureGeometry();
+                PublishPanelTrailDip(true);
+                // The list has its final extent now, so the dismiss gate is
+                // re-armed against the settled rect and offsets.
+                CacheScrollableElement(true);
+            } catch (winrt::hresult_error const& e) {
+                Wh_Log(L"Settled trail failed: %08X", e.code());
+            } catch (...) {
+                // Never let an exception escape into XAML.
+            }
+            // Revoked after the measurement, and also when one threw, so the
+            // handler never outlives the open it belongs to.
+            StopSettledTrailWatch();
+        });
+    } catch (winrt::hresult_error const& e) {
+        g_layoutToken = {};
+        g_layoutTicksLeft = 0;
+        FileLog(L"layout watch failed err=%08X", static_cast<unsigned>(e.code()));
+    } catch (...) {
+        g_layoutToken = {};
+        g_layoutTicksLeft = 0;
+        FileLog(L"layout watch failed err=unknown");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scroller cache (the element a vertical dismiss competes with)
+//
+// Measured on this build, the menu contains three ScrollViewers, and only one of
+// them can take a drag away from a dismiss:
+//
+// - the wrapper around StartUI.AllAppsGridListView (depth 16, 85,230-345,839)
+//   reports ScrollableWidth 8380 and VerticalOffset 2252 whatever the content
+//   does: its offsets are not the visual position, and its huge horizontal
+//   extent marks it as a host rather than a list;
+// - StartUI.TileListView's viewer (353,225-1005,839) and the rail's
+//   (13,656-60,794) report ScrollableHeight 0, so they have nothing to scroll
+//   and a drag on them belongs to the dismiss;
+// - the ScrollViewer inside the AllApps ListView (depth 21, same rect as the
+//   wrapper, ScrollableHeight 3664) is the one that moves with the list.
+//
+// Selection is therefore: the innermost ScrollViewer whose ScrollableWidth is
+// zero and whose ScrollableHeight is not, with a non-empty rect. Depth beats
+// area, so the live list wins over its wrapper at the same rect; at equal depth
+// the smaller rect wins, because the more specific element is the one a press
+// lands on. The rect is mapped to screen DIP through the same origin as the
+// panel trail, so the input thread can test a press point against it directly.
+// ---------------------------------------------------------------------------
+struct ScrollerCandidate {
+    wuxc::ScrollViewer viewer{nullptr};
+    float left = 0.0f;
+    float top = 0.0f;
+    float right = 0.0f;
+    float bottom = 0.0f;
+    float area = 0.0f;
+    uint32_t depth = 0;
+    bool found = false;
+};
+
+void FindScrollableElement(const wux::UIElement& element, uint32_t depth,
+                           float originX, float originY,
+                           ScrollerCandidate& best) {
+    if (!element || depth > kScrollerScanMaxDepth) {
+        return;
+    }
+
+    try {
+        wuxc::ScrollViewer viewer = element.try_as<wuxc::ScrollViewer>();
+        if (viewer) {
+            const winrt::Windows::Foundation::Size size = element.ActualSize();
+            const wux::Media::GeneralTransform transform =
+                element.TransformToVisual(nullptr);
+            const winrt::Windows::Foundation::Point topLeft =
+                transform.TransformPoint({0.0f, 0.0f});
+            const winrt::Windows::Foundation::Point bottomRight =
+                transform.TransformPoint({size.Width, size.Height});
+
+            const float left = originX + topLeft.X;
+            const float top = originY + topLeft.Y;
+            const float right = originX + bottomRight.X;
+            const float bottom = originY + bottomRight.Y;
+            const float area = (right - left) * (bottom - top);
+
+            // A viewer that cannot scroll vertically cannot take the drag, and
+            // a collapsed or inverted rect is not a place a finger can press.
+            if (viewer.ScrollableWidth() <= kScrollerAxisSlopDip &&
+                viewer.ScrollableHeight() > kScrollerAxisSlopDip &&
+                right > left && bottom > top && area > 1.0f) {
+                if (!best.found || depth > best.depth ||
+                    (depth == best.depth && area < best.area)) {
+                    best.viewer = viewer;
+                    best.left = left;
+                    best.top = top;
+                    best.right = right;
+                    best.bottom = bottom;
+                    best.area = area;
+                    best.depth = depth;
+                    best.found = true;
+                }
+            }
+        }
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Scroller measure failed: %08X", e.code());
+    } catch (...) {
+        // A branch mid-teardown ends this branch only.
+    }
+
+    if (depth >= kScrollerScanMaxDepth) {
+        return;
+    }
+
+    try {
+        const int32_t count =
+            wux::Media::VisualTreeHelper::GetChildrenCount(element);
+        for (int32_t i = 0; i < count; ++i) {
+            FindScrollableElement(
+                wux::Media::VisualTreeHelper::GetChild(element, i)
+                    .try_as<wux::UIElement>(),
+                depth + 1, originX, originY, best);
+        }
+    } catch (...) {
+        // A child being attached or removed ends this branch only.
+    }
+}
+
+// Drops only the handler, so a re-measure can subscribe to the same or another
+// element. Runs on the UI thread.
+void RevokeScrollerWatch() {
+    wuxc::ScrollViewer viewer = g_scrollerViewer;
+    if (g_scrollerToken.value && viewer) {
+        try {
+            viewer.ViewChanged(g_scrollerToken);
+        } catch (winrt::hresult_error const& e) {
+            Wh_Log(L"ViewChanged revoke failed: %08X", e.code());
+        } catch (...) {
+            // The element is gone; its handler dies with it.
+        }
+    }
+    g_scrollerToken = {};
+    g_scrollerViewer = nullptr;
+}
+
+// Publishes the offsets of the cached element. ViewChanged fires on the UI
+// thread and only while the list actually scrolls, so this is the whole cost of
+// keeping the gate honest.
+void RefreshScrollerOffsets() {
+    wuxc::ScrollViewer viewer = g_scrollerViewer;
+    if (!viewer) {
+        return;
+    }
+
+    try {
+        const float verticalOffset = viewer.VerticalOffset();
+        const float scrollableHeight = viewer.ScrollableHeight();
+        std::lock_guard lock(g_scrollerMutex);
+        if (g_scroller.valid) {
+            g_scroller.verticalOffset = verticalOffset;
+            g_scroller.scrollableHeight = scrollableHeight;
+        }
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Scroller offset read failed: %08X", e.code());
+    } catch (...) {
+        // A closed menu must not break the handler.
+    }
+}
+
+// Finds and caches the element for the open that is being measured. Runs on the
+// UI thread from the open transition and again from the settled layout pass; the
+// second call replaces the first measurement, which can still belong to the
+// storyboard.
+void CacheScrollableElement(bool settled) {
+    wux::FrameworkElement root = g_root;
+    if (!root) {
+        return;
+    }
+
+    float originX = 0.0f;
+    float originY = 0.0f;
+    if (!XamlOriginDip(originX, originY)) {
+        return;
+    }
+
+    ScrollerCandidate best;
+    try {
+        FindScrollableElement(root, 0, originX, originY, best);
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Scroller search failed: %08X", e.code());
+    } catch (...) {
+        // An unreadable tree leaves the previous cache alone.
+    }
+
+    // One handler per measurement: the element must not be observed twice.
+    RevokeScrollerWatch();
+
+    if (!best.found) {
+        // Nothing scrolls: every vertical press belongs to the dismiss. This is
+        // also what the open transition can see while the storyboard still has
+        // the list unmeasured, which is why the settled pass measures again
+        // instead of trusting this answer.
+        std::lock_guard lock(g_scrollerMutex);
+        g_scroller = ScrollerCache{};
+        return;
+    }
+
+    float verticalOffset = 0.0f;
+    float scrollableHeight = 0.0f;
+    try {
+        verticalOffset = best.viewer.VerticalOffset();
+        scrollableHeight = best.viewer.ScrollableHeight();
+    } catch (...) {
+        // A viewer that cannot be read is no better than no viewer.
+        std::lock_guard lock(g_scrollerMutex);
+        g_scroller = ScrollerCache{};
+        return;
+    }
+
+    {
+        std::lock_guard lock(g_scrollerMutex);
+        g_scroller.valid = true;
+        // Only the post-storyboard pass may arm the gate: the rect measured on
+        // the open transition belongs to a window the shell is still moving.
+        g_scroller.settled = settled;
+        g_scroller.left = best.left;
+        g_scroller.top = best.top;
+        g_scroller.right = best.right;
+        g_scroller.bottom = best.bottom;
+        g_scroller.verticalOffset = verticalOffset;
+        g_scroller.scrollableHeight = scrollableHeight;
+    }
+
+    // One line per open. The settled pass speaks only when it moved the rect the
+    // first pass logged, so a storyboard that was still growing cannot hide the
+    // final geometry.
+    const bool moved = !g_scrollerLogged ||
+                       std::fabs(best.left - g_scrollerLoggedRect[0]) > 1.0f ||
+                       std::fabs(best.top - g_scrollerLoggedRect[1]) > 1.0f ||
+                       std::fabs(best.right - g_scrollerLoggedRect[2]) > 1.0f ||
+                       std::fabs(best.bottom - g_scrollerLoggedRect[3]) > 1.0f;
+    if (moved) {
+        g_scrollerLogged = true;
+        g_scrollerLoggedRect[0] = best.left;
+        g_scrollerLoggedRect[1] = best.top;
+        g_scrollerLoggedRect[2] = best.right;
+        g_scrollerLoggedRect[3] = best.bottom;
+        FileLog(L"scroller rect=%.0f,%.0f,%.0f,%.0f vo=%.0f sh=%.0f", best.left,
+                best.top, best.right, best.bottom, verticalOffset,
+                scrollableHeight);
+    }
+
+    g_scrollerViewer = best.viewer;
+    try {
+        g_scrollerToken = best.viewer.ViewChanged(
+            [](auto const&, auto const&) { RefreshScrollerOffsets(); });
+    } catch (winrt::hresult_error const& e) {
+        g_scrollerToken = {};
+        FileLog(L"scroller watch failed err=%08X", static_cast<unsigned>(e.code()));
+    } catch (...) {
+        g_scrollerToken = {};
+        FileLog(L"scroller watch failed err=unknown");
+    }
+}
+
+// Drops the cached element, its offsets and its handler. The close path and the
+// renderer teardown call it, so a closed menu can never gate a press against the
+// rect of the previous open.
+void ReleaseScrollableElement() {
+    RevokeScrollerWatch();
+    g_scrollerLogged = false;
+    g_scrollerLoggedRect[0] = 0.0f;
+    g_scrollerLoggedRect[1] = 0.0f;
+    g_scrollerLoggedRect[2] = 0.0f;
+    g_scrollerLoggedRect[3] = 0.0f;
+    std::lock_guard lock(g_scrollerMutex);
+    g_scroller = ScrollerCache{};
+}
+
 // The HWND is needed for the DWM cloaked query that decides whether the menu
 // is open, and for the window bounds the input thread tests against.
 void CaptureCoreWindowHandle() {
@@ -3911,9 +4597,11 @@ void CaptureCoreWindowHandle() {
 }
 
 // Chooses the dismiss direction from the side of the work area the Start
-// window is anchored to. Checked on every setup because the window can move
-// between displays.
-void UpdateDismissAxis() {
+// window is anchored to. Runs on the UI thread, from Setup and from the
+// event-driven refresh. `logAxis` writes the full measurement line: the refresh
+// passes false and speaks only when the axis actually moved, so an unchanged
+// layout does not repeat four rect values on every open.
+void UpdateDismissAxis(bool logAxis) {
     HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
     if (!hwnd) {
         return;
@@ -3967,20 +4655,96 @@ void UpdateDismissAxis() {
         }
     }
 
+    const int32_t previousAxis = g_dismissAxis;
     g_dismissAxis = static_cast<int32_t>(axis);
-    FileLog(L"dismiss axis=%d (0=left,1=top,2=right,3=bottom) "
-            L"win=%d,%d,%d,%d work=%d,%d,%d,%d mon=%d,%d,%d,%d",
-            g_dismissAxis, static_cast<int>(windowRect.left),
-            static_cast<int>(windowRect.top),
-            static_cast<int>(windowRect.right),
-            static_cast<int>(windowRect.bottom), static_cast<int>(work.left),
-            static_cast<int>(work.top), static_cast<int>(work.right),
-            static_cast<int>(work.bottom), static_cast<int>(monitorRect.left),
-            static_cast<int>(monitorRect.top),
-            static_cast<int>(monitorRect.right),
-            static_cast<int>(monitorRect.bottom));
+    if (logAxis || g_dismissAxis != previousAxis) {
+        FileLog(L"dismiss axis=%d (0=left,1=top,2=right,3=bottom) "
+                L"win=%d,%d,%d,%d work=%d,%d,%d,%d mon=%d,%d,%d,%d",
+                g_dismissAxis, static_cast<int>(windowRect.left),
+                static_cast<int>(windowRect.top),
+                static_cast<int>(windowRect.right),
+                static_cast<int>(windowRect.bottom), static_cast<int>(work.left),
+                static_cast<int>(work.top), static_cast<int>(work.right),
+                static_cast<int>(work.bottom), static_cast<int>(monitorRect.left),
+                static_cast<int>(monitorRect.top),
+                static_cast<int>(monitorRect.right),
+                static_cast<int>(monitorRect.bottom));
+    }
 
     PublishGestureGeometry();
+}
+
+// Refreshes the dismiss axis and the translation the composition expression
+// bakes in. Runs on the UI thread when the menu opens and when the system
+// announces a work-area or display change.
+//
+// `StartUI::App::PrepareRootElement` does not fire on every open: the XAML root
+// is reused, so the axis, Distance, DirX and DirY captured by Setup can belong
+// to a taskbar that has moved since, and the expression would keep sliding the
+// panel the old way. The refresh rewrites all three composition inputs when the
+// axis or the extent changed; an unchanged layout keeps the scalars the property
+// set already holds and only records the check.
+//
+// A root that is not attached has no renderer to write: the refresh is a no-op
+// then.
+void RefreshGestureGeometry() {
+    wux::FrameworkElement root = g_root;
+    if (!root) {
+        return;
+    }
+
+    {
+        std::lock_guard lock(g_compositionMutex);
+        if (!g_state) {
+            return;
+        }
+    }
+
+    const int32_t previousAxis = g_dismissAxis;
+    const float previousDistance = g_dismissDistance;
+    UpdateDismissAxis(false);
+
+    float dirX = 0.0f;
+    float dirY = 0.0f;
+    float distance = 0.0f;
+    AxisTranslation(g_dismissAxis, static_cast<float>(root.ActualWidth()),
+                    static_cast<float>(root.ActualHeight()), dirX, dirY,
+                    distance);
+    if (!(distance > 0.0f)) {
+        return;  // the root has not been laid out yet
+    }
+
+    const bool changed = g_dismissAxis != previousAxis ||
+                         std::fabs(distance - previousDistance) > 0.5f;
+    g_dismissDistance = distance;
+
+    {
+        std::lock_guard lock(g_compositionMutex);
+        if (!g_state) {
+            return;
+        }
+        if (changed) {
+            try {
+                g_state.InsertScalar(L"Distance", distance);
+                g_state.InsertScalar(L"DirX", dirX);
+                g_state.InsertScalar(L"DirY", dirY);
+            } catch (winrt::hresult_error const& e) {
+                FileLog(L"gesture geometry write failed err=%08X",
+                        static_cast<unsigned>(e.code()));
+                return;
+            } catch (...) {
+                FileLog(L"gesture geometry write failed err=unknown");
+                return;
+            }
+        }
+    }
+
+    // The published pair the input thread reads has to match the scalars, so
+    // both happen after the write and never on their own.
+    PublishGestureGeometry();
+    FileLog(changed ? L"gesture geometry updated axis=%d dist=%.0f"
+                    : L"gesture geometry axis=%d dist=%.0f (unchanged)",
+            g_dismissAxis, distance);
 }
 
 // Runs on the UI thread, after the root element is loaded.
@@ -4005,7 +4769,7 @@ bool Setup(wux::FrameworkElement const& root) {
     if (!g_coreHwnd.load(std::memory_order_relaxed)) {
         Wh_Log(L"No CoreWindow HWND; gestures stay disabled");
     }
-    UpdateDismissAxis();
+    UpdateDismissAxis(true);
 
     wuxh::ElementCompositionPreview::SetIsTranslationEnabled(root, true);
 
@@ -4015,31 +4779,12 @@ bool Setup(wux::FrameworkElement const& root) {
     const float width = static_cast<float>(root.ActualWidth());
     const float height = static_cast<float>(root.ActualHeight());
 
-    float dirX = -1.0f;
+    // The first geometry of this renderer. The open transition and every
+    // work-area change after it refresh these three values in place.
+    float dirX = 0.0f;
     float dirY = 0.0f;
-    float distance = width;
-    switch (static_cast<DismissAxis>(g_dismissAxis)) {
-        case DismissAxis::Left:
-            dirX = -1.0f;
-            dirY = 0.0f;
-            distance = width;
-            break;
-        case DismissAxis::Top:
-            dirX = 0.0f;
-            dirY = -1.0f;
-            distance = height;
-            break;
-        case DismissAxis::Right:
-            dirX = 1.0f;
-            dirY = 0.0f;
-            distance = width;
-            break;
-        case DismissAxis::Bottom:
-            dirX = 0.0f;
-            dirY = 1.0f;
-            distance = height;
-            break;
-    }
+    float distance = 0.0f;
+    AxisTranslation(g_dismissAxis, width, height, dirX, dirY, distance);
     g_dismissDistance = distance;
 
     wuc::CompositionPropertySet state = compositor.CreatePropertySet();
@@ -4077,32 +4822,16 @@ bool Setup(wux::FrameworkElement const& root) {
         g_retractEasing = retractEasing;
     }
 
+    // A resize changes the extent the expression slides by, and it may be the
+    // first real layout after Setup. The refresh owns the axis check as well, so
+    // a root that is laid out again after a taskbar move is corrected here too.
     g_sizeToken = root.SizeChanged(
-        [](winrt::Windows::Foundation::IInspectable const& sender,
+        [](winrt::Windows::Foundation::IInspectable const&,
            wux::SizeChangedEventArgs const&) {
             try {
-                wux::FrameworkElement fe =
-                    sender.try_as<wux::FrameworkElement>();
-                if (!fe) {
-                    return;
-                }
-
-                const float width = static_cast<float>(fe.ActualWidth());
-                const float height = static_cast<float>(fe.ActualHeight());
-                const float distance =
-                    IsHorizontalAxis(g_dismissAxis) ? width : height;
-                g_dismissDistance = distance;
-
-                {
-                    std::lock_guard lock(g_compositionMutex);
-                    if (g_state) {
-                        g_state.InsertScalar(L"Distance", distance);
-                    }
-                }
-
-                PublishGestureGeometry();
-                // The root may have been resized by the panel layout, so the
-                // trail is remapped with the new extent in force.
+                RefreshGestureGeometry();
+                // The root was resized by the panel layout, so the trail is
+                // remapped with the new extent in force.
                 PublishPanelTrailDip(false);
             } catch (winrt::hresult_error const& e) {
                 Wh_Log(L"SizeChanged update failed: %08X", e.code());
@@ -4112,9 +4841,8 @@ bool Setup(wux::FrameworkElement const& root) {
         });
 
     // Everything the input thread reads is published before the root opens.
-    // This trail is the initial anchor: the frame is still off its settled
-    // position here, so the input thread re-measures it once the open animation
-    // has finished.
+    // This trail is the initial anchor: the frame can still be off its settled
+    // position here, so the open transition re-measures it.
     PublishGestureGeometry();
     PublishPanelTrailDip(false);
     g_hasRoot.store(true, std::memory_order_release);
@@ -4453,6 +5181,12 @@ DWORD WINAPI PollModulesThread(LPVOID) {
 
 // Runs on the UI thread.
 void RevokeHandlers() {
+    // The settled-trail watch and the cached scroller belong to this root, so
+    // both are dropped before its reference goes away: their handlers hold XAML
+    // objects and must never run against the next open.
+    StopSettledTrailWatch();
+    ReleaseScrollableElement();
+
     wux::FrameworkElement root = g_root;
     if (!root) {
         return;
@@ -4564,7 +5298,6 @@ void ResetComposition() {
 
     g_distancePub.store(0.0f, std::memory_order_relaxed);
     g_panelTrailDip.store(0.0f, std::memory_order_relaxed);
-    g_nextTrailCheckTick.store(0, std::memory_order_relaxed);
 
     // Invalidate a stale Loaded handler from the previous root.
     g_setupGeneration.fetch_add(1, std::memory_order_relaxed);
@@ -4581,7 +5314,7 @@ void ResetRenderer() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.11.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.12.0 initializing");
     LoadRetractStartSpeed();
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
@@ -4674,7 +5407,7 @@ void Wh_ModBeforeUninit() {
         g_pollThread = nullptr;
     }
 
-    // The message-only window and its raw input registration belong to the
+    // The hidden input window and its raw input registration belong to the
     // input thread. Ask it to leave the message loop and wait for it before
     // the module's code can be unmapped.
     HWND hwnd = g_hidHwnd.load(std::memory_order_relaxed);
