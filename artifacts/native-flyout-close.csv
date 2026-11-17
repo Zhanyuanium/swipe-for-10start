@@ -1,0 +1,19 @@
+# Quick Settings (Win+A), ControlCenterWindow, 2880x1800 at 200%, taskbar on top.
+# Frame time is ms from the window becoming visible (1 ms IsWindowVisible poll).
+# dy = px the panel content sits above its settled place; travel 1156 px = 578 DIP.
+# d = 1 - dy/1156 (open) or dy/1156 (close), normalised displacement 0..1.
+t_ms,dy_px,d
+-169.1,0,0.000
+-153.1,17,0.015
+-144.7,29,0.025
+-136.1,44,0.038
+-119.0,84,0.073
+-102.5,140,0.121
+-86.5,216,0.187
+-78.2,263,0.228
+-69.8,319,0.276
+-62.1,384,0.332
+-54.3,463,0.401
+-46.2,559,0.484
+-38.3,681,0.589
+-30.8,853,0.738

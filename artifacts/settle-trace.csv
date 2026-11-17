@@ -1,0 +1,21 @@
+# Settle trace of the shipped mod, top taskbar, injected pull from the screen edge.
+# `edge` is the panel's bottom edge in screen px (fresh menu: 96 top, 1350 bottom).
+# t is ms from the touch UP, measured at the start of a 2880x1020 BitBlt.
+# The mod detects the release at ~20 ms (relms) and the composition animation
+# reaches the screen ~50 ms after the UP, so the panel is still at the held
+# position at t=41 in both runs: no jump.
+style,held,t_ms,edge_px
+win11,450,41.2,450
+win11,450,83.2,776
+win11,450,120.0,1117
+win11,450,171.3,1265
+win11,450,213.1,1312
+win11,450,261.3,1335
+win11,450,303.8,1344
+win10,450,40.7,450
+win10,450,83.8,652
+win10,450,120.7,982
+win10,450,154.1,1177
+win10,450,204.9,1295
+win10,450,246.3,1339
+win10,450,296.0,1348

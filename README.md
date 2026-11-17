@@ -61,29 +61,31 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    ```
 
    `y` is the normalised travel from the release position to the target, `y0`
-   its initial slope, `omega = 2*pi / 0.25 s`, `zeta = 0.9`, and the settle ends
-   at `T = 5 / (zeta*omega)`, about 221 ms. Twelve segments (thirteen keyframes
-   from t=0 to t=T) are sampled from that curve and clamped to `[0, 1]`. Because
-   the spring starts at the finger's speed and only decelerates, opening and
-   closing are the same mechanism with the sign flipped; a bezier with a fixed
-   duration could not do that, since matching the finger's speed forced it to
-   accelerate.
+   its initial slope, and the settle's duration is five time constants of the
+   spring's slowest root, `T = clamp(5/tau, 180, 400)` ms. Twelve segments
+   (thirteen keyframes from t=0 to t=T) are sampled from that curve and clamped
+   to `[0, 1]`. Because the spring starts at the finger's speed and only
+   decelerates, opening and closing are the same mechanism with the sign
+   flipped; a bezier with a fixed duration could not do that, since matching the
+   finger's speed forced it to accelerate.
 
    The close's `VK_LWIN` tap is scheduled at `T`, and `close-mode.txt` tells the
    bridge the hide that tap causes needs no retract lead.
 
-   Two settle styles ship, chosen by the **Gesture animation style** setting
-   (`AnimationStyle`, default `Windows 11`):
+   Two parameter sets ship, chosen by the **Gesture animation style** setting
+   (`AnimationStyle`, default `Windows 11`). Both run the same generator, so
+   neither style can drift from the other in mechanism:
 
-   - `Windows 11`: the Fluent decelerate curve
-     `cubic-bezier(0.1, 0.9, 0.2, 1)` over 300 ms from rest, the same shape the
-     shell's own menus use.
-   - `Windows 10`: the damped spring above.
+   - `Windows 11`: period 0.102 s, damping ratio 1.72, 253 ms. Fitted on this
+     machine to the native Quick Settings flyout (`Win+A`), which uses the same
+     Fluent motion; see "How the Windows 11 numbers were measured" below.
+   - `Windows 10`: period 0.25 s, damping ratio 0.9, 221 ms. The spring this mod
+     shipped with, unchanged.
 
-   With the spring, **Gesture animation start speed (% of finger speed)**
-   (`GestureStartSpeedPercent`, default 100, clamped 0-300) scales its initial
-   velocity: 100 starts at exactly the finger's speed, higher snaps away faster,
-   0 starts from rest. The Win11 curve ignores it.
+   **Gesture animation start speed (% of finger speed)**
+   (`GestureStartSpeedPercent`, default 100, clamped 0-300) scales the settle's
+   initial velocity in either style: 100 starts at exactly the finger's speed,
+   higher snaps away faster, 0 starts from rest.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.
@@ -94,7 +96,8 @@ open slides in the way a gesture open does. A Win-key close is animated too:
 `twinui.pcshell.dll` `CStartExperienceManager::Hide` is where the shell takes
 the menu away, so the explorer-side bridge delays that call by 350 ms and writes
 `retract=1` to the mod's debug file first; the mod retracts `Progress` with the
-shared 260 ms curve while the shell waits. Measured with the menu open (one
+selected settle style (253 ms on Windows 11, 221 ms on Windows 10) while the
+shell waits. Measured with the menu open (one
 run, frames at ~123 ms and ~189 ms after the key-down): the panel's right edge
 moved 0 → 119 → 344 DIP left and was gone by ~260 ms, instead of vanishing on
 the first frame.
@@ -130,6 +133,71 @@ measured separately:
 
 Measured release latency (`relms` on the release line): 31 ms before, 19-23 ms
 after.
+
+## How the Windows 11 numbers were measured
+
+`tools/native_flyout_frames.ps1` captures the native
+Quick Settings flyout (`Win+A`) as 32bpp frames; `tools/native_flyout_track.py`
+fits a vertical offset of each frame against the settled frame (Pearson
+`r >= 0.999` over the card's interior). On this machine the taskbar is on top, so
+`ControlCenterWindow` (768x1704 physical) opens anchored to the **top**-right
+corner and its content unfolds **downward**: the leading edge is the panel's
+*bottom* edge, not the top one, and `dy_hidden = 1252 - 96 = 1156 px` (578 DIP)
+is the whole travel.
+
+Sampling was 9.2 ms per frame (a 200 px wide strip, one `BitBlt` into a reused
+DIB). `DwmFlush` before each `BitBlt` costs a whole compositor interval on top of
+the ~8 ms a read-back already takes, which dropped the rate to 17 ms; the
+read-back returns the last presented frame anyway, so the frame time is the
+`BitBlt` and the offset to the presented content is 0-8 ms. `IsWindowVisible` on
+`ControlCenterWindow` (not `DWMWA_CLOAKED`, which stays 0) was polled every 1 ms
+as the time reference.
+
+Normalised displacement, open, `t` from the window becoming visible:
+
+| t (ms) | d | note |
+|---|---|---|
+| 0 | 0.00 | window visible, panel still above the window top |
+| 10.3 | 0.00 | still absent |
+| 29.7 | 0.54 | first visible frame |
+| 37.5 | 0.60 | |
+| 45.7 | 0.65 | |
+| 55.9 | 0.69 | |
+| 72.1 | 0.76 | |
+| 89.8 | 0.81 | |
+| 104.7 | 0.85 | |
+| 120.4 | 0.89 | |
+| 137.6 | 0.92 | |
+| 153.9 | 0.94 | |
+| 171.4 | 0.96 | |
+| 187.2 | 0.97 | |
+| 204.1 | 0.98 | |
+| 220.1 | 0.99 | |
+| 228.8 | 0.993 | |
+| 253.0 | 0.999 | last frame that still moved (1 px) |
+| 261.6 | 1.000 | at rest |
+
+Duration from the window becoming visible to rest: 262 ms. No overshoot in
+either direction (`dy` decays monotonically to 0). The close is the mirror in
+kind but not in timing: the panel accelerates upward and is gone 135 ms after its
+first moving frame (0.04 at 25 ms, 0.19 at 75 ms, 0.59 at 122 ms, hidden at
+~137 ms); no overshoot.
+
+Fitting the mod's spring with `y0 = 0` to this curve (area between the curves
+over 0..306 ms) gives **period 102 ms, damping 1.72**: area 10 ms of
+displacement, mean `|y - d|` 0.034, and at most 0.012 after the first 90 ms. The
+second open run (17 ms frames) fits 84 ms / 1.98 with the same 247 ms duration,
+so the ridge is real: the data fixes the decay time (about 50 ms) and the
+duration (about 250 ms), not the pair's exact split. The native curve is faster
+than any `y0 = 0` spring in its first 30 ms (0.54 of the travel against 0.38);
+the shell starts that animation with its own initial velocity, which a settle
+that must continue the finger cannot copy.
+
+Initial slope at a release half open (`Distance` 1440 DIP, finger 0.4 DIP/ms):
+the spring (either style) moves the panel at 0.4 DIP/ms, 4.0 DIP in the first
+10 ms. The `cubic-bezier(0.1, 0.9, 0.2, 1)` the Windows 11 style used before had
+an initial slope of `0.9/0.1 = 9x` its average, i.e. 21.6 DIP/ms and 216 DIP in
+the first 10 ms — that is the jump a release at half open produced.
 
 ## Opening follows the finger too
 
@@ -253,6 +321,22 @@ is enabled, without an explorer restart on this build.
 - `tools/inject_swipe_holds.ps1` — swipe with pauses at waypoints.
 - `tools/measure_swipe.ps1`, `tools/read_shared_gesture.ps1` — earlier
   investigation helpers for the edge-gesture bridge.
+- `tools/native_flyout_frames.ps1` — capture the native Quick Settings flyout
+  (`Win+A`) as BMP frames at ~10 ms, with the `ControlCenterWindow` visibility
+  poll that anchors t=0.
+- `tools/native_flyout_track.py` — fit each captured frame's vertical offset
+  against the settled frame and print `t -> dy`.
+- `tools/fit_settle_spring.py` — the two-parameter fit of the mod's spring to
+  the measured curve, with the residuals and the initial-slope comparison.
+- `tools/settle_track.ps1` — pull the menu half open, hold, release, and track
+  the panel's bottom edge for 500 ms; used to prove the settle starts from the
+  held position at ~0 speed.
+
+The raw tables behind the Windows 11 fit are in `artifacts/`:
+`native-flyout-open.csv` and `native-flyout-close.csv` are the per-frame
+`t -> dy -> d` curves of the native flyout (9 ms frames, `d` normalised to the
+panel's 578 DIP travel), and `settle-trace.csv` is the shipped mod's settle
+trace in both styles for the same half-open hold release.
 
 The mod has a file-driven debug channel for the renderer:
 write `p=0.5`, `t=x,y,z` or `e=x,y` to
