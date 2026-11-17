@@ -2725,8 +2725,21 @@ bool VerticalDismissAllowed(int32_t axis, float x, float y, uint64_t tickMs) {
         std::lock_guard lock(g_scrollerMutex);
         if (!g_scroller.valid || !g_scroller.settled) {
             // Nothing measured for this open, or only the transitional rect
-            // seen while the shell was still moving the window: fail open.
-            return true;
+            // seen while the shell was still moving the window. Failing open
+            // here let a swipe right after the open dismiss the menu while the
+            // user was scrolling; wait for the measurement instead, but only
+            // while the press is inside the panel band so a press on the
+            // desktop still passes.
+            const float trail = g_panelTrailDip.load(std::memory_order_relaxed);
+            const float distance = g_distancePub.load(std::memory_order_relaxed);
+            const bool insidePanel =
+                trail > 0.0f && distance > 0.0f &&
+                (axis == static_cast<int32_t>(DismissAxis::Bottom)
+                     ? (y >= trail - kScrollerEndSlopDip &&
+                        y <= trail + distance)
+                     : (y <= trail + kScrollerEndSlopDip &&
+                        y >= trail - distance));
+            return !insidePanel;
         }
         scroller = g_scroller;
     }
