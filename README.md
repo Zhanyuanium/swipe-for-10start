@@ -51,26 +51,31 @@ Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
    arms a `VK_LWIN` tap (down 60 ms, up) for the end of that retract. That tap is
    the shell's own Start toggle: its key handler performs
    `CStartExperienceManager::Hide`, so the next Windows press opens the menu and
-   no re-arm tap exists. Every close — dismiss or cancelled reveal — runs the
-   same planner:
+   no re-arm tap exists. Every outcome — dismiss, cancelled reveal, reveal
+   commit and dismiss cancel — runs one settle: a damped spring whose initial
+   velocity is the release speed.
 
    ```
-   flick    = max(0, velocity - 0.45 DIP/ms)
-   duration = 260 ms / (1 + 0.35 * flick), never below 45% (117 ms)
+   y(t) = 1 - e^(-zeta*omega*t) * (cos(wd*t) + ((zeta*omega - y0)/wd) * sin(wd*t))
+   y0   = (gain * velocity) / remaining      wd = omega * sqrt(1 - zeta^2)
    ```
 
-   The duration comes from the flick; the curve is built per close so the panel
-   leaves at the speed the finger had. Its initial slope is
-   `1.75 x finger speed / average speed`, expressed as
-   `s = clamp(gain * velocity / avg, 0, 3)` with `y1 = clamp(s * 0.35, 0.02, 1)`
-   on `cubic-bezier(0.35, y1, 0.55, 1)`. A release below the commit threshold is
-   not a flick, so it keeps the plain 260 ms; only a real flick shortens the
-   slide. At the release the mod writes `gesture=0` to `close-mode.txt`, so the
-   bridge knows the Hide its tap causes needs no retract lead.
+   `y` is the normalised travel from the release position to the target, `y0`
+   its initial slope, `omega = 2*pi / 0.25 s`, `zeta = 0.9`, and the settle ends
+   at `T = 5 / (zeta*omega)`, about 221 ms. Twelve segments (thirteen keyframes
+   from t=0 to t=T) are sampled from that curve and clamped to `[0, 1]`. Because
+   the spring starts at the finger's speed and only decelerates, opening and
+   closing are the same mechanism with the sign flipped; a bezier with a fixed
+   duration could not do that, since matching the finger's speed forced it to
+   accelerate.
+
+   The close's `VK_LWIN` tap is scheduled at `T`, and `close-mode.txt` tells the
+   bridge the hide that tap causes needs no retract lead.
 
    The gain is a mod setting: **Gesture animation start speed (% of finger
-   speed)** (`GestureStartSpeedPercent`, default 175, clamped 0-300). 100 leaves
-   at exactly the finger's speed, 0 gives the old flat-start curve.
+   speed)** (`GestureStartSpeedPercent`, default 100, clamped 0-300). It scales
+   the spring's initial velocity: 100 starts at exactly the finger's speed,
+   higher snaps away faster, 0 starts from rest.
 
 `Progress` is written whenever the finger moves 0.5 DIP, so the drag is
 continuous rather than stepping on a progress grid.
