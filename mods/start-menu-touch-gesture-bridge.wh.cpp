@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.15.0
+// @version         0.16.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -73,8 +73,11 @@ the retract request/answer pair described below, both in
 
 Hooked functions are forwarded unchanged except for the keyboard wait described
 below. The mod creates no windows, threads or COM objects. It refuses to
-initialize unless its own image can be pinned, and on unload it waits for every
-Hide inside the hook before it closes the channel.
+initialize unless its own image can be pinned, and on unload it waits, with no
+deadline, until every Hide that is inside the hook has left, and closes the
+channel only then. A Hide that does not return therefore holds the whole Windhawk
+reload until it does; that is the price of never handing the host a trampoline a
+live frame can still call.
 
 Notes:
 - Windhawk compiles the mod from stdin, so the repository `mods` folder is
@@ -103,14 +106,17 @@ Notes:
   one `hide open generation unavailable err=...` for a Hide that found no
   published open generation (0 is never a generation).
 - The two channels have two lifetimes. The v2 channel (the section mapping and
-  view, the mutex and the three events) is closed when the mod is disabled, but
-  only after the disable flag keeps new Hides out of it and every Hide that
-  already entered has left: quiescence is the condition, and the drain's bound
-  is only where the wait stops. A Hide still inside at that bound keeps every
-  handle and logs
-  `ipc unload residual hides=...; the v2 channel stays until explorer exits`.
-  A re-enable of the pinned image reuses such a channel instead of opening a
-  second one over it.
+  view, the mutex and the three events) is closed when the mod is disabled, and
+  only then: the disable flag keeps new Hides out of it, and the unload waits for
+  every Hide that already entered to leave before it closes anything. That wait
+  has no deadline, so its outcome is one of two. `drained`: the count reached
+  zero, the channel is closed, the unload returns. `stalled`: the count is still
+  nonzero and nothing else happens — no close, no return, no handle left behind.
+  The price of `stalled` is exact: a Hide that does not return, because the shell
+  call under it never came back or a debugger suspended its thread, holds the
+  Windhawk reload until it resumes. A re-enable of the pinned image reuses a
+  channel an earlier activation left open instead of opening a second one over
+  it.
   The gesture mapping and its event stay for the rest of the explorer process
   lifetime instead: a consumer maps them independently, and an in-flight gesture
   callback may still hold the view, so unmapping them is unsafe. The image is
@@ -121,15 +127,17 @@ Notes:
 - The in-flight count buys the unload's close, and one more thing. The lease
   spans the whole hook, the `Hide_Original` call included, so a count of zero
   also says that no frame of this hook can still need the MinHook trampoline.
-  That is why the unload waits for quiescence instead of returning when a bound
-  expires: the drain is bounded at 10 s, above this mod's own hold (660 ms with
-  the shipped Start mod: a 100 ms answer wait plus the 560 ms fallback, or a
-  planned settle clamped to 520 ms plus 30 ms; at most 2.13 s for any answer the
-  channel accepts) and with room for a thread the scheduler kept off the CPU.
-  500 ms is only the mark where the wait says a call is overdue
-  (`ipc unload drain over 500 ms hides=...; still waiting for quiescence`). A
-  drain that reaches 10 s keeps every handle and logs the residual; that path is
-  unchanged.
+  That zero is the only condition on which this mod hands trampoline removal back
+  to the host: a frame that is still about to call the original holds a lease, so
+  no timeout can stand in for the count, and a timeout that expired under a live
+  frame would return to the host a frame whose trampoline it is about to free.
+  An ordinary unload is quiet at once, because every wait inside the hook ends
+  within one 10 ms step of the disable flag; a wait long enough to be noticed
+  means a frame that cannot run at all. 500 ms is where the wait first reports one
+  (`ipc unload drain over 500 ms hides=...`), and from then on it reports every
+  10 s (`ipc unload stalled hides=... waited=... ms`) until the count reaches
+  zero. Both lines are diagnostics: neither ends the wait and neither changes
+  what happens next.
 - The count answers "is a Hide still inside", never "this Hide runs after that
   one": two Hides on different threads hold it at once, and a re-entrant Hide on
   one thread holds one lease per frame, so it balances by itself. The lease is
@@ -159,8 +167,10 @@ Notes:
   below it on the stack, so a scan that sees the frame is enough for that frame;
   a scan blind to it leaves a return into freed code, and that is Windhawk's
   unload to fix, not a mod's. Neither claim reaches a trampoline, because a
-  trampoline is not in this image: the scan is the only cover there, and the pin
-  is the cover for this module's code. The hazard is reduced, not eliminated.
+  trampoline is not in this image: the pin is the cover for this module's code,
+  and the drain is the cover for every counted frame's trampoline, because it
+  returns only at zero. What is left is the entry window the count cannot see, and
+  only the host's scan can cover that.
 - The pin is a prerequisite. `Wh_ModInit` returns `FALSE` when it fails and logs
   `mod init refused: the image could not be pinned; no hook, no channel and no
   thread installed`; a shell-owned `Hide` thread needs valid return code as much
@@ -177,10 +187,12 @@ Notes:
   `mod init refused: a Hide from the previous activation is still inside; no
   hook, no channel and no thread installed`. Clearing `g_disabled` and
   re-pointing the globals under that frame would hand it a half-reset module, so
-  the old state stays exactly as the unload left it. When the count is zero,
+  the old state stays exactly as the unload left it. A drained unload returns at
+  zero, so this refusal is reachable only through the entry window the count
+  cannot see; it is kept because that window is real. When the count is zero,
   `ResetReinitState` clears the lifecycle flags, retries a failed gesture
   mapping, and the init logs `activation state reset`; a ready mapping and a
-  channel an earlier unload kept are reused rather than rebuilt.
+  channel an earlier activation left open are reused rather than rebuilt.
 
 The delayed Hide:
 
@@ -250,31 +262,42 @@ The delayed Hide:
  *   call at once for a Hide on a tapped stamp that is newer than the attach
  *   watermark and not older than the newest open generation, because the Start
  *   side taps before the shell's key handler hides. The v2 channel is closed on
- *   disable once no Hide is inside it: the lease spans the whole hook, the
- *   original call included, so that quiescence also means no counted frame can
- *   still need the trampoline. The wait for it is bounded at 10 s; 500 ms is
- *   only where a call is reported overdue, and a wait that reaches the bound
- *   keeps every handle and logs the residual. The count is a lifetime guard for
- *   that channel, not a barrier between two Hides: it counts the Hides inside
- *   `Hide_Hook` through an RAII lease that every exit path releases, so a
- *   re-entrant call on one thread balances per frame, and a call that has
- *   entered the detour but not yet taken its lease is invisible to it. Windhawk
- *   does not drain the hook before `Wh_ModUninit`: at 2.0.0-alpha.8 `ModsManager`
- *   calls `Wh_ModUninit` and only then waits for threads inside the mod image
+ *   disable, and only at quiescence: the disable flag keeps new Hides out and
+ *   the unload waits, with no deadline, until every Hide already inside has
+ *   left, then closes the channel (`ipc close`) and returns. Because the lease
+ *   spans the whole hook, the original call included, that same zero is the only
+ *   condition under which this mod hands trampoline removal back to the host: a
+ *   frame still about to call the original holds a lease, so no timeout can
+ *   stand in for the count. The two outcomes are `drained` (zero, channel
+ *   closed, returned) and `stalled` (still nonzero, and the unload keeps
+ *   waiting; nothing else happens). 500 ms is where the wait first says a call
+ *   is late (`ipc unload drain over 500 ms hides=...`), and every 10 s after
+ *   that it reports `ipc unload stalled hides=... waited=... ms`. The price is
+ *   paid in the host: a Hide that does not return, because the shell call under
+ *   it never came back or a debugger suspended its thread, blocks the Windhawk
+ *   reload until it resumes. The count is a lifetime guard for that channel, not
+ *   a barrier between two Hides: it counts the Hides inside `Hide_Hook` through
+ *   an RAII lease that every exit path releases, so a re-entrant call on one
+ *   thread balances per frame, and a call that has entered the detour but not
+ *   yet taken its lease is invisible to it. Windhawk does not drain the hook
+ *   before `Wh_ModUninit`: at 2.0.0-alpha.8 `ModsManager` calls `Wh_ModUninit`
+ *   and only then waits for threads inside the mod image
  *   (`ThreadsCallStackWaitForRegions(..., 200, 400)`) before freeing the module,
  *   and that wait is bounded and unchecked. This mod therefore refuses to
  *   initialize unless its own image is pinned
  *   (`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
  *   GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`), which keeps
  *   the return address and the lease destructor of an uncounted frame valid; the
- *   host's wait covers the trampoline when it can see the frame, and a scan
- *   blind to it covers nothing. A re-enable re-initialises the same image and
- *   refuses while the previous activation still has a Hide inside; otherwise
- *   the lifecycle flags are reset (logged `activation state reset`), the gesture
- *   mapping is reused, and a v2 channel that the previous unload kept is handed
- *   on rather than opened again. The gesture mapping keeps the process-lifetime
- *   behaviour below. Every path calls the original Hide; nothing is pressed and
- *   no hide is requested. No exported symbols.
+ *   host's wait covers an uncounted frame's trampoline when it can see the
+ *   frame, and a scan blind to it covers nothing. A re-enable re-initialises the
+ *   same image and refuses while the previous activation still has a Hide inside
+ *   — reachable only through that uncounted entry window, because a drained
+ *   unload returns at zero; otherwise the lifecycle flags are reset (logged
+ *   `activation state reset`), the gesture mapping is reused, and a v2 channel an
+ *   earlier activation left open is handed on rather than opened again. The
+ *   gesture mapping keeps the process-lifetime behaviour below. Every path calls
+ *   the original Hide; nothing is pressed and no hide is requested. No exported
+ *   symbols.
  * [POS]: explorer-side half of the legacy Start gesture work. It observes the
  *   shell's own hide decision and decides whether that Hide still needs the
  *   retract lead. Both closes are Windows taps performed by the Start side, and
@@ -289,11 +312,11 @@ The delayed Hide:
  *   unconsumed fresh stamp is evidence of correlation, not proof of cause: the
  *   plan-versus-tapped distinction is what makes the gesture path correct, and
  *   the binding only keeps a stamp of a menu that is gone from passing a later
- *   Hide. The drain runs inside `Wh_ModUninit` and cannot wait past it: when it
- *   reaches its bound the channel handles stay open; the image is pinned as
- *   a prerequisite because a hook-only mod cannot wait for its own caller, and
- *   the unload waits for the counted frames to leave before it closes the
- *   channel, which is the part of the trampoline hazard a mod can remove.
+ *   Hide. The drain runs inside `Wh_ModUninit` and returns only at quiescence, so
+ *   the reload blocks instead of running under a live frame: the image is pinned
+ *   as a prerequisite because a hook-only mod cannot wait for its own caller, the
+ *   pin covers an entry the count cannot see, and the drain covers the trampoline
+ *   of every counted frame.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -366,19 +389,13 @@ constexpr uint64_t kCloseStampFreshMs = 800;
 // disabled under it.
 constexpr DWORD kHidePollMs = 10;
 
-// How long Wh_ModUninit waits for the Hides inside the hook before it gives up
-// on quiescence. Quiescence, not this number, is what makes closing the v2
-// channel safe, and the lease spans the whole call, the `Hide_Original` call
-// included, so a count of zero also says that no frame of this hook can still
-// need the MinHook trampoline. Every wait in the hook ends within one
-// kHidePollMs step of the disable flag, so a normal unload is quiet at once; the
-// 10 s bound is far above the mod's own hold (at most 2.13 s) and leaves room
-// for a thread the scheduler kept off the CPU.
-constexpr DWORD kIpcUnloadDrainMs = 10000;
+// Where an unload that is still waiting first says so. Diagnostic only: reaching
+// this mark grants nothing, and no mark ends the wait.
+constexpr DWORD kIpcUnloadMarkMs = 500;
 
-// Where a drain that is still waiting says so. Diagnostic only: reaching this
-// mark is not permission to return while a call is live.
-constexpr DWORD kIpcUnloadOverdueMs = 500;
+// How often a stalled unload repeats itself while it keeps waiting. Nothing else
+// happens on that path: no close, no return, no handle left behind.
+constexpr DWORD kIpcUnloadStallReportMs = 10000;
 
 // The cross-process channel (swipe_ipc_shared.h). Opened once at init. Its
 // handles are closed by Wh_ModUninit once no Hide can still be inside them; see
@@ -432,13 +449,14 @@ std::atomic<bool> g_initRefused{false};
 //
 // Two Hides on different threads hold a lease at the same time, and a
 // re-entrant Hide on one thread holds one lease per frame, so it balances by
-// itself. Quiescence — the count reaching zero — is what Wh_ModUninit waits for,
-// and because the lease spans the `Hide_Original` call it settles the trampoline
-// question for every counted frame: a frame that is still about to call the
-// original holds a lease, so the unload does not return under it. The one window
-// the count cannot see is an entry that has not yet run the constructor below;
-// the pinned image keeps that frame's own code and the destructor mapped, and
-// its trampoline use is the host's unload to cover.
+// itself. The count reaching zero is `drained`, and it is the only condition on
+// which Wh_ModUninit closes the channel or returns; because the lease spans the
+// `Hide_Original` call it also settles the trampoline question for every counted
+// frame: a frame that is still about to call the original holds a lease, so the
+// unload does not return under it and no timeout may stand in for the count. The
+// one window the count cannot see is an entry that has not yet run the
+// constructor below; the pinned image keeps that frame's own code and the
+// destructor mapped, and its trampoline use is the host's unload to cover.
 struct HideCallLease {
     HideCallLease() { g_hideCalls.fetch_add(1, std::memory_order_acq_rel); }
     ~HideCallLease() { g_hideCalls.fetch_sub(1, std::memory_order_acq_rel); }
@@ -1485,8 +1503,8 @@ HMODULE g_modulePin = nullptr;
 // its result is discarded, so a frame it sees is a frame it waited on, and a
 // frame it does not see is one nothing covered. "The scan saw the frame" and
 // "the frame exited before removal" are two claims, and only the first follows
-// from that scan. The counted frames are covered instead by the drain's
-// quiescence wait.
+// from that scan. The counted frames are covered instead by the drain, which
+// returns only when the count has reached zero.
 //
 // A failure is a refusal, not a warning: Wh_ModInit returns FALSE and installs
 // nothing. A shell-owned thread that resumes in an unmapped image is the crash
@@ -1519,8 +1537,9 @@ bool PinThisModule() {
 // Wh_ModInit calls this only when g_hideCalls is zero: a Hide from the previous
 // activation that is still inside would otherwise see g_disabled cleared and the
 // globals re-pointed under it. A refused activation never reaches this function.
-// g_hideCalls itself is deliberately not touched: a residual Hide that outlived
-// the drain still owns its lease, and that count must keep saying so.
+// A drained unload returns at zero, so that refusal is reachable only through the
+// entry window the count cannot see; g_hideCalls itself is still deliberately not
+// touched, because such a frame owns its lease and that count must say so.
 void ResetReinitState() {
     g_initRefused.store(false, std::memory_order_relaxed);
     g_disabled.store(false, std::memory_order_relaxed);
@@ -1540,13 +1559,14 @@ void ResetReinitState() {
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.15.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.16.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
     // previous activation's lifecycle flags must be cleared explicitly — but
-    // only once nothing of that activation is still running. A Hide from it can
-    // outlive Wh_ModUninit's drain; clearing g_disabled and re-pointing the
+    // only once nothing of that activation is still running. A drained unload
+    // returns at zero, so a Hide can still be inside only through the entry
+    // window the count cannot see; clearing g_disabled and re-pointing the
     // globals under that frame would hand it a half-reset module, so this
     // activation refuses and leaves the previous state exactly as the unload
     // left it. The next enable tries again.
@@ -1586,9 +1606,9 @@ BOOL Wh_ModInit() {
     // that cannot be initialised at all.
     //
     // A re-enable of the pinned image meets the previous activation's channel
-    // only when that unload timed out and kept its handles on purpose.
-    // SwipeIpcOpen would map a second channel over the globals and leak the
-    // first, so the survivor is reused exactly as it stands.
+    // only when that activation left it open (an unload that never ran to
+    // completion). SwipeIpcOpen would map a second channel over the globals and
+    // leak the first, so the survivor is reused exactly as it stands.
     bool created = false;
     DWORD ipcError = 0;
     const bool channelOpen = g_ipc.state != nullptr;
@@ -1683,22 +1703,27 @@ void Wh_ModUninit() {
     // three events are closed once no Hide hook can still be inside them.
     // g_disabled was set in Wh_ModBeforeUninit, so no new Hide decision reaches
     // the channel; g_hideCalls names the Hides that are already inside. Their
-    // waits end within one kHidePollMs step of that flag, so the drain normally
-    // returns at once.
+    // waits end within one kHidePollMs step of that flag, so an ordinary unload
+    // is drained at once.
     //
-    // Quiescence, not the drain's bound, is what makes that close safe: the
-    // lease spans the whole call, the original Hide included, so a count of zero
-    // also proves that no frame of this hook can still need the MinHook
-    // trampoline. The drain therefore waits for the count, and
-    // kIpcUnloadDrainMs is only where waiting stops. kIpcUnloadOverdueMs is a
-    // diagnostic mark, not permission to return while a call is live; the 10 s
-    // bound is above this mod's own hold with room for a thread the scheduler
-    // kept off the CPU.
+    // The wait below has no deadline, and that is the whole point. The lease
+    // spans the whole call, the original Hide included, so a count of zero also
+    // proves that no frame of this hook can still need the MinHook trampoline.
+    // Windhawk removes the hooks and frees their trampolines as soon as this
+    // function returns, so returning with a frame still about to call
+    // Hide_Original would hand the host a frame whose trampoline it is about to
+    // free. A timeout cannot stand in for the count: it would expire under
+    // exactly that frame. The two outcomes are `drained` — the count reached
+    // zero, the channel is closed, this call returns — and `stalled` — the count
+    // is still nonzero and nothing else happens: no close, no return, no handle
+    // left behind. The price is paid where it is owed: a Hide that does not
+    // return, because the shell call under it never came back or a debugger
+    // suspended its thread, blocks the Windhawk reload until it resumes.
     //
-    // A drain that reaches the bound keeps every handle and says so. That leak
-    // is the price of not unmapping a channel under a Hide that is still inside
-    // it: a process that has to restart to finish the unload is cheaper than a
-    // Hide reading freed records.
+    // kIpcUnloadMarkMs and kIpcUnloadStallReportMs are diagnostics only. Neither
+    // grants anything and neither ends the wait. The reports go through FileLog,
+    // so a Hide wedged inside FileLog keeps them out of the file; that changes no
+    // outcome, because this call is blocked either way.
     //
     // The pin and the count are not the same cover. The pin keeps an entry that
     // has not yet taken its lease from returning into unmapped code; the drain
@@ -1713,39 +1738,35 @@ void Wh_ModUninit() {
     // is proof for an uncounted entry. The pin does not reach the trampoline; it
     // is the host's allocation, not this image.
     const ULONGLONG drainStart = GetTickCount64();
-    const ULONGLONG drainDeadline = drainStart + kIpcUnloadDrainMs;
-    bool overdueReported = false;
+    bool markLogged = false;
+    ULONGLONG nextStallReport = 0;
     for (;;) {
         const int hides = g_hideCalls.load(std::memory_order_acquire);
         if (hides == 0) {
             break;
         }
         const ULONGLONG now = GetTickCount64();
-        if (now >= drainDeadline) {
-            break;
+        if (!markLogged &&
+            now - drainStart >= static_cast<ULONGLONG>(kIpcUnloadMarkMs)) {
+            markLogged = true;
+            nextStallReport = now + kIpcUnloadStallReportMs;
+            FileLog(L"ipc unload drain over %u ms hides=%d",
+                    static_cast<unsigned>(kIpcUnloadMarkMs), hides);
         }
-        if (!overdueReported &&
-            now - drainStart >= static_cast<ULONGLONG>(kIpcUnloadOverdueMs)) {
-            overdueReported = true;
-            FileLog(L"ipc unload drain over %u ms hides=%d; still waiting for "
-                    L"quiescence",
-                    static_cast<unsigned>(kIpcUnloadOverdueMs), hides);
+        if (markLogged && now >= nextStallReport) {
+            nextStallReport = now + kIpcUnloadStallReportMs;
+            FileLog(L"ipc unload stalled hides=%d waited=%llu ms", hides,
+                    static_cast<unsigned long long>(now - drainStart));
         }
         Sleep(kHidePollMs);
     }
 
-    const int residualHides = g_hideCalls.load(std::memory_order_acquire);
-    if (residualHides == 0) {
-        if (g_ipc.state) {
-            SwipeIpcClose(&g_ipc);
-            FileLog(L"ipc close");
-        }
-    } else {
-        FileLog(L"ipc unload residual hides=%d; the v2 channel stays until "
-                L"explorer exits",
-                residualHides);
-        Wh_Log(L"Unload left the v2 channel open: %d Hide hook(s) are still "
-               L"inside it; the image stays pinned",
-               residualHides);
+    // Drained: the count reached zero, so this is the one path that closes the
+    // channel and the one point where the host may take the trampolines back.
+    FileLog(L"ipc unload drained waited=%llu ms",
+            static_cast<unsigned long long>(GetTickCount64() - drainStart));
+    if (g_ipc.state) {
+        SwipeIpcClose(&g_ipc);
+        FileLog(L"ipc close");
     }
 }
