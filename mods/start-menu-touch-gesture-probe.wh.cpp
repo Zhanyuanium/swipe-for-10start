@@ -3,7 +3,7 @@
 // @name            Start Menu Touch Gesture Probe
 // @description     Phase 0 diagnostic probe for Win10 Start menu touch gestures (ExplorerPatcher classic mode)
 // @version         0.1.0
-// @author          doubao
+// @author          Zhanyuanium
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64

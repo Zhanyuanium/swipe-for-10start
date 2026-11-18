@@ -2,33 +2,257 @@
 
 C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
-mods/ - Windhawk mod sources (7 files: start-menu-legacy-swipe, msgprobe, inputprobe, touch-gesture-bridge, touch-gesture-probe, touch-gesture-consumer, start_gesture_shared.h)
-tools/ - PowerShell probes, injectors and animation harnesses (screenshot, start_menu, inject_swipe, touch_hold, follow_hold, inject_swipe_holds, measure_swipe, read_shared_gesture, native_flyout_frames, native_flyout_track, fit_settle_spring, settle_track)
-artifacts/ - captured measurements (raw input samples, cursor probe, window geometry, native flyout displacement curves, shipped settle trace)
+mods/ - Windhawk mod sources (9 files: 8 sources - start-menu-legacy-swipe, touch-gesture-bridge, touch-gesture-consumer, touch-gesture-probe, msgprobe, inputprobe, start_gesture_shared.h, swipe_ipc_shared.h - plus AGENTS.md)
+tools/ - PowerShell probes, injectors and animation harnesses (16 files: 15 scripts - screenshot, start_menu, inject_swipe, touch_common, touch_hold, follow_hold, inject_swipe_holds, measure_swipe, read_shared_gesture, probe_cursor_follow, ipc, native_flyout_frames, native_flyout_track, fit_settle_spring, settle_track - plus AGENTS.md)
+artifacts/ - captured measurements (8 files: cursor-follow, gesture-shared, native-flyout-close, native-flyout-open, settle-trace, start-window, inputprobe.dll and AGENTS.md)
+docs/ - technical documentation (10 files: index README, input, gesture, animation, geometry, ipc, lifecycle, testing, limits - plus AGENTS.md)
 </directory>
 <config>
-README.md - what works, what was falsified, build and test instructions
+README.md - user-facing quick start (English; README.zh-CN.md is the Chinese page); technical detail lives in docs/
+README.zh-CN.md - the Chinese page of the user-facing quick start
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 
-Two mods ship together. `mods/start-menu-legacy-swipe.wh.cpp` runs in
+Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.33.0) runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
-every XAML/DirectManipulation source on this UI is empty (see README). Every
-gesture outcome settles on one damped spring whose shape `AnimationStyle` picks
+every XAML/DirectManipulation source on this UI is empty (see docs/input.md). The
+tracked contact is named by the HID Contact Identifier (`0x0D/0x51`) when the
+device declares one, else by `(device, node index)` (`identity=contactid|node`),
+and when several slots carry that identifier the one that asserts contact wins,
+with one `hid contact id=... declared down in ... slots; using=...` line.
+Liveness for a report that carries no coordinates refreshes only when the report
+asserts contact (`TipSwitch`/`InRange`, or a slot state of Contact), never on
+identifier presence alone; the liveness clock is
+separate from the position clock, so a coordinate-less assertion does not feed a
+position and the 18 ms idle does not end a contact the device asserts; the same
+idle ends the gesture with `src=idle`, and once no session owns the contact it
+clears the contact latch and forgets the tracked identity. The identity carries
+its own evidence clock (`lastEvidenceTick`), which moves only when the report
+proves the contact — the tracked slot's `TipSwitch`/`InRange` asserts it with no
+point, or the report carries a position this path feeds; a name-only report
+updates the slot and the identifier for diagnostics and then returns with no
+position, no liveness and no clock write. `CheckHidIdleRelease` forgets an
+identity whose last evidence is at least the idle window old, admitted or not,
+once no session owns the contact, and logs `hid identity expired slot=...
+latch=0` when no latch held it. A refused admission therefore cannot strand a
+name. A coordinate-only
+device applies its Contact Count and its `(0,0)` rule in the
+tracked branch too, because it cannot assert a tip for the tracked slot. The
+dismiss axis and the panel-acceptance band come from the taskbar itself:
+`SHAppBarMessage(ABM_GETTASKBARPOS)` first, cross-checked against the
+`Shell_TrayWnd`/`Shell_SecondaryTrayWnd` rectangle (flush to the edge and thin
+across it), the work-area inset only when it truly insets, and never the Start
+window's own rect; a probe that names nothing keeps the last axis and band and
+retries on the next open or broadcast. That band is also the strip a reveal
+candidate may start in — `804..900` on this bottom auto-hidden layout, the same
+in both hide states because the hidden bar still measures its 48 DIP — and the
+fixed `kEdgeBandDip` of 12 DIP is only the fallback before a snapshot carries
+one. The open runs exactly one of three paths, in this order: a live takeover (a
+contact still down that has travelled `kAdoptTravelDip`, 24 DIP — a candidate
+promoted at the open instead of waiting for a report it may never get, or a
+contact with none adopted, both from their own down point), the late release
+record below, or the keyboard settle. A tap or a finger resting at the edge has
+not travelled 24 DIP and is not promoted. `gestureOwnsProgress` is
+`g_reveal.active`, that takeover itself and never a candidate, so a candidate the
+open never reaches cannot take the animation away. A contact that lifts before
+the shell opens the menu keeps its travel, mapped position and end speed —
+measured at the release over the same 8-30 ms window — in one `RevealLateRelease`
+record for `kLateRevealWindowMs` (300 ms; the shell's open arrived 107-251 ms
+after the lift here), which the open reads even when a new contact is already
+down, because that contact cannot be the pull that opened the menu, and starts
+the settle at the panel's live position (`TakeProgressNow()`, the off-screen rest
+while it is hidden, because no animation runs through the cloak) with that end
+speed; the mapped position is a diagnostic (`pos=...`), never a start value. A live
+takeover, an admitted newer pull, the consumption and the 300 ms window
+invalidate the record; a new down does not. A contact that starts inside the
+reveal band while the menu is open and moves away from the taskbar is the
+opening pull's tail: at 8 DIP of net travel from its own down point it starts no
+dismiss and settles nothing (`dismiss skipped band tail travel=...`, at most once
+per 500 ms), and a press that starts on the panel takes the ordinary dismiss path
+from its first sample.
+Every gesture outcome settles on one
+damped spring whose shape `AnimationStyle` picks
 (`Windows 11`, damping 1.72, fitted to the native Quick Settings flyout on this
 machine; `Windows 10`, damping 0.9) and whose duration the travel plans:
 `T = clamp(remaining / 2.2 DIP/ms, 160, 520)`, so the 900 DIP panel takes 409 ms.
-Both start at the finger's release speed over the travel left, so a release from
-a hold starts at zero speed instead of jumping. Both close paths then tap
-`VK_LWIN` at the end of that settle: the shell's own key handler performs the
-hide, so the Start toggle stays in step and no re-arm tap exists. A new pull
-during the settle drops the tap before the shell is touched. The Start mod stamps
-`close-mode.txt` with `gesture=0` (or `cancelled` when the tap is dropped) and
-answers a bridge `retract` request with the duration it just planned in
-`retract-plan.txt`; `mods/start-menu-touch-gesture-bridge.wh.cpp` runs in
-`explorer.exe`, passes the Hide at once for the stamp and otherwise holds it for
-that answered duration plus 30 ms, or 560 ms when no answer arrives. Everything
-else in `mods/` is diagnosis.
+That settle is the only settle animation, and the only other `Progress` animation
+is the coast: a 200 ms linear continuation that starts after 8 ms without a
+report and is pinned by the next report or ended by the release. A keyboard open
+runs the settle from rest (`vel=0.00`), the curve is scaled by its own value at
+`T`, so it lands on the target with no step, and `TakeProgressNow()` is the only
+reader that turns the animation's recorded base — its target — into a position,
+so every interruption starts where the panel is. Both styles start at the
+component of the finger's end speed toward the target, over the travel left,
+projected onto the axis, so a release from a hold starts at zero speed instead
+of jumping. That end speed is two checks. Freshness: the newest stored position
+must be no more than 30 ms older than the release, or the answer is 0, so a hold
+whose only reports assert the tip leaves no speed from before the hold. Span:
+from that newest position backward, the oldest sample is the first at least 8 ms
+and at most 30 ms older than it, so the pair is 8-30 ms wide and may lie up to
+60 ms before the release. A reveal reseeds that window at its takeover by
+replaying the contact's own last eight positioned reports through the trail
+mapping, so a menu that opens one or two reports before the lift still measures
+the finger (0.71-0.75 DIP/ms on a moving release, measured); a pull-back whose
+last move goes toward the taskbar is clamped to 0 and is honestly `vel=0.00`.
+100 % of `GestureStartSpeedPercent`
+means that component, not the raw
+release vector; the curve's end-value normalisation adjusts the seam slightly: it
+divides by 0.99249 for `Windows 11` and 0.99589 for `Windows 10` at zero initial
+slope, so 1.007 and 1.004 are example seam factors, not constants, and the first
+keyframe, up to 4 ms in, shows the first segment's average speed instead of the
+analytic seam. Panel and scroller decisions commit inside one lock
+(`g_measureMutex`), which every open, close and teardown epoch bump also takes;
+all XAML measurement stays outside it, and a layout change under a live contact
+is deferred whole and applied once after the release; a work-area change reaches
+the mod only as a broadcast (`WM_SETTINGCHANGE` with `wParam = SPI_SETWORKAREA`,
+`SPI_SETWORKAREA` being `0x002F`), which is why the input window is hidden and
+top-level rather than message-only. The apply reservation
+(`LayoutApplyGuard`) and the admission claim (`ClaimPanelForAdmission`) are the
+two `seq_cst` sides of one handshake: either the layout is deferred whole or
+that admission is refused and retried on the next report. A scalar write that
+throws after an earlier one landed marks the renderer invalid (`gesture renderer
+invalid until a successful reapply`) and refuses gestures until a full reapply.
+The vertical gate surveys every vertically scrollable region under the panel —
+up to six, deepest kept, with `scroller overflow (kept 6 deepest regions)` when
+one is dropped — asks the innermost region containing the press, and lets a
+press outside all of them dismiss, so the app list and the tile grid are both
+gated; a press inside a region that can still scroll is rejected with
+`dismiss deferred to scroll vo=... sh=... region=...`. The survey keeps three
+states, and every remeasure publishes `Unknown` first, so a failed pass cannot
+leave a previous answer speaking; its retries back off 100/200/400 ms for three
+attempts. A gesture close then taps `VK_LWIN` at the end of that settle: the
+shell's own key handler performs the hide, so the Start toggle stays in step and
+no re-arm tap exists. A keyboard close instead has the bridge hold
+`CStartExperienceManager::Hide` for the settle the Start side answers with. A
+new pull during the settle drops the tap before the shell is touched. A close
+exists only once its settle starts:
+`BeginDismissSettle` answers not started, started, or started with a lost batch
+observer (`close observer lost kind=...`), and only a close that provably never
+started restores the panel, through `AbandonClose(kind)`, which is the whole
+operation because such a close published no plan and armed no tap. The image
+is pinned before any thread
+exists (`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`), because `void
+Wh_ModUninit` cannot veto the unload: only a successful pin keeps the module
+mapped until the process exits. The pin and the instance guard are prerequisites:
+either failing returns failure from `Wh_ModInit` with `mod init refused: ...; no
+hook, no channel and no thread installed`, and `g_initRefused` short-circuits
+the later lifecycle callbacks. One instance per process takes
+`Local\WindhawkLegacyStartSwipe.instance.<pid>` before the stop event, the
+channel or any thread, and a second logs `instance guard refused: another
+instance is live in this process` and installs nothing; the name carries the
+PID, so it excludes another instance in that process, not every process in the
+session. Only a clean unload releases the mutex, and a re-initialisation of the
+same pinned image resets the lifecycle state (`ResetReinitState`) and then runs
+one per-activation reset (`ResetActivationState`, logged `activation state
+reset`), which the input thread's exit runs too: it clears the tracked contact,
+the contact latch, both sessions, the close mute, the deferred flag, the pending
+tap and the pull generation it was armed under, the pull serial, the coast, both
+velocity windows, the diagnostic latches and the `anim` override. Every entry
+into module code from the compositor or the dispatcher is counted from before it
+can run
+(`ModuleEntryLease`, `g_moduleEntryCount`); every turn posted through
+`PostCountedUiTurn` is counted, while the unload's revocation turn uses
+`RunAsync` plus an event and waits for it, deliberately not the counted post, so
+the unload knows the revocation ran before it frees what that turn holds. Unload
+is prerequisite-driven:
+the stop event exists before any thread starts (without it no raw-input thread
+runs and the mod logs `hid thread not started (stop event unavailable)`), the
+input thread watches it beside its messages in 10 ms slices, the module-scan
+thread waits on the same event, the 60 ms Windows tap waits on it and always
+releases the key, and unload waits 10 s per worker thread, revokes the XAML
+delegates, checks the settle batch, drains `g_moduleEntryCount` to zero, then
+frees. A thread that misses its wait keeps its handle and leaves every
+resource in place and logs `unload residual=...; process must restart to finish
+unloading`, or `unload entries outstanding=%d` when a counted entry does not
+drain; a joined thread's handle is closed. A XAML revoke that throws keeps its
+token and its owner, because that token is the only handle on a handler that can
+still fire, and a new registration is refused while one is outstanding (`xaml
+size handler left attached; new registration refused`, the same for `loaded`;
+the watches log `xaml layout handler left attached; new registration refused`
+and `xaml viewchanged handler left attached; new registration refused`): that
+root gets no renderer, the layout watch leaves that open to its 400 ms deadline,
+and the scroll pass adds no watcher, with
+`unload residual=xaml handlers; process must restart to finish unloading` while
+one survives. The `SizeChanged` and `Loaded` callbacks
+are gated on the setup generation; the layout watch mints a serial and captures
+its own measurement request by value, so a callback that outlived a newer watch
+measures and revokes nothing; `ScrollerWatch[6]` keeps a separate owner and
+viewer per region, the `ViewChanged` handler captures the viewer it was
+registered on, resolves its slot by that element on the UI thread before it takes
+`g_scrollerMutex`, and writes that region's offsets only under that mutex while
+the cache is `Scrollable`; the cache identity is assigned in the same
+uninterrupted UI-thread step as the commit; an owner whose revoke threw keeps its
+token and its slot, and a replacement registers no watch while it survives
+(`xaml viewchanged handler left attached; new registration refused`). After a
+disable/enable without a host restart, the reused XAML root means
+no new `PrepareRootElement` and no renderer, so a new contact cannot drive the
+panel until the host restarts. The Start mod publishes the close record
+three times (plan at the arm, `tapped` immediately before the tap, cancelled
+when a new pull drops it) and writes the cancelled kind
+again with every new open generation, so no `tapped` stamp survives into the next
+menu. It answers a bridge `retract` request with the duration it just planned, or
+with the no-settle sentinel when the request's open generation is not current,
+names generation 0, its 700 ms deadline passed, or the bridge already marked it
+done; `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.16.0) runs in
+`explorer.exe`, passes the Hide at once for an unconsumed `tapped` record and
+otherwise holds it for that answered duration plus 30 ms, or 560 ms when no
+answer arrives. It binds a `tapped` stamp to the open tick it read and refuses
+one older than that open; a fresh stamp is correlation, not causal identity, and
+a Hide caused by the tap is inferred, not proven. On unload it keeps new Hides
+out and waits for every counted `Hide` call to leave before it closes the v2
+channel: the count is a `HideCallLease` (RAII, exactly one release per frame)
+that spans the original call too, so zero is what makes both that close and the
+trampoline use safe, and the wait has no deadline and one exit. It is a guarantee
+about **counted** frames: a thread already inside the detour but paused before its
+first increment is outside any counter the hook body can keep, and that window
+belongs to the host's hook-removal boundary. Zero logs
+`ipc unload drained waited=... ms`, closes the v2 channel (`ipc close`) and
+returns; that is `drained`. 500 ms is where a call still inside is reported, once
+(`ipc unload drain over 500 ms hides=...`), and every 10 s after that the wait
+reports `ipc unload stalled hides=... waited=... ms`; `stalled` is a periodic
+status, not an outcome, since the same unload can report it and then reach zero and
+log `drained`. A Hide that does not return, because the shell
+call under it never came back or a debugger suspended its thread, blocks the
+Windhawk reload until it resumes. Measured on this machine: the disable landed
+inside a 439 ms hold (`hide delayed reason=1 retract=409 lead=439`) and the drain
+reached zero at `ipc unload drained waited=16 ms`, then `ipc close`; the CLI
+returns in 30 ms while the engine applies the unload about 440 ms later, so the
+drain is reachable and the `stalled` branch stays code-path only, because nothing
+available makes `Hide_Original` or `FileLog` hang.
+Windhawk 2.0.0-alpha.8 disables the hooks, calls `Wh_ModUninit`, then waits
+`ThreadsCallStackWaitForRegions(..., 200, 400)` before removing hooks and
+`FreeLibrary`, and discards that wait's result: "the scan found the frame" and
+"the frame exited before removal" are two different claims, and only the first is
+the host's. The bridge pins its own image as a prerequisite
+(`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`); a failed pin
+returns FALSE and installs nothing (`mod init refused: the image could not be
+pinned; no hook, no channel and no thread installed`, or `mod pin failed
+err=...`), because a shell-owned `Hide` thread needs valid return code as much as
+a worker would, and the pin keeps a frame that returns after `Wh_ModUninit` in
+mapped code with its lease still releasing. A re-enable re-initialises the same
+image and refuses while `g_hideCalls` is nonzero (`mod init refused: a Hide from
+the previous activation is still inside; ...`); otherwise `ResetReinitState()`
+clears `g_disabled`, `g_afterInit`, `g_explorerHooked`, `g_hideDelayEnabled` and
+`g_startPointTick`, retries a failed gesture mapping, leaves `g_hideCalls` alone,
+and logs `activation state reset`; a drained unload closes the channel before
+`Wh_ModUninit` returns, so a re-enable opens a fresh one, and `Wh_ModInit` still
+reuses a channel `g_ipc` already holds instead of mapping a second one over it.
+The older `start_gesture_shared.h` mapping stays for the process lifetime on
+purpose, because a consumer and a late gesture callback may still hold its view.
+The two processes talk only through `mods/swipe_ipc_shared.h` (v2): one session-local
+section, three events and one command mutex, every record a seqlock with its own
+counter, every field pinned by an `offsetof` assert (672 bytes), so nothing polls
+and an answer cannot be mistaken for an earlier one. `SwipeIpcOpen` may wait up to
+the whole 550 ms init budget, so a young claim is abandoned inside the call;
+`SwipeIpcReadOpen` refuses generation 0 with `ERROR_NOT_READY`, and an `initState`
+outside the four defined values is refused at once with `ERROR_INVALID_DATA`
+instead of being waited on. Both hook probes first prove that the inspected
+range lies in an executable section of the loaded image, so
+`startui root hook skipped (target not readable)` is a distinct line from a build
+or prologue mismatch. `tools/ipc.ps1` is the only command publisher and takes
+the mutex. Everything else in `mods/` is diagnosis.
 
 Laws: measure before designing · one data source per claim · docs and code move together
 

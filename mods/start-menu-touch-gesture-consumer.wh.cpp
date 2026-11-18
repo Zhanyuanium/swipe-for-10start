@@ -3,7 +3,7 @@
 // @name            Start Menu Touch Gesture Consumer (Probe)
 // @description     Reads the explorer gesture bridge and logs the live handle/state (no UI changes)
 // @version         0.1.0
-// @author          doubao
+// @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
 // @compilerOptions -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"

@@ -2,6 +2,9 @@
 # Frame time is ms from the window becoming visible (1 ms IsWindowVisible poll).
 # dy = px the panel content sits above its settled place; travel 1156 px = 578 DIP.
 # d = 1 - dy/1156 (open) or dy/1156 (close), normalised displacement 0..1.
+# Captured with the earlier loop: t was stamped after the BitBlt and its copy,
+# so it is late by that read-back (a few ms). New captures stamp before the
+# BitBlt and record the copy cost as cap=.
 t_ms,dy_px,d
 29.7,527,0.544
 37.5,458,0.604

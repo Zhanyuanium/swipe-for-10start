@@ -3,7 +3,7 @@
 // @name            Start Menu Input Probe
 // @description     Subclasses the CoreMessaging input windows and decodes raw touch HID reports
 // @version         0.2.0
-// @author          doubao
+// @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
 // @compilerOptions -luser32 -lhid -Wall -Wextra

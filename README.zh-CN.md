@@ -1,0 +1,62 @@
+[English](README.md) | **简体中文**
+
+# swipe-for-10start
+
+ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；本模组为它加上触摸和手写笔滑动手势。从任务栏所在的屏幕边缘划入，菜单会跟随手指打开；把已打开的菜单往该边缘拖回，菜单会滑出并关闭。用键盘打开或关闭菜单时播放同一套动画。由 Zhanyuanium 开发，以 Windhawk 模组形式发布。
+
+## 你需要什么
+
+- **Windows 11**，且 **ExplorerPatcher** 已设置为 Windows 10（经典）开始菜单（`Start_ShowClassicMode=1`）。已在 Windows 11 build 26300.9974 和
+  ExplorerPatcher 26100.9711 上验证。
+- **Windhawk** 2.0 或更高版本。
+- 触摸屏或手写笔。（本模组刻意不响应鼠标拖动。）
+
+## 两个模组
+
+两个模组配套发布，两个都装才有完整体验：
+
+- **Start menu legacy swipe**（`start-menu-legacy-swipe`）——负责手势本身：边缘划入打开、跟随手指、拖动关闭，以及滑动动画。
+- **Start menu touch gesture bridge**（`start-menu-touch-gesture-bridge`）——运行在 Explorer 中，使菜单在按 Windows 键或点击别处关闭时也播放滑出动画。没有它，菜单照常关闭，只是瞬间消失。
+
+## 安装
+
+在 Windhawk 界面中安装两个模组，或在以管理员身份运行的 PowerShell 中执行：
+
+```powershell
+& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-legacy-swipe.wh.cpp
+& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-touch-gesture-bridge.wh.cpp
+& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod enable local@start-menu-touch-gesture-bridge
+```
+
+然后重启 `StartMenuExperienceHost.exe`（任务管理器 → 详细信息 →
+`StartMenuExperienceHost.exe` → 结束任务，它会自动重启），或者注销并重新登录——模组只能在菜单进程创建窗口时挂载。`mod install` 不会启用先前被禁用的模组，所以上面那条 `enable` 命令是 Windows 键关闭动画所必需的；bridge 启用时会挂钩 Explorer，在当前系统版本上不必重启它。
+
+## 设置项
+
+- **菜单动画样式**（`AnimationStyle`，默认 `Windows 11`）——滑动动画的曲线形状。`Windows 11` 拟合自系统自带面板（快速设置弹出面板）的动作；`Windows 10` 是本模组最初发布时的手感，弹簧更松，可能略微过冲。两者跑的是同一条弹簧——这个选择只改手感，不改机制——同一个选择也决定按 Windows
+  键开合菜单时的动画。
+- **动画起步速度（占滑动速度的百分比）**（`GestureStartSpeedPercent`，默认 100，范围 0–300）——松手瞬间菜单继续滑动的速度，取手指朝菜单目标方向的速度分量的百分比。100 表示按手指速度继续；更大的值甩得更快；0 总是从静止起步。手指停住再抬起时无论设多少都从静止起步；用
+  Windows 键打开也总是从静止起步——这两种情况都不受这个设置影响。
+
+## 适用的场景
+
+- 任务栏在**左侧**、**顶部**或**底部**——已验证。**右侧**走的是同一代码路径，早前验证过，但未在当前环境上验证。支持**自动隐藏**（日常使用就是这个配置）。
+- **触摸**可用。**手写笔**输入已解码（悬停被忽略），但尚未在真机上实测过。
+- 任务栏在顶部或底部时，在已打开的菜单里上下滑动，会先滚动手指下方的内容（应用列表，或固定磁贴的网格）；等这块区域滚到底，同一次滑动才开始关闭菜单。
+- 从屏幕边缘稍微靠里一点起手——大约半个任务栏高，也就是系统自带滑动的起手范围——菜单会打开，并且从出现的那一帧起就跟随手指。起手位置更靠里则不会打开菜单：只有任务栏边缘能打开它。
+- 鼠标拖动刻意未启用。
+
+## 上手一试
+
+- 从任务栏边缘划入：菜单打开并跟随手指。从稍微靠里一点（约半个任务栏高）起手也会跟随手指，不会在手底下直接弹开。快速一甩若在菜单出现之前就离手，菜单也会顺着这股速度从屏幕边缘升起，而不是先停一下、再以半开的样子出现。拉得短或往回推会弹回去；拉得更长或快速一甩则保持打开。
+- 菜单打开时，把它往任务栏边缘拖即可关闭——任务栏在顶部或底部时拖过约十分之一行程（在侧边时约五分之一），或快速一甩，就构成一次关闭手势，菜单随之滑出。
+- 按 Windows 键：打开和关闭时播放同一套动画。
+
+## 如果看起来不对
+
+- 模组日志写在各自的 Windhawk 存储目录：`C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\renderer.log`
+  和 `...\local@start-menu-touch-gesture-bridge\bridge.log`。
+- 禁用再启用模组后要重启 `StartMenuExperienceHost.exe`——手势无法挂到已经存在的菜单窗口上。
+- 本模组要求 `StartUI_.dll` 的版本正好是 `10.0.22621.3733`；版本不符则不启动任何手势，日志里会看到 `startui root hook skipped ...`。
+- 拖动菜单期间，菜单内容仍在原位置接收触摸——这是已知限制；另一条已知限制：本模组假设触摸面板覆盖主显示器。
+- 完整的技术文档在 [docs/](docs/README.md)（英文），其中有测量数据、被证伪的方案和每项设计决定的理由，也包括完整的[已知限制列表](docs/limits.md)。
