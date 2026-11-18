@@ -330,9 +330,11 @@ the setup generation when they are registered and return when it has moved, so a
 late callback from the previous root touches nothing. The layout watch mints a
 serial and captures its own measurement request by value, so a callback that
 outlived a newer watch measures and revokes nothing. The `ViewChanged` handler
-captures the `ScrollViewer` it was registered on and may write the cached
-offsets only while that element is `g_scrollerCacheViewer` and the cache is
-`Scrollable`, both under `g_scrollerMutex`.
+captures the `ScrollViewer` it was registered on and tests that element against
+`g_scrollerCacheViewer` on the UI thread, before it takes any lock; the
+`Scrollable` test and the offset writes are under `g_scrollerMutex`. The cache
+identity is assigned in the same uninterrupted UI-thread step as the commit, so
+no handler can see a new rect under the old element's name.
 
 That drain is only meaningful because the image cannot go away. The pin and the
 instance guard are the two prerequisites of `Wh_ModInit`: either failing returns
@@ -600,13 +602,16 @@ Instead the mod takes over after the shell opens the window:
   retry, and a replacement registers no watch while it survives
   (`xaml viewchanged handler left attached; new registration refused`).
   `g_scrollerCacheViewer` is the element the committed rect and offsets were
-  measured from. A `ViewChanged` handler may write the cached offsets only
-  while the element it was registered on is that cache viewer and the cache is
-  `Scrollable`, both under `g_scrollerMutex`. When a replacement cannot be
-  watched, the gate keeps the new element's rect and the offsets that same pass
-  read — the correct list, possibly with stale end-of-list numbers — instead of
-  going `Unknown`, which would defer every press inside the panel for the rest
-  of that open. A positive candidate commits even when another branch was
+  measured from. A `ViewChanged` handler reads its own element's offsets and tests
+  on the UI thread, before it takes `g_scrollerMutex`, that the element it was
+  registered on is that cache viewer; the `Scrollable` test and the writes are
+  under the mutex. The cache identity moves in the same uninterrupted UI-thread
+  step as the commit, with no XAML call and no message pump between them, so no
+  handler can see the new rect under the old element's name. When a replacement
+  cannot be watched, the gate keeps the new element's rect and the offsets that
+  same pass read — the correct list, possibly with stale end-of-list numbers —
+  instead of going `Unknown`, which would defer every press inside the panel for
+  the rest of that open. A positive candidate commits even when another branch was
   unreadable, because refusing it would leave the gate Unknown for certain.
   Scrollable carries the rect and offsets, and a downward press
   inside it only starts a dismiss when the list is already at its end
@@ -680,7 +685,7 @@ is closed after the down, so the only in-process source is the digitizer itself.
 - **`mods/inputprobe.wh.cpp`** — diagnostic: raw HID decoding without the gesture
   logic. **Do not enable it together with the shipping mod**: Raw Input allows one
   sink per usage per process, and inputprobe takes the stream for itself.
-- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`, 0.15.0) —
+- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`, 0.16.0) —
   hooks `CStartExperienceManager::Hide`. Only a Hide on a `tapped` close record
   the bridge has not consumed, inside the record's 800 ms window and not older
   than the newest open tick it saw, runs at once (`hide passed (gesture)`); the
@@ -698,13 +703,17 @@ is closed after the down, so the only in-process source is the digitizer itself.
   reads anything) that spans the original call, so a count of zero also means no
   frame of that hook can still need the MinHook trampoline. On unload it keeps
   new Hides out and waits for that count to reach zero before it closes the v2
-  channel (`ipc close`); quiescence is the condition, and 500 ms is only the mark
-  where a call still live is reported
-  (`ipc unload drain over 500 ms hides=...; still waiting for quiescence`). The
-  drain's bound is 10 s — above the mod's own hold (660 ms for the shipped pair,
-  at most 2.13 s for any answer the channel accepts) and with room for a thread
-  the scheduler kept off the CPU — and a Hide that reaches it keeps every handle
-  (`ipc unload residual hides=...; the v2 channel stays until explorer exits`).
+  channel; the wait has no deadline and one exit. Zero logs
+  `ipc unload drained waited=... ms`, closes the v2 channel, logs `ipc close` and
+  returns; that is `drained`. 500 ms is where the wait first reports a call that
+  is still inside, once (`ipc unload drain over 500 ms hides=...`), and every 10 s
+  after that it reports `ipc unload stalled hides=... waited=... ms`; that is
+  `stalled`, the second terminal word: the count is nonzero and nothing else
+  happens — no close, no return, no handle closed. Both reports are diagnostics;
+  neither ends the wait. A Hide that does not return, because the shell call
+  under it never came back or a debugger suspended its thread, blocks the
+  Windhawk reload until it resumes: that is the price of never handing the host a
+  trampoline a live frame can still call.
   The host order was established from the installed engine's upstream tag
   (`Windhawk v2.0.0-alpha.8`, `src/windhawk/engine/mods_manager.cpp`): disable
   hooks, `Wh_ModUninit`, `ThreadsCallStackWaitForRegions(..., 200, 400)`, remove
@@ -728,8 +737,9 @@ is closed after the down, so the only in-process source is the digitizer itself.
   otherwise `ResetReinitState()` clears `g_disabled`, `g_afterInit`,
   `g_explorerHooked`, `g_hideDelayEnabled` and `g_startPointTick`, retries a
   failed gesture mapping, leaves `g_hideCalls` alone, and logs
-  `activation state reset`; a channel a timed-out unload kept open is reused
-  rather than remapped.
+  `activation state reset`; a drained unload closes the channel before it
+  returns, so a re-enable opens a fresh one. `Wh_ModInit` still reuses a channel
+  `g_ipc` already holds instead of mapping a second one over it.
   The `Local\WindhawkStartGestureShared` mapping stays for the process lifetime
   on purpose, because a consumer and a late gesture callback may still hold its
   view. **Enable it together with the Start mod**
@@ -928,14 +938,20 @@ publishes the close record.
   is logged (`hide delayed reason=1 retract=520 lead=550` on the left taskbar of
   this machine, whose 1440 DIP travel hits the 520 ms clamp); the Windows-key
   close reported 1 on this build. The gesture path does not wait.
-- Two limits here are code-path arguments, not measurements. With the CLI as the
-  lever, the bridge's drain/residual path cannot be reached: CLI-plus-engine
-  latency exceeds the 660 ms maximum hold of the shipped pair (100 ms answer wait
-  plus the 560 ms fallback; the shipped settle is clamped to 520 ms), while a
-  tap-to-cloaked run measured 574-592 ms. The two handles one pinned image keeps
-  (the gesture mapping and its event) are below explorer's handle-count noise
-  (±60), and a version change leaves the older image's pair too. Both are reasoned
-  from the code paths above, not observed as failures.
+- The bridge's drain was reached, so it is measured, not hypothetical, and its
+  marks are not a bound. An elevated agent disabled the bridge within ~2 ms of a
+  trigger file and tapped Win 333 ms later, and the unload landed inside the
+  439 ms hold: `hide reason=1`, `hide delayed reason=1 retract=409 lead=439`,
+  `ipc unload drained waited=16 ms`, `ipc close`. The CLI does return early — it
+  was measured at 30 ms — while the engine applies the unload about 440 ms later;
+  the 16 ms is the held wait ending at `g_disabled`, plus the drain's 10 ms poll
+  step. The drain is therefore reachable, measured at
+  `waited=16 ms`; the `stalled` branch stays code-path only, because nothing
+  available makes `Hide_Original` or `FileLog` hang. The two handles one pinned
+  image keeps (the gesture mapping and its event) are below explorer's
+  handle-count noise (±60), so that instrument cannot see a two-handle effect, and
+  a version change leaves the older image's pair too. That limit is reasoned from
+  the code, not observed as a failure.
 - The close record is an 800 ms window. A gesture close publishes the plan at
   its release and the `tapped` record immediately before the tap; a dropped close
   publishes the cancelled kind at once, and the tap's deadline republication is

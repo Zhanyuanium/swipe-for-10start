@@ -138,9 +138,11 @@ one survives. The `SizeChanged` and `Loaded` callbacks
 are gated on the setup generation; the layout watch mints a serial and captures
 its own measurement request by value, so a callback that outlived a newer watch
 measures and revokes nothing; the `ViewChanged` handler captures the viewer it
-was registered on and may write the cached offsets only while that element is
-`g_scrollerCacheViewer`, the element the committed rect was measured from, and
-the cache is `Scrollable`, both under `g_scrollerMutex`; `g_scrollerWatchOwner`
+was registered on, tests that element against
+`g_scrollerCacheViewer`, the element the committed rect was measured from, on the
+UI thread before it takes `g_scrollerMutex`, and writes the cached offsets only
+under that mutex while the cache is `Scrollable`; the cache identity is assigned
+in the same uninterrupted UI-thread step as the commit; `g_scrollerWatchOwner`
 is the separate element whose token must still be revoked, kept for a retry
 when its revoke threw, and a replacement registers no watch while it survives
 (`xaml viewchanged handler left attached; new registration refused`). After a
@@ -153,21 +155,29 @@ again with every new open generation, so no `tapped` stamp survives into the nex
 menu. It answers a bridge `retract` request with the duration it just planned, or
 with the no-settle sentinel when the request's open generation is not current,
 names generation 0, its 700 ms deadline passed, or the bridge already marked it
-done; `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.15.0) runs in
+done; `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.16.0) runs in
 `explorer.exe`, passes the Hide at once for an unconsumed `tapped` record and
 otherwise holds it for that answered duration plus 30 ms, or 560 ms when no
 answer arrives. It binds a `tapped` stamp to the open tick it read and refuses
 one older than that open; a fresh stamp is correlation, not causal identity, and
 a Hide caused by the tap is inferred, not proven. On unload it keeps new Hides
 out and waits for every counted `Hide` call to leave before it closes the v2
-channel (`ipc close`): the count is a `HideCallLease` (RAII, exactly one release
-per frame) that spans the original call too, so quiescence is what makes both
-that close and the trampoline use safe, and 500 ms is only where a call still
-live is reported (`ipc unload drain over 500 ms hides=...; still waiting for
-quiescence`); the drain's own bound is 10 s, above the mod's hold (660 ms for the
-shipped pair, at most 2.13 s for any answer the channel accepts), and a Hide that
-reaches it keeps every handle
-(`ipc unload residual hides=...; the v2 channel stays until explorer exits`).
+channel: the count is a `HideCallLease` (RAII, exactly one release per frame)
+that spans the original call too, so zero is what makes both that close and the
+trampoline use safe, and the wait has no deadline and one exit. Zero logs
+`ipc unload drained waited=... ms`, closes the v2 channel (`ipc close`) and
+returns; that is `drained`. 500 ms is where a call still inside is reported, once
+(`ipc unload drain over 500 ms hides=...`), and every 10 s after that the wait
+reports `ipc unload stalled hides=... waited=... ms`; that is `stalled`, the
+other terminal word, where the count is nonzero and nothing else happens — no
+close, no return, no handle closed. A Hide that does not return, because the shell
+call under it never came back or a debugger suspended its thread, blocks the
+Windhawk reload until it resumes. Measured on this machine: the disable landed
+inside a 439 ms hold (`hide delayed reason=1 retract=409 lead=439`) and the drain
+reached zero at `ipc unload drained waited=16 ms`, then `ipc close`; the CLI
+returns in 30 ms while the engine applies the unload about 440 ms later, so the
+drain is reachable and the `stalled` branch stays code-path only, because nothing
+available makes `Hide_Original` or `FileLog` hang.
 Windhawk 2.0.0-alpha.8 disables the hooks, calls `Wh_ModUninit`, then waits
 `ThreadsCallStackWaitForRegions(..., 200, 400)` before removing hooks and
 `FreeLibrary`, and discards that wait's result: "the scan found the frame" and
@@ -184,8 +194,9 @@ image and refuses while `g_hideCalls` is nonzero (`mod init refused: a Hide from
 the previous activation is still inside; ...`); otherwise `ResetReinitState()`
 clears `g_disabled`, `g_afterInit`, `g_explorerHooked`, `g_hideDelayEnabled` and
 `g_startPointTick`, retries a failed gesture mapping, leaves `g_hideCalls` alone,
-and logs `activation state reset`; a channel a timed-out unload kept is reused
-rather than remapped.
+and logs `activation state reset`; a drained unload closes the channel before
+`Wh_ModUninit` returns, so a re-enable opens a fresh one, and `Wh_ModInit` still
+reuses a channel `g_ipc` already holds instead of mapping a second one over it.
 The older `start_gesture_shared.h` mapping stays for the process lifetime on
 purpose, because a consumer and a late gesture callback may still hold its view.
 The two processes talk only through `mods/swipe_ipc_shared.h` (v2): one session-local

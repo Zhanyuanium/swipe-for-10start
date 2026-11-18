@@ -1605,10 +1605,12 @@ BOOL Wh_ModInit() {
     // of this attachment, which the budget makes reachable only for a section
     // that cannot be initialised at all.
     //
-    // A re-enable of the pinned image meets the previous activation's channel
-    // only when that activation left it open (an unload that never ran to
-    // completion). SwipeIpcOpen would map a second channel over the globals and
-    // leak the first, so the survivor is reused exactly as it stands.
+    // A re-enable of the pinned image starts with no channel, because a drained
+    // unload closes it before Wh_ModUninit returns. The reuse below therefore only
+    // covers the states that precede the channel: a refused activation that never
+    // opened one, or a channel this same activation already holds. SwipeIpcOpen
+    // would map a second channel over the globals and leak the first, so a
+    // survivor is reused exactly as it stands.
     bool created = false;
     DWORD ipcError = 0;
     const bool channelOpen = g_ipc.state != nullptr;
