@@ -701,19 +701,22 @@ is closed after the down, so the only in-process source is the digitizer itself.
   which the shipping mod does not read. The in-flight `Hide` count is a
   `HideCallLease` (RAII, exactly one release per frame, taken before the hook
   reads anything) that spans the original call, so a count of zero also means no
-  frame of that hook can still need the MinHook trampoline. On unload it keeps
+  **counted** frame of that hook can still need the MinHook trampoline; a thread
+  already redirected into the detour but paused before its first increment is
+  outside any counter the hook body can keep, and that window belongs to the
+  host's hook-removal boundary. On unload it keeps
   new Hides out and waits for that count to reach zero before it closes the v2
   channel; the wait has no deadline and one exit. Zero logs
   `ipc unload drained waited=... ms`, closes the v2 channel, logs `ipc close` and
   returns; that is `drained`. 500 ms is where the wait first reports a call that
   is still inside, once (`ipc unload drain over 500 ms hides=...`), and every 10 s
-  after that it reports `ipc unload stalled hides=... waited=... ms`; that is
-  `stalled`, the second terminal word: the count is nonzero and nothing else
-  happens — no close, no return, no handle closed. Both reports are diagnostics;
+  after that it reports `ipc unload stalled hides=... waited=... ms`; `stalled`
+  is a periodic status, not an outcome: the same unload can report it and then
+  reach zero and log `drained`. Both reports are diagnostics;
   neither ends the wait. A Hide that does not return, because the shell call
   under it never came back or a debugger suspended its thread, blocks the
   Windhawk reload until it resumes: that is the price of never handing the host a
-  trampoline a live frame can still call.
+  trampoline a counted frame can still call.
   The host order was established from the installed engine's upstream tag
   (`Windhawk v2.0.0-alpha.8`, `src/windhawk/engine/mods_manager.cpp`): disable
   hooks, `Wh_ModUninit`, `ThreadsCallStackWaitForRegions(..., 200, 400)`, remove

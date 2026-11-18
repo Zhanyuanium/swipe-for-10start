@@ -164,13 +164,16 @@ a Hide caused by the tap is inferred, not proven. On unload it keeps new Hides
 out and waits for every counted `Hide` call to leave before it closes the v2
 channel: the count is a `HideCallLease` (RAII, exactly one release per frame)
 that spans the original call too, so zero is what makes both that close and the
-trampoline use safe, and the wait has no deadline and one exit. Zero logs
+trampoline use safe, and the wait has no deadline and one exit. It is a guarantee
+about **counted** frames: a thread already inside the detour but paused before its
+first increment is outside any counter the hook body can keep, and that window
+belongs to the host's hook-removal boundary. Zero logs
 `ipc unload drained waited=... ms`, closes the v2 channel (`ipc close`) and
 returns; that is `drained`. 500 ms is where a call still inside is reported, once
 (`ipc unload drain over 500 ms hides=...`), and every 10 s after that the wait
-reports `ipc unload stalled hides=... waited=... ms`; that is `stalled`, the
-other terminal word, where the count is nonzero and nothing else happens — no
-close, no return, no handle closed. A Hide that does not return, because the shell
+reports `ipc unload stalled hides=... waited=... ms`; `stalled` is a periodic
+status, not an outcome, since the same unload can report it and then reach zero and
+log `drained`. A Hide that does not return, because the shell
 call under it never came back or a debugger suspended its thread, blocks the
 Windhawk reload until it resumes. Measured on this machine: the disable landed
 inside a 439 ms hold (`hide delayed reason=1 retract=409 lead=439`) and the drain

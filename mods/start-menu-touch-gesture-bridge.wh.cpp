@@ -1606,11 +1606,9 @@ BOOL Wh_ModInit() {
     // that cannot be initialised at all.
     //
     // A re-enable of the pinned image starts with no channel, because a drained
-    // unload closes it before Wh_ModUninit returns. The reuse below therefore only
-    // covers the states that precede the channel: a refused activation that never
-    // opened one, or a channel this same activation already holds. SwipeIpcOpen
-    // would map a second channel over the globals and leak the first, so a
-    // survivor is reused exactly as it stands.
+    // unload closes it before Wh_ModUninit returns; a refused activation never
+    // opened one. Either way, do not map over a channel this process already
+    // holds: SwipeIpcOpen would leak the first and swap the globals under it.
     bool created = false;
     DWORD ipcError = 0;
     const bool channelOpen = g_ipc.state != nullptr;
