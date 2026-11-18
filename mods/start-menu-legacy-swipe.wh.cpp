@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.28.0
+// @version         0.29.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -147,13 +147,16 @@ What it does:
   gesture. When several slots carry the same identifier, one that asserts contact
   wins over one that merely carries the name; if two assert it, the tracked slot
   is taken and the ambiguity is logged once. A report from another device cannot
-  move or lift it. The tracked identity has its own last-seen clock: every report
-  that names it refreshes that clock, and the same 18 ms idle tick that ends a
-  contact forgets an identity no report has named since, independently of the
+  move or lift it. The tracked identity has its own evidence clock: a report
+  moves it by asserting the contact or by carrying a point this decoder feeds for
+  it, never by merely naming it, and the same 18 ms idle tick that ends a contact
+  forgets an identity whose last evidence is that old, independently of the
   contact latch. A report the decoder tracked while a layout apply refused
-  admission therefore leaves no identity behind to lock out the next finger. A
-  pen report with `In Range` set and `Tip Switch` clear is a hover and drives
-  nothing, because a slot with the tip up is not a contact; a pen lift ends the
+  admission therefore leaves no identity behind to lock out the next finger, and
+  a device that keeps reporting an unused slot's retained identifier cannot hold
+  the tracker with reports that prove nothing. A pen report with `In Range` set
+  and `Tip Switch` clear is a hover and drives nothing, because a slot with the
+  tip up is not a contact; a pen lift ends the
   contact even while coordinates keep arriving. The one fallback is a device that
   exposes neither Tip Switch nor In Range: no report can then say whether a slot
   is real, so the count/position path is used and its count and positioned
@@ -191,18 +194,21 @@ What it does:
   velocity exceeds 0.45 DIP/ms. Both outcomes settle with the style the setting
   selects: a commit retracts `Progress` to 0, a cancel returns it to 1. The
   settle's initial velocity is the gesture's **end** speed, not its average: it
-  is measured from the reports inside a window of at most 30 ms and at least
-  8 ms before the release, in `Progress` units (the quantity the follow inserts),
-  and the elapsed time is the one between the first and the last report of that
-  window. A contact that moved the panel nowhere in that window reports 0, so a
-  finger dragged 300 DIP, held still for 1.2 s and released starts the settle
-  from rest; the old whole-gesture `travel / elapsed` reported 0.20 DIP/ms and
-  left the seam at a speed the finger did not have. The window is measured back
-  from the release: a newest position more than 30 ms older than the release
-  answers 0, so a finger that flicked and then only asserted its tip down through
-  a long hold does not hand the settle the speed from before the hold. The speed
-  is signed along the gesture axis and projected onto the settle's direction: a release still
-  moving away from its target (a pull back before letting go) contributes 0 and
+  comes from two checks, and they are separate. First freshness: the newest
+  stored position must be no more than 30 ms older than the release, or the
+  answer is 0, so a finger that flicked and then only asserted its tip down
+  through a long hold does not hand the settle the speed from before the hold.
+  Then the span: 8-30 ms measured backward from that newest position, not from
+  the release, so the window may lie up to 60 ms before the release when the
+  stream paused just before the lift. The speed is the change in `Progress` (the
+  quantity the follow inserts) across that span divided by its elapsed time, the
+  time between the oldest and the newest report of the window. A contact that
+  moved the panel nowhere in the window reports 0, so a finger dragged 300 DIP,
+  held still for 1.2 s and released starts the settle from rest; the old
+  whole-gesture `travel / elapsed` reported 0.20 DIP/ms and left the seam at a
+  speed the finger did not have. The speed is signed along the gesture axis and
+  projected onto the settle's direction: a release still moving away from its
+  target (a pull back before letting go) contributes 0 and
   the settle starts from rest instead of backwards. The unit is `Progress` per
   ms, so one estimator serves both families and the settle divides by the travel
   in the same units. The tap that closes is armed for the end of that settle.
@@ -238,8 +244,14 @@ What it does:
   so a pass that ends without an answer (a throw, the depth limit, an unreadable
   viewer) never leaves a previous `Nothing` or `Scrollable` speaking for a tree it
   did not measure; a completed negative result also revokes the old `ViewChanged`
-  watch. The retry that follows is bounded: 100, 200 and 400 ms, then
-  `scroller retry exhausted gen=...` and the gate stays `Unknown` for that open.
+  watch. Two roles that used to share one variable are now separate: the object
+  whose registration token must still be revoked (it outlives a revoke that
+  threw) and the object the committed rect was measured from, which is the only
+  one whose handler may refresh the cached offsets. So a watch whose revoke
+  failed keeps its token and stops writing instead of writing another list's
+  numbers into the rect the gate tests. The retry that follows is bounded: 100,
+  200 and 400 ms, then `scroller retry exhausted gen=...` and the gate stays
+  `Unknown` for that open.
 - The settle has two styles, and one setting picks the parameter set for all
   four outcomes: the dismiss commit and cancel, the reveal commit and cancel.
   Both styles run the same damped-spring generator in normalized travel
@@ -579,7 +591,10 @@ Unload:
   overwrite a surviving token (`xaml layout handler left attached; new
   registration refused`, the same for `viewchanged`), and the layout watch and
   the scroller watch carry the request or element they were created for, so an
-  old callback can neither advance nor revoke a newer watch.
+  old callback can neither advance nor revoke a newer watch; the scroller's
+  handler is authorized by the cache's identity, not by its registration, so a
+  watch that survived its revoke cannot write the offsets of a rect it does not
+  own.
 - Every entry into module code from the compositor or the dispatcher is counted
   from before it can run. The settle batch's `Completed` registration takes a
   counted entry before the batch is ended, and every UI turn that touches module
@@ -620,17 +635,17 @@ Settings:
   "Animation start speed (% of swipe speed)", is the settle's start speed as
   a percentage of the estimated end speed component toward the target over the
   travel left, in either style. 100 continues at that component, so the seam
-  has no speed step: the end speed is measured over the last 8-30 ms of reports,
-  projected onto the settle's direction, and the curve's own end-value scale
-  (about 0.993, see above) divides the whole motion. It is not the raw release
-  vector: a finger moving sideways or back toward where it came from hands the
-  settle only the part that moves the panel toward where it is going. Higher
-  snaps away faster; 0 starts from rest, which a finger held still reports
-  anyway. The end speed is the last 8-30 ms of
-  reports, and its newest position must be no more than 30 ms older than the
-  release: a hold before the lift reports 0 where a whole-gesture average
-  reported the drag's speed, and a finger that only asserts its tip down after
-  the motion reports 0 too. Windows-key opens and closes
+  has no speed step: the end speed comes from the newest 8-30 ms of reports that
+  is still fresh at the lift, projected onto the settle's direction, and the
+  curve's own end-value scale (about 0.993, see above) divides the whole motion.
+  It is not the raw release vector: a finger moving sideways or back toward
+  where it came from hands the settle only the part that moves the panel toward
+  where it is going. Higher snaps away faster; 0 starts from rest, which a
+  finger held still reports anyway. The end speed is the 8-30 ms of reports
+  ending at the newest position, and that position must be no more than 30 ms
+  older than the release: a hold before the lift reports 0 where a whole-gesture
+  average reported the drag's speed, and a finger that only asserts its tip down
+  after the motion reports 0 too. Windows-key opens and closes
   have no finger speed and always start from rest, so this setting does not
   change them; the style does. `Wh_ModInit` reads it once into an atomic and
   logs `settle start speed=...`; `Wh_ModSettingsChanged` refreshes the
@@ -745,6 +760,9 @@ Diagnostics:
   its Contact Identifier or by its contact-node index),
   `hid contact id=... declared down in ... slots; using=...` once per activation
   when two slots assert the same identifier,
+  `hid identity expired slot=... latch=0` when the tracked identity's last
+  evidence is older than the idle window and no contact latch holds it — the
+  refused-admission case, which no lift and no latch cleanup could release,
   `attached root=...`, `dismiss axis=...` (with `src=appbar|bar|work` and what
   every source said), `dismiss axis=... kept, no source named an edge` (once per
   undecided episode; the last edge stays in force), `debug p=...`, `debug t=...`,
@@ -930,12 +948,14 @@ Known risks:
   $name: Animation start speed (% of swipe speed)
   $description: >-
     How fast the menu keeps moving at the instant you lift your finger. The
-    speed is measured from the last 8-30 ms of reports and projected onto the
-    direction the menu is about to move: 100 continues at that component, a
-    higher value snaps it away faster (up to 300), 0 starts from a standstill.
-    A finger held still has no speed to carry, and sideways motion does not
-    count, because only the part toward the target enters the motion. Neither
-    do Windows-key opens and closes: they start from rest whatever you set.
+    speed is measured from an 8-30 ms window of reports that ends at the newest
+    point, which must itself be no more than 30 ms before you lift, and it is
+    projected onto the direction the menu is about to move: 100 continues at
+    that component, a higher value snaps it away faster (up to 300), 0 starts
+    from a standstill. A finger held still has no speed to carry, and sideways
+    motion does not count, because only the part toward the target enters the
+    motion. Neither do Windows-key opens and closes: they start from rest
+    whatever you set.
 */
 // ==/WindhawkModSettings==
 
@@ -1025,7 +1045,9 @@ Known risks:
  *   its owner are cleared only after the removal succeeded, a registration that
  *   survived its revoke is never overwritten by the next root, so the handle
  *   to retry it is not lost, and each watch carries the request or element it
- *   was created for so an old callback cannot drive a newer one. Every entry
+ *   was created for so an old callback cannot drive a newer one; the scroller's
+ *   handler is authorized by the cache's element, not by its registration, so a
+ *   watch that survived its revoke writes nothing. Every entry
  *   into module code from the compositor or the dispatcher is counted from before
  *   it can run: the batch's Completed registration takes a counted entry before
  *   the batch is ended, and every posted UI turn that touches module state takes
@@ -1077,10 +1099,14 @@ Known risks:
  *   value at the duration (about 0.993 on a normal settle). `Windows 11` (the
  *   default) keeps damping 1.72, fitted on this
  *   machine to the native Quick Settings flyout; `Windows 10` keeps damping 0.9,
- *   the spring this mod shipped with. The end speed is measured from the reports
- *   of the last 8-30 ms only, in `Progress` units, signed along the
- *   gesture axis, and projected onto the settle's direction: a contact that did
- *   not move the panel in that window (a finger held still) reports 0, and a
+ *   the spring this mod shipped with. The end speed is measured from an 8-30 ms
+ *   window that ends at the newest stored position, in `Progress` units, signed
+ *   along the gesture axis, and projected onto the settle's direction: the
+ *   newest position must itself be no more than 30 ms older than the release,
+ *   and the span is then measured backward from it, so the pair can lie up to
+ *   60 ms before the release when the stream paused just before the lift. A
+ *   contact that did not move the panel in that window (a finger held still)
+ *   reports 0, and a
  *   release still moving away from its target contributes 0 rather than starting
  *   the settle backwards. The duration is the panel travel divided
  *   by 2.2 DIP/ms, the native flyout's own speed, clamped to 160-520 ms, and the
@@ -1117,7 +1143,12 @@ Known risks:
  *   Nothing (a completed search after the shell settled found nothing scrolls,
  *   so the press dismisses) and Scrollable (rect and offsets, so a vertical
  *   dismiss that would only scroll the list is rejected and logs
- *   `dismiss deferred to scroll`); a search that threw or hit its depth limit is
+ *   `dismiss deferred to scroll`); the watch and the cache keep separate owners,
+ *   the element whose token must still be revoked and the element the committed
+ *   rect was measured from, and a handler may write the cached offsets only
+ *   while it belongs to the second, so a revoke that threw leaves a silent
+ *   handler instead of another list's offsets under this rect; a search that
+ *   threw or hit its depth limit is
  *   not a negative answer, so it stays Unknown and is retried with a bounded
  *   backoff (100, 200, 400 ms, then it leaves Unknown for that open), and a
  *   remeasure publishes Unknown before it starts so no earlier answer survives
@@ -1173,10 +1204,14 @@ Known risks:
  *   its tip up is a hover that drives nothing. A report that names the tracked
  *   contact without a point keeps it alive only when it asserts the contact, and
  *   moves nothing either way; the liveness clock it refreshes is not the position
- *   clock the coast reads, and the release speed is measured back from the
- *   release so a status-only hold cannot hand the settle an old velocity. The
- *   identity also carries its own last-seen tick, so a contact that vanished
- *   without a lift cannot lock out the next finger. A report id that
+ *   clock the coast reads, and the release speed is judged fresh at the release
+ *   and measured backward from the newest position so a status-only hold cannot
+ *   hand the settle an old velocity. The
+ *   identity also carries its own evidence tick: an asserted contact or a fed
+ *   point refreshes it, a report that only names the contact does not, and the
+ *   idle window forgets an identity whose last evidence is that old, so a
+ *   contact that vanished without a lift — even one a layout apply refused to
+ *   admit — cannot lock out the next finger. A report id that
  *   carries no
  *   contact field is ignored whole, and a device with neither tip nor in-range
  *   usage is the logged count/position fallback, whose Contact Count 0 and
@@ -2058,9 +2093,15 @@ struct ScrollerCache {
 std::mutex g_scrollerMutex;
 ScrollerCache g_scroller;
 
-// UI thread only: the element the cache describes and its ViewChanged handler.
-// A stale handler is revoked before the next element replaces it.
-wuxc::ScrollViewer g_scrollerViewer{nullptr};
+// UI thread only. Two roles, deliberately two variables: `g_scrollerWatchOwner`
+// is the object whose ViewChanged token must still be revoked — it outlives a
+// revoke that threw, so the token can be retried — and `g_scrollerCacheViewer`
+// is the object the committed rect was measured from, the only one allowed to
+// write the cached offsets. One variable made the two the same object, and then a
+// failed revoke let the old viewer keep writing into the cache that another
+// viewer's rect had just replaced.
+wuxc::ScrollViewer g_scrollerWatchOwner{nullptr};
+wuxc::ScrollViewer g_scrollerCacheViewer{nullptr};
 winrt::event_token g_scrollerToken{};
 // The rect line speaks once per open, not once per measurement: the open
 // transition and the settled pass both measure the same element, and only a
@@ -4664,20 +4705,23 @@ uint64_t g_contactTick = 0;      // input thread only, last report of a contact
 // declares Contact Identifier: the device may hand the same node to another
 // finger between two reports, and the identifier is what proves it did not.
 //
-// `lastSeenTick` is the identity's own clock, on the coarse tick the contact
-// latch uses. A report the decoder tracks can be refused admission by the layout
-// handshake, which deliberately leaves the latch clear so the next report can
-// retry; if that contact then vanishes without a lift, the latch's cleanup can
-// never reach the identity it installed, and every later finger would be
-// rejected as "another contact". Any report that names the contact refreshes
-// this clock, and the idle tick that ends contacts forgets an identity no report
-// has named since.
+// `lastEvidenceTick` is the identity's own clock, on the coarse tick the contact
+// latch uses, and it moves only on evidence: a report that asserts the contact
+// (`TipSwitch`/`InRange`, or a slot state of Contact) or carries a point this
+// decoder feeds for it. A report that merely names the contact — a device that
+// keeps an unused slot's retained identifier — moves nothing. That distinction
+// is what makes a refused admission survivable: the layout handshake
+// deliberately leaves the latch clear so the next report can retry, so a contact
+// that then vanished without a lift would otherwise hold the identity forever,
+// with the latch's cleanup unable to reach it and every later finger rejected as
+// "another contact". The idle tick that ends contacts forgets an identity whose
+// last evidence is that old, admitted or not.
 struct HidContactTrack {
     HANDLE device = nullptr;
     int slot = -1;
     bool hasIdentifier = false;
     ULONG identifier = 0;
-    uint64_t lastSeenTick = 0;
+    uint64_t lastEvidenceTick = 0;
 };
 
 HidContactTrack g_trackedContact;  // input thread only
@@ -4816,16 +4860,17 @@ float CoastVelocity(float distance) {
 // and the settle left the seam at a speed the finger did not have; the settings
 // page's promise that a held finger starts from rest was false. The release
 // speed is therefore measured from the reports inside one short window at the
-// end of the gesture:
+// end of the gesture, in two steps: a freshness check on the newest position,
+// then a span measured back from that position.
 //
-// - at most 30 ms, so a stop is seen: a finger that held still reports the same
-//   value for that whole window and the answer is 0;
-// - at least 8 ms, so one report cannot decide it: the window is the oldest
-//   report that is still inside 30 ms and at least 8 ms old;
-// - elapsed between the first and the last report of that window;
-// - and the window is anchored at the release: a newest position more than 30 ms
-//   older than the release answers 0, because a status-only hold keeps the
-//   contact alive without feeding a position.
+// - Freshness: the newest stored position must be no more than 30 ms older than
+//   the release. A status-only hold keeps the contact alive without feeding a
+//   position, and the speed from before that hold is not the release speed.
+// - Span: 8-30 ms, measured backward from the newest position and not from the
+//   release, so the pair can lie up to 60 ms before the release. At most 30 ms so
+//   a stop is seen: a finger that held still repeats one value across the span
+//   and the answer is 0. At least 8 ms so one report cannot decide it.
+// - Elapsed between the first and the last report of that window.
 //
 // The sample value is Progress: the quantity the follow inserts and the settle
 // animates, which is what lets one estimator serve both gesture families. The
@@ -4876,12 +4921,16 @@ void SampleEndVelocity(float progress, uint64_t qpcMs) {
 // Progress per millisecond at the release, signed along the gesture axis. 0 when
 // the window holds no movement, which is what a held contact reports.
 //
-// The window is measured back from the release, not from the newest sample: an
-// asserted contact with no point keeps the gesture alive without feeding a
-// position, so a finger that moved quickly and then only held its tip down must
-// not hand the settle the velocity from before the hold. A newest position more
-// than `kEndVelocityWindowMs` older than the release answers 0; inside that
-// freshness bound the widest 8-30 ms window of stored positions is used.
+// Two checks, and they are separate. First freshness: the newest stored position
+// must be no more than `kEndVelocityWindowMs` older than the release, or the
+// answer is 0 — an asserted contact with no point keeps the gesture alive without
+// feeding a position, so a finger that moved quickly and then only held its tip
+// down must not hand the settle the velocity from before the hold. Second, the
+// span: it is measured backward from that newest position, not from the release.
+// Its oldest sample is the first one at least `kEndVelocityMinMs` and at most
+// `kEndVelocityWindowMs` older than the newest, so the pair is 8-30 ms wide and
+// may lie up to 60 ms before the release when the stream paused just before the
+// lift. The whole pair therefore need not lie inside the last 30 ms.
 float EndVelocityProgressPerMs(uint64_t releaseQpc) {
     if (g_endVelocityCount < 2) {
         return 0.0f;
@@ -6054,17 +6103,28 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         ReleaseRevealSession(geometry);
     }
 
-    // The tracked identity carries its own last-seen clock, independent of the
+    // The tracked identity carries its own evidence clock, independent of the
     // contact latch. A report the decoder tracked can be refused admission by
     // the layout handshake, which leaves the latch clear so the next report can
     // retry; a contact that then vanishes without a lift would hold the identity
     // forever, and every later finger would be rejected as another contact. The
-    // same idle window that ends a contact forgets an identity no report named.
-    // No session may own the contact here: a live session's reports name it and
-    // refresh this clock, and its own idle release runs first in this tick.
+    // clock moves only on evidence — an asserted contact or a point this decoder
+    // feeds — never on a report that merely names the contact, so the same idle
+    // window that ends a contact forgets an identity no report has proven since,
+    // admitted or not. An identity that expires with the latch clear is the case
+    // this clock exists for, and it is the one worth a line: no lift and no latch
+    // cleanup could ever have released it.
+    // No session may own the contact here: a live session's reports carry the
+    // points (or the asserted tip) that refresh this clock, and its own idle
+    // release runs first in this tick.
     if (!session.active && !g_reveal.edgeCandidate &&
-        g_trackedContact.slot >= 0 && tickMs > g_trackedContact.lastSeenTick &&
-        tickMs - g_trackedContact.lastSeenTick >= kIdleReleaseMs) {
+        g_trackedContact.slot >= 0 &&
+        tickMs > g_trackedContact.lastEvidenceTick &&
+        tickMs - g_trackedContact.lastEvidenceTick >= kIdleReleaseMs) {
+        if (!g_contactDown) {
+            FileLog(L"hid identity expired slot=%d latch=0",
+                    g_trackedContact.slot);
+        }
         ForgetTrackedContact();
     }
 
@@ -6727,10 +6787,15 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
         }
 
         const HidContactSlot& slot = slots[trackedSlot];
-        // The report names the tracked contact, so its identity stays alive:
-        // whether it carries a point, a status, or only the name is decided
-        // below, and a refused admission is not the decoder's business.
-        g_trackedContact.lastSeenTick = tickMs;
+        // A name is not evidence. This report names the tracked contact, but it
+        // may carry neither a point nor an asserted tip, and such a report must
+        // not hold the tracker: after a refused admission the latch is clear, so
+        // no lift and no latch cleanup could ever release this identity.
+        // `lastEvidenceTick` therefore moves only where the report proves the
+        // contact — an asserting tip or in-range bit below, or a point this path
+        // feeds — and a name-only report updates the slot and the name
+        // (diagnostics, and the identity the expiry line prints) and nothing
+        // else.
         // A contact the report names is named by that name from here on, so a
         // later slot reassignment cannot transfer the gesture.
         if (slot.hasIdentifier) {
@@ -6769,13 +6834,20 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
             // or zero their ids would keep a stale finger alive and every other
             // device out.
             if (state == HidContactState::Contact) {
+                g_trackedContact.lastEvidenceTick = tickMs;  // asserted, not named
                 NoteContactAlive(tickMs);
             }
             return;
         }
         if (device.coordinatePath && slot.atOrigin) {
+            // A zero pair on the count/position path is its no-position report:
+            // there is no point to feed and therefore none to count as evidence.
             return;
         }
+        // A point this path is about to feed is the other half of the evidence
+        // rule; it is written before the feed, so a feed that ends the contact
+        // cannot leave a clock behind on a forgotten identity.
+        g_trackedContact.lastEvidenceTick = tickMs;
         FeedContactPoint(device, slot.rawX, slot.rawY, reportId,
                          collections[trackedSlot], tickMs);
         return;
@@ -6847,7 +6919,7 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
         g_trackedContact.slot = chosen;
         g_trackedContact.hasIdentifier = false;
         g_trackedContact.identifier = 0;
-        g_trackedContact.lastSeenTick = tickMs;
+        g_trackedContact.lastEvidenceTick = tickMs;
         FeedContactPoint(device, chosenX, chosenY, reportId, collections[chosen],
                          tickMs);
         return;
@@ -6899,7 +6971,7 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
     g_trackedContact.slot = chosen;
     g_trackedContact.hasIdentifier = slots[chosen].hasIdentifier;
     g_trackedContact.identifier = slots[chosen].identifier;
-    g_trackedContact.lastSeenTick = tickMs;
+    g_trackedContact.lastEvidenceTick = tickMs;
     FeedContactPoint(device, slots[chosen].rawX, slots[chosen].rawY, reportId,
                      collections[chosen], tickMs);
 }
@@ -8351,18 +8423,20 @@ void FindScrollableElement(const wux::UIElement& element, uint32_t depth,
 
 // Drops only the handler, so a re-measure can subscribe to the same or another
 // element. Runs on the UI thread. A revoke that throws keeps the token and its
-// viewer: the token is the only handle on a handler that can still fire, and
-// overwriting it with the next registration would lose it for the process
-// lifetime.
+// owner — `g_scrollerWatchOwner`, not the cache's viewer: the token is the only
+// handle on a handler that can still fire, and overwriting it with the next
+// registration would lose it for the process lifetime. Clearing the cache's
+// viewer is the caller's decision, because a cache that keeps its rect keeps the
+// viewer that measured it.
 void RevokeScrollerWatch() {
-    wuxc::ScrollViewer viewer = g_scrollerViewer;
+    wuxc::ScrollViewer owner = g_scrollerWatchOwner;
     if (g_scrollerToken.value) {
-        if (!viewer) {
+        if (!owner) {
             Wh_Log(L"ViewChanged registration has no owner to revoke on");
             return;
         }
         try {
-            viewer.ViewChanged(g_scrollerToken);
+            owner.ViewChanged(g_scrollerToken);
             g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
         } catch (winrt::hresult_error const& e) {
             Wh_Log(L"ViewChanged revoke failed: %08X", e.code());
@@ -8373,16 +8447,21 @@ void RevokeScrollerWatch() {
         }
     }
     g_scrollerToken = {};
-    g_scrollerViewer = nullptr;
+    g_scrollerWatchOwner = nullptr;
 }
 
-// Publishes the offsets of the cached element. ViewChanged fires on the UI
+// Publishes the offsets of the committed element. ViewChanged fires on the UI
 // thread and only while the list actually scrolls, so this is the whole cost of
-// keeping the gate honest. The handler passes the viewer it was registered on:
-// a handler that outlived its element writes nothing, so an old watch cannot
-// drive the offsets of a newer one.
+// keeping the gate honest.
+//
+// The authorization is the cache's own identity, not the registration: a handler
+// may write only while the element it was registered on is the element the
+// committed rect was measured from. A handler whose revoke threw is still the
+// registration owner and still fires, so it is exactly the case that must not be
+// trusted: after a replacement its numbers would land under another list's rect,
+// and a vertical drag would then be gated against the wrong list.
 void RefreshScrollerOffsets(wuxc::ScrollViewer const& watched) {
-    if (!watched || watched != g_scrollerViewer) {
+    if (!watched || watched != g_scrollerCacheViewer) {
         return;
     }
 
@@ -8518,6 +8597,9 @@ void ClearScrollerRetry() {
 // repeat, and the input thread must not gate a dismiss on it. Unknown inside the
 // panel only defers, so the pass fails safe.
 void PublishScrollerUnknown(uint32_t generation) {
+    // No element describes the cache any more, so no handler is authorized to
+    // write it; the next positive commit names the element it measured.
+    g_scrollerCacheViewer = nullptr;
     std::lock_guard lock(g_scrollerMutex);
     g_scroller = ScrollerCache{};
     g_scroller.generation = generation;
@@ -8571,6 +8653,9 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     // The layout the rect is about to be mapped in is read with it, so a resize
     // that lands while the search runs is caught at commit.
     const uint32_t layoutVersion = g_layoutVersion.load(std::memory_order_acquire);
+    // The cache is about to hold no rect at all, so no handler may write it while
+    // this pass runs; a positive commit names its element again.
+    g_scrollerCacheViewer = nullptr;
     {
         std::lock_guard lock(g_scrollerMutex);
         g_scroller = ScrollerCache{};
@@ -8633,7 +8718,11 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         // The old handler belongs to an element this answer no longer names, so a
         // completed negative search revokes it as well; only the positive path
         // used to. An attached handler on a viewer the panel no longer shows would
-        // keep refreshing offsets the gate can never use.
+        // keep refreshing offsets the gate can never use. The cache now names no
+        // element, so it authorizes no handler either — set before the revoke, so
+        // a revoke that throws cannot leave the old watch authorized for a cache
+        // it no longer describes.
+        g_scrollerCacheViewer = nullptr;
         RevokeScrollerWatch();
         if (settled && !g_scrollerNoneLogged) {
             g_scrollerNoneLogged = true;
@@ -8704,6 +8793,12 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
             return;
     }
 
+    // The committed rect is this element's, so this element's handler is the one
+    // authorized to refresh it. The identity moves in the same uninterrupted
+    // UI-thread step as the commit — no XAML call and no message pump between
+    // them — so no handler can see the new rect under the old element's name.
+    g_scrollerCacheViewer = best.viewer;
+
     // One line per open. The settled pass speaks only when it moved the rect the
     // first pass logged, so a storyboard that was still growing cannot hide the
     // final geometry.
@@ -8726,10 +8821,17 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     // One handler per measurement: the element must not be observed twice. The
     // revoke and the new registration are XAML calls, so they stay outside the
     // commit section; the cache itself is already written. A registration that
-    // survived its revoke keeps its token and its element: this pass adds no
-    // second watch, and the old handler still writes nothing for a newer element.
+    // survived its revoke keeps its token and its owner: this pass adds no second
+    // watch, and the old handler is not authorized for this cache anyway, so it
+    // writes nothing even though it still fires.
     RevokeScrollerWatch();
     if (g_scrollerToken.value) {
+        // A replacement that cannot be watched does not make this cache Unknown:
+        // the rect and the offsets were both measured from this element in this
+        // pass, so the cache is coherent now, and Unknown would defer every press
+        // inside the panel for the rest of the open. What is lost is future
+        // refresh only, and the old handler is not authorized for this cache, so
+        // it cannot spoil it.
         Wh_Log(L"ViewChanged registration is still attached; this pass adds no "
                L"scroll watcher");
         FileLog(L"xaml viewchanged handler left attached; new registration "
@@ -8737,7 +8839,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         return;
     }
 
-    g_scrollerViewer = best.viewer;
+    g_scrollerWatchOwner = best.viewer;
     try {
         const wuxc::ScrollViewer watched = best.viewer;
         g_scrollerToken = watched.ViewChanged(
@@ -8749,11 +8851,11 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         }
     } catch (winrt::hresult_error const& e) {
         g_scrollerToken = {};
-        g_scrollerViewer = nullptr;
+        g_scrollerWatchOwner = nullptr;
         FileLog(L"scroller watch failed err=%08X", static_cast<unsigned>(e.code()));
     } catch (...) {
         g_scrollerToken = {};
-        g_scrollerViewer = nullptr;
+        g_scrollerWatchOwner = nullptr;
         FileLog(L"scroller watch failed err=unknown");
     }
 }
@@ -8763,6 +8865,9 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
 // rect of the previous open, and the next open starts from Unknown.
 void ReleaseScrollableElement() {
     RevokeScrollerWatch();
+    // The cache is emptied below, so its viewer is gone too: no surviving handler
+    // may write offsets into a rect that describes no element.
+    g_scrollerCacheViewer = nullptr;
     g_scrollerLogged = false;
     g_scrollerNoneLogged = false;
     g_scrollerRetryLogged = false;
@@ -10196,7 +10301,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.28.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.29.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance
