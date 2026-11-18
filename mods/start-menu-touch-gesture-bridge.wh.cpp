@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.13.0
+// @version         0.14.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -72,7 +72,8 @@ the retract request/answer pair described below, both in
 `Local\SwipeFor10Start_v2_*` (see `swipe_ipc_shared.h`).
 
 Hooked functions are forwarded unchanged except for the keyboard wait described
-below. The mod creates no windows, threads or COM objects.
+below. The mod creates no windows, threads or COM objects; it pins its own image
+so a Hide frame that outlives the unload returns into mapped code.
 
 Notes:
 - Windhawk compiles the mod from stdin, so the repository `mods` folder is
@@ -95,20 +96,25 @@ Notes:
   write as the edge and the handle. There is no per-frame position sampling.
 - Each gesture state transition appends one line to `bridge.log` in the mod
   storage folder: `state=... edge=... src=... prov=... <reason>`. The channel to
-  the Start mod logs one `ipc open created=... close=...` at init, and one
-  `hide open generation unavailable err=...` for a Hide that found no published
-  open generation (0 is never a generation).
+  the Start mod logs one `ipc open created=... close=...` at init, one
+  `activation state reset` when a re-enable re-initialises the pinned image, and
+  one `hide open generation unavailable err=...` for a Hide that found no
+  published open generation (0 is never a generation).
 - The two channels have two lifetimes. The v2 channel (the section mapping and
   view, the mutex and the three events) is closed when the mod is disabled, but
   only after the disable flag keeps new Hides out of it and every Hide that
   already entered has left;
   a Hide that outlives the drain keeps every handle and logs
   `ipc unload residual hides=...; the v2 channel stays until explorer exits`.
+  A re-enable of the pinned image reuses such a channel instead of opening a
+  second one over it.
   The gesture mapping and its event stay for the rest of the explorer process
   lifetime instead: a consumer maps them independently, and an in-flight gesture
-  callback may still hold the view, so unmapping them is unsafe. A reload opens
-  a fresh pair and leaves the previous pair to process exit, so those two
-  handles per reload are deliberate; process exit reclaims them.
+  callback may still hold the view, so unmapping them is unsafe. The image is
+  pinned, so a re-enable re-initialises this same mapping instead of opening a
+  new one; a different installed version maps its own handles and leaves the
+  older image's pair to process exit. That is two handles per pinned image,
+  deliberate; process exit reclaims them.
 - That drain is the only thing the in-flight Hide count buys, and the count is a
   guard for this mod's own handles, not a barrier between two Hides. It answers
   "is a Hide still inside", two Hides on different threads hold it at once, and
@@ -131,18 +137,34 @@ Notes:
   `ModsManager`. `LoadedMod::BeforeUninit` says what it waits for itself:
   "Waits for in-flight hook creations, then locks out new ones." So a Hide can
   still be inside the hook when this mod frees its channel, which is exactly
-  why the residual keeps the handles instead of closing them. Returning into
-  this module's code after that is the host's business, not the count's: the
-  wait above covers the mod image, it is bounded at 200 x 400 ms, and its
-  result is discarded. A Hide spends under 2.2 s inside the hook (a 100 ms
-  answer wait plus a lead capped at a 2 s settle plus 30 ms, plus logging), so
-  that bound is more than a thirtyfold margin. The mod therefore does not pin
-  its own image the way the Start mod does: a pin is available to a hook-only
-  mod and would be mechanically safe here (no threads, no COM, no windows), but
-  it would trade a permanently mapped image per load in explorer for a case the
-  host already covers, and the host's wait covers the MinHook trampoline too:
-  `MH_RemoveHookEx` frees a trampoline only in `~LoadedMod`, after the stack
-  wait, and every caller of the original has this hook below it on the stack.
+  why the residual keeps the handles instead of closing them. The return into
+  this module's code after that is not the count's business: the wait above
+  covers the mod image, it is bounded at 200 x 400 ms, and its result is
+  discarded. Nor is that bound a promise about this call: it covers only the
+  wait the host requests, not a thread the scheduler kept off the CPU, and not
+  the time the original shell call spends inside. The hold this mod asks for is
+  660 ms with the shipped Start mod (a 100 ms answer wait plus the 560 ms
+  fallback, or a planned settle clamped to 520 ms plus 30 ms) and at most
+  2.13 s with any answer the channel accepts; the drain is sized against that
+  hold, not against how long the frame can stay on the stack.
+  The mod therefore pins its own image, which is the maximum a mod can do:
+  `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+  GET_MODULE_HANDLE_EX_FLAG_PIN)` on an address in this module, logged once as
+  `mod pin image=... pinned=1` (or `mod pin failed err=...`). A failed pin does
+  not refuse the mod: with no thread of its own, this mod is then exactly what
+  it was without the pin. The pin covers this module's own code and its lease:
+  a `Hide_Hook` frame that returns after `Wh_ModUninit` lands in code that is
+  still mapped, so its return address and the `HideCallLease` destructor are
+  valid and the lease still releases. The host's wait covers the MinHook
+  trampoline when it can see the frame: `MH_RemoveHookEx` frees a trampoline
+  only in `~LoadedMod`, after that wait, and every caller of the original has
+  this hook below it on the stack. A scanner blind to the frame leaves a return
+  into a freed trampoline, and that case is outside what any mod can fix; it
+  belongs to Windhawk's unload. The hazard is reduced, not eliminated. The
+  price is an image that stays mapped for the rest of the explorer process
+  lifetime: a re-enable re-initialises the same pinned DLL, and a version change
+  leaves the old image mapped as well. Against a return into unmapped code, that
+  mapping is the cheaper of the two risks.
 
 The delayed Hide:
 
@@ -192,6 +214,8 @@ The delayed Hide:
  *   EdgeAnimationRelationshipManager::ReportEdgeGesture,
  *   CStartExperienceManager::SetAnimationData/Show/Hide; on version.dll for the
  *   build gate; on LoadLibraryExW from kernelbase.dll for the late module load;
+ *   on GetModuleHandleExW from kernelbase.dll, which pins this image for the
+ *   process lifetime;
  *   on the shared-memory contract in start_gesture_shared.h; on the channel in
  *   swipe_ipc_shared.h, whose close record carries a tapped gesture stamp (the
  *   tap's own Hide) and whose retract request/answer pair carries the settle
@@ -219,10 +243,19 @@ The delayed Hide:
  *   `Wh_ModUninit`: at 2.0.0-alpha.8 `ModsManager` calls `Wh_ModUninit` and only
  *   then waits for threads inside the mod image
  *   (`ThreadsCallStackWaitForRegions(..., 200, 400)`) before freeing the module,
- *   and that wait is bounded and unchecked, so the module's own code after
- *   `Wh_ModUninit` is the host's responsibility. The gesture mapping keeps the
- *   process-lifetime behaviour below. Every path calls the original Hide;
- *   nothing is pressed and no hide is requested. No exported symbols.
+ *   and that wait is bounded and unchecked. This mod pins its own image
+ *   (`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+ *   GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`), so the
+ *   return address and the lease destructor of a frame that returns after
+ *   `Wh_ModUninit` stay valid; that pin covers this module's code, the host's
+ *   wait covers the trampoline when it can see the frame, and a scan blind to
+ *   the frame is outside what a mod can fix. A re-enable therefore
+ *   re-initialises the same image: the lifecycle flags are reset (logged
+ *   `activation state reset`), the gesture mapping is reused, and a v2 channel
+ *   that the previous unload kept is handed on rather than opened again. The
+ *   gesture mapping keeps the process-lifetime behaviour below. Every path
+ *   calls the original Hide; nothing is pressed and no hide is requested. No
+ *   exported symbols.
  * [POS]: explorer-side half of the legacy Start gesture work. It observes the
  *   shell's own hide decision and decides whether that Hide still needs the
  *   retract lead. Both closes are Windows taps performed by the Start side, and
@@ -238,7 +271,9 @@ The delayed Hide:
  *   plan-versus-tapped distinction is what makes the gesture path correct, and
  *   the binding only keeps a stamp of a menu that is gone from passing a later
  *   Hide. The channel's drain cannot outlive `Wh_ModUninit` on its own, so the
- *   code that runs in either process after that point belongs to the host.
+ *   channel handles stay open when that drain times out, and the image is
+ *   pinned because a hook-only mod cannot wait for its own caller: a frame that
+ *   returns after the unload must land in code that is still mapped.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -1390,10 +1425,88 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
     return module;
 }
 
+// ---------------------------------------------------------------------------
+// Module lifetime
+// ---------------------------------------------------------------------------
+
+// Any address in this module identifies the image that must stay mapped. The
+// function is never called; only its address is taken.
+void ModulePinAnchor() {}
+
+// The pinned image, once per process. A re-init of the same image keeps it.
+HMODULE g_modulePin = nullptr;
+
+// Pins this image until the process terminates. Nothing in this mod creates a
+// thread, so no worker can resume in unmapped code; the pin covers the one
+// frame that can still be on a stack: a Hide_Hook call below Windhawk's
+// Wh_ModUninit. Its return address and the HideCallLease destructor then point
+// into code that is still mapped, and the lease still releases.
+//
+// This is the maximum a mod can do. The host's
+// ThreadsCallStackWaitForRegions covers the MinHook trampoline when it can see
+// that frame; a scan blind to the frame leaves a return into a freed
+// trampoline, and no mod can fix that.
+//
+// The pin is logged once: a re-enable of the same image runs Wh_ModInit again
+// and finds g_modulePin already set. Unlike the Start mod's pin, it is not a
+// prerequisite: a failure leaves this mod exactly what it was without a pin,
+// and no thread of this mod exists to be stranded.
+bool PinThisModule() {
+    if (g_modulePin) {
+        return true;  // a re-init of the same pinned image
+    }
+    HMODULE module = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_PIN,
+                           reinterpret_cast<LPCWSTR>(&ModulePinAnchor),
+                           &module)) {
+        g_modulePin = module;
+        FileLog(L"mod pin image=%p pinned=1", reinterpret_cast<void*>(module));
+        return true;
+    }
+    FileLog(L"mod pin failed err=%u", static_cast<unsigned>(GetLastError()));
+    return false;
+}
+
+// A pinned image is initialised a second time in the same process: after a
+// clean unload the module is still mapped, so the next enable runs Wh_ModInit
+// on that same image and the loader initialises nothing. Every lifecycle flag
+// the previous activation left behind is cleared here, so the second init
+// installs its hooks again instead of believing they are still there.
+// g_hideCalls is deliberately not touched: a residual Hide that outlived the
+// drain still owns its lease, and that count must keep saying so.
+void ResetReinitState() {
+    g_disabled.store(false, std::memory_order_relaxed);
+    g_afterInit.store(false, std::memory_order_relaxed);
+    g_explorerHooked.store(false, std::memory_order_relaxed);
+    g_hideDelayEnabled.store(false, std::memory_order_relaxed);
+    g_startPointTick.store(0, std::memory_order_relaxed);
+    // A failed gesture mapping is retried by the next activation, as it was
+    // when every activation loaded a fresh image. A ready one is kept: the
+    // section and this process's view of it are still valid.
+    if (g_sharedInitState.load(std::memory_order_relaxed) == kSharedFailed) {
+        g_sharedInitState.store(kSharedNotStarted, std::memory_order_relaxed);
+        g_sharedErrorLogged.store(false, std::memory_order_relaxed);
+    }
+}
+
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.13.0 initializing");
+    // A disable/enable cycle re-initialises this same image, because the pin
+    // keeps it mapped. Nothing in it was re-initialised by the loader, so the
+    // previous activation's lifecycle flags must be cleared explicitly.
+    const bool reinit = g_modulePin != nullptr;
+    ResetReinitState();
+    if (reinit) {
+        FileLog(L"activation state reset");
+    }
+
+    // Before anything else: a Hide frame that outlives the unload must return
+    // into mapped code. Logged once; see PinThisModule.
+    PinThisModule();
+
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.14.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();
@@ -1405,9 +1518,15 @@ BOOL Wh_ModInit() {
     // a hook. A failure here means every Hide takes the fixed lead for the life
     // of this attachment, which the budget makes reachable only for a section
     // that cannot be initialised at all.
+    //
+    // A re-enable of the pinned image meets the previous activation's channel
+    // only when that unload timed out and kept its handles on purpose.
+    // SwipeIpcOpen would map a second channel over the globals and leak the
+    // first, so the survivor is reused exactly as it stands.
     bool created = false;
     DWORD ipcError = 0;
-    if (!SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
+    const bool channelOpen = g_ipc.state != nullptr;
+    if (!channelOpen && !SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
         Wh_Log(L"Swipe IPC channel unavailable (%u); a keyboard close takes the "
                L"fixed lead",
                static_cast<unsigned>(ipcError));
@@ -1472,11 +1591,12 @@ void Wh_ModUninit() {
     // maps the section independently and may poll it at any time, and an
     // in-flight gesture callback can still hold the view pointer that
     // EnsureShared cached; unmapping it here would turn either into an access to
-    // a freed view. A reload opens a fresh pair for its own module instance and
-    // leaves the previous instance's pair to process exit: that is two handles
-    // per reload, the price of the safety above. The reset published by
-    // PublishInactiveOnUnload is what tells a reader that this instance is gone,
-    // not the handle lifetime. Process exit reclaims every pair.
+    // a freed view. A re-enable re-initialises this same pinned image and
+    // reuses the pair it already mapped; a different installed version maps its
+    // own handles and leaves the previous image's pair to process exit. The
+    // reset published by PublishInactiveOnUnload is what tells a reader that
+    // this instance is gone, not the handle lifetime. Process exit reclaims
+    // every pair.
     //
     // The v2 channel is closed, because its objects are named and its records
     // belong to the other process: g_ipc is unmapped and its mapping, mutex and
@@ -1491,9 +1611,19 @@ void Wh_ModUninit() {
     // Wh_ModUninit, then ThreadsCallStackWaitForRegions(..., 200, 400), then
     // frees the module), and that wait is bounded and its result discarded. So a
     // Hide can still be inside the hook here, and freeing the channel under it
-    // would be a use-after-close. That case keeps every handle and says so; the
-    // module's own code afterwards belongs to the host, which is the only party
-    // that can wait for a hook to return.
+    // would be a use-after-close. That case keeps every handle and says so;
+    // waiting for a hook to return is the host's job, not this function's.
+    //
+    // The image is pinned, and the pin is process-wide and cannot be undone, so
+    // it stays in place here. It covers this module's own side of that case: a
+    // frame that returns after this function lands in code that is still mapped,
+    // and its lease still releases. The host's wait remains the only cover for
+    // the MinHook trampoline, and only when that wait can see the frame.
+    //
+    // If the drain below times out, every handle stays as well: that leak is
+    // the price of not unmapping a channel under a Hide that is still inside
+    // it. A process that has to restart to finish the unload is cheaper than a
+    // Hide reading freed records.
     const ULONGLONG drainDeadline = GetTickCount64() + kIpcUnloadDrainMs;
     while (g_hideCalls.load(std::memory_order_acquire) != 0 &&
            GetTickCount64() < drainDeadline) {
@@ -1511,7 +1641,7 @@ void Wh_ModUninit() {
                 L"explorer exits",
                 residualHides);
         Wh_Log(L"Unload left the v2 channel open: %d Hide hook(s) are still "
-               L"inside it",
+               L"inside it; the image stays pinned",
                residualHides);
     }
 }

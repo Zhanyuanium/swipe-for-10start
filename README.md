@@ -86,7 +86,12 @@ measurement depends on the placement, the text names it.
    not transfer the drag. When a report names a new contact, its real contacts
    are the candidates and the one nearest the last tracked raw position is
    chosen; once tracked, only that contact can move or end the gesture, and a
-   report from another slot or another device is ignored.
+   report from another slot or another device is ignored. The identity carries
+   its own last-seen tick, refreshed by any report that names it and independent
+   of gesture admission and of the contact latch; a name no report has named for
+   the 18 ms idle is forgotten even when no session ever owned the contact, so a
+   refused admission cannot strand it and make every later finger be rejected
+   as another contact.
 4. A state machine on that thread drives a `Progress` scalar in a
    `CompositionPropertySet`; an expression translates the root visual by
    `(1 - Progress) * Direction * Distance`.
@@ -174,14 +179,18 @@ measurement depends on the placement, the text names it.
    style. The end speed is measured over the widest eligible window of the last
    reports (8-30 ms) and projected onto the gesture axis, so only the part that
    moves the panel toward where it is going counts: 100 means that component,
-   not the raw release vector. The end-value normalisation adjusts that seam
-   slightly: it divides the whole motion by the curve's value at `T`, clamped to
-   0.5-1, and that divisor depends on the damping and the initial slope. At zero
-   initial slope it is 0.99249 for `Windows 11` and 0.99589 for `Windows 10`, so
-   1.007 is the Win11 example of the seam factor and 1.004 the Win10 one. The
-   first keyframe lands up to 4 ms into the curve, so the panel's first segment
-   runs at that segment's average speed, not at the analytic seam: the
-   continuity with the finger is approximate. A higher value snaps away faster,
+   not the raw release vector. The window is anchored at the release: a newest
+   position more than 30 ms older than the release answers 0, so a finger that
+   moved, held with only asserted tip-down reports and then lifted starts from
+   rest instead of at the speed from before the hold.
+   The end-value normalisation adjusts that seam slightly: it divides the whole
+   motion by the curve's value at `T`, clamped to 0.5-1, and that divisor depends
+   on the damping and the initial slope. At zero initial slope it is 0.99249 for
+   `Windows 11` and 0.99589 for `Windows 10`, so 1.007 is the Win11 example of
+   the seam factor and 1.004 the Win10 one. The first keyframe lands up to 4 ms
+   into the curve, so the panel's first segment runs at that segment's average
+   speed, not at the analytic seam: the continuity with the finger is
+   approximate. A higher value snaps away faster,
    0 starts from rest. A finger held still before lifting reports `vel=0.00`, so
    it starts from rest whatever the setting says;
    Windows-key opens and closes have no finger speed either and start from rest
@@ -199,7 +208,9 @@ measurement depends on the placement, the text names it.
      默认 100，范围 0–300）决定松手瞬间菜单以朝向目标的速度分量的百分之几
      继续滑动，两种样式相同。末端速度取最后 8–30 ms 里最宽的可选窗口，
      并投影到手势轴上，所以只有真正推动面板朝目标走的那部分计入：100% 使用
-     松手速度在目标方向上的分量，而不是松手时的原始速度向量。曲线按自身在
+     松手速度在目标方向上的分量，而不是松手时的原始速度向量。窗口以松手时刻
+     为基准：最新位置比松手早 30 ms 以上时按 0 计，所以手指先移动、随后只发
+     按住状态报告、然后抬起时，不会带着按住之前的速度起步。曲线按自身在
      `T` 处的值（夹在 0.5–1）归一化，会略微调整接缝速度；这个除数取决于
      阻尼和起始斜率：起始斜率为零时 `Windows 11` 为 0.99249、`Windows 10`
      为 0.99589，所以接缝倍率以 `Windows 11` 的 1.007 为例，`Windows 10`
@@ -297,13 +308,21 @@ it, a joined thread's handle is closed, and the hid-thread case also logs
 `unload hid thread still running; ipc view leaked` instead of unmapping a
 section the running thread still touches. A counted entry that does not drain
 logs `unload entries outstanding=%d`. A XAML delegate that could not be revoked
-keeps its token, because that token is the only handle on a handler that can
-still fire, and a new root refuses to overwrite that outstanding registration
-(`xaml size handler left attached; new registration refused`, the same for
-`loaded`): the root then gets no renderer, and the unload reports the residual.
-The `SizeChanged` and `Loaded` callbacks capture the setup generation when they
-are registered and return when it has moved, so a late callback from the
-previous root touches nothing.
+keeps its token and its owner, because that token is the only handle on a
+handler that can still fire, and a new registration is refused while one is
+outstanding (`xaml size handler left attached; new registration refused`, the
+same for `loaded`; the watches log `xaml layout handler left attached; new
+registration refused` and `xaml viewchanged handler left attached; new
+registration refused`). The root then gets no renderer, the layout watch leaves
+that open to its 400 ms deadline, and the scroll pass adds no watcher; the
+unload logs `unload residual=xaml handlers; process must restart to finish
+unloading` while one survives. The `SizeChanged` and `Loaded` callbacks capture
+the setup generation when they are registered and return when it has moved, so a
+late callback from the previous root touches nothing. The layout watch mints a
+serial and captures its own measurement request by value, so a callback that
+outlived a newer watch measures and revokes nothing. The `ViewChanged` handler
+captures the `ScrollViewer` it was registered on and writes offsets only while
+that viewer is still the cached one.
 
 That drain is only meaningful because the image cannot go away. The pin and the
 instance guard are the two prerequisites of `Wh_ModInit`: either failing returns
@@ -332,10 +351,11 @@ unload resets the lifecycle state (`ResetReinitState`) and then runs one
 per-activation reset
 (`ResetActivationState`, logged `activation state reset`), which the input
 thread's exit runs too: the tracked contact, the contact latch, both sessions,
-the close mute, the deferred flag, the pending tap and its serial, the pull
-serial, the coast, both velocity windows, the diagnostic latches and the `anim`
-override all start over. Every entry into module code from the compositor or the
-dispatcher is counted from before it can run: the batch completion takes a
+the close mute, the deferred flag, the pending tap and the pull generation it was
+armed under, the pull serial, the coast, both velocity windows, the diagnostic
+latches and the `anim` override all start over. Every entry into module code from
+the compositor or the dispatcher is counted from before it can run: the batch
+completion takes a
 `ModuleEntryLease` before `batch.End()`, and every UI turn posted through
 `PostCountedUiTurn` is counted. The unload's revocation turn is the exception by
 design: it uses `RunAsync` plus an event and waits for it, not the counted post,
@@ -509,7 +529,8 @@ Instead the mod takes over after the shell opens the window:
   `804..900` and the open storyboard's rect is rejected whole; a rejection
   publishes nothing and
   logs `reveal panelTrail rejected ... axis=... rect=... work=... mon=...
-  band=...` once per open for the settled pass. The previous rect is
+  band=...` once per open, from the first pass that sees a rejected rect; the
+  last whole snapshot stays. The previous rect is
   carried over only when the whole layout identity — axis, travel, client
   origin, work area and monitor — matches (±0.5 DIP on travel). The axis is part
   of that identity, so an axis-only change bumps the token, drops the carried
@@ -623,13 +644,13 @@ is closed after the down, so the only in-process source is the digitizer itself.
 ## Mods
 
 - **`mods/start-menu-legacy-swipe.wh.cpp`** (`StartMenuExperienceHost.exe`,
-  0.27.0) — the shipping mod described above.
+  0.28.0) — the shipping mod described above.
 - **`mods/msgprobe.wh.cpp`** — diagnostic: logs `WM_POINTER*` and mouse messages
   pulled from the message queue. Proved the queue dead end. Not needed at runtime.
 - **`mods/inputprobe.wh.cpp`** — diagnostic: raw HID decoding without the gesture
   logic. **Do not enable it together with the shipping mod**: Raw Input allows one
   sink per usage per process, and inputprobe takes the stream for itself.
-- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`, 0.13.0) —
+- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`, 0.14.0) —
   hooks `CStartExperienceManager::Hide`. Only a Hide on a `tapped` close record
   the bridge has not consumed, inside the record's 800 ms window and not older
   than the newest open tick it saw, runs at once (`hide passed (gesture)`); the
@@ -652,9 +673,23 @@ is closed after the down, so the only in-process source is the digitizer itself.
   (`Windhawk v2.0.0-alpha.8`, `src/windhawk/engine/mods_manager.cpp`): disable
   hooks, `Wh_ModUninit`, `ThreadsCallStackWaitForRegions(..., 200, 400)`, remove
   hooks, `FreeLibrary`, with that wait's result discarded — so the timeout is
-  reachable, the residual is real, and the module's code after `Wh_ModUninit` is
-  the host's responsibility. That is why the bridge keeps the handles and does
-  not pin its image.
+  reachable and the residual is real. The bridge pins its own image at init,
+  before the channel and the hooks
+  (`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+  GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`, or
+  `mod pin failed err=...`): the pin keeps its own code and the `HideCallLease`
+  destructor mapped for a frame that returns after `Wh_ModUninit`, while the
+  host's wait covers the MinHook trampoline when it can see the frame, and a
+  scanner blind to the frame is outside what any mod can fix — the hazard is
+  reduced, not eliminated. A failed pin only logs, because this mod owns no
+  thread that could be stranded. A re-enable re-initialises the same image
+  without the loader resetting anything: `ResetReinitState()` clears
+  `g_disabled`, `g_afterInit`, `g_explorerHooked`, `g_hideDelayEnabled` and
+  `g_startPointTick`, retries a failed gesture mapping, leaves `g_hideCalls`
+  alone, and logs `activation state reset`; a channel a timed-out unload kept
+  open is reused rather than remapped. The 500 ms drain is sized against the
+  mod's own hold (660 ms for the shipped pair, at most 2.13 s for any answer the
+  channel accepts), not against how long a frame can stay on the stack.
   The `Local\WindhawkStartGestureShared` mapping stays for the process lifetime
   on purpose, because a consumer and a late gesture callback may still hold its
   view. **Enable it together with the Start mod**
@@ -852,9 +887,10 @@ publishes the close record.
   lever, the bridge's drain/residual path cannot be reached: CLI-plus-engine
   latency exceeds the 660 ms maximum hold of the shipped pair (100 ms answer wait
   plus the 560 ms fallback; the shipped settle is clamped to 520 ms), while a
-  tap-to-cloaked run measured 574-592 ms. The two handles a reload leaves (the
-  gesture mapping and its event) are below explorer's handle-count noise (±60).
-  Both are reasoned from the code paths above, not observed as failures.
+  tap-to-cloaked run measured 574-592 ms. The two handles one pinned image keeps
+  (the gesture mapping and its event) are below explorer's handle-count noise
+  (±60), and a version change leaves the older image's pair too. Both are reasoned
+  from the code paths above, not observed as failures.
 - The close record is an 800 ms window. A gesture close publishes the plan at
   its release and the `tapped` record immediately before the tap; a dropped close
   publishes the cancelled kind at once, and the tap's deadline republication is

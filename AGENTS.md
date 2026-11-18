@@ -11,7 +11,7 @@ README.md - what works, what was falsified, build and test instructions
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 
-Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.27.0) runs in
+Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.28.0) runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
 every XAML/DirectManipulation source on this UI is empty (see README). The
 tracked contact is named by the HID Contact Identifier (`0x0D/0x51`) when the
@@ -24,7 +24,11 @@ identifier presence alone; the liveness clock is
 separate from the position clock, so a coordinate-less assertion does not feed a
 position and the 18 ms idle does not end a contact the device asserts; the same
 idle ends the gesture with `src=idle`, and once no session owns the contact it
-clears the contact latch and forgets the tracked identity. A coordinate-only
+clears the contact latch and forgets the tracked identity. The identity carries
+its own last-seen tick, refreshed by any report that names it and independent of
+admission and of the latch, so a name no report has named for the idle window is
+forgotten even when no session ever owned that contact, and a refused admission
+cannot strand it. A coordinate-only
 device applies its Contact Count and its `(0,0)` rule in the
 tracked branch too, because it cannot assert a tip for the tracked slot. The
 dismiss axis and the panel-acceptance band come from the taskbar itself:
@@ -47,7 +51,10 @@ so every interruption starts where the panel is. Both styles start at the
 component of the finger's end speed toward the target, over the travel left,
 measured from the widest eligible window of the last reports (8-30 ms) and
 projected onto the axis, so a release from a hold starts at zero speed instead
-of jumping. 100 % of `GestureStartSpeedPercent` means that component, not the raw
+of jumping. The window is anchored at the release: a newest position more than
+30 ms older than the release answers 0, so a hold whose only reports assert the
+tip leaves no speed from before the hold. 100 % of `GestureStartSpeedPercent`
+means that component, not the raw
 release vector; the curve's end-value normalisation adjusts the seam slightly: it
 divides by 0.99249 for `Windows 11` and 0.99589 for `Windows 10` at zero initial
 slope, so 1.007 and 1.004 are example seam factors, not constants, and the first
@@ -90,9 +97,10 @@ same pinned image resets the lifecycle state (`ResetReinitState`) and then runs
 one per-activation reset (`ResetActivationState`, logged `activation state
 reset`), which the input thread's exit runs too: it clears the tracked contact,
 the contact latch, both sessions, the close mute, the deferred flag, the pending
-tap and its serial, the pull serial, the coast, both velocity windows, the
-diagnostic latches and the `anim` override. Every entry into module code from
-the compositor or the dispatcher is counted from before it can run
+tap and the pull generation it was armed under, the pull serial, the coast, both
+velocity windows, the diagnostic latches and the `anim` override. Every entry
+into module code from the compositor or the dispatcher is counted from before it
+can run
 (`ModuleEntryLease`, `g_moduleEntryCount`); every turn posted through
 `PostCountedUiTurn` is counted, while the unload's revocation turn uses
 `RunAsync` plus an event and waits for it, deliberately not the counted post, so
@@ -108,21 +116,29 @@ frees. A thread that misses its wait keeps its handle and leaves every
 resource in place and logs `unload residual=...; process must restart to finish
 unloading`, or `unload entries outstanding=%d` when a counted entry does not
 drain; a joined thread's handle is closed. A XAML revoke that throws keeps its
-token, because that token is the only handle on a handler that can still fire,
-and a new root refuses to overwrite an outstanding registration (`xaml size
-handler left attached; new registration refused`, the same for `loaded`): that
-root gets no renderer and the unload reports the residual; the `SizeChanged` and
-`Loaded` callbacks are gated on the setup generation. After a disable/enable
-without a host restart, the reused XAML root means no new `PrepareRootElement`
-and no renderer, so a new contact cannot drive the panel until the host
-restarts. The Start mod publishes the close record three times (plan at the arm,
-`tapped` immediately before the tap, cancelled when a new pull drops it) and
-writes the cancelled kind
+token and its owner, because that token is the only handle on a handler that can
+still fire, and a new registration is refused while one is outstanding (`xaml
+size handler left attached; new registration refused`, the same for `loaded`;
+the watches log `xaml layout handler left attached; new registration refused`
+and `xaml viewchanged handler left attached; new registration refused`): that
+root gets no renderer, the layout watch leaves that open to its 400 ms deadline,
+and the scroll pass adds no watcher, with
+`unload residual=xaml handlers; process must restart to finish unloading` while
+one survives. The `SizeChanged` and `Loaded` callbacks
+are gated on the setup generation; the layout watch mints a serial and captures
+its own measurement request by value, so a callback that outlived a newer watch
+measures and revokes nothing; the `ViewChanged` handler captures the viewer it
+was registered on and writes offsets only while that viewer is still the cached
+one. After a disable/enable without a host restart, the reused XAML root means
+no new `PrepareRootElement` and no renderer, so a new contact cannot drive the
+panel until the host restarts. The Start mod publishes the close record
+three times (plan at the arm, `tapped` immediately before the tap, cancelled
+when a new pull drops it) and writes the cancelled kind
 again with every new open generation, so no `tapped` stamp survives into the next
 menu. It answers a bridge `retract` request with the duration it just planned, or
 with the no-settle sentinel when the request's open generation is not current,
 names generation 0, its 700 ms deadline passed, or the bridge already marked it
-done; `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.13.0) runs in
+done; `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.14.0) runs in
 `explorer.exe`, passes the Hide at once for an unconsumed `tapped` record and
 otherwise holds it for that answered duration plus 30 ms, or 560 ms when no
 answer arrives. It binds a `tapped` stamp to the open tick it read and refuses
@@ -135,7 +151,21 @@ one release per frame); a Hide that outlives the drain keeps every handle
 Windhawk 2.0.0-alpha.8 disables the hooks, calls `Wh_ModUninit`, then waits
 `ThreadsCallStackWaitForRegions(..., 200, 400)` before removing hooks and
 `FreeLibrary`, and discards that wait's result: the timeout is reachable and the
-residual is real, so the bridge keeps the handles and does not pin its image.
+residual is real. The bridge pins its own image
+(`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`, or
+`mod pin failed err=...`), so a `Hide_Hook` frame that returns after
+`Wh_ModUninit` lands in mapped code and still releases its lease; the host's
+wait covers the trampoline when it can see the frame, and a scan blind to the
+frame is outside what any mod can fix, so the hazard is reduced, not eliminated.
+A failed pin only logs, because the bridge owns no thread that could be
+stranded. A re-enable re-initialises the same image: `ResetReinitState()` clears
+`g_disabled`, `g_afterInit`, `g_explorerHooked`, `g_hideDelayEnabled` and
+`g_startPointTick`, retries a failed gesture mapping, leaves `g_hideCalls`
+alone, and logs `activation state reset`; a channel a timed-out unload kept is
+reused rather than remapped. The 500 ms drain is sized against the mod's own
+hold (660 ms for the shipped pair, at most 2.13 s for any answer the channel
+accepts), not against how long a frame can stay on the stack.
 The older `start_gesture_shared.h` mapping stays for the process lifetime on
 purpose, because a consumer and a late gesture callback may still hold its view.
 The two processes talk only through `mods/swipe_ipc_shared.h` (v2): one session-local

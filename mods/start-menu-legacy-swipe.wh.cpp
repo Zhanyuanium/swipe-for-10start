@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.27.0
+// @version         0.28.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -147,7 +147,11 @@ What it does:
   gesture. When several slots carry the same identifier, one that asserts contact
   wins over one that merely carries the name; if two assert it, the tracked slot
   is taken and the ambiguity is logged once. A report from another device cannot
-  move or lift it. A
+  move or lift it. The tracked identity has its own last-seen clock: every report
+  that names it refreshes that clock, and the same 18 ms idle tick that ends a
+  contact forgets an identity no report has named since, independently of the
+  contact latch. A report the decoder tracked while a layout apply refused
+  admission therefore leaves no identity behind to lock out the next finger. A
   pen report with `In Range` set and `Tip Switch` clear is a hover and drives
   nothing, because a slot with the tip up is not a contact; a pen lift ends the
   contact even while coordinates keep arriving. The one fallback is a device that
@@ -193,8 +197,11 @@ What it does:
   window. A contact that moved the panel nowhere in that window reports 0, so a
   finger dragged 300 DIP, held still for 1.2 s and released starts the settle
   from rest; the old whole-gesture `travel / elapsed` reported 0.20 DIP/ms and
-  left the seam at a speed the finger did not have. The speed is signed along
-  the gesture axis and projected onto the settle's direction: a release still
+  left the seam at a speed the finger did not have. The window is measured back
+  from the release: a newest position more than 30 ms older than the release
+  answers 0, so a finger that flicked and then only asserted its tip down through
+  a long hold does not hand the settle the speed from before the hold. The speed
+  is signed along the gesture axis and projected onto the settle's direction: a release still
   moving away from its target (a pull back before letting go) contributes 0 and
   the settle starts from rest instead of backwards. The unit is `Progress` per
   ms, so one estimator serves both families and the settle divides by the travel
@@ -384,8 +391,8 @@ What it does:
   2 DIP margin only rounds it. The shell's open storyboard fails that by the
   width of the panel: measured here, its rect is 12,-12..1005,539 where the
   settled one is 236,289..1229,840 on a bottom taskbar. A rejected measurement
-  publishes nothing and logs `reveal panelTrail rejected ...` once per open for
-  the settled pass; the last whole snapshot stays. The
+  publishes nothing and logs `reveal panelTrail rejected ...` once per open, from
+  the first pass that sees a rejected rect; the last whole snapshot stays. The
   snapshot is published at setup, on every root `SizeChanged`, on every menu open
   and on the second layout pass of that open, and on every work-area or display
   change, and the line `reveal panelTrail=...` reports the edge with the axis, its
@@ -568,7 +575,11 @@ Unload:
   `ViewChanged`, the settle batch's `Completed`), so removing one cannot lose the
   others if it throws. A revoke that throws keeps its object and its token: the
   token is the only handle on a handler that can still run, and the unload treats
-  it as a residual instead of dropping it.
+  it as a residual instead of dropping it. A new registration refuses to
+  overwrite a surviving token (`xaml layout handler left attached; new
+  registration refused`, the same for `viewchanged`), and the layout watch and
+  the scroller watch carry the request or element they were created for, so an
+  old callback can neither advance nor revoke a newer watch.
 - Every entry into module code from the compositor or the dispatcher is counted
   from before it can run. The settle batch's `Completed` registration takes a
   counted entry before the batch is ended, and every UI turn that touches module
@@ -616,8 +627,10 @@ Settings:
   settle only the part that moves the panel toward where it is going. Higher
   snaps away faster; 0 starts from rest, which a finger held still reports
   anyway. The end speed is the last 8-30 ms of
-  reports, so a hold before the lift reports 0 where a whole-gesture average
-  reported the drag's speed. Windows-key opens and closes
+  reports, and its newest position must be no more than 30 ms older than the
+  release: a hold before the lift reports 0 where a whole-gesture average
+  reported the drag's speed, and a finger that only asserts its tip down after
+  the motion reports 0 too. Windows-key opens and closes
   have no finger speed and always start from rest, so this setting does not
   change them; the style does. `Wh_ModInit` reads it once into an atomic and
   logs `settle start speed=...`; `Wh_ModSettingsChanged` refreshes the
@@ -720,7 +733,7 @@ Diagnostics:
   `reveal panelTrail=... axis=... (fallback)` once, when no panel has been
   measured, or
   `reveal panelTrail rejected ... axis=... rect=... work=... mon=... band=...`
-  once per open for the settled pass, when
+  once per open, when
   the measured rect is not the panel this layout shows and the last whole snapshot
   was kept),
   `hid decodefail dev=... err=...` (a field that belongs to the report and
@@ -746,9 +759,11 @@ Diagnostics:
   contact ends),
   `gesture geometry write failed ...`, `gesture renderer invalid until a
   successful reapply`, `gesture geometry queue err=...`,
-  `xaml size handler left attached; new registration refused` and
-  `xaml loaded handler left attached; new registration refused` (a revoke threw,
-  so the token and its owner are kept instead of being overwritten),
+  `xaml size handler left attached; new registration refused`,
+  `xaml loaded handler left attached; new registration refused`,
+  `xaml layout handler left attached; new registration refused` and
+  `xaml viewchanged handler left attached; new registration refused` (a revoke
+  threw, so the token and its owner are kept instead of being overwritten),
   `work area changed`,
   `scroller rect=...,...,...,... vo=... sh=...` (once per open, when the
   scrolling element was measured, and again only if the settled pass moved it),
@@ -992,7 +1007,8 @@ Known risks:
  *   succeeded stays for the process lifetime while nothing else acts.
  *   One per-activation reset (`ResetActivationState`) clears the tracked contact,
  *   the contact latch, both gesture sessions, the close mute, the deferred-layout
- *   flag, the pending tap and its serial, the coast and the debug overrides; it
+ *   flag, the pending tap and its pull generation, the coast and the debug
+ *   overrides; it
  *   runs before the input thread exists and on that thread as it stops, so a
  *   clean re-enable of the same pinned image does not inherit a finger.
  *   Unload order: set the
@@ -1006,9 +1022,10 @@ Known risks:
  *   attempt can still join it. Every delegate registration keeps its own
  *   revoke token (root Loaded and SizeChanged, the layout watch, the scroller's
  *   ViewChanged, the settle batch's Completed) and its own try block; a token and
- *   its owner are cleared only after the removal succeeded, and a registration
- *   that survived its revoke is never overwritten by the next root, so the handle
- *   to retry it is not lost. Every entry
+ *   its owner are cleared only after the removal succeeded, a registration that
+ *   survived its revoke is never overwritten by the next root, so the handle
+ *   to retry it is not lost, and each watch carries the request or element it
+ *   was created for so an old callback cannot drive a newer one. Every entry
  *   into module code from the compositor or the dispatcher is counted from before
  *   it can run: the batch's Completed registration takes a counted entry before
  *   the batch is ended, and every posted UI turn that touches module state takes
@@ -1156,7 +1173,10 @@ Known risks:
  *   its tip up is a hover that drives nothing. A report that names the tracked
  *   contact without a point keeps it alive only when it asserts the contact, and
  *   moves nothing either way; the liveness clock it refreshes is not the position
- *   clock the coast reads. A report id that
+ *   clock the coast reads, and the release speed is measured back from the
+ *   release so a status-only hold cannot hand the settle an old velocity. The
+ *   identity also carries its own last-seen tick, so a contact that vanished
+ *   without a lift cannot lock out the next finger. A report id that
  *   carries no
  *   contact field is ignored whole, and a device with neither tip nor in-range
  *   usage is the logged count/position fallback, whose Contact Count 0 and
@@ -1971,12 +1991,18 @@ std::atomic<uint32_t> g_setupGeneration{0};
 // corrects the trail on the second one, then detaches itself.
 //
 // `g_layoutTicksLeft` is 0 when no watch is armed, which is also what the close
-// teardown leaves behind; both fields are UI thread only.
+// teardown leaves behind; every field here is UI thread only.
 winrt::event_token g_layoutToken{};
 uint32_t g_layoutTicksLeft = 0;
 // The element the layout token was registered on, so its revoke does not depend
 // on g_root still pointing at it.
 wux::FrameworkElement g_layoutRoot{nullptr};
+// Identity of the armed watch. The callback captures the value it was created
+// with and acts only while that value is still current, so a handler whose
+// revoke failed can never advance or revoke a watch armed later. The mint skips
+// zero so "no watch" is a distinct value.
+uint32_t g_layoutWatchSerial = 0;
+uint32_t g_layoutWatchMint = 0;
 
 // ---------------------------------------------------------------------------
 // The scrolling element of the open menu
@@ -2092,27 +2118,20 @@ enum class CloseKind {
 // its tap would run.
 uint32_t g_pullSerial = 0;  // input thread only
 
-// The one tap slot. `g_pendingTapSerial` is the identity of the close that owns
-// the slot, minted once per armed tap: a newer close replaces the slot and keeps
-// its own identity, and the tap runner refuses a slot that carries none. Zero
-// means the slot is empty.
+// The one tap slot. `g_pendingTapPull` is the pull generation sampled when the
+// tap was armed: a newer pull replaces it, and the tap runner drops a slot whose
+// generation no longer matches. Zero in `g_pendingTapTick` means the slot is
+// empty, so no separate tap identity is needed.
 uint64_t g_pendingTapTick = 0;  // input thread only, 0 = none
 CloseKind g_pendingTapKind = CloseKind::None;
 uint32_t g_pendingTapPull = 0;
-uint32_t g_pendingTapSerial = 0;
-uint32_t g_tapSerial = 0;  // input thread only, the mint
 
 // Arms the tap for a close that has just started its settle. The deadline is
-// the end of that settle. Returns the slot's identity for this close, never 0.
-uint32_t ScheduleCloseTap(CloseKind kind, uint64_t delayMs) {
+// the end of that settle.
+void ScheduleCloseTap(CloseKind kind, uint64_t delayMs) {
     g_pendingTapTick = GetTickCount64() + delayMs;
     g_pendingTapKind = kind;
     g_pendingTapPull = g_pullSerial;
-    if (++g_tapSerial == 0) {
-        ++g_tapSerial;  // 0 is reserved for "no close owns the slot"
-    }
-    g_pendingTapSerial = g_tapSerial;
-    return g_pendingTapSerial;
 }
 
 std::atomic<HWND> g_coreHwnd{nullptr};
@@ -2390,11 +2409,13 @@ std::atomic<uint32_t> g_scrollerRetryGeneration{0};
 
 // UI thread only. Setup resets the open log; a failed mapping logs its fallback
 // once per process so a missing panel does not flood the log every resize. A
-// measurement rejected by the layout guard logs once, and the last good snapshot
-// stays published whole.
+// measurement rejected by the layout guard logs once per open: the generation it
+// was rejected in is part of the latch, so a retried pass in the same open stays
+// silent and the next open speaks again.
 bool g_panelTrailLogged = false;
 bool g_panelTrailFallbackLogged = false;
 bool g_panelTrailRejectedLogged = false;
+uint32_t g_panelTrailRejectedGeneration = 0;
 
 HANDLE g_hidThread = nullptr;
 std::atomic<HWND> g_hidHwnd{nullptr};
@@ -3154,8 +3175,8 @@ const wchar_t* CloseKindName(CloseKind kind) {
 // come through here, so the two families cannot diverge. The plan is not the tap:
 // it is published tapped = 0, so a Hide that arrives while the settle runs (the
 // user pressing the key) is a keyboard close for the bridge and gets its own
-// lead. Returns the tap slot's identity for this close.
-uint32_t ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
+// lead.
+void ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
     // A finger that has just lifted is already leaving the panel, so this close
     // does not have to mute a contact that will keep reporting.
     TakeCloseOwnership(GetTickCount64(), false);
@@ -3163,7 +3184,7 @@ uint32_t ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
                               0, g_pullSerial)) {
         FileLog(L"close mode stamp failed kind=%s", CloseKindName(kind));
     }
-    return ScheduleCloseTap(kind, static_cast<uint64_t>(duration.count()));
+    ScheduleCloseTap(kind, static_cast<uint64_t>(duration.count()));
 }
 
 // The commit decision both gesture families make at release. The travel at
@@ -3187,12 +3208,11 @@ bool ReleaseCommits(bool allowCommit, float travelDip, uint64_t elapsedMs,
            averageVelocity > kCommitVelocity;
 }
 
-// What a close attempt left behind: whether the settle runs, and the identity of
-// the tap it armed. `tapSerial` is 0 only when nothing was armed, which is the
-// only state in which the panel may be put back.
+// What a close attempt left behind: whether its settle runs. A close exists once
+// that settle started, and only then is a tap armed; there is no separate tap
+// identity to compare, because the pull generation already decides cancellation.
 struct GestureClose {
     bool started = false;
-    uint32_t tapSerial = 0;
 };
 
 // The close every gesture path runs, from the value the coast left. A close
@@ -3209,7 +3229,7 @@ GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
         return close;
     }
     close.started = true;
-    close.tapSerial = ArmGestureClose(kind, duration);
+    ArmGestureClose(kind, duration);
     return close;
 }
 
@@ -3255,7 +3275,6 @@ enum class DismissClose {
 
 struct DismissCloseResult {
     DismissClose start = DismissClose::NotStarted;
-    uint32_t tapSerial = 0;  // the tap this close armed, 0 when nothing was armed
 };
 
 // The close both gesture paths schedule. The settle runs first; the tap is
@@ -3316,7 +3335,6 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 
         // From here on the close exists: its settle runs, its plan is published
         // and its tap is scheduled. Nothing below may restore the panel.
-        result.tapSerial = close.tapSerial;
         result.start = DismissClose::StartedUnobserved;
 
         // The counted entry is taken before the batch is ended, so a completion
@@ -3438,11 +3456,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         }
         std::lock_guard lock(g_compositionMutex);
         InvalidateDismissBatchLocked();
-        // The animation starts before any of the batch work, so a close that
-        // already armed its tap exists even here; only a close with no tap may
-        // be abandoned.
-        result.start = result.tapSerial != 0 ? DismissClose::StartedUnobserved
-                                             : DismissClose::NotStarted;
+        // `result.start` is already the answer: the settle starts before any of
+        // the batch work, and a throw after that leaves a close with an armed
+        // tap, which only a close that never started may abandon.
         return result;
     } catch (...) {
         Wh_Log(L"Dismiss animation failed with an unknown exception");
@@ -3454,8 +3470,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         }
         std::lock_guard lock(g_compositionMutex);
         InvalidateDismissBatchLocked();
-        result.start = result.tapSerial != 0 ? DismissClose::StartedUnobserved
-                                             : DismissClose::NotStarted;
+        // `result.start` is already the answer: the settle starts before any of
+        // the batch work, and a throw after that leaves a close with an armed
+        // tap, which only a close that never started may abandon.
         return result;
     }
 }
@@ -3796,7 +3813,6 @@ void ApplyRetractRequest() {
         g_pendingTapTick = 0;
         g_pendingTapKind = CloseKind::None;
         g_pendingTapPull = 0;
-        g_pendingTapSerial = 0;
         FileLog(L"close tap dropped kind=%s", CloseKindName(dropped));
         if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
                                   g_pullSerial)) {
@@ -4647,11 +4663,21 @@ uint64_t g_contactTick = 0;      // input thread only, last report of a contact
 // tracked finger. The node index alone is not an identity on a device that
 // declares Contact Identifier: the device may hand the same node to another
 // finger between two reports, and the identifier is what proves it did not.
+//
+// `lastSeenTick` is the identity's own clock, on the coarse tick the contact
+// latch uses. A report the decoder tracks can be refused admission by the layout
+// handshake, which deliberately leaves the latch clear so the next report can
+// retry; if that contact then vanishes without a lift, the latch's cleanup can
+// never reach the identity it installed, and every later finger would be
+// rejected as "another contact". Any report that names the contact refreshes
+// this clock, and the idle tick that ends contacts forgets an identity no report
+// has named since.
 struct HidContactTrack {
     HANDLE device = nullptr;
     int slot = -1;
     bool hasIdentifier = false;
     ULONG identifier = 0;
+    uint64_t lastSeenTick = 0;
 };
 
 HidContactTrack g_trackedContact;  // input thread only
@@ -4796,7 +4822,10 @@ float CoastVelocity(float distance) {
 //   value for that whole window and the answer is 0;
 // - at least 8 ms, so one report cannot decide it: the window is the oldest
 //   report that is still inside 30 ms and at least 8 ms old;
-// - elapsed between the first and the last report of that window.
+// - elapsed between the first and the last report of that window;
+// - and the window is anchored at the release: a newest position more than 30 ms
+//   older than the release answers 0, because a status-only hold keeps the
+//   contact alive without feeding a position.
 //
 // The sample value is Progress: the quantity the follow inserts and the settle
 // animates, which is what lets one estimator serve both gesture families. The
@@ -4846,12 +4875,23 @@ void SampleEndVelocity(float progress, uint64_t qpcMs) {
 
 // Progress per millisecond at the release, signed along the gesture axis. 0 when
 // the window holds no movement, which is what a held contact reports.
-float EndVelocityProgressPerMs() {
+//
+// The window is measured back from the release, not from the newest sample: an
+// asserted contact with no point keeps the gesture alive without feeding a
+// position, so a finger that moved quickly and then only held its tip down must
+// not hand the settle the velocity from before the hold. A newest position more
+// than `kEndVelocityWindowMs` older than the release answers 0; inside that
+// freshness bound the widest 8-30 ms window of stored positions is used.
+float EndVelocityProgressPerMs(uint64_t releaseQpc) {
     if (g_endVelocityCount < 2) {
         return 0.0f;
     }
 
     const EndVelocitySample& newest = g_endVelocity[g_endVelocityCount - 1];
+    if (releaseQpc > newest.qpc &&
+        releaseQpc - newest.qpc > kEndVelocityWindowMs) {
+        return 0.0f;
+    }
     const EndVelocitySample* first = nullptr;
     // Oldest to newest, so the ages only shrink. The first entry inside the band
     // is the oldest one that is at least 8 ms old and at most 30 ms old, which
@@ -4896,7 +4936,7 @@ float EndVelocityProgressPerMs() {
 // - both gesture sessions (the dismiss drag and the reveal follow);
 // - the close mute and the deferred-layout flag, plus the panel-ownership
 //   publication derived from the sessions;
-// - the pending tap, the serial it was minted from and the pull generation;
+// - the pending tap and the pull generation it was armed under;
 // - the coast and both velocity windows;
 // - the diagnostic latches that steer behaviour, and the `anim` debug override.
 //
@@ -4921,8 +4961,6 @@ void ResetActivationState() {
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
-    g_pendingTapSerial = 0;
-    g_tapSerial = 0;
     g_pullSerial = 0;
 
     g_coasting.store(false, std::memory_order_relaxed);
@@ -5429,6 +5467,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     // The release line is written after the animation starts: the file write
     // costs time on the input thread, and every millisecond before the
     // animation is a frame the panel stands still at the seam.
+    const uint64_t releaseQpc = QpcMsNow();
     EndContactTiming();
 
     // The coast carried the panel past the last report, so both outcomes start
@@ -5436,8 +5475,9 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     // which is the measurement, not the point the animation starts from.
     const float from = TakeProgressNow();
     // Progress per millisecond at the end of the gesture, signed along the
-    // reveal axis. The settle projects it onto its own direction.
-    const float endVelocity = EndVelocityProgressPerMs();
+    // reveal axis. The settle projects it onto its own direction. The release
+    // time makes the freshness test: a held tip with no point answers 0.
+    const float endVelocity = EndVelocityProgressPerMs(releaseQpc);
     const float releaseSpeed = SpeedTowardDip(endVelocity, from,
                                               commit ? 1.0f : 0.0f, distance);
 
@@ -5639,8 +5679,9 @@ void ReleaseHidSession(const GestureGeometry& geometry, bool allowCommit,
     // before it settles. Both gesture families read it through the same call.
     const float from = TakeProgressNow();
     // Progress per millisecond at the end of the gesture, signed along the
-    // dismiss axis: a finger still moving toward the taskbar is negative.
-    const float endVelocity = EndVelocityProgressPerMs();
+    // dismiss axis: a finger still moving toward the taskbar is negative. The
+    // release time makes the freshness test: a held tip with no point answers 0.
+    const float endVelocity = EndVelocityProgressPerMs(releaseQpc);
     const float releaseSpeed = SpeedTowardDip(
         endVelocity, from, commit ? 0.0f : 1.0f, distance);
 
@@ -5691,10 +5732,11 @@ void AbortHidSession(const GestureGeometry& geometry) {
     // The same end-of-gesture speed the release lines report, without a target
     // to project onto: an abort has no seam, so the magnitude is enough.
     const float distance = std::max(geometry.distance(), 0.0f);
+    const uint64_t releaseQpc = QpcMsNow();
     const float velocity =
-        std::fabs(EndVelocityProgressPerMs()) * distance;
+        std::fabs(EndVelocityProgressPerMs(releaseQpc)) * distance;
 
-    LogHidRelease(session, velocity, false, QpcMsNow(), L"abort");
+    LogHidRelease(session, velocity, false, releaseQpc, L"abort");
     session.active = false;
     EndContactTiming();
     ShowAtRest();
@@ -6012,6 +6054,20 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         ReleaseRevealSession(geometry);
     }
 
+    // The tracked identity carries its own last-seen clock, independent of the
+    // contact latch. A report the decoder tracked can be refused admission by
+    // the layout handshake, which leaves the latch clear so the next report can
+    // retry; a contact that then vanishes without a lift would hold the identity
+    // forever, and every later finger would be rejected as another contact. The
+    // same idle window that ends a contact forgets an identity no report named.
+    // No session may own the contact here: a live session's reports name it and
+    // refresh this clock, and its own idle release runs first in this tick.
+    if (!session.active && !g_reveal.edgeCandidate &&
+        g_trackedContact.slot >= 0 && tickMs > g_trackedContact.lastSeenTick &&
+        tickMs - g_trackedContact.lastSeenTick >= kIdleReleaseMs) {
+        ForgetTrackedContact();
+    }
+
     // A contact that holds no session is not tracked per report, so the same
     // silence that ends a gesture ends the "this contact already started"
     // latch. Without it a lost lift would swallow the next edge swipe. The
@@ -6034,8 +6090,7 @@ void CheckHidIdleRelease(uint64_t tickMs) {
 // is dropped and no Hide ever reaches the shell. The close record then names the
 // cancel with tapped = 0, so a later keyboard close takes its own lead.
 void RunPendingCloseTap(uint64_t tickMs) {
-    if (g_pendingTapTick == 0 || g_pendingTapSerial == 0 ||
-        tickMs < g_pendingTapTick) {
+    if (g_pendingTapTick == 0 || tickMs < g_pendingTapTick) {
         return;
     }
 
@@ -6044,7 +6099,6 @@ void RunPendingCloseTap(uint64_t tickMs) {
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
-    g_pendingTapSerial = 0;  // the slot is empty; only an armed close owns one
 
     if (g_pullSerial != pull || g_reveal.active || g_reveal.edgeCandidate) {
         if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
@@ -6241,13 +6295,10 @@ void RunGeometryMeasurement(const SettledMeasureRequest& request, bool settled) 
             // One trail line per open, and the open-time turn is where it starts:
             // the settled turn then only speaks when the value moved.
             g_panelTrailLogged = false;
-        } else {
-            // The settled rect is the one that decides the reveal anchor, so its
-            // rejection speaks once per open even when the open-time rect (the
-            // storyboard's) was rejected first. A flag that never reset would hide
-            // a settled rejection for the rest of the process.
-            g_panelTrailRejectedLogged = false;
         }
+        // `g_panelTrailRejectedLogged` is not touched here: the publish keys it
+        // by the open generation, so a rejected rect speaks once per open, from
+        // whichever pass sees the first one.
         // The edge may only move while no contact drives it. This is re-read
         // inside the publish, at commit, not taken when the request was recorded:
         // a finger that started between the two must not have the edge moved
@@ -6578,7 +6629,8 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
     // Every candidate slot is decoded once, before identity is decided. The
     // tracked contact may be named by an identifier in any slot (a node index is
     // only where it was last seen), and a report that carries a tip-down or an
-    // identifier without a point still proves the contact is alive.
+    // in-range assertion without a point still proves the contact is alive; the
+    // identifier alone does not.
     HidContactSlot slots[kMaxContactCollections];
     bool anyDeclared = countField == HidField::Ok;
     for (int i = 0; i < slotCount; ++i) {
@@ -6675,6 +6727,10 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
         }
 
         const HidContactSlot& slot = slots[trackedSlot];
+        // The report names the tracked contact, so its identity stays alive:
+        // whether it carries a point, a status, or only the name is decided
+        // below, and a refused admission is not the decoder's business.
+        g_trackedContact.lastSeenTick = tickMs;
         // A contact the report names is named by that name from here on, so a
         // later slot reassignment cannot transfer the gesture.
         if (slot.hasIdentifier) {
@@ -6791,6 +6847,7 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
         g_trackedContact.slot = chosen;
         g_trackedContact.hasIdentifier = false;
         g_trackedContact.identifier = 0;
+        g_trackedContact.lastSeenTick = tickMs;
         FeedContactPoint(device, chosenX, chosenY, reportId, collections[chosen],
                          tickMs);
         return;
@@ -6842,6 +6899,7 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
     g_trackedContact.slot = chosen;
     g_trackedContact.hasIdentifier = slots[chosen].hasIdentifier;
     g_trackedContact.identifier = slots[chosen].identifier;
+    g_trackedContact.lastSeenTick = tickMs;
     FeedContactPoint(device, slots[chosen].rawX, slots[chosen].rawY, reportId,
                      collections[chosen], tickMs);
 }
@@ -7904,24 +7962,39 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
                 candidate.right = panel.right;
                 candidate.bottom = panel.bottom;
                 measuredPanel = true;
-            } else if (!g_panelTrailRejectedLogged) {
+            } else {
                 // The rect was measured but is not a panel: the storyboard has
                 // not placed it, or the layout is between sizes. Nothing from it
                 // is published; the snapshot keeps its last whole value. One line
-                // per open: the next open retries and must be able to speak again.
-                g_panelTrailRejectedLogged = true;
-                FileLog(L"reveal panelTrail rejected %.0f axis=%d "
-                        L"rect=%.0f,%.0f,%.0f,%.0f work=%.0f,%.0f,%.0f,%.0f "
-                        L"mon=%.0f,%.0f,%.0f,%.0f band=%.0f,%.0f",
-                        TrailEdge(candidate.layout.axis, panel.left, panel.top,
-                                  panel.right, panel.bottom),
-                        candidate.layout.axis, panel.left, panel.top,
-                        panel.right, panel.bottom, home.work.left,
-                        home.work.top, home.work.right, home.work.bottom,
-                        home.monitor.left, home.monitor.top, home.monitor.right,
-                        home.monitor.bottom,
-                        home.taskbarBand ? home.taskbarLow : -1.0f,
-                        home.taskbarBand ? home.taskbarHigh : -1.0f);
+                // per open: the generation is part of the latch, so a retried
+                // pass in the same open stays silent and the next open speaks
+                // again. A pass whose open is already gone stays silent too.
+                const uint32_t openGeneration =
+                    g_openGeneration.load(std::memory_order_relaxed);
+                if (expectedGeneration == 0 ||
+                    expectedGeneration == openGeneration) {
+                    const uint32_t rejectedGeneration =
+                        expectedGeneration != 0 ? expectedGeneration
+                                                : openGeneration;
+                    if (!g_panelTrailRejectedLogged ||
+                        g_panelTrailRejectedGeneration != rejectedGeneration) {
+                        g_panelTrailRejectedLogged = true;
+                        g_panelTrailRejectedGeneration = rejectedGeneration;
+                        FileLog(
+                            L"reveal panelTrail rejected %.0f axis=%d "
+                            L"rect=%.0f,%.0f,%.0f,%.0f work=%.0f,%.0f,%.0f,%.0f "
+                            L"mon=%.0f,%.0f,%.0f,%.0f band=%.0f,%.0f",
+                            TrailEdge(candidate.layout.axis, panel.left,
+                                      panel.top, panel.right, panel.bottom),
+                            candidate.layout.axis, panel.left, panel.top,
+                            panel.right, panel.bottom, home.work.left,
+                            home.work.top, home.work.right, home.work.bottom,
+                            home.monitor.left, home.monitor.top,
+                            home.monitor.right, home.monitor.bottom,
+                            home.taskbarBand ? home.taskbarLow : -1.0f,
+                            home.taskbarBand ? home.taskbarHigh : -1.0f);
+                    }
+                }
             }
         }
     }
@@ -8038,29 +8111,39 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
 // because a menu that closed before the second pass must not measure anything
 // later.
 //
-// The watch carries the request it belongs to, not a decision taken when it was
-// armed: a callback that outlived a newer request measures nothing.
+// The watch carries the request it belongs to and its own serial: a callback
+// that outlived a newer request, or a newer watch, measures and revokes nothing.
+// A revoke that throws keeps the token and its owner, so the handle can be
+// retried; a root that still carries a registration refuses the next one.
 // ---------------------------------------------------------------------------
 SettledMeasureRequest g_layoutRequest{};  // UI thread only
 
 void StopSettledTrailWatch() {
     wux::FrameworkElement root = g_layoutRoot ? g_layoutRoot : g_root;
-    if (g_layoutToken.value && root) {
+    if (g_layoutToken.value) {
+        if (!root) {
+            Wh_Log(L"LayoutUpdated registration has no owner to revoke on");
+            return;
+        }
         try {
             root.LayoutUpdated(g_layoutToken);
             g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
         } catch (winrt::hresult_error const& e) {
             Wh_Log(L"LayoutUpdated revoke failed: %08X", e.code());
+            // The token and its owner stay: the token is the only handle on a
+            // handler that can still fire, and overwriting it with the next
+            // watch would lose it for the process lifetime. The request and the
+            // serial stay with it, so the handler still acts only for itself.
+            return;
         } catch (...) {
-            // A root mid-teardown cannot revoke; the request guard in the
-            // handler keeps a stale callback from measuring the next open. The
-            // registration count stays raised, so the unload reports the
-            // residual instead of claiming the handler is gone.
+            Wh_Log(L"LayoutUpdated revoke failed with an unknown exception");
+            return;
         }
     }
     g_layoutToken = {};
     g_layoutRoot = nullptr;
     g_layoutTicksLeft = 0;
+    g_layoutWatchSerial = 0;
     g_layoutRequest = SettledMeasureRequest{};
 }
 
@@ -8080,44 +8163,75 @@ void ArmLayoutWatch(const SettledMeasureRequest& request) {
     }
 
     // One watch per open: a work-area broadcast records a new request, and the
-    // previous watch would otherwise measure the same settled layout twice.
+    // previous watch would otherwise measure the same settled layout twice. A
+    // registration that survived its revoke keeps its token and its owner:
+    // overwriting them would lose the only handle on a handler that can still
+    // fire. This open then gets no layout watch; its deadline still measures.
     StopSettledTrailWatch();
+    if (g_layoutToken.value) {
+        Wh_Log(L"LayoutUpdated registration survived its revoke; this open gets "
+               L"no layout watch");
+        FileLog(L"xaml layout handler left attached; new registration refused");
+        return;
+    }
     g_layoutTicksLeft = 2;
     g_layoutRequest = request;
     g_layoutRoot = root;
 
+    uint32_t watchSerial = ++g_layoutWatchMint;
+    if (watchSerial == 0) {
+        watchSerial = ++g_layoutWatchMint;  // 0 always means "no watch"
+    }
+    // The serial is current before the registration exists: a callback can only
+    // run after it, and the catch below clears the serial with the token.
+    g_layoutWatchSerial = watchSerial;
     try {
-        g_layoutToken = root.LayoutUpdated([](
-            winrt::Windows::Foundation::IInspectable const&,
-            winrt::Windows::Foundation::IInspectable const&) {
-            try {
-                if (g_layoutTicksLeft == 0) {
-                    return;  // a callback that outlived its revoke
+        g_layoutToken = root.LayoutUpdated(
+            [watchSerial, request](
+                winrt::Windows::Foundation::IInspectable const&,
+                winrt::Windows::Foundation::IInspectable const&) {
+                try {
+                    if (watchSerial != g_layoutWatchSerial) {
+                        return;  // a callback that outlived its revoke
+                    }
+                    if (g_layoutTicksLeft == 0) {
+                        return;
+                    }
+                    if (--g_layoutTicksLeft > 0) {
+                        return;  // the first pass precedes the panel placement
+                    }
+                    RunGeometryMeasurement(request, true);
+                } catch (winrt::hresult_error const& e) {
+                    Wh_Log(L"Settled trail failed: %08X", e.code());
+                } catch (...) {
+                    // Never let an exception escape into XAML.
                 }
-                if (--g_layoutTicksLeft > 0) {
-                    return;  // the first pass precedes the panel placement
+                // Revoked after the measurement, and also when one threw, so the
+                // handler never outlives the open it belongs to. Only this
+                // watch's own stop: a newer watch may already own the fields.
+                if (watchSerial == g_layoutWatchSerial) {
+                    StopSettledTrailWatch();
                 }
-                const SettledMeasureRequest request = g_layoutRequest;
-                RunGeometryMeasurement(request, true);
-            } catch (winrt::hresult_error const& e) {
-                Wh_Log(L"Settled trail failed: %08X", e.code());
-            } catch (...) {
-                // Never let an exception escape into XAML.
-            }
-            // Revoked after the measurement, and also when one threw, so the
-            // handler never outlives the open it belongs to.
-            StopSettledTrailWatch();
-        });
+            });
         if (g_layoutToken.value) {
             g_uiRegistrationCount.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_layoutWatchSerial = 0;
+            g_layoutRoot = nullptr;
+            g_layoutTicksLeft = 0;
+            g_layoutRequest = SettledMeasureRequest{};
         }
     } catch (winrt::hresult_error const& e) {
         g_layoutToken = {};
+        g_layoutWatchSerial = 0;
+        g_layoutRoot = nullptr;
         g_layoutTicksLeft = 0;
         g_layoutRequest = SettledMeasureRequest{};
         FileLog(L"layout watch failed err=%08X", static_cast<unsigned>(e.code()));
     } catch (...) {
         g_layoutToken = {};
+        g_layoutWatchSerial = 0;
+        g_layoutRoot = nullptr;
         g_layoutTicksLeft = 0;
         g_layoutRequest = SettledMeasureRequest{};
         FileLog(L"layout watch failed err=unknown");
@@ -8236,18 +8350,26 @@ void FindScrollableElement(const wux::UIElement& element, uint32_t depth,
 }
 
 // Drops only the handler, so a re-measure can subscribe to the same or another
-// element. Runs on the UI thread.
+// element. Runs on the UI thread. A revoke that throws keeps the token and its
+// viewer: the token is the only handle on a handler that can still fire, and
+// overwriting it with the next registration would lose it for the process
+// lifetime.
 void RevokeScrollerWatch() {
     wuxc::ScrollViewer viewer = g_scrollerViewer;
-    if (g_scrollerToken.value && viewer) {
+    if (g_scrollerToken.value) {
+        if (!viewer) {
+            Wh_Log(L"ViewChanged registration has no owner to revoke on");
+            return;
+        }
         try {
             viewer.ViewChanged(g_scrollerToken);
             g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
         } catch (winrt::hresult_error const& e) {
             Wh_Log(L"ViewChanged revoke failed: %08X", e.code());
+            return;
         } catch (...) {
-            // The element is gone; its handler dies with it. The count stays
-            // raised, so the unload reports the residual.
+            Wh_Log(L"ViewChanged revoke failed with an unknown exception");
+            return;
         }
     }
     g_scrollerToken = {};
@@ -8256,16 +8378,17 @@ void RevokeScrollerWatch() {
 
 // Publishes the offsets of the cached element. ViewChanged fires on the UI
 // thread and only while the list actually scrolls, so this is the whole cost of
-// keeping the gate honest.
-void RefreshScrollerOffsets() {
-    wuxc::ScrollViewer viewer = g_scrollerViewer;
-    if (!viewer) {
+// keeping the gate honest. The handler passes the viewer it was registered on:
+// a handler that outlived its element writes nothing, so an old watch cannot
+// drive the offsets of a newer one.
+void RefreshScrollerOffsets(wuxc::ScrollViewer const& watched) {
+    if (!watched || watched != g_scrollerViewer) {
         return;
     }
 
     try {
-        const float verticalOffset = viewer.VerticalOffset();
-        const float scrollableHeight = viewer.ScrollableHeight();
+        const float verticalOffset = watched.VerticalOffset();
+        const float scrollableHeight = watched.ScrollableHeight();
         std::lock_guard lock(g_scrollerMutex);
         if (g_scroller.state == ScrollerState::Scrollable) {
             g_scroller.verticalOffset = verticalOffset;
@@ -8581,11 +8704,6 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
             return;
     }
 
-    // One handler per measurement: the element must not be observed twice. The
-    // revoke and the new registration are XAML calls, so they stay outside the
-    // commit section; the cache itself is already written.
-    RevokeScrollerWatch();
-
     // One line per open. The settled pass speaks only when it moved the rect the
     // first pass logged, so a storyboard that was still growing cannot hide the
     // final geometry.
@@ -8605,18 +8723,37 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
                 scrollableHeight);
     }
 
+    // One handler per measurement: the element must not be observed twice. The
+    // revoke and the new registration are XAML calls, so they stay outside the
+    // commit section; the cache itself is already written. A registration that
+    // survived its revoke keeps its token and its element: this pass adds no
+    // second watch, and the old handler still writes nothing for a newer element.
+    RevokeScrollerWatch();
+    if (g_scrollerToken.value) {
+        Wh_Log(L"ViewChanged registration is still attached; this pass adds no "
+               L"scroll watcher");
+        FileLog(L"xaml viewchanged handler left attached; new registration "
+                L"refused");
+        return;
+    }
+
     g_scrollerViewer = best.viewer;
     try {
-        g_scrollerToken = best.viewer.ViewChanged(
-            [](auto const&, auto const&) { RefreshScrollerOffsets(); });
+        const wuxc::ScrollViewer watched = best.viewer;
+        g_scrollerToken = watched.ViewChanged(
+            [watched](auto const&, auto const&) {
+                RefreshScrollerOffsets(watched);
+            });
         if (g_scrollerToken.value) {
             g_uiRegistrationCount.fetch_add(1, std::memory_order_relaxed);
         }
     } catch (winrt::hresult_error const& e) {
         g_scrollerToken = {};
+        g_scrollerViewer = nullptr;
         FileLog(L"scroller watch failed err=%08X", static_cast<unsigned>(e.code()));
     } catch (...) {
         g_scrollerToken = {};
+        g_scrollerViewer = nullptr;
         FileLog(L"scroller watch failed err=unknown");
     }
 }
@@ -10059,7 +10196,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.27.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.28.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance
