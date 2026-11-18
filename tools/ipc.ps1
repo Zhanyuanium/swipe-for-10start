@@ -4,18 +4,23 @@
 #          events and mutex `mods/swipe_ipc_shared.h` defines.
 # [OUTPUT]: `pwsh -File tools/ipc.ps1 p=0.5` publishes one command; -State
 #           prints one snapshot of the channel (each record with the sequence it
-#           was copied under) and refuses a section whose magic, version or
-#           layoutBytes is not this header's.
+#           was copied under) and refuses a section whose initState is not ready
+#           or whose magic, version or layoutBytes is not this header's.
 # [POS]: replaces writing into the mod's debug.txt from a shell. The offsets
 #        below are the contract in swipe_ipc_shared.h; the mod asserts the same
-#        numbers at compile time, and this tool compares the section's magic,
-#        version and layoutBytes before it reads or writes, so a foreign layout
-#        is refused instead of misread. Every record is a seqlock: the counter is
-#        bumped to odd before a write and to even after, and a reader retries
-#        while it is odd or changed, returning the accepted counter with the copy
-#        so no display can mix two publishes. The command record needs the
-#        channel's writer mutex as well, because two tools publishing at once
-#        would interleave their text.
+#        numbers at compile time, and this tool compares the section's initState,
+#        magic, version and layoutBytes before it reads or writes, so a foreign
+#        or uninitialised section is refused instead of misread. Every record is
+#        a seqlock: the counter is bumped to odd before a write and to even
+#        after, and a reader retries while it is odd or changed, returning the
+#        accepted counter with the copy so no display can mix two publishes. The
+#        command record needs the channel's writer mutex as well, because two
+#        tools publishing at once would interleave their text. An interrupted
+#        publish leaves cmdSeq odd on purpose: -State then prints that record as
+#        `unstable`, no reader accepts the half-written line, and the next
+#        publisher steps the odd value forward before it writes a complete
+#        record. The command event is set only after the even publish, never by
+#        a failed one.
 #
 # Examples:
 #   pwsh -NoProfile -File tools\ipc.ps1 -State
@@ -110,13 +115,13 @@ if ($State) {
         $version = $view.ReadUInt32($OffsetVersion)
         $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
         $initState = $view.ReadInt32($OffsetInitState)
-        if ($magic -ne 0x53313053 -or $version -ne 2 -or
+        if ($initState -ne 2 -or $magic -ne 0x53313053 -or $version -ne 2 -or
             $layoutBytes -ne $StateBytes) {
             $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
                        'initState={3}') -f $magic, $version, $layoutBytes,
                        $initState
-            throw ("The section '$StateName' is not the v2 layout this tool " +
-                   "reads: $detail. Nothing was printed.")
+            throw ("The section '$StateName' is not a ready v2 layout this " +
+                   "tool reads: $detail. Nothing was printed.")
         }
 
         $cmd = Read-Record $view $OffsetCmdSeq {
@@ -227,40 +232,41 @@ try {
             [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite)
 
         # The same layout check as -State, before a byte is written: the offsets
-        # below are this header's, and a section of another version would take
-        # this text and this counter into fields that mean something else.
+        # below are this header's, a section of another version would take this
+        # text and this counter into fields that mean something else, and a
+        # section that is not ready may still be initialising.
         $magic = $view.ReadUInt32($OffsetMagic)
         $version = $view.ReadUInt32($OffsetVersion)
         $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
+        $initState = $view.ReadInt32($OffsetInitState)
+        if ($initState -ne 2) {
+            throw ("The section '$StateName' is not ready " +
+                   "(initState=$initState); nothing was sent.")
+        }
         if ($magic -ne 0x53313053 -or $version -ne 2 -or
             $layoutBytes -ne $StateBytes) {
-            $detail = ('magic=0x{0:X8} version={1} layoutBytes={2}') -f $magic,
-                $version, $layoutBytes
+            $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
+                       'initState={3}') -f $magic, $version, $layoutBytes,
+                       $initState
             throw ("The section '$StateName' is not the v2 layout this tool " +
                    "writes: $detail. Nothing was sent.")
         }
 
-        # Seqlock: odd marks a write in progress, even publishes it.
+        # Seqlock: odd marks a write in progress, even publishes it. There is no
+        # restore on failure: if a write below throws, the record stays odd, so
+        # no reader accepts the half-written line and a command event that was
+        # signalled earlier cannot wake the Start side with it. The next
+        # publisher steps the odd value forward (the same rule as
+        # SwipeIpcBeginWrite in the header) and writes the whole record again;
+        # -State reports the odd record as `unstable` until then.
         $sequence = $view.ReadInt64($OffsetCmdSeq)
         $odd = if (($sequence -band 1) -eq 0) { $sequence + 1 } else { $sequence + 2 }
         $view.Write($OffsetCmdSeq, $odd)
-        $published = $false
-        try {
-            $view.WriteArray($OffsetCmdText, $bytes, 0, $bytes.Length)
-            $view.Write($OffsetCmdText + $bytes.Length, [byte]0)
-            $view.Write($OffsetCmdTick, [Environment]::TickCount64)
-            $view.Write($OffsetCmdSeq, $odd + 1)
-            $published = $true
-            $sequence = $odd + 1
-        } finally {
-            if (-not $published) {
-                # A record left odd makes every reader retry and skip it until
-                # the next write. Restoring the even value keeps the record
-                # readable; the command event is set only after a complete
-                # write, so no reader acts on the mixed line.
-                try { $view.Write($OffsetCmdSeq, $odd + 1) } catch { }
-            }
-        }
+        $view.WriteArray($OffsetCmdText, $bytes, 0, $bytes.Length)
+        $view.Write($OffsetCmdText + $bytes.Length, [byte]0)
+        $view.Write($OffsetCmdTick, [Environment]::TickCount64)
+        $view.Write($OffsetCmdSeq, $odd + 1)
+        $sequence = $odd + 1
         $view.Dispose()
     } finally {
         $mapping.Dispose()

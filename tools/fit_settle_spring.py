@@ -389,16 +389,44 @@ def report_legacy(samples):
 
 
 def report_initial_slope():
+    """The half-open release, with the tangent and the model kept apart.
+
+    The old line printed `velocity * 10 ms` as the displacement of the first
+    10 ms. That is the initial tangent, not a position on the curve: the spring
+    starts at the finger's speed and accelerates away from it at once. This
+    report evaluates the generated frame list, which is what the animation
+    actually receives, and prints the first sampled frame and the 10 ms position
+    next to the tangent that used to be labelled as one of them.
+    """
     velocity = 0.4
     remaining = 0.5 * DISTANCE_DIP
-    print('\n== shipping settle, analytic (not measured)')
-    print('   half-open release: Distance %.0f DIP, finger %.1f DIP/ms'
-          % (DISTANCE_DIP, velocity))
-    print('   y0 = v/remaining = %.3f 1/ms -> %.2f DIP/ms, %.1f DIP in the first 10 ms'
-          % (velocity / remaining, velocity, velocity * 10.0))
+    t_total = shipped_duration(remaining)
+    y0 = velocity / remaining
+    times, values, _, end_value, steps = settle_frames(
+        WIN11_DAMPING, t_total, y0)
+    first_frame_ms = times[1]
+    first_frame_dip = values[1] * remaining
+    at_10_ms_dip = model_value(times, values, 10.0) * remaining
+
+    print('\n== shipping settle, half-open release (analytic, not measured)')
+    print('   Distance %.0f DIP, remaining %.0f DIP, finger %.1f DIP/ms'
+          % (DISTANCE_DIP, remaining, velocity))
+    print('   y0 = v/remaining = %.6f 1/ms (%.3f 1/s), T = %d ms'
+          % (y0, y0 * 1000.0, t_total))
+    print('   tangent   initial slope x 10 ms = %.1f DIP: a straight-line'
+          % (velocity * 10.0))
+    print('             extrapolation, not the model position at 10 ms')
+    print('   frames    %d segments of %.2f ms, endValue %.4f'
+          % (steps, t_total / steps, end_value))
+    print('   model     first sampled frame %.2f ms -> %.1f DIP'
+          % (first_frame_ms, first_frame_dip))
+    print('             at 10 ms -> %.1f DIP (frame list, interpolated)'
+          % at_10_ms_dip)
     old = 9.0 * remaining / 300.0
     print('   old Windows 11 bezier(0.1,0.9,0.2,1)/300 ms: 9x average = '
-          '%.2f DIP/ms, %.0f DIP in the first 10 ms' % (old, old * 10.0))
+          '%.2f DIP/ms,' % old)
+    print('             %.0f DIP as a tangent (the curve is slower after 0)'
+          % (old * 10.0))
 
 
 def main(argv):

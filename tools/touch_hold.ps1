@@ -68,9 +68,13 @@ try {
     $bmp.Dispose()
     "SHOT path=$ScreenshotPath width=$($bounds.Width) height=$($bounds.Height)"
 } finally {
-    Stop-ContactHold
     if ($ReleaseAtEnd) {
+        # End-Contact stops, joins and lifts in one call; a throw in a separate
+        # stop would skip the UP, so the release has a single owner.
         End-Contact
+    } else {
+        # The contact is meant to stay down: only the keep-alive is stopped.
+        Stop-ContactHold
     }
 }
 

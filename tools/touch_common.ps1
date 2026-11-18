@@ -14,7 +14,7 @@ Every tool that drives a finger through InjectTouchInput uses this file, so a
     Hold-Contact        UPDATE at the held point every KeepAliveMs, blocking
     Start-ContactHold   the same keep-alive on a background thread, so the caller
     Stop-ContactHold    can capture the screen while the contact stays down
-    End-Contact         UP; the last injection of that contact
+    End-Contact         stops and joins the keep-alive, then UP
 
 The keep-alive interval is [TouchCommon.Injector]::KeepAliveMs, 5 ms. The mod
 ends a contact after kIdleReleaseMs = 18 ms without a raw report, so any interval
@@ -25,11 +25,16 @@ reads a finger.
 Injection is serialised. The contact flags, the last point and every
 InjectTouchInput call sit under one lock, and End-Contact stops and joins the
 keep-alive thread before it sends the UP. No UPDATE can reach the injector for
-that contact after the UP, so the UP is the release, and nothing races it.
+that contact after the UP, so the UP is the release, and nothing races it. If
+the join times out, the UP is not sent: the thread may still inject an UPDATE,
+and the contact state stays open. A failed UP injection also keeps the contact
+open and leaves ReleaseMs at 0, so the caller sees that no release happened and
+a retry can send it.
 
-End-Contact records the UP timestamp immediately before that injection
-([TouchCommon.Injector]::ReleaseMs, on the Stopwatch clock), so a trace can time
-the release without taking a stamp after a capture.
+End-Contact records the UP timestamp's value immediately before that injection
+([TouchCommon.Injector]::ReleaseMs, on the Stopwatch clock) and stores it when
+the UP succeeds, so a trace can time the release without taking a stamp after a
+capture.
 
 Pacing uses CREATE_WAITABLE_TIMER_HIGH_RESOLUTION. The mod measured the reason:
 this host puts a windowless pwsh into a timer class where timeBeginPeriod is
@@ -167,8 +172,9 @@ namespace TouchCommon
         public static int LastX { get { lock (gate) { return lastX; } } }
         public static int LastY { get { lock (gate) { return lastY; } } }
 
-        // Stopwatch-clock time (ms) of the release, stamped immediately before
-        // the UP injection that ended the contact. 0 until a contact has ended.
+        // Stopwatch-clock time (ms) of the release. The value is taken
+        // immediately before the UP injection and stored only when that
+        // injection succeeds; 0 until a contact has ended.
         public static double ReleaseMs { get { return releaseMs; } }
 
         public static double NowMs()
@@ -317,45 +323,79 @@ namespace TouchCommon
             }
         }
 
-        public static string StopHold()
+        // Stops and joins the keep-alive. `error` is the keep-alive's own
+        // injection error, if any. False means the thread is still alive after
+        // the join timeout: it may still inject an UPDATE, so the caller must
+        // not send the UP and must leave the contact open. The thread reference
+        // is kept on a timeout, so a later StopHold retries the same join
+        // instead of pretending the thread is gone.
+        static bool StopHoldThread(out string error)
         {
             Thread t;
-            lock (gate) { keep = false; t = keepThread; keepThread = null; }
-            // Join outside the lock: the thread needs it to finish an injection.
-            if (t != null) t.Join(2000);
+            lock (gate) { keep = false; t = keepThread; }
+            if (t != null)
+            {
+                // Join outside the lock: the thread needs it to finish an
+                // injection.
+                if (!t.Join(2000))
+                {
+                    error = "keep-alive thread did not stop within 2000 ms";
+                    return false;
+                }
+                lock (gate) { if (keepThread == t) keepThread = null; }
+            }
             string e = keepError;
             keepError = null;
-            return string.IsNullOrEmpty(e) ? "OK" : "keep-alive: " + e;
+            error = string.IsNullOrEmpty(e) ? null : "keep-alive: " + e;
+            return true;
+        }
+
+        public static string StopHold()
+        {
+            string error;
+            StopHoldThread(out error);
+            return error ?? "OK";
         }
 
         // The release, under the lock, after the keep-alive thread is joined.
+        // The UP is the last injection of the contact. A failed UP is reported
+        // as a failure and leaves the contact open, and ReleaseMs stays 0: the
+        // caller can see that no release happened, and a retry can send the UP.
         static string EndLocked(int x, int y)  // caller holds gate
         {
             if (!contactOpen) return "no contact is open";
-            releaseMs = NowMs();  // immediately before the UP, not after a capture
+            double stamp = NowMs();  // the value is taken immediately before the UP
             string r = Inject(x, y, UP | INRANGE);
-            contactOpen = false;  // the contact is over even if the UP failed
-            return r;
+            if (r != "OK")
+                return "the UP failed (" + r + "); the contact is still down";
+            releaseMs = stamp;
+            contactOpen = false;
+            return "OK";
         }
 
-        static string End(string hold, int x, int y)
+        static string EndAfterHold(string hold, int x, int y)
         {
             string r;
             lock (gate) { r = EndLocked(x, y); }
-            return hold == "OK" ? r : hold + " (then " + r + ")";
+            return hold == null ? r : hold + " (then " + r + ")";
         }
 
         public static string End(int x, int y)
         {
-            return End(StopHold(), x, y);
+            string hold;
+            if (!StopHoldThread(out hold))
+                return hold + "; the UP was not sent, the contact is still down";
+            return EndAfterHold(hold, x, y);
         }
 
         public static string End()
         {
-            string hold = StopHold();
+            string hold;
+            if (!StopHoldThread(out hold))
+                return hold + "; the UP was not sent, the contact is still down";
             string r;
             lock (gate) { r = EndLocked(lastX, lastY); }
-            return hold == "OK" ? r : hold + " (then " + r + ")";
+            return hold == null ? r : hold + " (then " + r + ")";
         }
 
         // One contact, one path, one release: DOWN, one UPDATE per step, UP.
@@ -451,6 +491,9 @@ function Start-ContactHold {
     if ($r -ne 'OK') { throw "Start-ContactHold: $r" }
 }
 
+# Stops the keep-alive and joins its thread. Throws when the thread did not stop
+# within 2 s: the contact is still open, and End-Contact will refuse to send the
+# UP for the same reason until a later call joins it.
 function Stop-ContactHold {
     [CmdletBinding()]
     param()
@@ -458,8 +501,14 @@ function Stop-ContactHold {
     if ($r -ne 'OK') { throw "Stop-ContactHold: $r" }
 }
 
-# UP, either at X,Y or at the last injected point. This is the release: the
-# keep-alive is stopped and joined first, so no UPDATE follows the UP.
+# The release: stops and joins the keep-alive, then sends the UP, either at X,Y
+# or at the last injected point. End-Contact owns all three steps, so no UPDATE
+# can follow the UP. Two failures keep the contact open instead of pretending it
+# ended, and both throw what the caller sees:
+#   - the join timed out: no UP was sent ("...; the UP was not sent, the contact
+#     is still down"), because the keep-alive thread may still inject;
+#   - the UP injection failed: "the UP failed (...); the contact is still down",
+#     and ReleaseMs stays 0, so a retry can send the UP again.
 function End-Contact {
     [CmdletBinding(DefaultParameterSetName = 'LastPoint')]
     param(

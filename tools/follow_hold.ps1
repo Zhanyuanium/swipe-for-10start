@@ -10,7 +10,10 @@ real panel reports at ~170 Hz. A plain hold therefore goes silent for longer
 than the mod's 18 ms idle release and the capture shows the post-release state.
 This script starts the shared keep-alive (tools/touch_common.ps1, one UPDATE
 every 5 ms) for as long as the screenshot takes, so the reveal follow is still
-live when the pixels are read. End-Contact lifts after the capture.
+live when the pixels are read. End-Contact lifts after the capture and owns the
+whole release: it stops and joins the keep-alive, then sends the UP. A failed
+join or UP throws while the contact stays open, so the caller sees that the
+release did not happen.
 
 Coordinates are physical screen pixels (this machine is 2880x1800 at 200%).
 
@@ -53,7 +56,8 @@ try {
     $bmp.Dispose()
     "SHOT path=$ScreenshotPath width=$($bounds.Width) height=$($bounds.Height) hold=$HoldX,$HoldY"
 } finally {
-    Stop-ContactHold
+    # End-Contact stops, joins and lifts in one call. Calling Stop-ContactHold
+    # first would let a failed stop skip the UP; a single owner cannot.
     End-Contact
 }
 

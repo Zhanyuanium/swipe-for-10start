@@ -70,10 +70,15 @@
 //      while this call is still waiting for it. Waiting past the abandon age is
 //      the point of the budget. Both sides call SwipeIpcOpen exactly once, at
 //      mod init, so a caller that gave up inside that window would hold no
-//      channel for the rest of its attachment.
+//      channel for the rest of its attachment. Every retry path checks the
+//      deadline, including a lost claim race, so no state can keep the caller
+//      past the budget.
 //   4. A claim older than kSwipeIpcInitAbandonMs is marked abandoned, and the
 //      next attempt claims it. A process that died inside step 2 therefore does
 //      not brick the channel for the rest of the session.
+//   5. Any other initState value is refused with ERROR_INVALID_DATA at once.
+//      No state this header writes can turn it into a claim, so waiting could
+//      only break the budget; the section is left untouched.
 //
 // SwipeIpcOpen may sleep for its whole budget. Call it from mod init and never
 // from a hook: a hook that finds no channel takes its own fixed lead instead of
@@ -84,9 +89,11 @@
 //                      initialised yet (a claim with no readable age outlived
 //                      the budget, or claims keep replacing each other). Nothing
 //                      was changed; the caller runs without the channel.
-//   ERROR_INVALID_DATA initState says ready, but magic, version or layoutBytes
-//                      disagrees with this header. The section is broken or
-//                      belongs to another build. It is left untouched.
+//   ERROR_INVALID_DATA initState is not one of the four values this header
+//                      defines, or it says ready while magic, version or
+//                      layoutBytes disagrees with this header. The section is
+//                      broken or belongs to another build. It is left
+//                      untouched.
 //
 // Neither side ever destroys or re-creates a section the other side may hold:
 // SwipeIpcClose closes this process's handles only, and a section object stays
@@ -383,6 +390,13 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
     // that is alive but stuck becomes this caller's instead of ending the wait
     // with no channel.
     const ULONGLONG deadline = GetTickCount64() + kSwipeIpcOpenBudgetMs;
+    const auto fail = [&](DWORD code) -> bool {
+        *error = code;
+        UnmapViewOfFile(state);
+        CloseHandle(mapping);
+        return false;
+    };
+
     bool owner = false;
     for (;;) {
         const LONG observed = InterlockedCompareExchange(&state->initState, 0, 0);
@@ -399,7 +413,19 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
                 owner = true;
                 break;
             }
-            continue;  // another process claimed it first
+            // Another process claimed it first. The next pass sees its state;
+            // the budget still bounds this loop.
+            if (GetTickCount64() >= deadline) {
+                return fail(ERROR_NOT_READY);
+            }
+            continue;
+        }
+        if (observed != kSwipeIpcInitialising) {
+            // Not a state this header publishes. Waiting cannot turn it into a
+            // claim, and a loop that waited anyway would outlast the documented
+            // budget. The section belongs to another build or is corrupt; it is
+            // left untouched for its owner.
+            return fail(ERROR_INVALID_DATA);
         }
 
         // Initialising. Either a live claim or one whose owner died inside it.
@@ -413,13 +439,15 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
             now - claimed > kSwipeIpcInitAbandonMs) {
             InterlockedCompareExchange(&state->initState, kSwipeIpcAbandoned,
                                        kSwipeIpcInitialising);
+            // Re-observe whether this process or another one marked it; the
+            // deadline check covers a takeover that another caller won first.
+            if (GetTickCount64() >= deadline) {
+                return fail(ERROR_NOT_READY);
+            }
             continue;
         }
         if (now >= deadline) {
-            *error = ERROR_NOT_READY;
-            UnmapViewOfFile(state);
-            CloseHandle(mapping);
-            return false;
+            return fail(ERROR_NOT_READY);
         }
         Sleep(1);
     }

@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.11.0
+// @version         0.12.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -98,6 +98,17 @@ Notes:
   the Start mod logs one `ipc open created=... close=...` at init, and one
   `hide open generation unavailable err=...` for a Hide that found no published
   open generation (0 is never a generation).
+- The two channels have two lifetimes. The v2 channel (the section mapping and
+  view, the mutex and the three events) is closed when the mod is disabled, but
+  only after the disable flag keeps new Hides out and the in-flight Hide count
+  has drained;
+  a Hide that outlives the drain keeps every handle and logs
+  `ipc unload residual hides=...; the v2 channel stays until explorer exits`.
+  The gesture mapping and its event stay for the rest of the explorer process
+  lifetime instead: a consumer maps them independently, and an in-flight gesture
+  callback may still hold the view, so unmapping them is unsafe. A reload opens
+  a fresh pair and leaves the previous pair to process exit, so those two
+  handles per reload are deliberate; process exit reclaims them.
 
 The delayed Hide:
 
@@ -164,9 +175,11 @@ The delayed Hide:
  *   per keyboard close; a `hide passed (gesture)` line and the original
  *   call at once for a Hide on a tapped stamp that is newer than the attach
  *   watermark and not older than the newest open generation, because the Start
- *   side taps before the shell's key handler hides. Every path calls the
- *   original Hide; nothing is pressed and no hide is requested. No exported
- *   symbols.
+ *   side taps before the shell's key handler hides. The v2 channel is closed on
+ *   disable once no Hide is inside it; a Hide that outlives the drain keeps it,
+ *   and logs the residual. The gesture mapping keeps the process-lifetime
+ *   behaviour below. Every path calls the original Hide; nothing is pressed and
+ *   no hide is requested. No exported symbols.
  * [POS]: explorer-side half of the legacy Start gesture work. It observes the
  *   shell's own hide decision and decides whether that Hide still needs the
  *   retract lead. Both closes are Windows taps performed by the Start side, and
@@ -175,10 +188,13 @@ The delayed Hide:
  *   worker thread, timer or re-arm tap. The shipping Start mod does not read the
  *   shared gesture memory; the close record, the open generation and the
  *   retract request/answer pair in the swipe_ipc_shared.h channel are the
- *   couplings that are live today. An unconsumed fresh stamp is evidence of
- *   correlation, not proof of cause: the plan-versus-tapped distinction is what
- *   makes the gesture path correct, and the binding only keeps a stamp of a menu
- *   that is gone from passing a later Hide.
+ *   couplings that are live today. That channel's handles are released when the
+ *   mod can prove no Hide is inside it; the older gesture mapping is kept for
+ *   the process lifetime because its consumer maps it independently. An
+ *   unconsumed fresh stamp is evidence of correlation, not proof of cause: the
+ *   plan-versus-tapped distinction is what makes the gesture path correct, and
+ *   the binding only keeps a stamp of a menu that is gone from passing a later
+ *   Hide.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -251,9 +267,17 @@ constexpr uint64_t kCloseStampFreshMs = 800;
 // disabled under it.
 constexpr DWORD kHidePollMs = 10;
 
-// The cross-process channel (swipe_ipc_shared.h). Opened once at init; its
-// handles stay for the life of the process, like the gesture mapping, because a
-// Hide may still be in flight while the mod unloads.
+// How long Wh_ModUninit lets an in-flight Hide leave the v2 channel before it
+// keeps the handles instead of closing them. Every wait in the hook ends within
+// one kHidePollMs step of the disable flag, so this only covers a hook that the
+// system preempted; it is bounded because explorer's unload thread must not be
+// held by one call.
+constexpr DWORD kIpcUnloadDrainMs = 500;
+
+// The cross-process channel (swipe_ipc_shared.h). Opened once at init. Its
+// handles are closed by Wh_ModUninit once no Hide can still be inside them; see
+// the two lifetimes there. The gesture mapping and its event, unlike this
+// channel, stay for the whole process lifetime.
 SwipeIpcChannel g_ipc;
 // The highest tapped close this hook has consumed. Seeded from the channel at
 // attach, so a tap written before this process belongs to someone else's close.
@@ -282,6 +306,12 @@ std::atomic<bool> g_disabled{false};
 // Set only after Wh_SetFunctionHook accepted the Hide hook, so a hide is never
 // delayed on a build where the hook was refused.
 std::atomic<bool> g_hideDelayEnabled{false};
+// Hides currently inside Hide_Hook, entry to exit, incremented before the hook
+// reads anything else. Wh_ModUninit closes the v2 channel only when this is
+// zero: g_disabled is set in Wh_ModBeforeUninit first, so a Hide that enters
+// after that point skips the channel, and the count names the ones that were
+// already inside when the flag went up.
+std::atomic<int> g_hideCalls{0};
 
 enum : int {
     kSharedNotStarted = 0,
@@ -1094,6 +1124,10 @@ bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
 // takes two arguments. Both return paths set eax: 0 on success, the negative
 // HRESULT of a failing inner call otherwise, so the return type is HRESULT.
 HRESULT Hide_Hook(void* self, uint32_t reason) {
+    // The only module state this hook releases on the way out is g_ipc, so the
+    // count covers the whole call: an unload that sees zero knows no Hide can
+    // reach the channel or the code that reads it any more.
+    g_hideCalls.fetch_add(1, std::memory_order_acq_rel);
     FileLog(L"hide reason=%u", reason);
     ClearSharedGestureState(L"Hide");
 
@@ -1175,7 +1209,9 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
         }
     }
 
-    return Hide_Original ? Hide_Original(self, reason) : S_OK;
+    const HRESULT result = Hide_Original ? Hide_Original(self, reason) : S_OK;
+    g_hideCalls.fetch_sub(1, std::memory_order_acq_rel);
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,7 +1332,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.11.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.12.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();
@@ -1357,7 +1393,9 @@ void Wh_ModAfterInit() {
 
 void Wh_ModBeforeUninit() {
     // This must be set before Windhawk removes the hooks. The Hide hook reads it
-    // in its wait loop, so a hide that is being held ends its wait at once.
+    // in its wait loop, so a hide that is being held ends its wait at once. The
+    // v2 channel is closed in Wh_ModUninit, after this flag has kept new Hides
+    // out of it and g_hideCalls has been drained.
     g_disabled = true;
     g_startPointTick.store(0, std::memory_order_relaxed);
 
@@ -1365,8 +1403,46 @@ void Wh_ModBeforeUninit() {
 }
 
 void Wh_ModUninit() {
-    // g_sharedMapping, its view and g_sharedEvent are intentionally kept for
-    // the rest of the process lifetime: an in-flight hook may still be using
-    // the view, and unmapping it here could crash explorer. Process exit
-    // reclaims the handles.
+    // Two channels, two lifetimes, for two reasons.
+    //
+    // The gesture mapping (Local\WindhawkStartGestureShared) and its event are
+    // kept for the rest of the explorer process lifetime, on purpose. A consumer
+    // maps the section independently and may poll it at any time, and an
+    // in-flight gesture callback can still hold the view pointer that
+    // EnsureShared cached; unmapping it here would turn either into an access to
+    // a freed view. A reload opens a fresh pair for its own module instance and
+    // leaves the previous instance's pair to process exit: that is two handles
+    // per reload, the price of the safety above. The reset published by
+    // PublishInactiveOnUnload is what tells a reader that this instance is gone,
+    // not the handle lifetime. Process exit reclaims every pair.
+    //
+    // The v2 channel is closed, because its objects are named and its records
+    // belong to the other process: g_ipc is unmapped and its mapping, mutex and
+    // three events are closed once no Hide hook can still be inside them.
+    // g_disabled was set in Wh_ModBeforeUninit, so a Hide that enters after it
+    // never reaches the channel; g_hideCalls names the Hides that entered
+    // before. Their waits end within one kHidePollMs step of that flag, so the
+    // bounded drain below normally returns at once. If it does not, the handles
+    // stay and the log says so: freeing them while a Hide is inside the channel
+    // would be a use-after-close, and the process must exit to reclaim them.
+    const ULONGLONG drainDeadline = GetTickCount64() + kIpcUnloadDrainMs;
+    while (g_hideCalls.load(std::memory_order_acquire) != 0 &&
+           GetTickCount64() < drainDeadline) {
+        Sleep(kHidePollMs);
+    }
+
+    const int residualHides = g_hideCalls.load(std::memory_order_acquire);
+    if (residualHides == 0) {
+        if (g_ipc.state) {
+            SwipeIpcClose(&g_ipc);
+            FileLog(L"ipc close");
+        }
+    } else {
+        FileLog(L"ipc unload residual hides=%d; the v2 channel stays until "
+                L"explorer exits",
+                residualHides);
+        Wh_Log(L"Unload left the v2 channel open: %d Hide hook(s) are still "
+               L"inside it",
+               residualHides);
+    }
 }
