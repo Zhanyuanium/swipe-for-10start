@@ -13,7 +13,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 
-Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.30.0) runs in
+Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.33.0) runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
 every XAML/DirectManipulation source on this UI is empty (see docs/input.md). The
 tracked contact is named by the HID Contact Identifier (`0x0D/0x51`) when the
@@ -47,11 +47,29 @@ retries on the next open or broadcast. That band is also the strip a reveal
 candidate may start in — `804..900` on this bottom auto-hidden layout, the same
 in both hide states because the hidden bar still measures its 48 DIP — and the
 fixed `kEdgeBandDip` of 12 DIP is only the fallback before a snapshot carries
-one. A contact that began while the menu was closed and has travelled
-`kAdoptTravelDip` (24 DIP) along the opening axis adopts a late open
-(`reveal adopt ...`) and continues from the panel's live position; a tap has no
-travel and is not adopted. `gestureOwnsProgress` needs a moving candidate or an
-active follow, so a stationary candidate does not suppress the keyboard settle.
+one. The open runs exactly one of three paths, in this order: a live takeover (a
+contact still down that has travelled `kAdoptTravelDip`, 24 DIP — a candidate
+promoted at the open instead of waiting for a report it may never get, or a
+contact with none adopted, both from their own down point), the late release
+record below, or the keyboard settle. A tap or a finger resting at the edge has
+not travelled 24 DIP and is not promoted. `gestureOwnsProgress` is
+`g_reveal.active`, that takeover itself and never a candidate, so a candidate the
+open never reaches cannot take the animation away. A contact that lifts before
+the shell opens the menu keeps its travel, mapped position and end speed —
+measured at the release over the same 8-30 ms window — in one `RevealLateRelease`
+record for `kLateRevealWindowMs` (300 ms; the shell's open arrived 107-251 ms
+after the lift here), which the open reads even when a new contact is already
+down, because that contact cannot be the pull that opened the menu, and starts
+the settle at the panel's live position (`TakeProgressNow()`, the off-screen rest
+while it is hidden, because no animation runs through the cloak) with that end
+speed; the mapped position is a diagnostic (`pos=...`), never a start value. A live
+takeover, an admitted newer pull, the consumption and the 300 ms window
+invalidate the record; a new down does not. A contact that starts inside the
+reveal band while the menu is open and moves away from the taskbar is the
+opening pull's tail: at 8 DIP of net travel from its own down point it starts no
+dismiss and settles nothing (`dismiss skipped band tail travel=...`, at most once
+per 500 ms), and a press that starts on the panel takes the ordinary dismiss path
+from its first sample.
 Every gesture outcome settles on one
 damped spring whose shape `AnimationStyle` picks
 (`Windows 11`, damping 1.72, fitted to the native Quick Settings flyout on this

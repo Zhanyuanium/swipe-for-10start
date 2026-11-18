@@ -1,6 +1,6 @@
 # Test tools and measurement artifacts
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). Member lists with more detail: [../tools/AGENTS.md](../tools/AGENTS.md) and [../artifacts/AGENTS.md](../artifacts/AGENTS.md).
 
 ## Tools

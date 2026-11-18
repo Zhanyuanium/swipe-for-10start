@@ -1,6 +1,6 @@
 # Input layer — why Raw HID, and how reports are decoded
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). Code member list: [../mods/AGENTS.md](../mods/AGENTS.md).
 
 ExplorerPatcher replaces Windows 11's Start UI with the legacy `StartUI_.dll`,
@@ -118,7 +118,10 @@ with their `QueryPerformanceCounter` stamps, duplicates included and in report
 order. The reveal's takeover replays them through its own trail mapping, so the
 settle's release window spans the open instead of starting at the takeover
 ([gesture.md](gesture.md)). A duplicate is kept on purpose: the window, not the
-buffer, is what collapses a resting finger to one value.
+buffer, is what collapses a resting finger to one value. A release that ends
+before its menu opens replays the same buffer at the release, into a record the
+same input thread reads when its visibility poll sees the open, so nothing is
+published between them.
 
 Measured layouts on this machine: ELAN2513 Col01 touch is five contact
 collections with `Tip` on each, Col05 pen carries tip and in-range, SYNA3580 is

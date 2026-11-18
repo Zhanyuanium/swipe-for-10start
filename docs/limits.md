@@ -1,6 +1,6 @@
 # Known limits, risks, and the hardware checks still owed
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md).
 
 ## Outstanding hardware checks
@@ -48,7 +48,19 @@
   A pull the shell does open for and that still reached the menu without a
   candidate — a fresh process before the first snapshot carried a band, a
   refused admission, or a taskbar probe that named no edge — is adopted at
-  24 DIP of travel instead of animated from 0.
+  24 DIP of travel instead of animated from 0. A contact that starts in that
+  band while the menu is open is the opening pull's tail: while it stays at
+  least 8 DIP away from the taskbar, measured from its own down point, it starts
+  no dismiss and settles nothing (`dismiss skipped band tail travel=...`), and a
+  press that starts on the panel takes the ordinary dismiss path from its first
+  sample.
+- A pull that lifts before the shell opens the menu is carried by one record for
+  300 ms, and 300 ms is a measured bound, not a guarantee: the open arrived
+  107-251 ms after the lift here, and a shell that took longer — a loaded
+  machine, a cold start — finds no record and runs the keyboard settle from
+  rest, so that pull pauses and then opens instead of carrying the hand. The
+  record also needs 24 DIP of travel and a measured distance; a shorter release
+  has nothing to carry.
 - The scroll gate is a survey of at most six regions. A viewer beyond the sixth
   is dropped and only the deepest six are kept
   (`scroller overflow (kept 6 deepest regions)`), so a press inside the dropped

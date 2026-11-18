@@ -1,6 +1,6 @@
 # Lifetime — pin, instance guard, counted entries, quiescence
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). The bridge's `Hide` drain this depends on is in [ipc.md](ipc.md).
 
 ## The two prerequisites of `Wh_ModInit`

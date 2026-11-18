@@ -1,6 +1,6 @@
 # Geometry — where the panel is, which way is out, and what may scroll
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). The gestures that consume this geometry are in [gesture.md](gesture.md).
 
 ## The snapshot

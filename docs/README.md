@@ -1,6 +1,6 @@
 # Technical documentation
 
-> Language: English only · 语言：本目录仅有英文。面向使用者的说明有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 
 This tree is the project's memory: what was measured, what was falsified, and
 why each design decision was taken. The user-facing quick start is
@@ -24,8 +24,8 @@ it.
 | File | Topic |
 |---|---|
 | [input.md](input.md) | Why Raw HID: the falsified data sources, the report decode (report IDs, `TipSwitch`/`InRange`, contact identity and its evidence clock, the coordinate-only fallback), release detection and its timers. |
-| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the taskbar band, the adoption of a late open, the commit thresholds, what a close does to a live gesture. |
-| [animation.md](animation.md) | The damped-spring settle: both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam and the window replay at a reveal takeover, the two shipped styles, and the native Quick Settings flyout measurement behind the 1.72 fit. |
+| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the taskbar band, the adoption of a late open and the record a lift before it leaves, the commit thresholds, what a close does to a live gesture. |
+| [animation.md](animation.md) | The damped-spring settle: both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam and the window replay at a reveal takeover or a late release, the two shipped styles, and the native Quick Settings flyout measurement behind the 1.72 fit. |
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
 | [ipc.md](ipc.md) | The v2 shared-memory channel, the open generation, the plan/tapped/cancelled close record, the retract request/answer, and the bridge's `Hide` policy and unload drain. |
 | [lifecycle.md](lifecycle.md) | The image pin, the per-process instance guard, the counted module entries, the unload order and its residuals, re-initialisation, and the host's unload boundary. |
@@ -37,7 +37,7 @@ it.
 Two mods ship together (full member list in
 [../mods/AGENTS.md](../mods/AGENTS.md)):
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.30.0) — runs in
+- `mods/start-menu-legacy-swipe.wh.cpp` (0.33.0) — runs in
   `StartMenuExperienceHost.exe`; the whole gesture, follow and animation.
 - `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.16.0) — runs in
   `explorer.exe`; hooks `CStartExperienceManager::Hide` so keyboard and

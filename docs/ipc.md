@@ -1,6 +1,6 @@
 # IPC — the channel, the close protocol, and the explorer bridge
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). The gestures and settle this protocol schedules are in [gesture.md](gesture.md) and [animation.md](animation.md); the unload guarantees are in [lifecycle.md](lifecycle.md).
 
 ## The v2 channel

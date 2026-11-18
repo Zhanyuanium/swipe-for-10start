@@ -83,8 +83,10 @@ when it is enabled, without an Explorer restart on this build.
 
 - Swipe in from the taskbar edge: the menu opens and follows your finger. A
   swipe that begins a little further in, about half a taskbar's height, keeps
-  up with your hand too instead of snapping open. A short or reversed pull
-  springs back; a longer pull or a flick keeps it open.
+  up with your hand too instead of snapping open. A quick flick that ends
+  before the menu appears still carries its speed into the opening motion, and
+  the menu rises from the bottom edge instead of appearing part-way open. A
+  short or reversed pull springs back; a longer pull or a flick keeps it open.
 - With the menu open, drag it toward the taskbar edge to dismiss it — past a
   tenth of the way on a top or bottom taskbar (a fifth on a side one), or with
   a flick, it commits and slides out.

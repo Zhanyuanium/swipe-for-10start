@@ -1,6 +1,6 @@
 # Gesture model — the two state machines and their thresholds
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). The tracked contact these machines run on is defined in [input.md](input.md); the settle they commit into is defined in [animation.md](animation.md); the panel geometry they read is defined in [geometry.md](geometry.md).
 
 A state machine on the raw-input thread drives a `Progress` scalar in a
@@ -71,15 +71,75 @@ Instead the mod takes over after the shell opens the window:
   menu appears under it (`reveal adopt ...`), continuing from the panel's live
   position at the finger. A tap has no travel and is not adopted; a contact
   that began on the open panel is a dismiss and never adopts.
+- When the menu opens under a contact, exactly one of three paths runs, in this
+  order:
+
+  1. **Live takeover.** A contact still down that has travelled
+     `kAdoptTravelDip` (24 DIP) along the opening axis takes the open over: a
+     candidate is promoted at the open (`PromoteRevealContact`) instead of
+     waiting for a report it may never get, and a contact with no candidate is
+     adopted (`reveal adopt ...`). Either way the follow starts from the
+     contact's own down point and logs `reveal takeover from=...`, the position
+     the takeover replaced. A tap, or a finger resting at the edge, has not
+     travelled 24 DIP and is not promoted.
+  2. **Late release.** No takeover ran and the pull already lifted: the
+     `RevealLateRelease` record below carries it across the open. The record is
+     read even when a new contact is already down, because that contact cannot
+     be the pull that opened the menu and may be refused on its next report.
+  3. **Keyboard settle.** Neither ran, so the open plays from rest.
+
+  The suppression test is that actual takeover — `gestureOwnsProgress` is
+  `g_reveal.active` — never the existence of a candidate, so a candidate the
+  open never reaches cannot take the animation away. The fixed order means a
+  fresh open runs one animation, never two and never none, and a settle whose
+  start already equals its target inserts that value for every keyframe, so a
+  `remaining=0` no-op moves nothing.
+- A fast pull can also end before the shell opens the menu. On this machine the
+  closed→open transition landed 107-251 ms after the release — 242-251 ms for
+  ten fast pulls, 107-117 ms for short slow ones — and by then the candidate had
+  ended (`reveal candidate released unopened`), so no contact was left for the
+  live adoption to take. A released candidate that travelled at least 24 DIP
+  leaves a `RevealLateRelease` record for `kLateRevealWindowMs`: the release
+  QPC, the travel, the mapped position the follow would have written (a
+  diagnostic only), the end velocity measured at the release from the same
+  eight-report replay the takeover uses, and the pull serial. That window is
+  300 ms — the measured range plus margin; an earlier 120 ms guess expired at
+  124 ms, before the open it existed for. The open consumes it and starts the
+  settle at the position the panel actually shows — `TakeProgressNow()`, which
+  is the off-screen rest while the menu is hidden, because neither the follow
+  nor any settle runs through the cloak — at that velocity: one line
+  `reveal adopt late travel=... vel=... age=... gen=... from=... pos=...`
+  (`vel` in DIP/ms, `from` the live position the settle starts from, `pos` the
+  mapped position the follow would have written, `age` the milliseconds since
+  the lift). Measured with the open arriving after the lift on this machine:
+  the compositor held `from=0.000` while the record said `pos=0.603`, so
+  starting the settle at the mapped position made the first presented frame
+  82 % open — the owner's teleport. Ten fast pulls now enter the screen at
+  top≈1728-1768 px and reach the 520 px rest in ~370 ms, at
+  `vel=4.15-4.48` DIP/ms and `age=241-292`; a plain keyboard open still logs
+  `win open dur=409` from rest and no adoption line. The activation reset, a
+  live takeover, an admitted newer pull, the consumption and the 300 ms window
+  invalidate it; a new down does not, because the contact that arrives first
+  cannot be the pull that opened the menu. An open that finds none runs the
+  keyboard settle from rest as before.
+- Ten interleaved pulls — fast pull, lift, 200 ms, second touch at the edge —
+  split across the three paths: five consumed the record (`age=204-228`), two
+  promoted a live candidate, and none opened without an adopt, a late record or
+  a takeover; no `remaining=0` no-op appeared.
 - A candidate that has not travelled 24 DIP does not own the open, so a tap on
   the taskbar still starts the keyboard settle (`win open dur=...`, 409 ms on
   the 900 DIP panel).
 - A candidate the shell never opens for — a start deeper than the shell's own
   threshold — moves nothing and ends with one line,
-  `reveal candidate released unopened travel=... axis=...`; below 24 DIP of
-  travel the line stays silent, so a tap is silent. Measured: a pull from
-  60 DIP inside the screen logged `travel=448`, and no keyboard settle played
-  because the menu never opened under it.
+  `reveal candidate released unopened travel=... axis=... vel=... pos=...`:
+  `vel` is its end speed toward the open in DIP/ms and `pos` the mapped position
+  the follow would have written first; the travel and the speed are what the
+  closed→open path consumes within 300 ms, and `pos` stays a diagnostic. A
+  release with no measured distance to map it through logs the
+  bare `travel=... axis=...` and carries nothing; below 24 DIP of travel the
+  line stays silent, so a tap is silent. Measured: a pull from 60 DIP inside the
+  screen logged `travel=448`, and no keyboard settle played because the menu
+  never opened under it.
 - Once the menu is open and the contact is still down, every report drives
   `Progress` from the **absolute** finger position and the panel's trailing
   edge:
@@ -104,6 +164,15 @@ Instead the mod takes over after the shell opens the window:
   0.75 from the screen edge and 0.71 from 20 DIP in. A finger that rested
   before the open repeats one value, so the window stays flat and the release
   is `vel=0.00`.
+- A contact that starts inside the band while the menu is open is the tail of
+  the pull that opened it, not a drag of the panel: once it has moved
+  `kBandTailTravelDip` (8 DIP) away from the taskbar it starts no dismiss and
+  takes neither `Progress` nor a settle, and one line at most once per 500 ms
+  says so (`dismiss skipped band tail travel=...`). The test is the net travel
+  from the contact's own down point along the opening axis, so only a return
+  within 8 DIP of that point clears it; a press that starts on the panel takes
+  the ordinary dismiss path from its first sample, where that travel is 0, so
+  the mute never takes a real drag.
 - A vertical dismiss (top or bottom taskbar) yields to the menu's own
   scrolling, and the menu scrolls in more than one place. The gate asks the
   region under the press, not one cached viewer: a downward press inside a

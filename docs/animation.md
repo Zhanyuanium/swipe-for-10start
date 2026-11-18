@@ -1,6 +1,6 @@
 # The settle — one damped spring for every outcome
 
-> Language: English only · 语言：仅此页为英文。用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
+> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). The gestures that start a settle are in [gesture.md](gesture.md); the close protocol that schedules the tap is in [ipc.md](ipc.md).
 
 Every gesture outcome — dismiss, cancelled reveal, reveal commit, dismiss
@@ -103,6 +103,22 @@ moving finger; auto-hide made that common, because the pull reveals the bar
 before the menu opens. Measured on this build: a moving release reports
 `vel=0.71-0.75` DIP/ms, and a finger that rested before the open still reports
 `vel=0.00`.
+
+The same replay measures a pull that lifts before the menu opens, and the
+closed→open path starts its settle at the speed that record measured: the
+release measured it at the lift, over the same 8-30 ms window from the
+same reports, so the freshness and span checks are the ones already described.
+The position is the other half and it is not taken from the record: no animation
+runs through the cloak, so the panel is still at the off-screen rest when the
+window is presented, and `TakeProgressNow()` is where the settle starts — the
+record's mapped position describes a panel that was never on screen. Starting
+there made the first presented frame 82 % open.
+Measured: ten fast pulls the shell opened 223-256 ms after the lift all started
+at `vel=4.00-4.48` DIP/ms, and a short slow one at `vel=0.30`, so the seam is
+the finger's even when the menu arrives a quarter of a second later. The open
+runs exactly one of three paths — live takeover, this record, keyboard settle —
+so no open plays two animations or none. The window and what clears the record
+are in [gesture.md](gesture.md).
 
 A release that is moving away from its target is honestly 0. The component is
 projected onto the settle direction and clamped at 0 (`TowardTarget`), so a
