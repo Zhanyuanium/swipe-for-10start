@@ -103,7 +103,7 @@
 // The records
 // ---------------------------------------------------------------------------
 //
-// Command (tools -> Start): one line in the syntax the README documents. The
+// Command (tools -> Start): one line in the syntax `docs/ipc.md` documents. The
 // command event is manual-reset, so a command published while the reader is
 // busy is not lost. Only one writer may publish at a time: a publisher holds
 // kSwipeIpcCommandMutexName around its record. tools/ipc.ps1 is the only
@@ -172,7 +172,7 @@ constexpr wchar_t kSwipeIpcRetractPlanEventName[] =
 constexpr uint32_t kSwipeIpcMagic = 0x53313053;  // 'S' '0' '1' 'S', LE
 constexpr uint32_t kSwipeIpcVersion = 2;
 
-// One command per line, in the same syntax the README documents.
+// One command per line, in the same syntax `docs/ipc.md` documents.
 constexpr size_t kSwipeIpcCommandMaxBytes = 512;
 
 // closeKind values. Only a tapped gesture close passes its Hide without a wait.

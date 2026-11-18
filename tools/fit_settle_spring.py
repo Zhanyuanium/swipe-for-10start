@@ -27,7 +27,7 @@ Two models, and the report names the one that produced each number:
 
 Residual: the model's frame list is interpolated on a 1 ms grid between the
 first and the last sample, so `area` is ms of displacement (the metric the
-README quotes) and `mean` is its average. The native curve's first 30 ms are
+`docs/animation.md` quotes) and `mean` is its average. The native curve's first 30 ms are
 faster than any y0 = 0 spring at this duration, so that part is not what the fit
 identifies; the report prints the residual after 90 ms next to the overall one.
 

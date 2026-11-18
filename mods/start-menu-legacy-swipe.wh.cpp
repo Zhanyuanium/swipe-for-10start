@@ -2,8 +2,8 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.29.0
-// @author          doubao
+// @version         0.30.0
+// @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -lshell32 -Wall -Wextra -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"
@@ -206,7 +206,15 @@ What it does:
   moved the panel nowhere in the window reports 0, so a finger dragged 300 DIP,
   held still for 1.2 s and released starts the settle from rest; the old
   whole-gesture `travel / elapsed` reported 0.20 DIP/ms and left the seam at a
-  speed the finger did not have. The speed is signed along the gesture axis and
+  speed the finger did not have. The window starts at the contact's own reports,
+  not at the takeover: the shell opens the menu late when the taskbar is
+  auto-hidden (the pull first reveals the bar), so a menu that opened one or two
+  reports before the lift used to have one sample and could not be measured. Each
+  of the contact's last eight positioned reports is replayed through the same
+  trail mapping at the takeover, so the series is continuous with the first
+  inserted sample; a finger that rested before the open repeats one value and the
+  window stays flat, which is what a hold must report. The speed is signed along
+  the gesture axis and
   projected onto the settle's direction: a release still moving away from its
   target (a pull back before letting go) contributes 0 and
   the settle starts from rest instead of backwards. The unit is `Progress` per
@@ -216,42 +224,48 @@ What it does:
   `StartAnimation`, which is why no interruption may read that value as a
   position: `TakeProgressNow` answers where the panel is from the curve the
   compositor was handed, stops it and pins the answer.
-- A vertical dismiss competes with the app list's own scroll: dragging toward
-  the taskbar is how the list scrolls back, and that drag used to close the
-  menu. The element that scrolls is measured per open on the UI thread: the
-  innermost `ScrollViewer` with `ScrollableWidth` 0 and `ScrollableHeight` above
-  0, whose screen rect (XAML rect plus the client origin) and
-  `VerticalOffset`/`ScrollableHeight` are published for the input thread. The
-  cache has three states, not one flag: `Unknown` (no measurement speaks for this
-  open, or only the one taken while the shell still moved the window), `Nothing`
-  (measured after the shell settled, and nothing in the panel scrolls) and
-  `Scrollable` (measured after the shell settled, with rect and offsets). Only
-  `Unknown` defers: a press inside the panel waits for the settled measurement and
-  a press outside it passes, because the first report after an open used to
-  dismiss the menu while the user was scrolling. `Nothing` allows the dismiss, so
-  a panel that genuinely has nothing scrollable is no longer undismissable from
-  the inside. Inside a `Scrollable` rect the gate still keeps the end-of-list rule
-  (offset 0 on a bottom taskbar, offset == `ScrollableHeight` on a top one, with
-  the 24 DIP allowance a fling needs) and otherwise rejects the press with
-  `dismiss deferred to scroll vo=... sh=...` at most once per 500 ms. Outside the
-  rect the plain drag stays. The rejection starts no session, so the same contact
-  becomes a dismiss as soon as its scrolling reaches the end; the contact latch is
+- A vertical dismiss competes with the scroll of whatever is under the press:
+  dragging toward the taskbar is how a list scrolls back, and that drag used to
+  close the menu. One cached element was not enough, because the menu scrolls in
+  more than one place, so the survey enumerates every vertically scrollable
+  `ScrollViewer` under the root once per open — measured here: the app list
+  (`AllAppsGridListView`, `ScrollableHeight` 4065) and the tile grid's internal
+  `GridView` viewer (`TileListView`, `ScrollableHeight` 98) — and publishes each
+  one's screen rect (XAML rect plus the client origin), `VerticalOffset`,
+  `ScrollableHeight` and a label. At a press the innermost region whose rect
+  contains the point decides; no region means the drag has no content to scroll
+  and belongs to the dismiss, which is also what a press on the panel background
+  or the taskbar strip gets. The survey has the same three states, not one flag:
+  `Unknown` (no measurement speaks for this open, or only the one taken while the
+  shell still moved the window), `Nothing` (measured after the shell settled, and
+  nothing in the panel scrolls) and `Scrollable` (measured after the shell
+  settled, with the region list). Only `Unknown` defers: a press inside the panel
+  waits for the settled measurement and a press outside it passes, because the
+  first report after an open used to dismiss the menu while the user was
+  scrolling. `Nothing` allows the dismiss, so a panel that genuinely has nothing
+  scrollable is no longer undismissable from the inside. Inside a region the gate
+  keeps the end-of-list rule (offset 0 on a bottom taskbar, offset ==
+  `ScrollableHeight` on a top one, with the 24 DIP allowance a fling needs) and
+  otherwise rejects the press with
+  `dismiss deferred to scroll vo=... sh=... region=...` at most once per 500 ms,
+  naming the region. The rejection starts no session, so the same contact becomes
+  a dismiss as soon as its scrolling reaches the end; the contact latch is
   untouched and the next down starts from a clean state. `Left`/`Right` are
-  unchanged. The cache also carries the layout identity token the rect was mapped
-  in, so a resize inside one open (the epoch does not move) invalidates it for the
-  reader instead of gating against the old rect; a `SizeChanged` measures the
-  scroller again for the same reason. A remeasure starts by publishing `Unknown`,
-  so a pass that ends without an answer (a throw, the depth limit, an unreadable
-  viewer) never leaves a previous `Nothing` or `Scrollable` speaking for a tree it
-  did not measure; a completed negative result also revokes the old `ViewChanged`
-  watch. Two roles that used to share one variable are now separate: the object
-  whose registration token must still be revoked (it outlives a revoke that
-  threw) and the object the committed rect was measured from, which is the only
-  one whose handler may refresh the cached offsets. So a watch whose revoke
-  failed keeps its token and stops writing instead of writing another list's
-  numbers into the rect the gate tests. The retry that follows is bounded: 100,
-  200 and 400 ms, then `scroller retry exhausted gen=...` and the gate stays
-  `Unknown` for that open.
+  unchanged. The survey also carries the layout identity token the rects were
+  mapped in, so a resize inside one open (the epoch does not move) invalidates it
+  for the reader instead of gating against the old rects; a `SizeChanged`
+  measures the survey again for the same reason. A remeasure starts by publishing
+  `Unknown`, so a pass that ends without an answer (a throw, the depth limit)
+  never leaves a previous `Nothing` or `Scrollable` speaking for a tree it did
+  not measure; a completed negative result also revokes the old `ViewChanged`
+  watches. Two roles that used to share one variable are separate per region:
+  the object whose registration token must still be revoked (it outlives a
+  revoke that threw) and the object the committed rect was measured from, which
+  is the only one whose handler may refresh that region's offsets. So a watch
+  whose revoke failed keeps its token and stops writing instead of writing
+  another list's numbers into the rect the gate tests. The retry that follows is
+  bounded: 100, 200 and 400 ms, then `scroller retry exhausted gen=...` and the
+  gate stays `Unknown` for that open.
 - The settle has two styles, and one setting picks the parameter set for all
   four outcomes: the dismiss commit and cancel, the reveal commit and cancel.
   Both styles run the same damped-spring generator in normalized travel
@@ -366,14 +380,25 @@ What it does:
   jump. When the tracked contact lifts, the release settles as usual and the
   next report starts the following contact from scratch. A lift report is not
   required: a session with no sample for 18 ms ends on its own.
-- Reveal follow: a contact that starts within 12 DIP of the taskbar edge while
-  the menu is closed is a candidate. With auto-hide enabled that band overlaps
-  the OS's own reveal strip, so a press that starts on the hidden bar itself makes
-  the shell slide the bar out and this mod claims the same contact anyway
-  (measured at 200 %: a pull from y=1799 opened the menu with the bar revealed);
-  the band is deliberately not widened or narrowed for that. EP opens the menu by
-  itself once the contact passes its own edge threshold; the first report that sees
-  the menu open takes `Progress` over. The follow works in absolute screen DIP
+- Reveal follow: a contact that starts inside the taskbar's own band while the
+  menu is closed is a candidate. The band is the bar's measured strip plus one
+  bar thickness toward the desktop, published with the geometry snapshot, so an
+  auto-hidden bar keeps the same span although it reserves no work area; the
+  fixed 12 DIP strip at the screen edge is only the fallback for the first reports
+  of a process, before any snapshot has carried a band. Measured on this machine,
+  the OS's own edge gesture opens the menu from as far as 20 DIP inside the
+  screen, which the fixed strip did not cover: a pull that began there reached
+  the menu with no candidate, and the menu opened as if the Windows key had been
+  pressed. A contact that started while the menu was closed, has already pulled
+  24 DIP along the opening axis and finds the menu open under it is therefore
+  adopted: the same pull continues from the panel's live position at the finger
+  (`reveal adopt ...`), never from 0, and a tap is not adopted because it has no
+  travel. EP opens the menu by
+  itself once the contact passes its own edge threshold; the first report that
+  sees the menu open takes `Progress` over. A tap on the taskbar keeps the
+  keyboard-style settle: an open under a candidate that has not moved yet is not
+  the gesture's, and the follow takes that settle over from its live position if
+  the finger then moves. The follow works in absolute screen DIP
   against the panel edge that meets the finger (`panelTrail`), which the UI thread
   maps from the largest visible child of the root that does not fill it
   (`StartSizingFrame`) and translates by the XAML origin, the client origin of
@@ -783,17 +808,32 @@ Diagnostics:
   `xaml viewchanged handler left attached; new registration refused` (a revoke
   threw, so the token and its owner are kept instead of being overwritten),
   `work area changed`,
-  `scroller rect=...,...,...,... vo=... sh=...` (once per open, when the
-  scrolling element was measured, and again only if the settled pass moved it),
+  `scroller rect=...,...,...,... vo=... sh=... name=... depth=...` (once per
+  region per open, when that region was measured, and again only if the settled
+  pass moved it; `name` is the owning list, the region's own Name when that names
+  the element, else `own>owner`, else the element's type),
   `scroller none (measured, nothing scrolls)` once per open when the settled pass
   found nothing scrollable,
   `scroller retry why=origin|incomplete|not-allowed|offsets|commit gen=... try=...`
   once per open when a settled pass could not commit and a retry or deferred pass
   was arranged, and `scroller retry exhausted gen=...` when the bounded backoff
   (100, 200, 400 ms) ran out and the gate stays Unknown for that open,
-  `dismiss deferred to scroll vo=... sh=...` (at most once per 500 ms),
+  `dismiss deferred to scroll vo=... sh=... region=...` (at most once per 500 ms;
+  `region` is the scrollable area the press landed in),
   `dismiss skipped outside panel axis=... x=... y=... rect=... trail=... gen=...`
   (at most once per second),
+  `reveal admit x=... y=... axis=... band=...,... ok=... reason=...` once per
+  contact that lands in the reveal band: `ok=1 reason=admitted`, or the test that
+  refused it (`renderer`, `layout`, `distance`, `open`); a contact outside the
+  band stays silent, as it was,
+  `reveal adopt x=... y=... travel=... axis=... band=...,... gen=...` when the
+  menu opened under a live pull that had no candidate and that contact took the
+  follow over,
+  `reveal candidate released unopened travel=... axis=...` when a pull in the
+  reveal band ended without the menu ever opening under it (a tap stays silent),
+  `vel window count=... calls=... repeats=... rel=... newest=... age=... first=...
+  firstage=... d=... raw=...` behind `g_debugVelocity` (false): the release-speed
+  window one release read, for a seam that felt like a drop,
   `startui anim hooked`,
   `startui anim hook skipped`, `startui anim hook skipped (target not readable)`
   (the fixed RVAs are not executable code of this image, so the probe never read
@@ -990,8 +1030,10 @@ Known risks:
  *   layout (the second pass is where the panel is placed, which is what the
  *   measurement request waits for);
  *   on ScrollViewer, its ScrollableWidth/ScrollableHeight/VerticalOffset and its
- *   ViewChanged event from Windows.UI.Xaml.Controls, which name the element the
- *   app list scrolls with; on
+ *   ViewChanged event from Windows.UI.Xaml.Controls, which name and follow every
+ *   vertically scrollable region of the open menu (the app list and the tile
+ *   grid's internal viewer), and on VisualTreeHelper::GetParent, which names the
+ *   list a templated ScrollViewer belongs to; on
  *   ClientToScreen, which turns the host window's client origin into the screen
  *   offset of the XAML coordinate space; on the
  *   CoreDispatcher
@@ -1057,8 +1099,11 @@ Known risks:
  *   Composition `Progress` scalar plus the `Distance`/`DirX`/`DirY` inputs the
  *   expression reads, which the open-time and work-area refresh rewrites when
  *   the taskbar moves. One `GestureGeometry` snapshot carries the axis, the
- *   travel, the XAML origin, the work area and monitor, and the panel rect with
- *   the edge derived from it, in absolute screen DIP, behind a short writer lock:
+ *   travel, the XAML origin, the work area and monitor, the panel rect with
+ *   the edge derived from it, and the taskbar's reveal band (the bar's measured
+ *   strip plus one thickness toward the desktop, which the input thread uses to
+ *   admit a pull and to place an adoption), in absolute screen DIP, behind a
+ *   short writer lock:
  *   one writer on the UI thread, one whole read per gesture sample on the input
  *   thread, the root/open generation and a layout identity token the measurement
  *   was taken in. A cached copy whose token is older than the published layout
@@ -1104,7 +1149,10 @@ Known risks:
  *   along the gesture axis, and projected onto the settle's direction: the
  *   newest position must itself be no more than 30 ms older than the release,
  *   and the span is then measured backward from it, so the pair can lie up to
- *   60 ms before the release when the stream paused just before the lift. A
+ *   60 ms before the release when the stream paused just before the lift. The
+ *   window itself is replayed from the contact's last eight positioned reports
+ *   when the follow takes the panel over, so a menu that opens one or two reports
+ *   before the lift is still measured instead of starting from one sample. A
  *   contact that did not move the panel in that window (a finger held still)
  *   reports 0, and a
  *   release still moving away from its target contributes 0 rather than starting
@@ -1135,19 +1183,23 @@ Known risks:
  *   starts a settle from an animation's target; one helper that gives a close
  *   the same ownership whether it came from a gesture or the keyboard (the live
  *   sessions ended, the rest of a contact still down muted, the suppression
- *   window open, the timer period released); one cached scroller per
- *   open (the innermost vertically scrollable element the app list uses), with
- *   its screen rect and its `VerticalOffset`/`ScrollableHeight` published for the
- *   input thread and refreshed from its `ViewChanged` event, in three states:
+ *   window open, the timer period released); one survey per
+ *   open of every vertically scrollable `ScrollViewer` under the root (measured
+ *   here: `AllAppsGridListView` 309,307..569,839 with `ScrollableHeight` 4065 and
+ *   the tile grid's internal `GridView` viewer `TileListView` 577,302..1229,839
+ *   with 98), each with its screen rect, `VerticalOffset`, `ScrollableHeight` and
+ *   a label published for the input thread and refreshed from its own
+ *   `ViewChanged` event, in three states:
  *   Unknown (no measurement speaks for this open, the only one that defers),
- *   Nothing (a completed search after the shell settled found nothing scrolls,
- *   so the press dismisses) and Scrollable (rect and offsets, so a vertical
- *   dismiss that would only scroll the list is rejected and logs
- *   `dismiss deferred to scroll`); the watch and the cache keep separate owners,
- *   the element whose token must still be revoked and the element the committed
- *   rect was measured from, and a handler may write the cached offsets only
+ *   Nothing (a completed survey after the shell settled found nothing scrolls,
+ *   so the press dismisses) and Scrollable (the region list, so a vertical
+ *   dismiss that would only scroll the region under the press is rejected and
+ *   logs `dismiss deferred to scroll ... region=...`); each watch slot and its
+ *   region keep separate owners, the element whose token must still be revoked
+ *   and the element the committed rect was measured from, and a handler may
+ *   write a region's offsets only
  *   while it belongs to the second, so a revoke that threw leaves a silent
- *   handler instead of another list's offsets under this rect; a search that
+ *   handler instead of another list's offsets under this rect; a survey that
  *   threw or hit its depth limit is
  *   not a negative answer, so it stays Unknown and is retried with a bounded
  *   backoff (100, 200, 400 ms, then it leaves Unknown for that open), and a
@@ -1175,8 +1227,10 @@ Known risks:
  * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
  *   pointer and DirectManipulation paths with raw HID decoding, owns two
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
- *   takes the menu's own open over from the taskbar edge and pins the panel's
- *   trailing edge to the finger), and re-reads the taskbar edge behind both on
+ *   takes the menu's own open over from the taskbar band and pins the panel's
+ *   trailing edge to the finger, admitting a contact on the down or adopting one
+ *   when the menu opens under an already moving pull), and re-reads the taskbar
+ *   edge behind both on
  *   every open and on every work-area broadcast. Every sample takes one
  *   `GestureGeometry` snapshot, so the press hit test, the reveal follow, the
  *   release decision and the log line of that report all describe one panel;
@@ -1564,7 +1618,27 @@ constexpr uint64_t kDismissRejectLogMs = 500;
 // uses the dismiss thresholds on the travel away from the edge, not on the
 // mapped progress: the screen edge already maps to Progress 0.269 here, so any
 // progress threshold commits every release.
+//
+// `kEdgeBandDip` is only the fallback for the first reports of a process, before
+// the snapshot carries the taskbar's measured band (GestureGeometry::band): the
+// band is the bar's strip plus one bar thickness, so an auto-hidden bar keeps
+// the same 96 DIP even though it reserves no work area. The old fixed 12 DIP is
+// narrower than the strip a hand starts its pull in, which is why a pull that
+// began 20 DIP inside the hidden bar never became a candidate.
 constexpr float kEdgeBandDip = 12.0f;
+// A contact that started while the menu was closed and has already pulled this
+// far along the opening axis is a drag, not a tap. The number is what separates
+// a pull from the few DIP a finger slides during a tap: the shell opens the menu
+// under the contact, and only movement beyond it may take the open over. It is
+// also the travel the edge candidate needs before its open counts as its own,
+// so a tap on the taskbar still gets the keyboard-style settle.
+constexpr float kAdoptTravelDip = 24.0f;
+// How many of a contact's positioned reports the release window keeps. This is
+// the same count the end-velocity estimator holds: the window is replayed from
+// the contact's own reports when the menu opens under it, so a takeover one or
+// two reports before the lift still measures the finger instead of starting
+// from one sample.
+constexpr int kEndVelocitySamples = 8;
 // The panel reports at ~170 Hz (about 6 ms apart) and keeps reporting while the
 // finger rests, so a short silence really is a lift. 18 ms is above the 15.6 ms
 // quantum that an injected step really takes (measured: Sleep(8) in pwsh yields
@@ -1637,6 +1711,9 @@ constexpr float kCoastMaxVelocityDip = 6.0f;
 constexpr uint64_t kRevealCoastSettleMs = 50;
 // The coast start/stop lines measured the coast; off in the shipping build.
 constexpr bool g_debugCoast = false;
+// The `vel window` and `follow`/`take` lines print the release-speed window one
+// release reads; off in the shipping build, like g_debugCoast.
+constexpr bool g_debugVelocity = false;
 
 // Raw input and HID decoding limits.
 constexpr int kMaxHidDevices = 4;
@@ -2040,34 +2117,40 @@ uint32_t g_layoutWatchSerial = 0;
 uint32_t g_layoutWatchMint = 0;
 
 // ---------------------------------------------------------------------------
-// The scrolling element of the open menu
+// The scrolling regions of the open menu
 //
-// A vertical dismiss and the app list's own scroll are the same downward drag,
-// so the dismiss needs to know whether the element under the press point can
-// still scroll away from it. Measured on this build, exactly one element does
-// that: the ScrollViewer inside StartUI.AllAppsGridListView, XAML
-// 85,230-345,839, ScrollableHeight 3664, VerticalOffset 0 on every open. Its
-// screen rect, offset and extent are cached per open and published as plain
-// values; the input thread reads them once per down and never touches XAML.
+// A vertical dismiss and a list's own scroll are the same drag, so the dismiss
+// needs to know whether the element *under the press point* can still scroll
+// away from it. One cached element was not enough: the menu scrolls in more than
+// one place (the app list, and the tile grid when its tiles overflow), and a
+// single-element gate answered "not on the scrolling content" for every press in
+// the other, which let a tile-grid drag start the dismiss. The survey therefore
+// enumerates every vertical ScrollViewer under the root once per open, keeps each
+// one's screen rect, offset and extent, and the input thread picks the innermost
+// region that contains the press. Every scrolling area is gated by the same rule,
+// and no coordinate special case exists.
 //
-// The numbers belong together, so they are one POD behind a mutex instead of
-// four atomics: a torn rect/offset pair could allow or reject the wrong press.
-// The lock is taken once per down on the input side and only when the cache is
-// measured or scrolled on the UI side, so it is never contended.
+// The numbers of one region belong together, so the whole survey is one POD
+// behind a mutex instead of a set of atomics: a torn rect/offset pair could allow
+// or reject the wrong press. The lock is taken once per down on the input side
+// and only when the survey is measured or scrolled on the UI side, so it is
+// never contended.
 //
-// "Nothing scrollable here" and "not measured yet" were the same `valid == false`
-// cache, and the gate read both as "cannot decide", so a panel with genuinely
-// nothing scrollable could never be dismissed from inside. They are separate
-// states now:
+// "Nothing scrollable here" and "not measured yet" were once the same
+// `valid == false` cache, and the gate read both as "cannot decide", so a panel
+// with genuinely nothing scrollable could never be dismissed from inside. They
+// are separate states:
 //
 // - Unknown: no measurement that speaks for this open — nothing measured yet, a
-//   measurement that failed, or the open-time pass whose rect belongs to a window
+//   measurement that failed, or the open-time pass whose rects belong to a window
 //   the shell is still moving. The gate defers while the press is inside the
 //   panel and lets a press outside it pass.
 // - Nothing: measured after the shell settled, and nothing in the panel can
-//   scroll. Every vertical press belongs to the dismiss.
-// - Scrollable: measured after the shell settled; a press inside the rect may
-//   scroll, so the end-of-list test decides.
+//   scroll vertically. Every vertical press belongs to the dismiss.
+// - Scrollable: measured after the shell settled; `regions` holds every
+//   scrollable area. A press inside one may scroll, so that region's
+//   end-of-list test decides; a press inside none of them belongs to the
+//   dismiss.
 // ---------------------------------------------------------------------------
 enum class ScrollerState {
     Unknown = 0,
@@ -2075,42 +2158,74 @@ enum class ScrollerState {
     Scrollable = 2,
 };
 
-struct ScrollerCache {
-    ScrollerState state = ScrollerState::Unknown;
-    uint32_t generation = 0;  // the open epoch this rect was measured in
-    // The layout identity token the rect was mapped in. A resize inside one open
-    // does not move the epoch, so the generation alone cannot tell that the rect
-    // now describes a panel the shell has already moved.
-    uint32_t layoutVersion = 0;
-    float left = 0.0f;  // screen DIP, all four from the XAML origin
+// How many scrollable regions one survey keeps. The menu has one vertical
+// scroller in the app list and one in the tile grid (plus their non-scrolling
+// wrappers, which the survey rejects); the bound is what keeps the array in the
+// snapshot fixed and the copy to the input thread cheap. A survey that finds
+// more keeps the deepest ones and says so once.
+constexpr int kMaxScrollRegions = 6;
+constexpr int kScrollerLabelChars = 32;
+
+// One scrollable region the survey found, in screen DIP. The input thread tests
+// a press against these rects and gates the dismiss on the innermost one that
+// contains it, so every scrolling area is gated by the same rule instead of by
+// whichever single element was measured.
+struct ScrollerRegion {
+    float left = 0.0f;
     float top = 0.0f;
     float right = 0.0f;
     float bottom = 0.0f;
     float verticalOffset = 0.0f;
     float scrollableHeight = 0.0f;
+    uint32_t depth = 0;  // visual-tree depth, the innermost pick
+    int watchSlot = -1;  // the UI-thread watch that refreshes this entry, -1 none
+    // The element's own name when it has one, else its nearest named ancestor's,
+    // else its type. The deferral line prints it so a log says which region
+    // took the drag, without the input thread holding a XAML object.
+    wchar_t label[kScrollerLabelChars] = {};
+};
+
+// The whole survey, not one element. `state` is the survey's own answer:
+// Unknown = no whole measurement speaks for this open (defer inside the panel),
+// Nothing = measured and nothing here scrolls vertically (allow the dismiss),
+// Scrollable = `regions[0..count)` are the scrollable areas (a press inside one
+// is gated by that region's offsets, a press outside all of them is not).
+struct ScrollerCache {
+    ScrollerState state = ScrollerState::Unknown;
+    uint32_t generation = 0;  // the open epoch this survey was measured in
+    // The layout identity token the rects were mapped in. A resize inside one
+    // open does not move the epoch, so the generation alone cannot tell that a
+    // rect now describes a panel the shell has already moved.
+    uint32_t layoutVersion = 0;
+    int count = 0;
+    ScrollerRegion regions[kMaxScrollRegions];
 };
 
 std::mutex g_scrollerMutex;
 ScrollerCache g_scroller;
 
-// UI thread only. Two roles, deliberately two variables: `g_scrollerWatchOwner`
-// is the object whose ViewChanged token must still be revoked — it outlives a
-// revoke that threw, so the token can be retried — and `g_scrollerCacheViewer`
-// is the object the committed rect was measured from, the only one allowed to
-// write the cached offsets. One variable made the two the same object, and then a
-// failed revoke let the old viewer keep writing into the cache that another
-// viewer's rect had just replaced.
-wuxc::ScrollViewer g_scrollerWatchOwner{nullptr};
-wuxc::ScrollViewer g_scrollerCacheViewer{nullptr};
-winrt::event_token g_scrollerToken{};
-// The rect line speaks once per open, not once per measurement: the open
-// transition and the settled pass both measure the same element, and only a
-// rect that actually moved is worth a second line. The `scroller none` line is
-// the settled pass telling the log that the gate now allows a press that has
-// nothing to scroll, so it is also once per open.
+// UI thread only. One watch per committed region. Two roles per slot, on
+// purpose: `owner` is the object the ViewChanged token was registered on — it
+// outlives a revoke that threw, so the token can be retried and its slot is not
+// reused — while `viewer` is the object the committed region was measured from,
+// the only one whose handler may write that region. One variable per slot made
+// the two the same object, and then a failed revoke let the old viewer keep
+// writing into a region another viewer's rect had just replaced.
+struct ScrollerWatch {
+    wuxc::ScrollViewer owner{nullptr};
+    wuxc::ScrollViewer viewer{nullptr};
+    winrt::event_token token{};
+};
+ScrollerWatch g_scrollerWatches[kMaxScrollRegions];
+// The rect lines speak once per open per region, not once per measurement: the
+// open transition and the settled pass both measure the same elements, and only
+// a rect that actually moved is worth a second line. The `scroller none` line is
+// the settled pass telling the log that nothing here scrolls vertically.
 bool g_scrollerLogged = false;
 bool g_scrollerNoneLogged = false;
-float g_scrollerLoggedRect[4] = {};
+bool g_scrollerOverflowLogged = false;
+bool g_scrollerRegionLogged[kMaxScrollRegions] = {};
+float g_scrollerLoggedRect[kMaxScrollRegions][4] = {};
 // Coarse tick of the last `dismiss deferred to scroll` line. The digitizer
 // reports at ~170 Hz, so the rejection is rate limited; input thread only.
 uint64_t g_scrollerRejectLogTick = 0;
@@ -2272,6 +2387,16 @@ struct GestureGeometry {
     float top = 0.0f;
     float right = 0.0f;
     float bottom = 0.0f;
+    // The strip this layout's taskbar reserves at the screen edge, extended by
+    // one bar thickness toward the desktop, in absolute screen DIP along the
+    // dismiss axis. The reveal candidate starts anywhere inside it, so the
+    // band is the taskbar's own measurement (TaskbarProbe) and not a fixed
+    // number of DIP from the screen edge: an auto-hidden bar keeps its 48 DIP
+    // while reserving no work area at all. `band` is false before the first
+    // probe; the candidate test then falls back to kEdgeBandDip.
+    bool band = false;
+    float bandLow = 0.0f;
+    float bandHigh = 0.0f;
 
     int32_t axis() const { return layout.axis; }
     float distance() const { return layout.distance; }
@@ -4691,6 +4816,55 @@ struct HidRevealSession {
 
 HidRevealSession g_reveal;  // input thread only
 
+// The current contact's first and last positioned point, screen DIP, whether or
+// not a session owns it. The reveal candidate is admitted on the down, but the
+// shell can open the menu under a contact that started a little further in than
+// the band: the menu then opens because of the same pull, and the finger that
+// caused it is still down and moving. Adoption reads this record — the down
+// point to measure travel from, the last point to place the panel at — so the
+// follow continues from where the panel is instead of animating from 0. The
+// record starts on the first positioned report of a contact and ends on the
+// lift or the idle that ends the contact, so two contacts can never share a
+// down point.
+struct HidContactOrigin {
+    bool valid = false;
+    bool startedOpen = false;  // the menu was open when this contact went down
+    float downX = 0.0f;
+    float downY = 0.0f;
+    float x = 0.0f;  // last positioned point
+    float y = 0.0f;
+    uint64_t downTick = 0;
+
+    // The last positioned reports of this contact, oldest first. The reveal's
+    // release window is replayed from them when the menu opens under the
+    // contact, so the seam measures the finger even when the takeover lands one
+    // report before the lift.
+    struct Point {
+        float x = 0.0f;
+        float y = 0.0f;
+        uint64_t qpc = 0;
+    };
+    Point points[kEndVelocitySamples];
+    int pointCount = 0;
+};
+
+HidContactOrigin g_contactOrigin;  // input thread only
+
+// Appends one positioned report of the current contact, oldest first. A full
+// ring drops the oldest. Duplicates are kept on purpose: a finger that rests
+// repeats its position, and the end-velocity window is what collapses that to a
+// flat series.
+void SampleOriginPoint(float x, float y, uint64_t qpcMs) {
+    if (g_contactOrigin.pointCount == kEndVelocitySamples) {
+        std::memmove(g_contactOrigin.points, g_contactOrigin.points + 1,
+                     sizeof(HidContactOrigin::Point) *
+                         (kEndVelocitySamples - 1));
+        g_contactOrigin.pointCount--;
+    }
+    g_contactOrigin.points[g_contactOrigin.pointCount++] =
+        HidContactOrigin::Point{x, y, qpcMs};
+}
+
 // True from the first report of a contact until it lifts. The edge test runs
 // once per contact, never on a finger that slides into the band later.
 bool g_contactDown = false;      // input thread only
@@ -4885,7 +5059,8 @@ float CoastVelocity(float distance) {
 // that is moving away from its target to 0.
 constexpr uint64_t kEndVelocityWindowMs = 30;
 constexpr uint64_t kEndVelocityMinMs = 8;
-constexpr int kEndVelocitySamples = 8;
+// The `vel window` line prints the whole window one release reads; off in the
+// shipping build, like g_debugCoast.
 
 struct EndVelocitySample {
     float progress = 0.0f;
@@ -4894,17 +5069,23 @@ struct EndVelocitySample {
 
 EndVelocitySample g_endVelocity[kEndVelocitySamples];
 int g_endVelocityCount = 0;  // input thread only
+int g_endVelocityCalls = 0;  // input thread only, diagnostic
+int g_endVelocityRepeats = 0;  // input thread only, diagnostic
 
 void ResetEndVelocity() {
     g_endVelocityCount = 0;
+    g_endVelocityCalls = 0;
+    g_endVelocityRepeats = 0;
 }
 
 // Keeps the last few reports of the moving panel. A report that repeats the last
 // value did not move the panel: it only makes the window end here.
 void SampleEndVelocity(float progress, uint64_t qpcMs) {
+    g_endVelocityCalls++;
     if (g_endVelocityCount > 0) {
         EndVelocitySample& newest = g_endVelocity[g_endVelocityCount - 1];
         if (newest.progress == progress) {
+            g_endVelocityRepeats++;
             newest.qpc = qpcMs;
             return;
         }
@@ -4932,45 +5113,79 @@ void SampleEndVelocity(float progress, uint64_t qpcMs) {
 // may lie up to 60 ms before the release when the stream paused just before the
 // lift. The whole pair therefore need not lie inside the last 30 ms.
 float EndVelocityProgressPerMs(uint64_t releaseQpc) {
-    if (g_endVelocityCount < 2) {
-        return 0.0f;
-    }
+    float result = 0.0f;
+    int firstIndex = -1;
 
-    const EndVelocitySample& newest = g_endVelocity[g_endVelocityCount - 1];
-    if (releaseQpc > newest.qpc &&
-        releaseQpc - newest.qpc > kEndVelocityWindowMs) {
-        return 0.0f;
-    }
-    const EndVelocitySample* first = nullptr;
-    // Oldest to newest, so the ages only shrink. The first entry inside the band
-    // is the oldest one that is at least 8 ms old and at most 30 ms old, which
-    // is the widest window the rules allow; every later entry is shorter. A
-    // sample younger than 8 ms ends the scan because every later one is younger
-    // still. No entry in the band (one report, equal timestamps, or a stream
-    // coarser than the window) answers zero without a division.
-    for (int i = 0; i < g_endVelocityCount - 1; ++i) {
-        const uint64_t age =
-            newest.qpc >= g_endVelocity[i].qpc ? newest.qpc - g_endVelocity[i].qpc
-                                               : 0;
-        if (age > kEndVelocityWindowMs) {
-            continue;
-        }
-        if (age < kEndVelocityMinMs) {
+    do {
+        if (g_endVelocityCount < 2) {
             break;
         }
-        first = &g_endVelocity[i];
-        break;
+
+        const EndVelocitySample& newest =
+            g_endVelocity[g_endVelocityCount - 1];
+        if (releaseQpc > newest.qpc &&
+            releaseQpc - newest.qpc > kEndVelocityWindowMs) {
+            break;
+        }
+        const EndVelocitySample* first = nullptr;
+        // Oldest to newest, so the ages only shrink. The first entry inside the
+        // band is the oldest one that is at least 8 ms old and at most 30 ms
+        // old, which is the widest window the rules allow; every later entry is
+        // shorter. A sample younger than 8 ms ends the scan because every later
+        // one is younger still. No entry in the band (one report, equal
+        // timestamps, or a stream coarser than the window) answers zero without
+        // a division.
+        for (int i = 0; i < g_endVelocityCount - 1; ++i) {
+            const uint64_t age =
+                newest.qpc >= g_endVelocity[i].qpc
+                    ? newest.qpc - g_endVelocity[i].qpc
+                    : 0;
+            if (age > kEndVelocityWindowMs) {
+                continue;
+            }
+            if (age < kEndVelocityMinMs) {
+                break;
+            }
+            first = &g_endVelocity[i];
+            firstIndex = i;
+            break;
+        }
+
+        if (!first || newest.qpc <= first->qpc) {
+            break;
+        }
+
+        const float elapsed = static_cast<float>(newest.qpc - first->qpc);
+        if (!(elapsed > 0.0f)) {
+            break;
+        }
+        result = (newest.progress - first->progress) / elapsed;
+    } while (false);
+
+    if (g_debugVelocity) {
+        const uint64_t newestQpc =
+            g_endVelocityCount > 0
+                ? g_endVelocity[g_endVelocityCount - 1].qpc
+                : 0;
+        const uint64_t age =
+            releaseQpc > newestQpc ? releaseQpc - newestQpc : 0;
+        const uint64_t firstAge =
+            firstIndex >= 0 ? newestQpc - g_endVelocity[firstIndex].qpc : 0;
+        const float delta =
+            firstIndex >= 0
+                ? g_endVelocity[g_endVelocityCount - 1].progress -
+                      g_endVelocity[firstIndex].progress
+                : 0.0f;
+        FileLog(L"vel window count=%d calls=%d repeats=%d rel=%llu newest=%llu "
+                L"age=%llu first=%d firstage=%llu d=%.5f raw=%.4f",
+                g_endVelocityCount, g_endVelocityCalls, g_endVelocityRepeats,
+                static_cast<unsigned long long>(releaseQpc),
+                static_cast<unsigned long long>(newestQpc),
+                static_cast<unsigned long long>(age), firstIndex,
+                static_cast<unsigned long long>(firstAge), delta, result);
     }
 
-    if (!first || newest.qpc <= first->qpc) {
-        return 0.0f;
-    }
-
-    const float elapsed = static_cast<float>(newest.qpc - first->qpc);
-    if (!(elapsed > 0.0f)) {
-        return 0.0f;
-    }
-    return (newest.progress - first->progress) / elapsed;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -4997,6 +5212,7 @@ void ResetActivationState() {
     g_duplicateContactIdLogged = false;
     g_contactDown = false;
     g_contactTick = 0;
+    g_contactOrigin = HidContactOrigin{};
 
     g_hidSession = HidGestureSession{};
     g_reveal = HidRevealSession{};
@@ -5092,19 +5308,40 @@ bool PointInStartWindow(float x, float y) {
 }
 
 // The taskbar sits on the side the dismiss axis slides out along, so that axis
-// also names the edge band the reveal starts from.
-bool PointInEdgeBand(int32_t axis, float x, float y) {
+// also names the band the reveal starts from: the bar's own strip plus one bar
+// thickness toward the desktop, as the snapshot publishes it. `kEdgeBandDip` is
+// the fallback while no snapshot has carried a band yet (a fresh process, or a
+// taskbar probe that named no edge), which is the same rule over a smaller span.
+bool RevealBandDip(const GestureGeometry& geometry, float& low, float& high) {
+    const int32_t axis = geometry.axis();
+    if (geometry.band) {
+        low = std::min(geometry.bandLow, geometry.bandHigh);
+        high = std::max(geometry.bandLow, geometry.bandHigh);
+        return high > low;
+    }
     switch (static_cast<DismissAxis>(axis)) {
         case DismissAxis::Left:
-            return x <= kEdgeBandDip;
+            low = 0.0f;
+            high = kEdgeBandDip;
+            return true;
         case DismissAxis::Top:
-            return y <= kEdgeBandDip;
+            low = 0.0f;
+            high = kEdgeBandDip;
+            return true;
         case DismissAxis::Right:
-            return g_screenDipWidth > kEdgeBandDip &&
-                   x >= g_screenDipWidth - kEdgeBandDip;
+            if (!(g_screenDipWidth > kEdgeBandDip)) {
+                return false;
+            }
+            low = g_screenDipWidth - kEdgeBandDip;
+            high = g_screenDipWidth;
+            return true;
         case DismissAxis::Bottom:
-            return g_screenDipHeight > kEdgeBandDip &&
-                   y >= g_screenDipHeight - kEdgeBandDip;
+            if (!(g_screenDipHeight > kEdgeBandDip)) {
+                return false;
+            }
+            low = g_screenDipHeight - kEdgeBandDip;
+            high = g_screenDipHeight;
+            return true;
     }
     return false;
 }
@@ -5136,6 +5373,18 @@ float AxisDirection(int32_t axis) {
 // not, because that one already divides by AxisDirection.
 float AxisOpeningSign(int32_t axis) {
     return -AxisDirection(axis);
+}
+
+// How far the finger has moved away from the taskbar edge since the contact
+// began, signed by the opening direction and clamped at 0: a pull back toward
+// the edge reads 0. The reveal's travel, the open-ownership test and the
+// adoption rule all read this one number.
+float RevealTravelDip(int32_t axis, float downX, float downY, float x, float y) {
+    return std::max(
+        0.0f,
+        (AxisScreenPosition(axis, x, y) -
+         AxisScreenPosition(axis, downX, downY)) *
+            AxisOpeningSign(axis));
 }
 
 // ---------------------------------------------------------------------------
@@ -5234,26 +5483,26 @@ bool GeometryLayoutCurrent(const GestureGeometry& geometry) {
 }
 
 // Whether a vertical dismiss may start here. A vertical drag competes with the
-// content's own scrolling: dragging toward the taskbar is how the app list
-// scrolls back, and a dismiss started on that drag closed the menu instead.
-// Measured on this build, the list is at VerticalOffset 0 on every open and moves
-// exactly with its content, so the rule is the scroll position, not a guess at
-// the user's intent:
+// content's own scrolling: dragging toward the taskbar is how a list scrolls
+// back, and a dismiss started on that drag closed the menu instead. The gate asks
+// the region *under the press*, never one pre-cached element:
 //
-// - the scroller state is Nothing: the panel measured nothing that scrolls, so
-//   the drag has no content to scroll and belongs to the dismiss;
-// - the state is Unknown: no measurement speaks for this open. Wait for the
-//   settled pass, but only while the press is inside the panel: a press on the
-//   desktop still passes;
-// - the press is outside the cached scroller (tiles, rail, panel background): the
-//   drag has no content to scroll, allow it;
-// - the press is inside it and the list is already at the end the drag would
-//   scroll away from (offset 0 for a bottom taskbar, offset == scrollable height
-//   for a top one): there is nothing left to scroll, allow it;
-// - otherwise the same drag would scroll the list, so the dismiss waits. The
-//   contact is not consumed: BeginHidSession runs again on every later sample,
-//   so once the user has scrolled the list to its end the rest of that same drag
-//   becomes a dismiss.
+// - the survey state is Nothing: it measured that nothing in the panel scrolls
+//   vertically, so the drag has no content to scroll and belongs to the dismiss;
+// - the state is Unknown: no whole measurement speaks for this open. Wait for
+//   the settled pass, but only while the press is inside the panel: a press on
+//   the desktop still passes;
+// - Scrollable: the innermost region whose rect contains the press decides. No
+//   such region (the panel background, the rail, the taskbar strip, a scroll view
+//   at rest with nothing to scroll) means the drag has no content to scroll;
+// - inside one, the drag belongs to the scroll unless that region is already at
+//   the end the drag would scroll away from (offset 0 for a bottom taskbar,
+//   offset == scrollable height for a top one), in which case there is nothing
+//   left to scroll and the dismiss may start;
+// - otherwise the same drag would scroll that region, so the dismiss waits, and
+//   the line names the region. The contact is not consumed: BeginHidSession runs
+//   again on every later sample, so once the user has scrolled the region to its
+//   end the rest of that same drag becomes a dismiss.
 //
 // Left and right keep the plain drag: a sideways drag does not scroll a vertical
 // list.
@@ -5269,15 +5518,15 @@ bool VerticalDismissAllowed(const GestureGeometry& geometry, int32_t axis,
         scroller = g_scroller;
     }
 
-    // A cache measured for another open says nothing about this one. The close
+    // A survey measured for another open says nothing about this one. The close
     // path releases it, but a reopen that lands before that deferred turn runs
-    // must not gate its first press against the previous menu's rect.
+    // must not gate its first press against the previous menu's rects.
     if (scroller.generation !=
         g_openGeneration.load(std::memory_order_acquire)) {
         scroller = ScrollerCache{};
     }
     // A resize inside one open keeps the generation, so the layout token is the
-    // only thing that says the rect describes a panel the shell has moved since.
+    // only thing that says the rects describe a panel the shell has moved since.
     if (scroller.layoutVersion !=
         g_layoutVersion.load(std::memory_order_acquire)) {
         scroller = ScrollerCache{};
@@ -5294,71 +5543,62 @@ bool VerticalDismissAllowed(const GestureGeometry& geometry, int32_t axis,
         return !PanelContainsPress(geometry, x, y);
     }
 
-    if (x < scroller.left || x > scroller.right || y < scroller.top ||
-        y > scroller.bottom) {
-        return true;  // the press is not on the scrolling content
+    // The innermost region containing the press. Depth beats area, so a list
+    // inside a scroll host wins over the host; at equal depth the smaller rect
+    // wins, because the more specific element is the one a press lands on.
+    const ScrollerRegion* hit = nullptr;
+    for (int i = 0; i < scroller.count; ++i) {
+        const ScrollerRegion& region = scroller.regions[i];
+        if (x < region.left || x > region.right || y < region.top ||
+            y > region.bottom) {
+            continue;
+        }
+        if (!hit || region.depth > hit->depth ||
+            (region.depth == hit->depth &&
+             (region.right - region.left) * (region.bottom - region.top) <
+                 (hit->right - hit->left) * (hit->bottom - hit->top))) {
+            hit = &region;
+        }
+    }
+    if (!hit) {
+        return true;  // the press is not on any scrolling content
     }
 
     const bool atEnd =
         axis == static_cast<int32_t>(DismissAxis::Bottom)
-            ? scroller.verticalOffset <= kScrollerEndSlopDip
-            : scroller.verticalOffset >=
-                  scroller.scrollableHeight - kScrollerEndSlopDip;
+            ? hit->verticalOffset <= kScrollerEndSlopDip
+            : hit->verticalOffset >=
+                  hit->scrollableHeight - kScrollerEndSlopDip;
     if (atEnd) {
         return true;
     }
 
     // At most one line per window: the digitizer keeps reporting while the
-    // finger rests, and each report asks again.
+    // finger rests, and each report asks again. The name says which region took
+    // the drag, because the rule is the region under the press and not one
+    // cached element.
     if (tickMs >= g_scrollerRejectLogTick &&
         tickMs - g_scrollerRejectLogTick >= kDismissRejectLogMs) {
         g_scrollerRejectLogTick = tickMs;
-        FileLog(L"dismiss deferred to scroll vo=%.0f sh=%.0f",
-                scroller.verticalOffset, scroller.scrollableHeight);
+        FileLog(L"dismiss deferred to scroll vo=%.0f sh=%.0f region=%s",
+                hit->verticalOffset, hit->scrollableHeight, hit->label);
     }
     return false;
 }
 
-// Runs on the first report of a contact. A contact that starts on the taskbar
-// edge while the menu is closed can own the menu's own open; anything else is
-// left to the dismiss path. A touch on the edge of an *open* menu is a dismiss
-// start, not a candidate, unless a close of this mod is still in flight.
-//
-// A dismiss that is still settling does not block a candidate: the edge contact
-// during its retract is the pull that can still cancel the close if it began
-// before the tap, and refusing it would let the tap take the menu away under the
-// finger.
-bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
-                        uint64_t tickMs) {
-    if (!RendererReady() || !GeometryLayoutCurrent(geometry)) {
-        return false;
-    }
-
-    if (!(geometry.distance() > 0.0f)) {
-        return false;  // renderer not ready: no distance to follow
-    }
-
-    const int32_t axis = geometry.axis();
-    if (!PointInEdgeBand(axis, x, y)) {
-        return false;
-    }
-
-    // A close this mod started still reports the window open for a moment. A
-    // contact on the edge in that window is a new reveal attempt, not a drag of
-    // the settling panel: the shell opens the menu again under the contact
-    // and the follow takes over. Treating it as a dismiss drag froze the
-    // retract and restored Progress 1 on the down.
-    const bool closeInFlight =
-        tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
-    if (!closeInFlight && StartWindowIsOpenThrottled(tickMs)) {
-        return false;
-    }
-
+// Starts one reveal follow. Both entry points come through here — a contact
+// admitted on the down because it began inside the taskbar band, and a contact
+// adopted because the menu opened under it while it was already pulling — so the
+// clocks, the pull generation and the cancel stamp cannot diverge. `downX/downY`
+// is the first positioned point of the contact and is what travel is measured
+// from, whatever moment the follow actually takes the panel over.
+void StartRevealFollow(float downX, float downY, uint64_t downTick,
+                       uint64_t tickMs) {
     g_reveal = HidRevealSession{};
     g_reveal.edgeCandidate = true;
-    g_reveal.edgeStartX = x;
-    g_reveal.edgeStartY = y;
-    g_reveal.startTick = tickMs;
+    g_reveal.edgeStartX = downX;
+    g_reveal.edgeStartY = downY;
+    g_reveal.startTick = downTick;
     g_reveal.lastTick = tickMs;
     g_reveal.lastSampleQpc = QpcMsNow();
     g_reveal.lastAliveQpc = g_reveal.lastSampleQpc;
@@ -5379,86 +5619,174 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
                               g_pullSerial)) {
         FileLog(L"close mode cancel stamp failed");
     }
-    return true;
 }
 
-// One reveal step. While the menu is still closed the contact is only
-// remembered; the moment it is open under the contact, the follow takes
-// Progress over and every later report drives it.
-void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
-                         uint64_t tickMs) {
-    HidRevealSession& reveal = g_reveal;
-    const uint64_t sampleQpc = QpcMsNow();
-    reveal.lastTick = tickMs;
-    reveal.lastSampleQpc = sampleQpc;
-    reveal.lastAliveQpc = sampleQpc;
-
-    if (!reveal.active) {
-        if (!StartWindowIsOpenThrottled(tickMs)) {
-            return;
-        }
-
-        const float distance = geometry.distance();
-        if (!(distance > 0.0f)) {
-            // A new root is being installed under the contact, so this contact
-            // no longer has a renderer to drive.
-            reveal.edgeCandidate = false;
-            EndContactTiming();
-            return;
-        }
-
-        reveal.active = true;
-        reveal.activeSinceQpc = sampleQpc;
-        reveal.distance = distance;
-        reveal.progress = 0.0f;
-        reveal.samples = 0;
-
-        // The mapped progress below (0.269 at the screen edge on this layout)
-        // replaces whatever the panel was doing, so the first step of the follow
-        // must not become the coast speed, and the window starts at the value the
-        // panel really shows, not at the target of a settle it is taking over.
-        ResetCoastVelocity();
-        ResetEndVelocity();
-
-        // A cancel or dismiss animation from a previous gesture may still own
-        // Progress; the follow must drive the scalar from this sample on, and the
-        // takeover pins the position the panel has now so no frame between the
-        // two writes shows the old animation's target. A close tap that is still
-        // ahead is not touched here: it re-checks the pull generation once, so a
-        // pull that began first drops the close.
-        reveal.lastInserted = TakeProgressNow();
-
-        // Diagnostic: the position the takeover replaces, so a reopen backlash
-        // can be traced to a value left behind or to an animation still running.
-        // This is the pinned value, not the recorded target.
-        FileLog(L"reveal takeover from=%.3f", reveal.lastInserted);
-    }
-
+// The panel position the finger asks for: the panel's trailing edge meets the
+// finger, in absolute screen DIP on both sides so the value does not depend on
+// where the finger was when the menu was first seen open. One mapping for the
+// follow's samples and for the window replayed out of the contact's own reports,
+// so the two series cannot disagree about where the panel is.
+float RevealProgressDip(const GestureGeometry& geometry, float distance, float x,
+                        float y, float& panelTrailOut) {
     const int32_t axis = geometry.axis();
     const float finger = AxisScreenPosition(axis, x, y);
-    // Decision quantity: how far the finger moved away from the taskbar edge
-    // since the touch began. Signed by the opening direction and clamped at 0,
-    // so a pull back toward the edge reads 0 and cannot commit.
-    reveal.travel = std::max(
-        0.0f, (finger - AxisScreenPosition(axis, reveal.edgeStartX,
-                                           reveal.edgeStartY)) *
-                  AxisOpeningSign(axis));
-    reveal.maxTravel = std::max(reveal.maxTravel, reveal.travel);
-
     // The trail is the panel edge this open measured. Without a measurement the
     // root-width fallback places it at the far screen edge, which is where the
     // travel maps Progress 0 to the taskbar edge and 1 to the far one.
-    const float panelTrail =
-        geometry.panel ? GeometryTrailDip(geometry)
-                       : FallbackTrailDip(axis, reveal.distance);
-    reveal.panelTrail = panelTrail;
+    panelTrailOut = geometry.panel ? GeometryTrailDip(geometry)
+                                   : FallbackTrailDip(axis, distance);
+    if (!(distance > 0.0f)) {
+        return 0.0f;
+    }
+    return std::clamp(
+        1.0f - (finger - panelTrailOut) / (AxisDirection(axis) * distance), 0.0f,
+        1.0f);
+}
 
-    // Absolute screen DIP on both sides of the subtraction: the panel's
-    // trailing edge meets the finger, so the progress no longer depends on
-    // where the finger was when the menu was first seen open.
-    const float progress = std::clamp(
-        1.0f - (finger - panelTrail) / (AxisDirection(axis) * reveal.distance),
-        0.0f, 1.0f);
+// Takes Progress over for a contact whose menu is now open. The panel's position
+// is taken, never the animation's target; the trail mapping is read from this
+// snapshot and every later report drives Progress from the finger. One place, so
+// the admission's first sample and the adoption's first sample cannot differ.
+bool ActivateRevealFollow(const GestureGeometry& geometry, uint64_t sampleQpc) {
+    HidRevealSession& reveal = g_reveal;
+    const float distance = geometry.distance();
+    if (!(distance > 0.0f)) {
+        // A new root is being installed under the contact, so this contact no
+        // longer has a renderer to drive.
+        reveal.edgeCandidate = false;
+        EndContactTiming();
+        return false;
+    }
+
+    reveal.active = true;
+    reveal.activeSinceQpc = sampleQpc;
+    reveal.distance = distance;
+    reveal.progress = 0.0f;
+    reveal.samples = 0;
+
+    // The mapped progress below (0.269 at the screen edge on this layout)
+    // replaces whatever the panel was doing, so the first step of the follow
+    // must not become the coast speed, and the window starts at the value the
+    // panel really shows, not at the target of a settle it is taking over.
+    ResetCoastVelocity();
+
+    // The release window starts at the contact's own reports, not at the
+    // takeover: the shell opens the menu late when the taskbar is auto-hidden
+    // (the pull first reveals the bar), so a takeover one or two reports before
+    // the lift had no window to measure and the settle started from rest while
+    // the finger was moving. The replayed value is the mapped position the panel
+    // shows as soon as the follow drives it, so the series is continuous with
+    // the first inserted sample; a finger that rested before the open repeats
+    // one value and the window stays flat, which is what a hold must report.
+    ResetEndVelocity();
+    float ignoredTrail = 0.0f;
+    for (int i = 0; i < g_contactOrigin.pointCount; ++i) {
+        const HidContactOrigin::Point& point = g_contactOrigin.points[i];
+        SampleEndVelocity(
+            RevealProgressDip(geometry, distance, point.x, point.y,
+                              ignoredTrail),
+            point.qpc);
+    }
+
+    // A cancel or dismiss animation from a previous gesture may still own
+    // Progress; the follow must drive the scalar from this sample on, and the
+    // takeover pins the position the panel has now so no frame between the two
+    // writes shows the old animation's target. A close tap that is still ahead
+    // is not touched here: it re-checks the pull generation once, so a pull that
+    // began first drops the close.
+    reveal.lastInserted = TakeProgressNow();
+
+    // Diagnostic: the position the takeover replaces, so a reopen backlash can be
+    // traced to a value left behind or to an animation still running. This is the
+    // pinned value, not the recorded target.
+    FileLog(L"reveal takeover from=%.3f", reveal.lastInserted);
+    return true;
+}
+
+// Runs on the first report of a contact. A contact that starts inside the
+// taskbar's band while the menu is closed can own the menu's own open; anything
+// else is left to the dismiss path. A touch inside the band of an *open* menu is
+// a dismiss start, not a candidate, unless a close of this mod is still in
+// flight.
+//
+// A dismiss that is still settling does not block a candidate: the edge contact
+// during its retract is the pull that can still cancel the close if it began
+// before the tap, and refusing it would let the tap take the menu away under the
+// finger.
+bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
+                        uint64_t tickMs) {
+    float low = 0.0f;
+    float high = 0.0f;
+    const bool haveBand = RevealBandDip(geometry, low, high);
+    const int32_t axis = geometry.axis();
+    const float position = AxisScreenPosition(axis, x, y);
+    const bool inBand = haveBand && position >= low && position <= high;
+
+    // The line speaks once per contact, and only for a contact that landed in
+    // the band: a tap anywhere else is not this gesture and stays as quiet as it
+    // was. A contact that starts inside the band and is refused names the test
+    // that refused it, which is what a pull that never followed the finger reads.
+    const wchar_t* reason = L"admitted";
+    bool admitted = false;
+    do {
+        if (!inBand) {
+            break;  // a press outside the band is not this gesture
+        }
+        if (!RendererReady()) {
+            reason = L"renderer";
+            break;
+        }
+        if (!GeometryLayoutCurrent(geometry)) {
+            reason = L"layout";
+            break;
+        }
+        if (!(geometry.distance() > 0.0f)) {
+            reason = L"distance";  // renderer not ready: no travel to follow
+            break;
+        }
+        // A close this mod started still reports the window open for a moment. A
+        // contact on the edge in that window is a new reveal attempt, not a drag
+        // of the settling panel: the shell opens the menu again under the
+        // contact and the follow takes over. Treating it as a dismiss drag froze
+        // the retract and restored Progress 1 on the down.
+        const bool closeInFlight =
+            tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+        if (!closeInFlight && StartWindowIsOpenThrottled(tickMs)) {
+            reason = L"open";
+            break;
+        }
+        StartRevealFollow(x, y, tickMs, tickMs);
+        admitted = true;
+    } while (false);
+
+    if (inBand) {
+        FileLog(L"reveal admit x=%.0f y=%.0f axis=%d band=%.0f,%.0f ok=%d "
+                L"reason=%s",
+                x, y, axis, haveBand ? low : -1.0f, haveBand ? high : -1.0f,
+                admitted ? 1 : 0, reason);
+    }
+    return admitted;
+}
+
+// The follow's one sample: the mapped Progress from the finger, the trail the
+// panel actually shows, the coast handoff and the release-speed window. It runs
+// on every report once the follow is active, including the adoption's own
+// report, which is why the adoption needs no second code path.
+void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
+                       uint64_t sampleQpc) {
+    HidRevealSession& reveal = g_reveal;
+    const int32_t axis = geometry.axis();
+    // Decision quantity: how far the finger moved away from the taskbar edge
+    // since the touch began. Signed by the opening direction and clamped at 0,
+    // so a pull back toward the edge reads 0 and cannot commit.
+    reveal.travel = RevealTravelDip(axis, reveal.edgeStartX, reveal.edgeStartY,
+                                    x, y);
+    reveal.maxTravel = std::max(reveal.maxTravel, reveal.travel);
+
+    float panelTrail = 0.0f;
+    const float progress =
+        RevealProgressDip(geometry, reveal.distance, x, y, panelTrail);
+    reveal.panelTrail = panelTrail;
 
     // A report ends the coast: pin where it got to, then insert the real value
     // below even when it is inside the 0.5 DIP filter, so the panel returns to
@@ -5481,8 +5809,81 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
     SampleEndVelocity(reveal.lastInserted, sampleQpc);
 }
 
-// Release of the edge contact. A candidate that never saw the menu open ends
-// silently: it did not touch Progress. A reveal that ran logs exactly one line.
+// One reveal step. While the menu is still closed the contact is only
+// remembered; the moment it is open under the contact, the follow takes
+// Progress over and every later report drives it.
+void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
+                         uint64_t tickMs) {
+    HidRevealSession& reveal = g_reveal;
+    const uint64_t sampleQpc = QpcMsNow();
+    reveal.lastTick = tickMs;
+    reveal.lastSampleQpc = sampleQpc;
+    reveal.lastAliveQpc = sampleQpc;
+
+    if (!reveal.active) {
+        if (!StartWindowIsOpenThrottled(tickMs)) {
+            return;
+        }
+        if (!ActivateRevealFollow(geometry, sampleQpc)) {
+            return;
+        }
+    }
+
+    DriveRevealFollow(geometry, x, y, sampleQpc);
+}
+
+// Adopts a live contact as the reveal when the menu opens under it without a
+// candidate having admitted it. The shell's own edge gesture opens the menu from
+// a strip wider than any fixed band this mod can guess, and a pull that began
+// inside the taskbar's thickness therefore used to reach the menu as a
+// keyboard-style open from 0 while the finger was pulling. Adoption is the
+// takeover that was missing: the same contact, measured from its own down point,
+// continues from the panel's live position at the finger.
+//
+// Three tests keep a tap a tap: the contact must have started while the menu was
+// closed (a contact on the open panel is a dismiss), it must have moved
+// `kAdoptTravelDip` along the opening axis (a tap does not move), and no session
+// may already own it. The adoption runs from the open's own poll and from the
+// report path, so a flick whose lift arrives before the next poll is still
+// adopted.
+bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
+    if (g_reveal.edgeCandidate || g_reveal.active || g_hidSession.active ||
+        g_hidSession.suppress || !g_contactOrigin.valid ||
+        g_contactOrigin.startedOpen || !RendererReady() ||
+        !GeometryLayoutCurrent(geometry)) {
+        return false;
+    }
+
+    const int32_t axis = geometry.axis();
+    const float travel =
+        RevealTravelDip(axis, g_contactOrigin.downX, g_contactOrigin.downY,
+                        g_contactOrigin.x, g_contactOrigin.y);
+    if (!(travel >= kAdoptTravelDip)) {
+        return false;
+    }
+
+    float low = 0.0f;
+    float high = 0.0f;
+    const bool haveBand = RevealBandDip(geometry, low, high);
+    StartRevealFollow(g_contactOrigin.downX, g_contactOrigin.downY,
+                      g_contactOrigin.downTick, tickMs);
+    const uint64_t sampleQpc = QpcMsNow();
+    if (!ActivateRevealFollow(geometry, sampleQpc)) {
+        return false;
+    }
+    DriveRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
+                      sampleQpc);
+    FileLog(L"reveal adopt x=%.0f y=%.0f travel=%.0f axis=%d band=%.0f,%.0f gen=%u",
+            g_contactOrigin.x, g_contactOrigin.y, travel, axis,
+            haveBand ? low : -1.0f, haveBand ? high : -1.0f,
+            geometry.generation);
+    return true;
+}
+
+// Release of the edge contact. A candidate that never saw the menu open did not
+// touch Progress; when it was a real pull, one line says the menu never opened,
+// which is the difference between "the shell did not open it" and "the shell
+// opened it without the follow". A reveal that ran logs exactly one line.
 //
 // The decision mirrors ReleaseHidSession: it judges the travel at the moment of
 // release, not the mapped progress. Progress reads 0.269 at the screen edge on
@@ -5496,6 +5897,19 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
 
     reveal.edgeCandidate = false;
     if (!reveal.active) {
+        // The contact is gone and the menu never appeared under it. A tap is not
+        // worth a line (it never moved); a pull that travelled says the shell
+        // never opened the menu, so there was nothing to follow.
+        const float travel =
+            g_contactOrigin.valid
+                ? RevealTravelDip(geometry.axis(), reveal.edgeStartX,
+                                  reveal.edgeStartY, g_contactOrigin.x,
+                                  g_contactOrigin.y)
+                : 0.0f;
+        if (travel >= kAdoptTravelDip) {
+            FileLog(L"reveal candidate released unopened travel=%.0f axis=%d",
+                    travel, geometry.axis());
+        }
         EndContactTiming();
         return;
     }
@@ -5866,11 +6280,31 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
             ReleaseHidSession(geometry, true, L"report");
         }
         session.suppress = false;
+        // The origin stays for this release: a candidate that never saw the menu
+        // open reads its last point to say how far the pull got before it ends.
         ReleaseRevealSession(geometry);
+        g_contactOrigin = HidContactOrigin{};
         g_contactDown = false;
         g_openCheckValid = false;
         return;
     }
+
+    // The contact's own down point, kept for a follow that is adopted later: the
+    // menu can open under a pull that began outside every band this mod can
+    // admit, and adoption measures its travel from here. The record starts once
+    // per contact and is cleared by the lift above and by the idle that ends a
+    // contact, so a retried admission cannot move the down point.
+    if (!g_contactOrigin.valid) {
+        g_contactOrigin.valid = true;
+        g_contactOrigin.startedOpen = StartWindowIsOpenThrottled(tickMs);
+        g_contactOrigin.downX = xDip;
+        g_contactOrigin.downY = yDip;
+        g_contactOrigin.downTick = tickMs;
+        g_contactOrigin.pointCount = 0;
+    }
+    g_contactOrigin.x = xDip;
+    g_contactOrigin.y = yDip;
+    SampleOriginPoint(xDip, yDip, QpcMsNow());
 
     if (session.suppress) {
         // A close muted this contact: its reports are not a gesture, but the
@@ -5910,6 +6344,16 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
         BeginEdgeCandidate(geometry, xDip, yDip, tickMs);
     }
     if (g_reveal.edgeCandidate) {
+        UpdateRevealSession(geometry, xDip, yDip, tickMs);
+        return;
+    }
+
+    // The menu opened under this contact while it was already pulling, and the
+    // shell's own edge gesture is what opened it: the same pull adopts it and
+    // the panel follows from where it is. A tap cannot reach this line: it has
+    // no travel, and the record says the menu was open at its down if it began
+    // on the panel.
+    if (StartWindowIsOpenThrottled(tickMs) && AdoptRevealContact(geometry, tickMs)) {
         UpdateRevealSession(geometry, xDip, yDip, tickMs);
         return;
     }
@@ -6137,6 +6581,7 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     if (!session.active && !g_reveal.edgeCandidate && g_contactDown &&
         tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs) {
         g_contactDown = false;
+        g_contactOrigin = HidContactOrigin{};
         session.suppress = false;
         g_openCheckValid = false;
         ForgetTrackedContact();
@@ -6498,10 +6943,6 @@ void PollRootVisibility(uint64_t tickMs) {
     // flashed the panel fully open and the window then vanished.
     const bool closeInFlight =
         tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
-    // An edge contact that is still down owns the open: the follow drives the
-    // scalar from the finger, and inserting a fully open frame here would fight
-    // it.
-    const bool gestureOwnsProgress = g_reveal.edgeCandidate;
     if (justOpened) {
         // A fresh menu, so every retract request written for the previous one is
         // void from this point on, whatever its own deadline says. The
@@ -6523,6 +6964,32 @@ void PollRootVisibility(uint64_t tickMs) {
         // the previous one is stale from this point on, and a request that was
         // still live is cancelled by the epoch check in its turn.
         AdvanceOpenGeneration();
+
+        // The shell opens the menu from a strip wider than any fixed band this
+        // mod can admit, so a pull that began inside the taskbar's thickness can
+        // reach this line without a candidate. Adopt it here, at the open, so
+        // the finger that caused the open owns the scalar from this frame and no
+        // keyboard-style slide starts under it. A contact that began on the open
+        // panel is a dismiss, and a tap has not moved: AdoptRevealContact tests
+        // both.
+        const GestureGeometry geometry = ReadGestureGeometry();
+        if (!closeInFlight) {
+            AdoptRevealContact(geometry, tickMs);
+        }
+
+        // An edge contact that is still down and already pulling owns the open:
+        // the follow drives the scalar from the finger, and inserting a fully
+        // open frame here would fight it. A contact that has not moved yet is a
+        // tap on the taskbar: the shell's own button opened the menu and the
+        // keyboard-style settle is what the tap should look like. The follow
+        // takes that settle over from its live position if the finger then moves.
+        const bool candidateMoving =
+            g_reveal.edgeCandidate && g_contactOrigin.valid &&
+            RevealTravelDip(geometry.axis(), g_contactOrigin.downX,
+                            g_contactOrigin.downY, g_contactOrigin.x,
+                            g_contactOrigin.y) >= kAdoptTravelDip;
+        const bool gestureOwnsProgress = g_reveal.active || candidateMoving;
+
         // The keyboard open is the gesture open from rest: one curve for every
         // open, so a Windows press and an edge pull cannot look different, and
         // the travel plans the duration exactly as it does there.
@@ -6532,7 +6999,7 @@ void PollRootVisibility(uint64_t tickMs) {
             // open that lands before the first publish still has Distance 0: a
             // settle planned from it would run the 160 ms floor. Restore the
             // resting value instead and let the shell's own storyboard run.
-            if (ReadGestureGeometry().distance() > 0.0f) {
+            if (geometry.distance() > 0.0f) {
                 std::chrono::milliseconds duration{0};
                 if (BeginGestureSettle(0.0f, 1.0f, 0.0f, duration)) {
                     // The animation now owns Progress, so no later path needs to
@@ -7561,11 +8028,11 @@ bool BarWindowForMonitor(const RECT& monitor, RECT& bar, DismissAxis& edge) {
 // The bar's thickness is what the bar itself measures, so auto-hide cannot
 // narrow it (the measured hidden bar is 0,1798,2880,1894 and still occupies the
 // 48 DIP it has when shown), and the extension is a measured fact, not a
-// tolerance: the settled panel sits 12 DIP from the bar's inner edge — inside the
-// band for a top taskbar (`36` against the band `0..48`) and on the desktop side
-// of it for a bottom one (`840` against the band `852..900`) — while the open
-// storyboard's rect is 313 DIP away. Half a monitor is not a bar and answers
-// nothing.
+// tolerance: the settled panel sits 12 DIP from the bar's inner edge, so the
+// band is twice the bar's thickness — `0..96` for a top taskbar with the panel's
+// top at 36, `804..900` for a bottom one with the panel's bottom at 840 — while
+// the open storyboard's rect is 313 DIP away. Half a monitor is not a bar and
+// answers nothing.
 bool TaskbarBandDip(DismissAxis axis, const RECT& bar, const RECT& monitor,
                     float scale, float& low, float& high) {
     if (!(scale > 0.0f)) {
@@ -7699,6 +8166,52 @@ struct PanelHomeDip {
     float taskbarLow = 0.0f;
     float taskbarHigh = 0.0f;
 };
+
+// The band the reveal candidate starts on, when no taskbar probe measured one:
+// the work-area inset is the bar's thickness, so the band is the bar's strip
+// plus one more thickness toward the desktop, the same span TaskbarBandDip
+// builds from the probe. An auto-hidden bar reserves no inset, so this answers
+// false and the candidate test falls back to kEdgeBandDip.
+bool WorkAreaBandDip(const PanelHomeDip& home, int32_t axis, float& low,
+                     float& high) {
+    float inset = 0.0f;
+    switch (static_cast<DismissAxis>(axis)) {
+        case DismissAxis::Left:
+            inset = home.work.left - home.monitor.left;
+            break;
+        case DismissAxis::Top:
+            inset = home.work.top - home.monitor.top;
+            break;
+        case DismissAxis::Right:
+            inset = home.monitor.right - home.work.right;
+            break;
+        case DismissAxis::Bottom:
+            inset = home.monitor.bottom - home.work.bottom;
+            break;
+    }
+    if (!(inset > 0.0f)) {
+        return false;
+    }
+    switch (static_cast<DismissAxis>(axis)) {
+        case DismissAxis::Left:
+            low = home.monitor.left;
+            high = home.monitor.left + 2.0f * inset;
+            break;
+        case DismissAxis::Top:
+            low = home.monitor.top;
+            high = home.monitor.top + 2.0f * inset;
+            break;
+        case DismissAxis::Right:
+            low = home.monitor.right - 2.0f * inset;
+            high = home.monitor.right;
+            break;
+        case DismissAxis::Bottom:
+            low = home.monitor.bottom - 2.0f * inset;
+            high = home.monitor.bottom;
+            break;
+    }
+    return true;
+}
 
 
 bool MeasurePanelRect(PanelMeasurement& panel) {
@@ -7992,6 +8505,19 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
         candidate.layout.monitorTop = home.monitor.top;
         candidate.layout.monitorRight = home.monitor.right;
         candidate.layout.monitorBottom = home.monitor.bottom;
+
+        // The reveal candidate's band travels with the snapshot, so the input
+        // thread starts a pull on the taskbar's own strip instead of a fixed
+        // 12 DIP: the bar's measured span plus one thickness toward the desktop.
+        if (home.taskbarBand) {
+            candidate.band = true;
+            candidate.bandLow = home.taskbarLow;
+            candidate.bandHigh = home.taskbarHigh;
+        } else {
+            candidate.band = WorkAreaBandDip(home, candidate.layout.axis,
+                                             candidate.bandLow,
+                                             candidate.bandHigh);
+        }
     }
 
     // A rect may be carried only inside one layout identity, and only when it
@@ -8333,7 +8859,9 @@ void ArmLayoutWatch(const SettledMeasureRequest& request) {
 // lands on. The rect is mapped to screen DIP through the same origin as the
 // panel rect, so the input thread can test a press point against it directly.
 // ---------------------------------------------------------------------------
-struct ScrollerCandidate {
+// One scrollable element the survey found. `area` is the pick's tie-break and
+// never leaves this file.
+struct ScrollerFound {
     wuxc::ScrollViewer viewer{nullptr};
     float left = 0.0f;
     float top = 0.0f;
@@ -8341,20 +8869,170 @@ struct ScrollerCandidate {
     float bottom = 0.0f;
     float area = 0.0f;
     uint32_t depth = 0;
-    bool found = false;
+    wchar_t label[kScrollerLabelChars] = {};
 };
 
-// `complete` says the traversal reached every branch it was allowed to read. A
-// throw, an unreadable child or the depth limit clears it: "no element found"
-// then means "the search did not finish", never "nothing here scrolls".
-void FindScrollableElement(const wux::UIElement& element, uint32_t depth,
-                           float originX, float originY,
-                           ScrollerCandidate& best, bool& complete) {
+struct ScrollerSurvey {
+    ScrollerFound found[kMaxScrollRegions];
+    int count = 0;
+    // `complete` says the traversal reached every branch it was allowed to read.
+    // A throw, an unreadable child or the depth limit clears it: "no element
+    // found" then means "the search did not finish", never "nothing here
+    // scrolls".
+    bool complete = true;
+    // More scrollable viewers than slots: the deepest `kMaxScrollRegions` are
+    // kept, so the ones a press is most likely to land on survive.
+    bool overflow = false;
+};
+
+// Copies `text` into a fixed label, cut at the array bound. A label is a
+// diagnostic, so a cut name is better than no line.
+void CopyScrollerLabel(const wchar_t* text, wchar_t (&label)[kScrollerLabelChars]) {
+    const size_t length = text ? std::min(wcslen(text),
+                                          static_cast<size_t>(kScrollerLabelChars - 1))
+                               : 0;
+    if (length > 0) {
+        std::wmemcpy(label, text, length);
+    }
+    label[length] = L'\0';
+}
+
+// The containers every control template puts between a list and its own
+// ScrollViewer, by full and by short type name. A region's label skips them:
+// "StartUI.TileListView" names the element a user drags, "Border" does not.
+bool GenericContainerName(const winrt::hstring& name) {
+    static const wchar_t* const kGeneric[] = {
+        L"Windows.UI.Xaml.Controls.ScrollViewer",
+        L"Windows.UI.Xaml.Controls.Border",
+        L"Windows.UI.Xaml.Controls.Grid",
+        L"Windows.UI.Xaml.Controls.ContentPresenter",
+        L"Windows.UI.Xaml.Controls.ScrollContentPresenter",
+        L"Windows.UI.Xaml.Controls.ItemsPresenter",
+        L"Windows.UI.Xaml.Controls.StackPanel",
+        L"ScrollViewer",
+        L"Border",
+        L"Grid",
+        L"ContentPresenter",
+        L"ScrollContentPresenter",
+        L"ItemsPresenter",
+        L"StackPanel",
+    };
+    for (const wchar_t* generic : kGeneric) {
+        if (name == generic) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The part of a WinRT class name after the last dot: `ScrollViewer` for
+// `Windows.UI.Xaml.Controls.ScrollViewer`.
+winrt::hstring ShortTypeName(const winrt::hstring& type) {
+    const std::wstring_view view = type;
+    const size_t dot = view.rfind(L'.');
+    if (dot == std::wstring_view::npos) {
+        return type;
+    }
+    return winrt::hstring(view.substr(dot + 1));
+}
+
+// A name is worth a log line only when it names the element rather than its
+// template: the shell's templated ScrollViewer is literally named
+// "ScrollViewer", so its own name says nothing the type does not.
+bool MeaningfulElementName(const winrt::hstring& name,
+                           const winrt::hstring& type) {
+    if (name.empty() || GenericContainerName(name)) {
+        return false;
+    }
+    return name != type && name != ShortTypeName(type);
+}
+
+// The name a log line can use for this element: its own Name when that names the
+// element rather than its template, the short type name of the nearest ancestor
+// that is not a generic container (the list a templated ScrollViewer belongs to,
+// `TileListView` / `AllAppsGridListView`), and the two joined as `name>owner`
+// when both exist. Runs on the UI thread, once per region per survey.
+void DescribeScrollerElement(const wux::UIElement& element,
+                             wchar_t (&label)[kScrollerLabelChars]) {
+    winrt::hstring elementType;
+    try {
+        elementType = winrt::get_class_name(element);
+    } catch (...) {
+    }
+
+    winrt::hstring ownName;
+    try {
+        wux::FrameworkElement named = element.try_as<wux::FrameworkElement>();
+        if (named && MeaningfulElementName(named.Name(), elementType)) {
+            ownName = named.Name();
+        }
+    } catch (...) {
+    }
+
+    winrt::hstring ownerType;
+    wux::DependencyObject ancestor = element;
+    for (int level = 0; level < 12 && ancestor; ++level) {
+        try {
+            ancestor = wux::Media::VisualTreeHelper::GetParent(ancestor);
+        } catch (...) {
+            break;
+        }
+        if (!ancestor) {
+            break;
+        }
+        try {
+            const winrt::hstring type = winrt::get_class_name(ancestor);
+            if (ownerType.empty() && !GenericContainerName(type) &&
+                !GenericContainerName(ShortTypeName(type))) {
+                ownerType = ShortTypeName(type);
+            }
+        } catch (...) {
+        }
+    }
+
+    wchar_t text[kScrollerLabelChars * 2] = {};
+    if (!ownName.empty() && !ownerType.empty()) {
+        swprintf_s(text, L"%s>%s", ownName.c_str(), ownerType.c_str());
+    } else if (!ownName.empty()) {
+        swprintf_s(text, L"%s", ownName.c_str());
+    } else if (!ownerType.empty()) {
+        swprintf_s(text, L"%s", ownerType.c_str());
+    } else if (!elementType.empty()) {
+        swprintf_s(text, L"%s", ShortTypeName(elementType).c_str());
+    } else {
+        swprintf_s(text, L"ScrollViewer");
+    }
+    CopyScrollerLabel(text, label);
+}
+
+// Keeps the deepest scrollable viewers, dropping the shallowest when full: a
+// scroll host and the list inside it share a rect, and the list is the one a
+// press lands on.
+void AddScrollerFound(ScrollerSurvey& survey, const ScrollerFound& found) {
+    if (survey.count < kMaxScrollRegions) {
+        survey.found[survey.count++] = found;
+        return;
+    }
+    survey.overflow = true;
+    int shallowest = 0;
+    for (int i = 1; i < survey.count; ++i) {
+        if (survey.found[i].depth < survey.found[shallowest].depth) {
+            shallowest = i;
+        }
+    }
+    if (found.depth > survey.found[shallowest].depth) {
+        survey.found[shallowest] = found;
+    }
+}
+
+void CollectScrollableElements(const wux::UIElement& element, uint32_t depth,
+                               float originX, float originY,
+                               ScrollerSurvey& survey) {
     if (!element) {
         return;
     }
     if (depth > kScrollerScanMaxDepth) {
-        complete = false;
+        survey.complete = false;
         return;
     }
 
@@ -8380,63 +9058,66 @@ void FindScrollableElement(const wux::UIElement& element, uint32_t depth,
             if (viewer.ScrollableWidth() <= kScrollerAxisSlopDip &&
                 viewer.ScrollableHeight() > kScrollerAxisSlopDip &&
                 right > left && bottom > top && area > 1.0f) {
-                if (!best.found || depth > best.depth ||
-                    (depth == best.depth && area < best.area)) {
-                    best.viewer = viewer;
-                    best.left = left;
-                    best.top = top;
-                    best.right = right;
-                    best.bottom = bottom;
-                    best.area = area;
-                    best.depth = depth;
-                    best.found = true;
-                }
+                ScrollerFound found;
+                found.viewer = viewer;
+                found.left = left;
+                found.top = top;
+                found.right = right;
+                found.bottom = bottom;
+                found.area = area;
+                found.depth = depth;
+                DescribeScrollerElement(element, found.label);
+                AddScrollerFound(survey, found);
             }
         }
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Scroller measure failed: %08X", e.code());
-        complete = false;
+        survey.complete = false;
     } catch (...) {
         // A branch mid-teardown ends this branch only, but the answer is no
         // longer whole.
-        complete = false;
+        survey.complete = false;
     }
 
     try {
         const int32_t count =
             wux::Media::VisualTreeHelper::GetChildrenCount(element);
         if (depth >= kScrollerScanMaxDepth && count > 0) {
-            complete = false;  // children exist below the limit; not searched
+            survey.complete = false;  // children exist below the limit; not searched
             return;
         }
         for (int32_t i = 0; i < count; ++i) {
-            FindScrollableElement(
+            CollectScrollableElements(
                 wux::Media::VisualTreeHelper::GetChild(element, i)
                     .try_as<wux::UIElement>(),
-                depth + 1, originX, originY, best, complete);
+                depth + 1, originX, originY, survey);
         }
     } catch (...) {
         // A child being attached or removed ends this branch only.
-        complete = false;
+        survey.complete = false;
     }
 }
 
-// Drops only the handler, so a re-measure can subscribe to the same or another
+// Drops one slot's handler, so a re-measure can subscribe to the same or another
 // element. Runs on the UI thread. A revoke that throws keeps the token and its
-// owner — `g_scrollerWatchOwner`, not the cache's viewer: the token is the only
-// handle on a handler that can still fire, and overwriting it with the next
-// registration would lose it for the process lifetime. Clearing the cache's
-// viewer is the caller's decision, because a cache that keeps its rect keeps the
-// viewer that measured it.
-void RevokeScrollerWatch() {
-    wuxc::ScrollViewer owner = g_scrollerWatchOwner;
-    if (g_scrollerToken.value) {
+// owner — `owner`, not the slot's `viewer`: the token is the only handle on a
+// handler that can still fire, and overwriting it with the next registration
+// would lose it for the process lifetime, so the slot also stays occupied and is
+// not reused. Clearing the slot's `viewer` is the caller's decision, because a
+// committed region that keeps its rect keeps the viewer that measured it.
+void RevokeScrollerWatch(int slot) {
+    if (slot < 0 || slot >= kMaxScrollRegions) {
+        return;
+    }
+    ScrollerWatch& watch = g_scrollerWatches[slot];
+    wuxc::ScrollViewer owner = watch.owner;
+    if (watch.token.value) {
         if (!owner) {
             Wh_Log(L"ViewChanged registration has no owner to revoke on");
             return;
         }
         try {
-            owner.ViewChanged(g_scrollerToken);
+            owner.ViewChanged(watch.token);
             g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
         } catch (winrt::hresult_error const& e) {
             Wh_Log(L"ViewChanged revoke failed: %08X", e.code());
@@ -8446,22 +9127,34 @@ void RevokeScrollerWatch() {
             return;
         }
     }
-    g_scrollerToken = {};
-    g_scrollerWatchOwner = nullptr;
+    watch.token = {};
+    watch.owner = nullptr;
 }
 
-// Publishes the offsets of the committed element. ViewChanged fires on the UI
-// thread and only while the list actually scrolls, so this is the whole cost of
-// keeping the gate honest.
+// Publishes the offsets of the region a committed watch describes. ViewChanged
+// fires on the UI thread and only while that region actually scrolls, so this is
+// the whole cost of keeping the gate honest.
 //
 // The authorization is the cache's own identity, not the registration: a handler
-// may write only while the element it was registered on is the element the
-// committed rect was measured from. A handler whose revoke threw is still the
-// registration owner and still fires, so it is exactly the case that must not be
-// trusted: after a replacement its numbers would land under another list's rect,
-// and a vertical drag would then be gated against the wrong list.
+// may write only while its slot still names a region of the committed survey, the
+// survey is `Scrollable`, and it belongs to the open and the layout on screen. A
+// handler whose revoke threw is still the registration owner and still fires, so
+// it is exactly the case that must not be trusted: after a replacement its numbers
+// would land under another region's rect, and a vertical drag would then be gated
+// against the wrong element.
 void RefreshScrollerOffsets(wuxc::ScrollViewer const& watched) {
-    if (!watched || watched != g_scrollerCacheViewer) {
+    if (!watched) {
+        return;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < kMaxScrollRegions; ++i) {
+        if (g_scrollerWatches[i].viewer == watched) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
         return;
     }
 
@@ -8469,9 +9162,18 @@ void RefreshScrollerOffsets(wuxc::ScrollViewer const& watched) {
         const float verticalOffset = watched.VerticalOffset();
         const float scrollableHeight = watched.ScrollableHeight();
         std::lock_guard lock(g_scrollerMutex);
-        if (g_scroller.state == ScrollerState::Scrollable) {
-            g_scroller.verticalOffset = verticalOffset;
-            g_scroller.scrollableHeight = scrollableHeight;
+        if (g_scroller.state != ScrollerState::Scrollable ||
+            g_scroller.generation !=
+                g_openGeneration.load(std::memory_order_relaxed) ||
+            g_scroller.layoutVersion !=
+                g_layoutVersion.load(std::memory_order_acquire)) {
+            return;
+        }
+        for (int i = 0; i < g_scroller.count; ++i) {
+            if (g_scroller.regions[i].watchSlot == slot) {
+                g_scroller.regions[i].verticalOffset = verticalOffset;
+                g_scroller.regions[i].scrollableHeight = scrollableHeight;
+            }
         }
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Scroller offset read failed: %08X", e.code());
@@ -8597,9 +9299,8 @@ void ClearScrollerRetry() {
 // repeat, and the input thread must not gate a dismiss on it. Unknown inside the
 // panel only defers, so the pass fails safe.
 void PublishScrollerUnknown(uint32_t generation) {
-    // No element describes the cache any more, so no handler is authorized to
-    // write it; the next positive commit names the element it measured.
-    g_scrollerCacheViewer = nullptr;
+    // No region describes the cache any more, so no handler is authorized to
+    // write it; the next positive commit names the regions it measured.
     std::lock_guard lock(g_scrollerMutex);
     g_scroller = ScrollerCache{};
     g_scroller.generation = generation;
@@ -8607,15 +9308,15 @@ void PublishScrollerUnknown(uint32_t generation) {
         g_layoutVersion.load(std::memory_order_acquire);
 }
 
-// Finds and caches the element for the open that is being measured. Runs on the
-// UI thread from the open transition and again from the settled layout pass; the
-// second call replaces the first measurement, which can still belong to the
+// Surveys the menu for every place a vertical drag can scroll. Runs on the UI
+// thread from the open transition and again from the settled layout pass; the
+// second call replaces the first survey, which can still belong to the
 // storyboard.
 //
-// Only the settled pass can arm the gate. The open-time pass records the element
-// (so its ViewChanged handler is attached early and its rect is logged) but leaves
-// the state Unknown: the rect belongs to a window the shell is still moving, and
-// the old code armed the gate against it as soon as `valid` was set.
+// Only the settled pass can arm the gate. The open-time pass records the regions
+// (so their ViewChanged handlers are attached early and their rects are logged)
+// but leaves the state Unknown: the rects belong to a window the shell is still
+// moving, and the old code armed the gate against it as soon as a rect existed.
 //
 // A settled pass that completes and finds no scrollable element records Nothing,
 // not Unknown. That is the state that lets a vertical press inside the panel
@@ -8650,34 +9351,38 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     // the truth for this layout. The old code returned here on an incomplete
     // search and left a previous Nothing or Scrollable in place, so the gate went
     // on gating against an answer another layout (or an earlier tree) produced.
-    // The layout the rect is about to be mapped in is read with it, so a resize
-    // that lands while the search runs is caught at commit.
+    // The layout the rects are about to be mapped in is read with them, so a
+    // resize that lands while the search runs is caught at commit.
     const uint32_t layoutVersion = g_layoutVersion.load(std::memory_order_acquire);
     // The cache is about to hold no rect at all, so no handler may write it while
-    // this pass runs; a positive commit names its element again.
-    g_scrollerCacheViewer = nullptr;
+    // this pass runs; a positive commit names its regions again.
     {
         std::lock_guard lock(g_scrollerMutex);
         g_scroller = ScrollerCache{};
     }
 
-    ScrollerCandidate best;
-    bool complete = true;
+    ScrollerSurvey survey;
     try {
-        FindScrollableElement(root, 0, originX, originY, best, complete);
+        CollectScrollableElements(root, 0, originX, originY, survey);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Scroller search failed: %08X", e.code());
-        complete = false;
+        survey.complete = false;
     } catch (...) {
         // An unreadable tree means this pass has no answer, not that the previous
         // one still holds.
-        complete = false;
+        survey.complete = false;
     }
 
     // "Not found" is only a measurement when the traversal finished. A found
-    // element is usable even if another branch was unreadable: the candidate was
-    // read whole, and refusing it would leave the gate Unknown for certain.
-    if (!best.found && !complete) {
+    // element is usable even if another branch was unreadable: its own values were
+    // read whole, and refusing the whole survey would leave the gate Unknown for
+    // certain.
+    if (survey.overflow && !g_scrollerOverflowLogged) {
+        g_scrollerOverflowLogged = true;
+        FileLog(L"scroller overflow (kept %d deepest regions)",
+                kMaxScrollRegions);
+    }
+    if (survey.count == 0 && !survey.complete) {
         // Unknown so the vertical gate keeps deferring; the retry is bounded.
         PublishScrollerUnknown(expectedGeneration);
         if (settled) {
@@ -8686,10 +9391,10 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         return;
     }
 
-    if (!best.found) {
+    if (survey.count == 0) {
         // Nothing scrolls here, and only the settled pass can make that a fact:
         // the open transition can see an empty tree while the shell is still
-        // building the list.
+        // building the lists.
         ScrollerCache answer;
         answer.state =
             settled ? ScrollerState::Nothing : ScrollerState::Unknown;
@@ -8715,15 +9420,14 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
                 }
                 return;
         }
-        // The old handler belongs to an element this answer no longer names, so a
-        // completed negative search revokes it as well; only the positive path
-        // used to. An attached handler on a viewer the panel no longer shows would
-        // keep refreshing offsets the gate can never use. The cache now names no
-        // element, so it authorizes no handler either — set before the revoke, so
-        // a revoke that throws cannot leave the old watch authorized for a cache
-        // it no longer describes.
-        g_scrollerCacheViewer = nullptr;
-        RevokeScrollerWatch();
+        // The old handlers belong to elements this answer no longer names, so a
+        // completed negative survey revokes them as well. An attached handler on a
+        // viewer the panel no longer shows would keep refreshing offsets the gate
+        // can never use. The cache now names no region, so it authorizes no
+        // handler either; the cache was cleared before the search.
+        for (int i = 0; i < kMaxScrollRegions; ++i) {
+            RevokeScrollerWatch(i);
+        }
         if (settled && !g_scrollerNoneLogged) {
             g_scrollerNoneLogged = true;
             FileLog(L"scroller none (measured, nothing scrolls)");
@@ -8731,12 +9435,39 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         return;
     }
 
-    float verticalOffset = 0.0f;
-    float scrollableHeight = 0.0f;
-    try {
-        verticalOffset = best.viewer.VerticalOffset();
-        scrollableHeight = best.viewer.ScrollableHeight();
-    } catch (...) {
+    // One region per scrollable viewer, in tree order. An offset pair that cannot
+    // be read drops that region only: the others were measured whole, and one
+    // unreadable viewer is not a reason to leave the gate Unknown. A survey left
+    // with no readable region answers Unknown like a failed pass.
+    ScrollerCache answer;
+    answer.state = settled ? ScrollerState::Scrollable : ScrollerState::Unknown;
+    answer.generation = expectedGeneration;
+    answer.layoutVersion = layoutVersion;
+    wuxc::ScrollViewer answerViewers[kMaxScrollRegions]{nullptr};
+    for (int i = 0; i < survey.count && answer.count < kMaxScrollRegions; ++i) {
+        const ScrollerFound& found = survey.found[i];
+        float verticalOffset = 0.0f;
+        float scrollableHeight = 0.0f;
+        try {
+            verticalOffset = found.viewer.VerticalOffset();
+            scrollableHeight = found.viewer.ScrollableHeight();
+        } catch (...) {
+            continue;
+        }
+        ScrollerRegion& region = answer.regions[answer.count];
+        answerViewers[answer.count] = found.viewer;
+        answer.count++;
+        region.left = found.left;
+        region.top = found.top;
+        region.right = found.right;
+        region.bottom = found.bottom;
+        region.verticalOffset = verticalOffset;
+        region.scrollableHeight = scrollableHeight;
+        region.depth = found.depth;
+        std::wmemcpy(region.label, found.label, kScrollerLabelChars);
+    }
+
+    if (answer.count == 0) {
         // A viewer that cannot be read is no better than no viewer, and it does
         // not tell the gate anything: this pass publishes Unknown.
         PublishScrollerUnknown(expectedGeneration);
@@ -8746,7 +9477,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         return;
     }
 
-    // The client origin the rect was mapped through must still be the one in
+    // The client origin the rects were mapped through must still be the one in
     // force. This runs on the UI thread, which is also the origin's only writer,
     // so this is a check of the search's assumption, not a measurement of the
     // tree.
@@ -8760,17 +9491,6 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         }
         return;
     }
-
-    ScrollerCache answer;
-    answer.state = settled ? ScrollerState::Scrollable : ScrollerState::Unknown;
-    answer.generation = expectedGeneration;
-    answer.layoutVersion = layoutVersion;
-    answer.left = best.left;
-    answer.top = best.top;
-    answer.right = best.right;
-    answer.bottom = best.bottom;
-    answer.verticalOffset = verticalOffset;
-    answer.scrollableHeight = scrollableHeight;
 
     // The decision and the write are one section; the search above is not in it.
     switch (CommitScrollerCache(answer, expectedGeneration, requestId,
@@ -8793,91 +9513,162 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
             return;
     }
 
-    // The committed rect is this element's, so this element's handler is the one
-    // authorized to refresh it. The identity moves in the same uninterrupted
-    // UI-thread step as the commit — no XAML call and no message pump between
-    // them — so no handler can see the new rect under the old element's name.
-    g_scrollerCacheViewer = best.viewer;
-
-    // One line per open. The settled pass speaks only when it moved the rect the
-    // first pass logged, so a storyboard that was still growing cannot hide the
-    // final geometry.
-    const bool moved = !g_scrollerLogged ||
-                       std::fabs(best.left - g_scrollerLoggedRect[0]) > 1.0f ||
-                       std::fabs(best.top - g_scrollerLoggedRect[1]) > 1.0f ||
-                       std::fabs(best.right - g_scrollerLoggedRect[2]) > 1.0f ||
-                       std::fabs(best.bottom - g_scrollerLoggedRect[3]) > 1.0f;
-    if (moved) {
-        g_scrollerLogged = true;
-        g_scrollerLoggedRect[0] = best.left;
-        g_scrollerLoggedRect[1] = best.top;
-        g_scrollerLoggedRect[2] = best.right;
-        g_scrollerLoggedRect[3] = best.bottom;
-        FileLog(L"scroller rect=%.0f,%.0f,%.0f,%.0f vo=%.0f sh=%.0f", best.left,
-                best.top, best.right, best.bottom, verticalOffset,
-                scrollableHeight);
+    // The committed regions are these elements', so these elements' handlers are
+    // the ones authorized to refresh them. The watch slots move in the same
+    // uninterrupted UI-thread step as the commit — no XAML call and no message
+    // pump between them — so no handler can see the new rects under an old
+    // element's name.
+    //
+    // The revoke and the new registrations are XAML calls, so they stay outside
+    // the commit section; the cache is already written. A registration that
+    // survived its revoke keeps its token and its owner: its slot is not reused,
+    // and the old handler is not authorized for this cache anyway, so it writes
+    // nothing even though it still fires.
+    for (int i = 0; i < kMaxScrollRegions; ++i) {
+        ScrollerWatch& watch = g_scrollerWatches[i];
+        if (!watch.owner) {
+            continue;
+        }
+        bool named = false;
+        for (int r = 0; r < answer.count; ++r) {
+            if (watch.owner == answerViewers[r]) {
+                named = true;
+                break;
+            }
+        }
+        if (!named) {
+            RevokeScrollerWatch(i);
+            watch.viewer = nullptr;
+        }
     }
-
-    // One handler per measurement: the element must not be observed twice. The
-    // revoke and the new registration are XAML calls, so they stay outside the
-    // commit section; the cache itself is already written. A registration that
-    // survived its revoke keeps its token and its owner: this pass adds no second
-    // watch, and the old handler is not authorized for this cache anyway, so it
-    // writes nothing even though it still fires.
-    RevokeScrollerWatch();
-    if (g_scrollerToken.value) {
-        // A replacement that cannot be watched does not make this cache Unknown:
-        // the rect and the offsets were both measured from this element in this
-        // pass, so the cache is coherent now, and Unknown would defer every press
-        // inside the panel for the rest of the open. What is lost is future
-        // refresh only, and the old handler is not authorized for this cache, so
-        // it cannot spoil it.
+    bool watchRefused = false;
+    for (int r = 0; r < answer.count; ++r) {
+        const wuxc::ScrollViewer viewer = answerViewers[r];
+        int slot = -1;
+        for (int i = 0; i < kMaxScrollRegions; ++i) {
+            if (g_scrollerWatches[i].owner == viewer &&
+                g_scrollerWatches[i].token.value) {
+                slot = i;  // the same element this slot already watches
+                break;
+            }
+        }
+        if (slot < 0) {
+            for (int i = 0; i < kMaxScrollRegions; ++i) {
+                ScrollerWatch& watch = g_scrollerWatches[i];
+                if (watch.owner || watch.token.value) {
+                    continue;  // a survivor: its slot cannot be reused
+                }
+                watch.owner = viewer;
+                watch.viewer = viewer;
+                try {
+                    watch.token = viewer.ViewChanged(
+                        [viewer](auto const&, auto const&) {
+                            RefreshScrollerOffsets(viewer);
+                        });
+                    if (watch.token.value) {
+                        g_uiRegistrationCount.fetch_add(1,
+                                                        std::memory_order_relaxed);
+                        slot = i;
+                    }
+                } catch (winrt::hresult_error const& e) {
+                    watch.token = {};
+                    watch.owner = nullptr;
+                    watch.viewer = nullptr;
+                    FileLog(L"scroller watch failed err=%08X",
+                            static_cast<unsigned>(e.code()));
+                } catch (...) {
+                    watch.token = {};
+                    watch.owner = nullptr;
+                    watch.viewer = nullptr;
+                    FileLog(L"scroller watch failed err=unknown");
+                }
+                break;
+            }
+        }
+        if (slot < 0) {
+            // A region that cannot be watched does not make the survey Unknown:
+            // its rect and offsets were both measured in this pass, so the gate
+            // is coherent now, and Unknown would defer every press inside the
+            // panel for the rest of the open. What is lost is future refresh only.
+            watchRefused = true;
+            continue;
+        }
+        g_scrollerWatches[slot].viewer = viewer;
+        answer.regions[r].watchSlot = slot;
+    }
+    {
+        // Publish the slot binding the handlers test. Written after the commit
+        // and before anything can pump a message: the regions' rects are already
+        // committed, and only their authorization is added here.
+        std::lock_guard lock(g_scrollerMutex);
+        if (g_scroller.generation == expectedGeneration &&
+            g_scroller.layoutVersion == layoutVersion) {
+            for (int r = 0; r < answer.count; ++r) {
+                if (r < g_scroller.count) {
+                    g_scroller.regions[r].watchSlot = answer.regions[r].watchSlot;
+                }
+            }
+        }
+    }
+    if (watchRefused) {
         Wh_Log(L"ViewChanged registration is still attached; this pass adds no "
                L"scroll watcher");
         FileLog(L"xaml viewchanged handler left attached; new registration "
                 L"refused");
-        return;
     }
 
-    g_scrollerWatchOwner = best.viewer;
-    try {
-        const wuxc::ScrollViewer watched = best.viewer;
-        g_scrollerToken = watched.ViewChanged(
-            [watched](auto const&, auto const&) {
-                RefreshScrollerOffsets(watched);
-            });
-        if (g_scrollerToken.value) {
-            g_uiRegistrationCount.fetch_add(1, std::memory_order_relaxed);
+    // One line per region per open. The settled pass speaks only when it moved a
+    // rect the first pass logged, so a storyboard that was still growing cannot
+    // hide the final geometry.
+    for (int r = 0; r < answer.count; ++r) {
+        const ScrollerRegion& region = answer.regions[r];
+        const bool moved =
+            !g_scrollerRegionLogged[r] ||
+            std::fabs(region.left - g_scrollerLoggedRect[r][0]) > 1.0f ||
+            std::fabs(region.top - g_scrollerLoggedRect[r][1]) > 1.0f ||
+            std::fabs(region.right - g_scrollerLoggedRect[r][2]) > 1.0f ||
+            std::fabs(region.bottom - g_scrollerLoggedRect[r][3]) > 1.0f;
+        if (!moved) {
+            continue;
         }
-    } catch (winrt::hresult_error const& e) {
-        g_scrollerToken = {};
-        g_scrollerWatchOwner = nullptr;
-        FileLog(L"scroller watch failed err=%08X", static_cast<unsigned>(e.code()));
-    } catch (...) {
-        g_scrollerToken = {};
-        g_scrollerWatchOwner = nullptr;
-        FileLog(L"scroller watch failed err=unknown");
+        g_scrollerRegionLogged[r] = true;
+        g_scrollerLogged = true;
+        g_scrollerLoggedRect[r][0] = region.left;
+        g_scrollerLoggedRect[r][1] = region.top;
+        g_scrollerLoggedRect[r][2] = region.right;
+        g_scrollerLoggedRect[r][3] = region.bottom;
+        FileLog(L"scroller rect=%.0f,%.0f,%.0f,%.0f vo=%.0f sh=%.0f "
+                L"name=%s depth=%u",
+                region.left, region.top, region.right, region.bottom,
+                region.verticalOffset, region.scrollableHeight, region.label,
+                region.depth);
     }
 }
 
-// Drops the cached element, its offsets and its handler. The close path and the
+// Drops every cached region, its offsets and its handler. The close path and the
 // renderer teardown call it, so a closed menu can never gate a press against the
-// rect of the previous open, and the next open starts from Unknown.
+// rects of the previous open, and the next open starts from Unknown.
 void ReleaseScrollableElement() {
-    RevokeScrollerWatch();
-    // The cache is emptied below, so its viewer is gone too: no surviving handler
-    // may write offsets into a rect that describes no element.
-    g_scrollerCacheViewer = nullptr;
+    for (int i = 0; i < kMaxScrollRegions; ++i) {
+        RevokeScrollerWatch(i);
+        // The cache is emptied below, so its viewer is gone too: no surviving
+        // handler may write offsets into a region that describes no element.
+        g_scrollerWatches[i].viewer = nullptr;
+    }
     g_scrollerLogged = false;
     g_scrollerNoneLogged = false;
+    g_scrollerOverflowLogged = false;
     g_scrollerRetryLogged = false;
     g_scrollerRetryCount = 0;
     g_scrollerRetryGenerationScheduled = 0;
     g_scrollerRetryExhaustedLogged = false;
-    g_scrollerLoggedRect[0] = 0.0f;
-    g_scrollerLoggedRect[1] = 0.0f;
-    g_scrollerLoggedRect[2] = 0.0f;
-    g_scrollerLoggedRect[3] = 0.0f;
+    for (int i = 0; i < kMaxScrollRegions; ++i) {
+        g_scrollerRegionLogged[i] = false;
+        g_scrollerLoggedRect[i][0] = 0.0f;
+        g_scrollerLoggedRect[i][1] = 0.0f;
+        g_scrollerLoggedRect[i][2] = 0.0f;
+        g_scrollerLoggedRect[i][3] = 0.0f;
+    }
     std::lock_guard lock(g_scrollerMutex);
     g_scroller = ScrollerCache{};
 }

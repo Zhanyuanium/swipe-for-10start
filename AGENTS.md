@@ -5,15 +5,17 @@ C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 mods/ - Windhawk mod sources (9 files: 8 sources - start-menu-legacy-swipe, touch-gesture-bridge, touch-gesture-consumer, touch-gesture-probe, msgprobe, inputprobe, start_gesture_shared.h, swipe_ipc_shared.h - plus AGENTS.md)
 tools/ - PowerShell probes, injectors and animation harnesses (16 files: 15 scripts - screenshot, start_menu, inject_swipe, touch_common, touch_hold, follow_hold, inject_swipe_holds, measure_swipe, read_shared_gesture, probe_cursor_follow, ipc, native_flyout_frames, native_flyout_track, fit_settle_spring, settle_track - plus AGENTS.md)
 artifacts/ - captured measurements (8 files: cursor-follow, gesture-shared, native-flyout-close, native-flyout-open, settle-trace, start-window, inputprobe.dll and AGENTS.md)
+docs/ - technical documentation (10 files: index README, input, gesture, animation, geometry, ipc, lifecycle, testing, limits - plus AGENTS.md)
 </directory>
 <config>
-README.md - what works, what was falsified, build and test instructions
+README.md - user-facing quick start (English; README.zh-CN.md is the Chinese page); technical detail lives in docs/
+README.zh-CN.md - the Chinese page of the user-facing quick start
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 
-Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.29.0) runs in
+Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.30.0) runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
-every XAML/DirectManipulation source on this UI is empty (see README). The
+every XAML/DirectManipulation source on this UI is empty (see docs/input.md). The
 tracked contact is named by the HID Contact Identifier (`0x0D/0x51`) when the
 device declares one, else by `(device, node index)` (`identity=contactid|node`),
 and when several slots carry that identifier the one that asserts contact wins,
@@ -41,7 +43,16 @@ dismiss axis and the panel-acceptance band come from the taskbar itself:
 `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` rectangle (flush to the edge and thin
 across it), the work-area inset only when it truly insets, and never the Start
 window's own rect; a probe that names nothing keeps the last axis and band and
-retries on the next open or broadcast. Every gesture outcome settles on one
+retries on the next open or broadcast. That band is also the strip a reveal
+candidate may start in — `804..900` on this bottom auto-hidden layout, the same
+in both hide states because the hidden bar still measures its 48 DIP — and the
+fixed `kEdgeBandDip` of 12 DIP is only the fallback before a snapshot carries
+one. A contact that began while the menu was closed and has travelled
+`kAdoptTravelDip` (24 DIP) along the opening axis adopts a late open
+(`reveal adopt ...`) and continues from the panel's live position; a tap has no
+travel and is not adopted. `gestureOwnsProgress` needs a moving candidate or an
+active follow, so a stationary candidate does not suppress the keyboard settle.
+Every gesture outcome settles on one
 damped spring whose shape `AnimationStyle` picks
 (`Windows 11`, damping 1.72, fitted to the native Quick Settings flyout on this
 machine; `Windows 10`, damping 0.9) and whose duration the travel plans:
@@ -60,7 +71,12 @@ must be no more than 30 ms older than the release, or the answer is 0, so a hold
 whose only reports assert the tip leaves no speed from before the hold. Span:
 from that newest position backward, the oldest sample is the first at least 8 ms
 and at most 30 ms older than it, so the pair is 8-30 ms wide and may lie up to
-60 ms before the release. 100 % of `GestureStartSpeedPercent`
+60 ms before the release. A reveal reseeds that window at its takeover by
+replaying the contact's own last eight positioned reports through the trail
+mapping, so a menu that opens one or two reports before the lift still measures
+the finger (0.71-0.75 DIP/ms on a moving release, measured); a pull-back whose
+last move goes toward the taskbar is clamped to 0 and is honestly `vel=0.00`.
+100 % of `GestureStartSpeedPercent`
 means that component, not the raw
 release vector; the curve's end-value normalisation adjusts the seam slightly: it
 divides by 0.99249 for `Windows 11` and 0.99589 for `Windows 10` at zero initial
@@ -77,15 +93,21 @@ top-level rather than message-only. The apply reservation
 two `seq_cst` sides of one handshake: either the layout is deferred whole or
 that admission is refused and retried on the next report. A scalar write that
 throws after an earlier one landed marks the renderer invalid (`gesture renderer
-invalid until a successful reapply`) and refuses gestures until a full reapply. The vertical gate keeps the
-menu's ScrollViewer in three states, and every remeasure publishes `Unknown`
-first, so a failed pass cannot leave a previous answer speaking; its retries
-back off 100/200/400 ms for three attempts. A gesture close
-then taps `VK_LWIN` at the end of that settle: the shell's own key handler
-performs the hide, so the Start toggle stays in step and no re-arm tap exists. A
-keyboard close instead has the bridge hold `CStartExperienceManager::Hide` for
-the settle the Start side answers with. A new pull during the settle drops the
-tap before the shell is touched. A close exists only once its settle starts:
+invalid until a successful reapply`) and refuses gestures until a full reapply.
+The vertical gate surveys every vertically scrollable region under the panel —
+up to six, deepest kept, with `scroller overflow (kept 6 deepest regions)` when
+one is dropped — asks the innermost region containing the press, and lets a
+press outside all of them dismiss, so the app list and the tile grid are both
+gated; a press inside a region that can still scroll is rejected with
+`dismiss deferred to scroll vo=... sh=... region=...`. The survey keeps three
+states, and every remeasure publishes `Unknown` first, so a failed pass cannot
+leave a previous answer speaking; its retries back off 100/200/400 ms for three
+attempts. A gesture close then taps `VK_LWIN` at the end of that settle: the
+shell's own key handler performs the hide, so the Start toggle stays in step and
+no re-arm tap exists. A keyboard close instead has the bridge hold
+`CStartExperienceManager::Hide` for the settle the Start side answers with. A
+new pull during the settle drops the tap before the shell is touched. A close
+exists only once its settle starts:
 `BeginDismissSettle` answers not started, started, or started with a lost batch
 observer (`close observer lost kind=...`), and only a close that provably never
 started restores the panel, through `AbandonClose(kind)`, which is the whole
@@ -137,14 +159,13 @@ and the scroll pass adds no watcher, with
 one survives. The `SizeChanged` and `Loaded` callbacks
 are gated on the setup generation; the layout watch mints a serial and captures
 its own measurement request by value, so a callback that outlived a newer watch
-measures and revokes nothing; the `ViewChanged` handler captures the viewer it
-was registered on, tests that element against
-`g_scrollerCacheViewer`, the element the committed rect was measured from, on the
-UI thread before it takes `g_scrollerMutex`, and writes the cached offsets only
-under that mutex while the cache is `Scrollable`; the cache identity is assigned
-in the same uninterrupted UI-thread step as the commit; `g_scrollerWatchOwner`
-is the separate element whose token must still be revoked, kept for a retry
-when its revoke threw, and a replacement registers no watch while it survives
+measures and revokes nothing; `ScrollerWatch[6]` keeps a separate owner and
+viewer per region, the `ViewChanged` handler captures the viewer it was
+registered on, resolves its slot by that element on the UI thread before it takes
+`g_scrollerMutex`, and writes that region's offsets only under that mutex while
+the cache is `Scrollable`; the cache identity is assigned in the same
+uninterrupted UI-thread step as the commit; an owner whose revoke threw keeps its
+token and its slot, and a replacement registers no watch while it survives
 (`xaml viewchanged handler left attached; new registration refused`). After a
 disable/enable without a host restart, the reused XAML root means
 no new `PrepareRootElement` and no renderer, so a new contact cannot drive the

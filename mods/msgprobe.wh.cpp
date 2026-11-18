@@ -3,7 +3,7 @@
 // @name            Start Menu Pointer Message Probe
 // @description     Logs pointer messages and polls live pointer state for the legacy Start menu
 // @version         0.2.1
-// @author          doubao
+// @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
 // @compilerOptions -luser32

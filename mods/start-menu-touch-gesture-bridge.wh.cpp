@@ -3,7 +3,7 @@
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
 // @version         0.16.0
-// @author          doubao
+// @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -I"C:\Users\doubao\source\repos\swipe-for-10start\mods" -Wall -Wextra -luser32
