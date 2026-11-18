@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.12.0
+// @version         0.13.0
 // @author          doubao
 // @include         explorer.exe
 // @architecture    x86-64
@@ -100,8 +100,8 @@ Notes:
   open generation (0 is never a generation).
 - The two channels have two lifetimes. The v2 channel (the section mapping and
   view, the mutex and the three events) is closed when the mod is disabled, but
-  only after the disable flag keeps new Hides out and the in-flight Hide count
-  has drained;
+  only after the disable flag keeps new Hides out of it and every Hide that
+  already entered has left;
   a Hide that outlives the drain keeps every handle and logs
   `ipc unload residual hides=...; the v2 channel stays until explorer exits`.
   The gesture mapping and its event stay for the rest of the explorer process
@@ -109,6 +109,40 @@ Notes:
   callback may still hold the view, so unmapping them is unsafe. A reload opens
   a fresh pair and leaves the previous pair to process exit, so those two
   handles per reload are deliberate; process exit reclaims them.
+- That drain is the only thing the in-flight Hide count buys, and the count is a
+  guard for this mod's own handles, not a barrier between two Hides. It answers
+  "is a Hide still inside", two Hides on different threads hold it at once, and
+  a re-entrant Hide on one thread holds one lease per frame, so it balances by
+  itself. The lease is taken before the hook reads anything and released on
+  every exit, so a path that returns early and an exception out of `FileLog`
+  both release it exactly once. A call that has entered the detour but has not
+  yet taken its lease is invisible to the count; nothing inside the mod can
+  close that window.
+- Windhawk does not promise a drained hook at `Wh_ModUninit`: the timeout is
+  reachable. The shipped engine reports 2.0.0-alpha.8 and its `windhawk.dll`
+  carries the same `LoadedMod::BeforeUninit` / `_Z12Wh_ModUninitv` lifecycle,
+  and at that tag `ModsManager::ReloadModsAndSettings` calls
+  `mod.BeforeUninit()` (which queues the disable), applies it with
+  `MH_ApplyQueuedEx`, then calls `mod.Uninitialize()` — `Wh_ModUninit` — and
+  only after that waits for threads inside the mod image with
+  `ThreadsCallStackWaitForRegions(..., 200, 400)` before `m_mods.erase(it)`
+  frees the module; `~CustomizationSession` reaches the same order by
+  destroying its `MinHookScopeApply` (which disables every hook) before its
+  `ModsManager`. `LoadedMod::BeforeUninit` says what it waits for itself:
+  "Waits for in-flight hook creations, then locks out new ones." So a Hide can
+  still be inside the hook when this mod frees its channel, which is exactly
+  why the residual keeps the handles instead of closing them. Returning into
+  this module's code after that is the host's business, not the count's: the
+  wait above covers the mod image, it is bounded at 200 x 400 ms, and its
+  result is discarded. A Hide spends under 2.2 s inside the hook (a 100 ms
+  answer wait plus a lead capped at a 2 s settle plus 30 ms, plus logging), so
+  that bound is more than a thirtyfold margin. The mod therefore does not pin
+  its own image the way the Start mod does: a pin is available to a hook-only
+  mod and would be mechanically safe here (no threads, no COM, no windows), but
+  it would trade a permanently mapped image per load in explorer for a case the
+  host already covers, and the host's wait covers the MinHook trampoline too:
+  `MH_RemoveHookEx` frees a trampoline only in `~LoadedMod`, after the stack
+  wait, and every caller of the original has this hook below it on the stack.
 
 The delayed Hide:
 
@@ -177,9 +211,18 @@ The delayed Hide:
  *   watermark and not older than the newest open generation, because the Start
  *   side taps before the shell's key handler hides. The v2 channel is closed on
  *   disable once no Hide is inside it; a Hide that outlives the drain keeps it,
- *   and logs the residual. The gesture mapping keeps the process-lifetime
- *   behaviour below. Every path calls the original Hide; nothing is pressed and
- *   no hide is requested. No exported symbols.
+ *   and logs the residual. The drain is a lifetime guard for that channel, not a
+ *   barrier between two Hides: it counts the Hides inside `Hide_Hook` through an
+ *   RAII lease that every exit path releases, so a re-entrant call on one thread
+ *   balances per frame, and a call that has entered the detour but not yet taken
+ *   its lease is invisible to it. Windhawk does not drain the hook before
+ *   `Wh_ModUninit`: at 2.0.0-alpha.8 `ModsManager` calls `Wh_ModUninit` and only
+ *   then waits for threads inside the mod image
+ *   (`ThreadsCallStackWaitForRegions(..., 200, 400)`) before freeing the module,
+ *   and that wait is bounded and unchecked, so the module's own code after
+ *   `Wh_ModUninit` is the host's responsibility. The gesture mapping keeps the
+ *   process-lifetime behaviour below. Every path calls the original Hide;
+ *   nothing is pressed and no hide is requested. No exported symbols.
  * [POS]: explorer-side half of the legacy Start gesture work. It observes the
  *   shell's own hide decision and decides whether that Hide still needs the
  *   retract lead. Both closes are Windows taps performed by the Start side, and
@@ -194,7 +237,8 @@ The delayed Hide:
  *   unconsumed fresh stamp is evidence of correlation, not proof of cause: the
  *   plan-versus-tapped distinction is what makes the gesture path correct, and
  *   the binding only keeps a stamp of a menu that is gone from passing a later
- *   Hide.
+ *   Hide. The channel's drain cannot outlive `Wh_ModUninit` on its own, so the
+ *   code that runs in either process after that point belongs to the host.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -271,7 +315,8 @@ constexpr DWORD kHidePollMs = 10;
 // keeps the handles instead of closing them. Every wait in the hook ends within
 // one kHidePollMs step of the disable flag, so this only covers a hook that the
 // system preempted; it is bounded because explorer's unload thread must not be
-// held by one call.
+// held by one call. The bound is real: Windhawk runs Wh_ModUninit before it
+// waits for threads inside the mod image, so a Hide cannot be assumed gone here.
 constexpr DWORD kIpcUnloadDrainMs = 500;
 
 // The cross-process channel (swipe_ipc_shared.h). Opened once at init. Its
@@ -306,12 +351,29 @@ std::atomic<bool> g_disabled{false};
 // Set only after Wh_SetFunctionHook accepted the Hide hook, so a hide is never
 // delayed on a build where the hook was refused.
 std::atomic<bool> g_hideDelayEnabled{false};
-// Hides currently inside Hide_Hook, entry to exit, incremented before the hook
-// reads anything else. Wh_ModUninit closes the v2 channel only when this is
-// zero: g_disabled is set in Wh_ModBeforeUninit first, so a Hide that enters
-// after that point skips the channel, and the count names the ones that were
-// already inside when the flag went up.
+// Hides currently inside Hide_Hook, entry to exit. Wh_ModUninit closes the v2
+// channel only when this is zero. It is a lifetime guard for that channel, not
+// a barrier between two Hides: it answers "is a Hide still inside", never "this
+// Hide runs after that one".
 std::atomic<int> g_hideCalls{0};
+
+// Counts one Hide_Hook call for as long as that call is inside the hook. The
+// lease is taken before the hook reads anything and released on every exit,
+// including unwinding, so no path can leave the count stranded.
+//
+// Two Hides on different threads hold a lease at the same time, and a
+// re-entrant Hide on one thread holds one lease per frame, so it balances by
+// itself. A call that has entered the detour but has not yet run the
+// constructor below is invisible to the count; nothing in this module can close
+// that window, which is why Wh_ModUninit keeps the handles when the drain times
+// out instead of freeing them under a Hide that is still arriving.
+struct HideCallLease {
+    HideCallLease() { g_hideCalls.fetch_add(1, std::memory_order_acq_rel); }
+    ~HideCallLease() { g_hideCalls.fetch_sub(1, std::memory_order_acq_rel); }
+
+    HideCallLease(const HideCallLease&) = delete;
+    HideCallLease& operator=(const HideCallLease&) = delete;
+};
 
 enum : int {
     kSharedNotStarted = 0,
@@ -1124,10 +1186,10 @@ bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
 // takes two arguments. Both return paths set eax: 0 on success, the negative
 // HRESULT of a failing inner call otherwise, so the return type is HRESULT.
 HRESULT Hide_Hook(void* self, uint32_t reason) {
-    // The only module state this hook releases on the way out is g_ipc, so the
-    // count covers the whole call: an unload that sees zero knows no Hide can
-    // reach the channel or the code that reads it any more.
-    g_hideCalls.fetch_add(1, std::memory_order_acq_rel);
+    // The lease covers the whole call: the channel reads, the waits and the
+    // original call. It is released on every exit, so an early return or an
+    // exception out of FileLog cannot strand the count that Wh_ModUninit drains.
+    const HideCallLease hideCall;
     FileLog(L"hide reason=%u", reason);
     ClearSharedGestureState(L"Hide");
 
@@ -1210,7 +1272,6 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
     }
 
     const HRESULT result = Hide_Original ? Hide_Original(self, reason) : S_OK;
-    g_hideCalls.fetch_sub(1, std::memory_order_acq_rel);
     return result;
 }
 
@@ -1332,7 +1393,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.12.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.13.0 initializing");
 
     // Create the objects up front so the first gesture never pays for it.
     EnsureShared();
@@ -1393,9 +1454,10 @@ void Wh_ModAfterInit() {
 
 void Wh_ModBeforeUninit() {
     // This must be set before Windhawk removes the hooks. The Hide hook reads it
-    // in its wait loop, so a hide that is being held ends its wait at once. The
-    // v2 channel is closed in Wh_ModUninit, after this flag has kept new Hides
-    // out of it and g_hideCalls has been drained.
+    // in its wait loop, so a hide that is being held ends its wait at once. A
+    // Hide that enters after this point skips the channel; one that is already
+    // inside holds its lease until it returns. The v2 channel is closed in
+    // Wh_ModUninit, after that flag and after the drain.
     g_disabled = true;
     g_startPointTick.store(0, std::memory_order_relaxed);
 
@@ -1419,12 +1481,19 @@ void Wh_ModUninit() {
     // The v2 channel is closed, because its objects are named and its records
     // belong to the other process: g_ipc is unmapped and its mapping, mutex and
     // three events are closed once no Hide hook can still be inside them.
-    // g_disabled was set in Wh_ModBeforeUninit, so a Hide that enters after it
-    // never reaches the channel; g_hideCalls names the Hides that entered
-    // before. Their waits end within one kHidePollMs step of that flag, so the
-    // bounded drain below normally returns at once. If it does not, the handles
-    // stay and the log says so: freeing them while a Hide is inside the channel
-    // would be a use-after-close, and the process must exit to reclaim them.
+    // g_disabled was set in Wh_ModBeforeUninit, so no new Hide decision reaches
+    // the channel; g_hideCalls names the Hides that are already inside. Their
+    // waits end within one kHidePollMs step of that flag, so the bounded drain
+    // below normally returns at once.
+    //
+    // It is not a proof. Windhawk calls this function before it waits for
+    // threads inside the mod image (ModsManager::ReloadModsAndSettings calls
+    // Wh_ModUninit, then ThreadsCallStackWaitForRegions(..., 200, 400), then
+    // frees the module), and that wait is bounded and its result discarded. So a
+    // Hide can still be inside the hook here, and freeing the channel under it
+    // would be a use-after-close. That case keeps every handle and says so; the
+    // module's own code afterwards belongs to the host, which is the only party
+    // that can wait for a hook to return.
     const ULONGLONG drainDeadline = GetTickCount64() + kIpcUnloadDrainMs;
     while (g_hideCalls.load(std::memory_order_acquire) != 0 &&
            GetTickCount64() < drainDeadline) {

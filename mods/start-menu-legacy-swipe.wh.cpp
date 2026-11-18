@@ -2,11 +2,11 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.26.0
+// @version         0.27.0
 // @author          doubao
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -Wall -Wextra -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -lshell32 -Wall -Wextra -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -41,14 +41,22 @@ What it does:
   (`AnimationType` 1) always reaches the original unchanged. The animation type
   is read from the event arguments with the same three int getters the original
   calls, not from a call argument.
-- At every setup it gets the Start CoreWindow HWND via `ICoreWindowInterop`,
-  compares `GetWindowRect` with the monitor work area and picks the dismiss
-  direction: left if the window is anchored to the work-area left, then top,
-  then right, then bottom. It logs `dismiss axis=...` once and publishes the
-  axis, the window width/height and the window bounds in DIP for the input
-  thread. Setup is not per open: the root is reused, so the same axis is
-  refreshed on every menu open and on every work-area or display change (see
-  below).
+- At every setup it gets the Start CoreWindow HWND via `ICoreWindowInterop` and
+  asks the taskbar which edge it is docked to. The work area cannot answer: with
+  auto-hide enabled the shell reserves nothing, so the work area equals the
+  monitor on every side. The edge comes from
+  `SHAppBarMessage(ABM_GETTASKBARPOS)` (`uEdge`, and its docked rectangle even
+  while the bar is hidden), corroborated by the `Shell_TrayWnd` /
+  `Shell_SecondaryTrayWnd` rectangle (an auto-hidden bar keeps its thickness and
+  leaves a 2 px strip on screen), and only when neither answers, from the
+  work-area inset. It logs `dismiss axis=...` with what each source said, and
+  keeps the last edge instead of guessing one when no source is conclusive. The
+  same probe yields the strip the bar reserves along that edge, which is what
+  admits the measured panel rectangle, so the axis and the panel's anchor come
+  from one measurement. The axis, the window width/height and the window bounds
+  in DIP are published for the input thread. Setup is not per open: the root is
+  reused, so the same axis is refreshed on every menu open and on every work-area
+  or display change (see below).
 - Installs a `CompositionPropertySet` with `Progress` (animatable),
   `Distance` (window width or height), `DirX` and `DirY`, plus the
   expression
@@ -129,16 +137,27 @@ What it does:
   coordinates cannot restart it and another slot's stale lift cannot end it, and
   a report that carries no contact field for the tracked contact is not a lift
   either. A report that names the tracked contact but carries no point refreshes
-  its liveness without feeding a position, so a tip-down report without
-  coordinates is not mistaken for silence and a held finger cannot expire and
-  start a second gesture. A report from another device cannot move or lift it. A
+  its liveness only when it positively asserts the contact — tip down, or in
+  range where the device has no tip — and the identifier alone is not evidence,
+  because a device whose unused slots keep or zero their ids would otherwise keep
+  a stale finger alive and every other device out; the liveness clock it moves is
+  separate from the position clock, so a status report cannot make an old
+  velocity sample look current. A tip-down report without coordinates is thus
+  not mistaken for silence and a held finger cannot expire and start a second
+  gesture. When several slots carry the same identifier, one that asserts contact
+  wins over one that merely carries the name; if two assert it, the tracked slot
+  is taken and the ambiguity is logged once. A report from another device cannot
+  move or lift it. A
   pen report with `In Range` set and `Tip Switch` clear is a hover and drives
   nothing, because a slot with the tip up is not a contact; a pen lift ends the
   contact even while coordinates keep arriving. The one fallback is a device that
   exposes neither Tip Switch nor In Range: no report can then say whether a slot
   is real, so the count/position path is used and its count and positioned
   collections decide, exactly as the mod shipped, and there the old `(0,0)`
-  heuristic stays because a zero pair is how its lift reports look. That decision
+  heuristic stays because a zero pair is how its lift reports look. Those two
+  rules keep applying to that device after its contact is tracked: Contact Count
+  0 ends the contact even though the position fields keep their last value, and a
+  zero pair is a no-position sample, not the screen corner. That decision
   is made once at init and logged, not guessed per report:
   `hid usages dev=... tip=... inrange=... count=... buttons=... reportids=...
   coordpath=... identity=contactid|node` records which usages the device
@@ -329,11 +348,15 @@ What it does:
   next report starts the following contact from scratch. A lift report is not
   required: a session with no sample for 18 ms ends on its own.
 - Reveal follow: a contact that starts within 12 DIP of the taskbar edge while
-  the menu is closed is a candidate. EP opens the menu by itself once the
-  contact passes its own edge threshold; the first report that sees the menu
-  open takes `Progress` over. The follow works in absolute screen DIP against
-  the panel edge that meets the finger (`panelTrail`), which the UI thread maps
-  from the largest visible child of the root that does not fill it
+  the menu is closed is a candidate. With auto-hide enabled that band overlaps
+  the OS's own reveal strip, so a press that starts on the hidden bar itself makes
+  the shell slide the bar out and this mod claims the same contact anyway
+  (measured at 200 %: a pull from y=1799 opened the menu with the bar revealed);
+  the band is deliberately not widened or narrowed for that. EP opens the menu by
+  itself once the contact passes its own edge threshold; the first report that sees
+  the menu open takes `Progress` over. The follow works in absolute screen DIP
+  against the panel edge that meets the finger (`panelTrail`), which the UI thread
+  maps from the largest visible child of the root that does not fill it
   (`StartSizingFrame`) and translates by the XAML origin, the client origin of
   the host window in DIP (`ClientToScreen`), not the work-area origin:
   `Progress = 1 - (finger - panelTrail) / (dir * Distance)`.
@@ -351,17 +374,23 @@ What it does:
   the old one, and the dismiss hit test then tested a different panel from the one
   the follow mapped against.
   A measurement passes only when its rectangle lies on the monitor and the side
-  against the taskbar lies between the work-area edge and the monitor edge — that
-  band is the taskbar, so the menu's attaching edge is neither inside the desktop
-  nor past the screen, and the band's own width is the tolerance, with 2 DIP of
-  rounding. The shell's open storyboard fails that by the width of the panel:
-  measured here, its rect is 12,-12..1005,539 where the settled one is
-  411,163..1404,714. A rejected measurement publishes nothing and logs
-  `reveal panelTrail rejected ...` once; the last whole snapshot stays. The
+  against the taskbar lies inside the strip that side defines: the band the bar
+  reserves at the screen edge, extended by one bar thickness toward the desktop,
+  read from the bar itself. The work area cannot supply that band while the bar
+  is auto-hidden — an auto-hidden bar reserves nothing — so the strip comes from
+  `SHAppBarMessage(ABM_GETTASKBARPOS)` or from the bar window and falls back to
+  the work-area inset only when neither answers; the settled panel sits 12 DIP
+  from the bar's inner edge, so the strip is twice the bar's thickness and the
+  2 DIP margin only rounds it. The shell's open storyboard fails that by the
+  width of the panel: measured here, its rect is 12,-12..1005,539 where the
+  settled one is 236,289..1229,840 on a bottom taskbar. A rejected measurement
+  publishes nothing and logs `reveal panelTrail rejected ...` once per open for
+  the settled pass; the last whole snapshot stays. The
   snapshot is published at setup, on every root `SizeChanged`, on every menu open
   and on the second layout pass of that open, and on every work-area or display
-  change, and the line `reveal panelTrail=...` reports the edge with its
-  rectangle, the work area and the generation: once per open, and again whenever
+  change, and the line `reveal panelTrail=...` reports the edge with the axis, its
+  rectangle, the work area, the band it was tested against and the generation:
+  once per open, and again whenever
   the value moved by more than 1 DIP. A previous rectangle is carried into a new
   publish only when the whole layout identity matches — axis, travel, client
   origin, work area and monitor — and the carried rect is tested against the
@@ -371,11 +400,18 @@ What it does:
   owns the panel and is re-applied once when the contact ends, so the edge, the
   axis, the travel and the scroller rect never move under the finger; the turn
   that deferred it logs `gesture geometry deferred reason=panel-owned gen=...`.
+  The apply runs under one reservation: the UI thread raises it and re-reads
+  panel ownership before writing a scalar, a gesture admission claims the panel
+  and re-reads the reservation, and the two seq_cst sides cannot both miss each
+  other, so either the apply defers whole or the admission waits for the next
+  report; the XAML measurement itself runs under no lock.
   Renderer geometry (axis and travel) is committed only after
   the composition scalars that use it are written, and the applied distance is
   the value those scalars really hold: a failed or skipped write does not advance
   the cache, so a sequence of sub-epsilon moves cannot walk it away from what the
-  compositor was told.
+  compositor was told. A scalar write that throws after an earlier one landed
+  marks the renderer invalid (`gesture renderer invalid until a successful
+  reapply`) and every gesture is refused until one full apply rewrites all three.
   A panel that has never been measured has no rectangle at all: the follow then
   uses the root-width mapping this mod shipped with, whose rest position is the
   far screen edge minus the travel, so `Progress` still reads 0 at the taskbar
@@ -465,10 +501,9 @@ What it does:
   that loses its serial (a reset or a take-over replaced the animation) or throws
   leaves a running settle with an armed tap: that is `close observer lost
   kind=dismiss`, and the close continues. Only a close that never started its
-  settle may put the panel back, and it does so through one helper that also
-  cancels the close's own tap and stamp together (`AbandonClose`), logging
-  `close abandoned kind=dismiss|reveal`, so the panel
-  can never be restored while a tap of that close is still scheduled. A
+  settle may put the panel back (`AbandonClose`), and such a close published no
+  plan and armed no tap, so the restore is the whole operation: it logs
+  `close abandoned kind=dismiss|reveal` and no tap of a later close is touched. A
   registration exception takes the same route as a lost serial.
 
 What it does not do:
@@ -499,11 +534,16 @@ Unload:
   The pin is logged (`mod pin image=... pinned=1`).
 - One instance per process. Windhawk loads a DLL per version, so a pinned
   instance that could not unload can coexist with a new one in the same process.
-  `Wh_ModInit` takes a process-local named mutex,
+  `Wh_ModInit` first pins the image and then takes a process-local named mutex,
   `Local\WindhawkLegacyStartSwipe.instance.<pid>`, before it opens the channel,
-  creates the stop event or starts any thread. If the name is already taken, the
-  instance logs `instance guard refused: another instance is live in this
-  process` and installs nothing: no hook, no thread, no channel. Only a clean
+  creates the stop event or starts any thread. Both acquisitions are
+  prerequisites: a failed pin, a guard that cannot be created, or a name already
+  taken all make `Wh_ModInit` return FALSE and install nothing — no hook, no
+  thread, no channel. An existing holder is refused with `instance guard
+  refused: another instance is live in this process` without touching the state
+  that live activation owns; a pin that succeeded stays for the process lifetime,
+  which is harmless, and a failed guard does not pretend otherwise. A held guard
+  logs `instance guard held name=...`. Only a clean
   unload closes the handle, and only a clean unload can, because a residual
   unload returns with every resource in place.
 - A joined thread handle is kept when its wait times out: `g_hidThread` and
@@ -641,9 +681,12 @@ Debug channel (kept in the build):
 
 Diagnostics:
 
-- `mod init`, `mod pin image=... pinned=1` (or `mod pin failed err=...`),
+- `mod init`, `mod init refused: ...; no hook, no channel and no thread
+  installed`, `mod pin image=... pinned=1` (or `mod pin failed err=...`),
   `instance guard refused: another instance is live in this process` (or
-  `instance guard unavailable err=...`), `settle style selected=... setting=...`,
+  `instance guard unavailable err=...`), `instance guard held name=...`,
+  `activation state reset`,
+  `settle style selected=... setting=...`,
   `settle start speed=...%`,
   `settle plan speed=... dip/ms dur=160..520 segment=4.0 ms frames=13..129`,
   `settle spring win10 zeta=...`,
@@ -670,12 +713,15 @@ Diagnostics:
   back and nothing was armed),
   `close mode stamp failed kind=...`, `close mode cancel stamp failed`,
   `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
-  `reveal panelTrail=... rect=...,...,...,... work=...,...,...,... gen=...`
+  `reveal panelTrail=... axis=... rect=...,...,...,... work=...,...,...,...
+  band=...,... gen=...`
   (once per open from the open-time turn, and again whenever the value moved by
   more than 1 DIP), or
-  `reveal panelTrail=... (fallback)` once, when no panel has been measured, or
-  `reveal panelTrail rejected ... rect=... work=... mon=...` once, when the
-  measured rect is not the panel this layout shows and the last whole snapshot
+  `reveal panelTrail=... axis=... (fallback)` once, when no panel has been
+  measured, or
+  `reveal panelTrail rejected ... axis=... rect=... work=... mon=... band=...`
+  once per open for the settled pass, when
+  the measured rect is not the panel this layout shows and the last whole snapshot
   was kept),
   `hid decodefail dev=... err=...` (a field that belongs to the report and
   could not be decoded; logged once per device),
@@ -684,7 +730,11 @@ Diagnostics:
   `coordpath=1` is the logged count/position fallback for a device with no tip
   and no in-range usage; `identity` says whether the tracked contact is named by
   its Contact Identifier or by its contact-node index),
-  `attached root=...`, `dismiss axis=...`, `debug p=...`, `debug t=...`,
+  `hid contact id=... declared down in ... slots; using=...` once per activation
+  when two slots assert the same identifier,
+  `attached root=...`, `dismiss axis=...` (with `src=appbar|bar|work` and what
+  every source said), `dismiss axis=... kept, no source named an edge` (once per
+  undecided episode; the last edge stays in force), `debug p=...`, `debug t=...`,
   `debug e=...`, `debug anim=...`, `debug retract from=... dur=...`,
   `debug retract failed`, `retract answer failed dur=...`,
   `debug retract ignored (stale)`, `ipc open created=... cmd=... retract=...`,
@@ -694,7 +744,11 @@ Diagnostics:
   `gesture geometry deferred reason=panel-owned gen=...` (a layout change that
   arrived while a contact owned the panel; one settled pass applies it when the
   contact ends),
-  `gesture geometry write failed ...`, `gesture geometry queue err=...`,
+  `gesture geometry write failed ...`, `gesture renderer invalid until a
+  successful reapply`, `gesture geometry queue err=...`,
+  `xaml size handler left attached; new registration refused` and
+  `xaml loaded handler left attached; new registration refused` (a revoke threw,
+  so the token and its owner are kept instead of being overwritten),
   `work area changed`,
   `scroller rect=...,...,...,... vo=... sh=...` (once per open, when the
   scrolling element was measured, and again only if the settled pass moved it),
@@ -933,6 +987,14 @@ Known risks:
  *   the named mutex `Local\WindhawkLegacyStartSwipe.instance.<pid>`: a second
  *   instance in this process finds it taken, logs one line and installs no hook,
  *   starts no thread and opens no channel; only a clean unload releases it.
+ *   Both the pin and the guard are prerequisites: either failing returns FALSE
+ *   from `Wh_ModInit` before any hook, channel or thread exists, and a pin that
+ *   succeeded stays for the process lifetime while nothing else acts.
+ *   One per-activation reset (`ResetActivationState`) clears the tracked contact,
+ *   the contact latch, both gesture sessions, the close mute, the deferred-layout
+ *   flag, the pending tap and its serial, the coast and the debug overrides; it
+ *   runs before the input thread exists and on that thread as it stops, so a
+ *   clean re-enable of the same pinned image does not inherit a finger.
  *   Unload order: set the
  *   stop event, wait 10 s for the module poll thread and the input thread, revoke
  *   every XAML delegate on the UI thread and wait for that turn, revoke the
@@ -943,7 +1005,10 @@ Known risks:
  *   restart to finish the unload. A timed-out thread keeps its handle, so a later
  *   attempt can still join it. Every delegate registration keeps its own
  *   revoke token (root Loaded and SizeChanged, the layout watch, the scroller's
- *   ViewChanged, the settle batch's Completed) and its own try block. Every entry
+ *   ViewChanged, the settle batch's Completed) and its own try block; a token and
+ *   its owner are cleared only after the removal succeeded, and a registration
+ *   that survived its revoke is never overwritten by the next root, so the handle
+ *   to retry it is not lost. Every entry
  *   into module code from the compositor or the dispatcher is counted from before
  *   it can run: the batch's Completed registration takes a counted entry before
  *   the batch is ended, and every posted UI turn that touches module state takes
@@ -971,14 +1036,17 @@ Known risks:
  *   a reused id, and the
  *   publish and scroller commit decide the request identity, epoch, layout identity
  *   and panel ownership inside the section that writes, so no close or newer
- *   request can land between the decision and the write. One `VK_LWIN` tap armed for
+ *   request can land between the decision and the write, and the whole apply runs
+ *   under a reservation gesture admission observes: either it defers whole or the
+ *   admission waits for the next report. One `VK_LWIN` tap armed for
  *   the end of every
  *   committed dismiss or short reveal, the shell's own Start toggle that performs
  *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
  *   generation exists when it would run, and no request file or re-arm tap
  *   exists, and a close that never started its settle is the only one that may
- *   put the panel back; that restore and the close's own tap and stamp are one
- *   helper (`AbandonClose`), while a close whose batch observer was lost still
+ *   put the panel back; such a close armed nothing and published nothing, so
+ *   `AbandonClose` only restores the panel, while a close whose batch observer
+ *   was lost still
  *   runs to its tap (`close observer lost kind=dismiss`); one settle in the
  *   parameter set `AnimationStyle` selects, and one
  *   settle-and-arm helper for all four gesture outcomes. Both styles are the
@@ -1069,7 +1137,10 @@ Known risks:
  *   request per open, so no two triggers can
  *   measure the same layout twice or publish a measurement their epoch no
  *   longer owns, and a close cancels only the request identity it captured (a
- *   64-bit non-zero serial plus the epoch, checked and cleared as one pair). The
+ *   64-bit non-zero serial plus the epoch, checked and cleared as one pair); one
+ *   layout-apply reservation makes the ownership check and the scalar writes one
+ *   step against a gesture admission, and a half-applied scalar set marks the
+ *   renderer invalid until a full reapply. The
  *   animation hook is
  *   installed on every load and passes requests through; only the debug switch
  *   can drop the shell's open storyboard, and it is never the default. Both hook
@@ -1083,19 +1154,23 @@ Known risks:
  *   tip/in-range says it is real names the slot, and a pen
  *   in range with
  *   its tip up is a hover that drives nothing. A report that names the tracked
- *   contact without a point keeps it alive but moves nothing. A report id that
+ *   contact without a point keeps it alive only when it asserts the contact, and
+ *   moves nothing either way; the liveness clock it refreshes is not the position
+ *   clock the coast reads. A report id that
  *   carries no
  *   contact field is ignored whole, and a device with neither tip nor in-range
- *   usage is the logged count/position fallback. It also owns the close decision:
- *   the settle runs first, then the tap at its end; both settle styles are the
- *   same spring generator and differ only in damping, so a style switch can
- *   never change how the end speed enters the motion; the keyboard open
- *   is that settle started from rest, so no second open curve exists; a pull
- *   generation checked
+ *   usage is the logged count/position fallback, whose Contact Count 0 and
+ *   `(0,0)` rules keep deciding the contact's ends after it is tracked. It also
+ *   owns the close decision: the settle runs first, then the tap at its end; both
+ *   settle styles are the same spring generator and differ only in damping, so a
+ *   style switch can never change how the end speed enters the motion; the
+ *   keyboard open is that settle started from rest, so no second open curve
+ *   exists; a pull generation checked
  *   at the tap drops it, so a re-pull never touches the shell, and the cancel it
  *   publishes at once is what keeps that close out of the bridge's tap
  *   decision. A close that never started is the only one that restores the
- *   panel, and it drops its own tap and stamp in the same call; a close whose
+ *   panel, and such a close armed no tap and published no plan, so `AbandonClose`
+ *   restores it and nothing is recalled; a close whose
  *   optional batch observer was lost keeps running to its tap, because the tap is
  *   the close. A settle started from the value an earlier animation was heading
  *   to is the bug `TakeProgressNow` prevents: the panel's position is answered
@@ -1116,6 +1191,7 @@ Known risks:
 #include <windows.h>
 #undef GetCurrentTime  // MinGW winbase.h macro vs. Timeline.GetCurrentTime
 
+#include <shellapi.h>  // SHAppBarMessage(ABM_GETTASKBARPOS): the taskbar's dock edge
 #include <hidusage.h>
 #include <hidpi.h>
 
@@ -1447,17 +1523,19 @@ constexpr UINT kIdleTimerMs = 5;  // also the waitable timer period
 constexpr uint64_t kOpenCheckIntervalMs = 20;
 
 // A measured panel rectangle is this layout's panel only when it lies on the
-// monitor and the side against the taskbar sits on the work-area edge (or on the
-// monitor edge, when the taskbar overlays the screen), because that is where the
-// shell attaches the menu.
+// monitor and the side against the taskbar sits in the strip that side defines:
+// the band the taskbar reserves, extended by one bar thickness toward the desktop
+// (TaskbarProbe measures it, because an auto-hidden bar reserves no work area).
+// The settled panel sits 12 DIP from the bar's inner edge, so the strip is twice
+// the bar's thickness and the 2 DIP margin only rounds it.
 //
 // `kPanelLayoutMarginDip` rounds a border that sits exactly on an edge; nothing
 // larger is a layout fact. `kPanelAnchorMarginDip` is the same rounding for the
-// taskbar band, whose own width is the real tolerance. Neither is
+// taskbar strip. Neither is
 // `kScrollerEndSlopDip` (24 DIP): that number is a scroll-position allowance for
 // a list a fling stops short of its end, and reusing it for layout is what
 // accepted a storyboard frame on a work area whose origin is 0 (this machine:
-// panel rect 12,-12..1005,539 while the settled rect is 411,163..1404,714).
+// panel rect 12,-12..1005,539 while the settled rect is 236,289..1229,840).
 constexpr float kPanelLayoutMarginDip = 2.0f;
 constexpr float kPanelAnchorMarginDip = 2.0f;
 
@@ -1715,6 +1793,9 @@ std::atomic<bool> g_stopDismissCallback{false};
 HMODULE g_modulePin = nullptr;
 HANDLE g_instanceGuard = nullptr;
 std::atomic<bool> g_secondInstance{false};
+// Set when Wh_ModInit refused its prerequisites (the pin or the guard). No hook,
+// channel or thread exists then, and every later entry point returns at once.
+std::atomic<bool> g_initRefused{false};
 
 // The root of the guard's name. The PID is appended so the guard is process
 // local: the mutex lives in the session namespace but only this process can name
@@ -2011,11 +2092,10 @@ enum class CloseKind {
 // its tap would run.
 uint32_t g_pullSerial = 0;  // input thread only
 
-// The one tap slot. A close cannot start while another tap is still waiting.
-// `g_pendingTapSerial` is the identity of the close that owns the slot, minted
-// once per armed tap: a cancel can prove the slot is still the close it cancels,
-// and a newer close replaces the slot and keeps its own identity. Zero means the
-// slot is empty.
+// The one tap slot. `g_pendingTapSerial` is the identity of the close that owns
+// the slot, minted once per armed tap: a newer close replaces the slot and keeps
+// its own identity, and the tap runner refuses a slot that carries none. Zero
+// means the slot is empty.
 uint64_t g_pendingTapTick = 0;  // input thread only, 0 = none
 CloseKind g_pendingTapKind = CloseKind::None;
 uint32_t g_pendingTapPull = 0;
@@ -2063,9 +2143,15 @@ float g_dismissDistance = 0.0f;
 // start against a renderer that no longer existed. Nothing compares renderer
 // identities, so this is a readiness flag and not a generation.
 std::atomic<bool> g_rendererReady{false};
+// Set when a scalar write failed after an earlier one had already landed. The
+// property set then carries a mixture of two layouts, and no snapshot can
+// describe it: gestures stay refused until a full apply rewrites all three
+// scalars. Cleared by that apply and by the renderer teardown.
+std::atomic<bool> g_rendererInvalid{false};
 
 bool RendererReady() {
-    return g_rendererReady.load(std::memory_order_acquire);
+    return g_rendererReady.load(std::memory_order_acquire) &&
+           !g_rendererInvalid.load(std::memory_order_acquire);
 }
 // Diagnostics for a dismiss that did not start: one line per second, not per
 // report, because a deferred scroll produces a sample every ~6 ms.
@@ -2186,6 +2272,45 @@ void PublishGestureGeometry(const GestureGeometry& candidate);
 // request recorded on an idle panel must not move that edge under a finger that
 // started in between, so the measurement re-reads this when its turn runs.
 std::atomic<bool> g_panelOwned{false};
+
+// The layout-application reservation. The UI thread announces one whole apply
+// (renderer scalars, panel rect, scroller) with this counter and re-reads
+// ownership while it is raised; a gesture admission claims the panel and then
+// re-reads the counter. Both sides use seq_cst, so at least one of them sees the
+// other: either the apply defers whole, or the admission waits for the next
+// report. `g_panelOwned` alone left the window between "no owner" and the first
+// scalar write open, and a finger that claimed it there drove a panel whose
+// axis and travel were still being rewritten.
+std::atomic<uint32_t> g_layoutApplying{0};
+
+// UI thread. Raises the reservation and answers whether no contact owns the
+// panel. On false the reservation is already released and the caller must defer
+// the whole change.
+class LayoutApplyGuard {
+  public:
+    LayoutApplyGuard() = default;
+    LayoutApplyGuard(const LayoutApplyGuard&) = delete;
+    LayoutApplyGuard& operator=(const LayoutApplyGuard&) = delete;
+
+    ~LayoutApplyGuard() {
+        if (held_) {
+            g_layoutApplying.fetch_sub(1, std::memory_order_seq_cst);
+        }
+    }
+
+    bool Begin() {
+        g_layoutApplying.fetch_add(1, std::memory_order_seq_cst);
+        if (g_panelOwned.load(std::memory_order_seq_cst)) {
+            g_layoutApplying.fetch_sub(1, std::memory_order_seq_cst);
+            return false;
+        }
+        held_ = true;
+        return true;
+    }
+
+  private:
+    bool held_ = false;
+};
 
 // ---------------------------------------------------------------------------
 // The settled-measurement request
@@ -3088,29 +3213,16 @@ GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
     return close;
 }
 
-// Puts the panel back for a close that provably never started, and drops the tap
-// and the stamp that belonged to it if the slot still carries its identity.
+// Puts the panel back for a close that provably never started.
 //
-// This is the only path that may restore a panel after a failed close, and it is
-// one call so the restore cannot be separated from the cancel: a restore under a
-// live tap is what flashed the menu back and then closed it. A close whose settle
-// runs never comes here, not even when its batch observer was lost: the tap is
-// the close, and it still runs.
-bool AbandonClose(CloseKind kind, uint32_t tapSerial) {
-    if (tapSerial != 0 && g_pendingTapSerial == tapSerial) {
-        g_pendingTapTick = 0;
-        g_pendingTapKind = CloseKind::None;
-        g_pendingTapPull = 0;
-        g_pendingTapSerial = 0;
-        if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
-                                  g_pullSerial)) {
-            FileLog(L"close mode cancel stamp failed");
-        }
-        FileLog(L"close tap dropped kind=%s", CloseKindName(kind));
-    }
-    // The restore is a visible outcome, so the file log names it: the missing
-    // settle line already says the close never started, and this line says what
-    // the panel did instead.
+// A close exists only once its settle starts: ArmGestureClose publishes the plan
+// and arms the tap after BeginGestureSettle returned true. A close that never
+// started therefore published no plan and armed no tap, so there is nothing to
+// recall here; the restore is the whole operation. This is the only path that
+// may restore a panel after a failed close, and the log names the visible
+// outcome: the missing settle line already says the close never started, and
+// this line says what the panel did instead.
+bool AbandonClose(CloseKind kind) {
     FileLog(L"close abandoned kind=%s", CloseKindName(kind));
     return ShowAtRest();
 }
@@ -3683,6 +3795,8 @@ void ApplyRetractRequest() {
         const CloseKind dropped = g_pendingTapKind;
         g_pendingTapTick = 0;
         g_pendingTapKind = CloseKind::None;
+        g_pendingTapPull = 0;
+        g_pendingTapSerial = 0;
         FileLog(L"close tap dropped kind=%s", CloseKindName(dropped));
         if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
                                   g_pullSerial)) {
@@ -4462,9 +4576,15 @@ struct HidGestureSession {
     float startProgress = 1.0f;
     uint64_t startTick = 0;
     uint64_t lastTick = 0;
-    // Last sample on the QPC clock. The idle release compares against this
-    // instead of lastTick, because GetTickCount64 only advances every 15.6 ms.
+    // Last position sample on the QPC clock: where the coast measures its
+    // silence from. GetTickCount64 only advances every 15.6 ms, so the QPC clock
+    // is what tells an 8 ms gap from a 20 ms one.
     uint64_t lastSampleQpc = 0;
+    // The liveness clock: the last report that carried positive evidence of the
+    // contact, whether or not it had a position. The idle release reads this one
+    // only, so a status report keeps the contact alive without making an old
+    // velocity sample look current to the coast.
+    uint64_t lastAliveQpc = 0;
     float curDelta = 0.0f;
     float maxDelta = 0.0f;
     float maxPerp = 0.0f;
@@ -4505,7 +4625,8 @@ struct HidRevealSession {
     int samples = 0;
     uint64_t startTick = 0;
     uint64_t lastTick = 0;
-    uint64_t lastSampleQpc = 0;  // idle release clock, see HidGestureSession
+    uint64_t lastSampleQpc = 0;  // position clock, see HidGestureSession
+    uint64_t lastAliveQpc = 0;   // liveness clock, see HidGestureSession
     // QPC time of the report that took Progress over. The trail mapping is still
     // settling for the first 50 ms of the follow, so the coast stays off there.
     uint64_t activeSinceQpc = 0;
@@ -4534,6 +4655,11 @@ struct HidContactTrack {
 };
 
 HidContactTrack g_trackedContact;  // input thread only
+
+// One line per activation when a digitizer declares the same Contact Identifier
+// down in two slots: the tracked slot wins, and the line names the ambiguity
+// instead of logging it per report.
+bool g_duplicateContactIdLogged = false;  // input thread only
 
 void ForgetTrackedContact() {
     g_trackedContact = HidContactTrack{};
@@ -4756,6 +4882,86 @@ float EndVelocityProgressPerMs() {
         return 0.0f;
     }
     return (newest.progress - first->progress) / elapsed;
+}
+
+// ---------------------------------------------------------------------------
+// One activation's input state
+// ---------------------------------------------------------------------------
+//
+// This is the complete list of what one activation of this pinned image leaves
+// behind in the input layer. Every start and every stop of an activation calls
+// it, so a field added later has one obvious home:
+//
+// - the tracked contact identity and the contact latch;
+// - both gesture sessions (the dismiss drag and the reveal follow);
+// - the close mute and the deferred-layout flag, plus the panel-ownership
+//   publication derived from the sessions;
+// - the pending tap, the serial it was minted from and the pull generation;
+// - the coast and both velocity windows;
+// - the diagnostic latches that steer behaviour, and the `anim` debug override.
+//
+// It runs before the input thread exists (Wh_ModInit, after the guard proved no
+// previous activation is live) or on that thread as it stops (HidInputThread).
+// It never runs concurrently with a report handler.
+void ResetActivationState() {
+    ForgetTrackedContact();
+    g_duplicateContactIdLogged = false;
+    g_contactDown = false;
+    g_contactTick = 0;
+
+    g_hidSession = HidGestureSession{};
+    g_reveal = HidRevealSession{};
+
+    g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+    g_measureDeferred.store(false, std::memory_order_relaxed);
+    g_panelOwned.store(false, std::memory_order_relaxed);
+    g_dismissSettling.store(false, std::memory_order_relaxed);
+    g_dismissSerial.store(0, std::memory_order_relaxed);
+
+    g_pendingTapTick = 0;
+    g_pendingTapKind = CloseKind::None;
+    g_pendingTapPull = 0;
+    g_pendingTapSerial = 0;
+    g_tapSerial = 0;
+    g_pullSerial = 0;
+
+    g_coasting.store(false, std::memory_order_relaxed);
+    g_coastStartQpc = 0;
+    g_coastFrom = 1.0f;
+    g_coastTo = 1.0f;
+    ResetCoastVelocity();
+    ResetEndVelocity();
+
+    g_commitNeedsProgressReset = false;
+    g_rootWasOpen = false;
+    g_openCheckValid = false;
+    g_openCheckOpen = false;
+    g_lastOpenCheckTick = 0;
+    g_skipLogTick = 0;
+    g_edgeLogTick = 0;
+    g_scrollerRejectLogTick = 0;
+
+    g_suppressOpenAnim.store(false, std::memory_order_relaxed);
+    g_animLogCount.store(0, std::memory_order_relaxed);
+
+    EndContactTiming();
+    FileLog(L"activation state reset");
+}
+
+// Input thread. Claims the panel for a gesture admission and re-reads the
+// layout reservation. The seq_cst pair with LayoutApplyGuard::Begin is the
+// handshake: either the apply sees this claim and defers whole, or this claim
+// sees the apply and refuses the admission, whose next report retries it. A
+// refused claim restores the derived ownership, so a report that admitted
+// nothing leaves `g_panelOwned` truthful.
+bool ClaimPanelForAdmission() {
+    g_panelOwned.store(true, std::memory_order_seq_cst);
+    if (g_layoutApplying.load(std::memory_order_seq_cst) != 0) {
+        g_panelOwned.store(g_hidSession.active || g_reveal.edgeCandidate,
+                           std::memory_order_seq_cst);
+        return false;
+    }
+    return true;
 }
 
 float AxisDelta(int32_t axis, const HidGestureSession& session, float x,
@@ -5068,6 +5274,7 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
     g_reveal.startTick = tickMs;
     g_reveal.lastTick = tickMs;
     g_reveal.lastSampleQpc = QpcMsNow();
+    g_reveal.lastAliveQpc = g_reveal.lastSampleQpc;
     BeginContactTiming();
     // The release speed belongs to this contact only.
     ResetEndVelocity();
@@ -5097,6 +5304,7 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
     const uint64_t sampleQpc = QpcMsNow();
     reveal.lastTick = tickMs;
     reveal.lastSampleQpc = sampleQpc;
+    reveal.lastAliveQpc = sampleQpc;
 
     if (!reveal.active) {
         if (!StartWindowIsOpenThrottled(tickMs)) {
@@ -5270,7 +5478,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     // No settle ran, so no close is owed and no tap may be armed under a panel
     // that is still on screen. The committed dismiss puts its panel back in the
     // same case; this one leaves the menu open, fully in.
-    AbandonClose(CloseKind::RevealCancel, close.tapSerial);
+    AbandonClose(CloseKind::RevealCancel);
 }
 
 void LogHidRelease(const HidGestureSession& session, float velocity,
@@ -5288,6 +5496,13 @@ void LogHidRelease(const HidGestureSession& session, float velocity,
 
 void BeginHidSession(const GestureGeometry& geometry, float x, float y,
                      uint64_t tickMs) {
+    // No gesture starts while a layout apply owns the renderer: the claim sees
+    // the reservation, or the apply sees this claim and defers whole. The next
+    // report retries, because no session was started.
+    if (!ClaimPanelForAdmission()) {
+        return;
+    }
+
     // A close this mod started is still in flight: the panel is leaving, the
     // shell's Hide is ahead, and a session here would drag Progress back to rest
     // and flash the menu while it is being hidden.
@@ -5366,6 +5581,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
     session.startTick = tickMs;
     session.lastTick = tickMs;
     session.lastSampleQpc = QpcMsNow();
+    session.lastAliveQpc = session.lastSampleQpc;
     session.samples = 1;
     BeginContactTiming();
     // The speed of the previous gesture must not survive into this one.
@@ -5438,10 +5654,8 @@ void ReleaseHidSession(const GestureGeometry& geometry, bool allowCommit,
             g_commitNeedsProgressReset = true;
         } else {
             // The settle never started, so there is no close to wait for and no
-            // tap may stay armed under a panel that is still on screen. One
-            // helper puts the panel back and cancels the close's own tap and
-            // stamp together.
-            AbandonClose(CloseKind::Dismiss, close.tapSerial);
+            // tap was armed by it. The helper puts the panel back and says so.
+            AbandonClose(CloseKind::Dismiss);
         }
         session.active = false;
         return;
@@ -5510,6 +5724,7 @@ void UpdateHidSession(const GestureGeometry& geometry, float x, float y,
     session.lastTick = tickMs;
     const uint64_t sampleQpc = QpcMsNow();
     session.lastSampleQpc = sampleQpc;
+    session.lastAliveQpc = sampleQpc;
     session.curDelta = delta;
     session.maxDelta = std::max(session.maxDelta, delta);
     session.maxPerp = std::max(session.maxPerp, perpendicular);
@@ -5586,6 +5801,18 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     const bool newContact =
         !g_contactDown ||
         (tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs);
+    if (newContact && !ClaimPanelForAdmission()) {
+        // A layout apply owns the renderer: admit nothing, and leave the latch
+        // untouched so the next report of this contact is still new and retries
+        // the edge test.
+        return;
+    }
+    if (newContact && !GeometryLayoutCurrent(geometry)) {
+        // The layout was applied while this report was being decoded: the
+        // snapshot it carries is the old panel, so no admission starts from it.
+        // The next report re-reads the current snapshot.
+        return;
+    }
     g_contactDown = true;
     g_contactTick = tickMs;
     if (newContact) {
@@ -5611,7 +5838,10 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
 // per deferred resize, never a poll.
 void PublishPanelOwnership() {
     const bool owned = g_hidSession.active || g_reveal.edgeCandidate;
-    g_panelOwned.store(owned, std::memory_order_relaxed);
+    // seq_cst: the admission claim and the UI's layout reservation read this
+    // flag, and their handshake is what keeps a layout change out from under a
+    // gesture that has just started.
+    g_panelOwned.store(owned, std::memory_order_seq_cst);
     if (!owned && g_measureDeferred.exchange(false, std::memory_order_relaxed) &&
         !g_unloading.load(std::memory_order_relaxed)) {
         // The change that was held back is applied once now: renderer scalars,
@@ -5769,15 +5999,15 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     }
 
     const bool sessionIdle =
-        session.active && qpcNow >= session.lastSampleQpc &&
-        qpcNow - session.lastSampleQpc >= kIdleReleaseMs;
+        session.active && qpcNow >= session.lastAliveQpc &&
+        qpcNow - session.lastAliveQpc >= kIdleReleaseMs;
     if (sessionIdle) {
         ReleaseHidSession(geometry, true, L"idle");
     }
 
     const bool revealIdle =
-        g_reveal.edgeCandidate && qpcNow >= g_reveal.lastSampleQpc &&
-        qpcNow - g_reveal.lastSampleQpc >= kIdleReleaseMs;
+        g_reveal.edgeCandidate && qpcNow >= g_reveal.lastAliveQpc &&
+        qpcNow - g_reveal.lastAliveQpc >= kIdleReleaseMs;
     if (revealIdle) {
         ReleaseRevealSession(geometry);
     }
@@ -5804,7 +6034,8 @@ void CheckHidIdleRelease(uint64_t tickMs) {
 // is dropped and no Hide ever reaches the shell. The close record then names the
 // cancel with tapped = 0, so a later keyboard close takes its own lead.
 void RunPendingCloseTap(uint64_t tickMs) {
-    if (g_pendingTapTick == 0 || tickMs < g_pendingTapTick) {
+    if (g_pendingTapTick == 0 || g_pendingTapSerial == 0 ||
+        tickMs < g_pendingTapTick) {
         return;
     }
 
@@ -5978,13 +6209,15 @@ void RunGeometryMeasurement(const SettledMeasureRequest& request, bool settled) 
     }
 
     try {
-        // One policy for every layout change: while a live contact owns the panel,
-        // the refresh is deferred whole and re-applied once when ownership ends.
-        // The ownership test comes before RefreshGestureGeometry, because that
-        // call is what rewrites the axis and Distance the expression slides by;
-        // running it here would change the axis or the travel of a drag already in
-        // progress, and the release would then use a layout the drag never had.
-        if (g_panelOwned.load(std::memory_order_relaxed)) {
+        // One policy for every layout change: the whole apply runs under one
+        // reservation that gesture admission observes. While a live contact owns
+        // the panel, or claims it while this pass is entering, the change is
+        // deferred whole and re-applied once when ownership ends. The ownership
+        // test must be part of the reservation, not a read before it: a finger
+        // that took the panel in between would otherwise drive scalars that are
+        // being rewritten under it.
+        LayoutApplyGuard apply;
+        if (!apply.Begin()) {
             g_measureDeferred.store(true, std::memory_order_relaxed);
             // The deferred settled pass is this open's measurement turn, so it is
             // the one that writes the once-per-open trail line.
@@ -6008,6 +6241,12 @@ void RunGeometryMeasurement(const SettledMeasureRequest& request, bool settled) 
             // One trail line per open, and the open-time turn is where it starts:
             // the settled turn then only speaks when the value moved.
             g_panelTrailLogged = false;
+        } else {
+            // The settled rect is the one that decides the reveal anchor, so its
+            // rejection speaks once per open even when the open-time rect (the
+            // storyboard's) was rejected first. A flag that never reset would hide
+            // a settled rejection for the rest of the process.
+            g_panelTrailRejectedLogged = false;
         }
         // The edge may only move while no contact drives it. This is re-read
         // inside the publish, at commit, not taken when the request was recorded:
@@ -6227,21 +6466,23 @@ void PollRootVisibility(uint64_t tickMs) {
 }
 
 // A report that names the tracked contact but carries no point is still that
-// contact being down. It refreshes every clock the idle window reads, so 18 ms of
-// coordinate-less reports never release a finger that is still on the glass and
-// never let the same finger start a second gesture. No state-machine step runs:
-// there is no position to feed and the panel must not move.
+// contact being down when the report asserts it. It refreshes the liveness clock
+// the idle window reads, so 18 ms of coordinate-less reports never release a
+// finger that is still on the glass and never let the same finger start a second
+// gesture. The position clock is not touched, because the coast measures its own
+// silence from the last point and a status report is not one. No state-machine
+// step runs: there is no position to feed and the panel must not move.
 void NoteContactAlive(uint64_t tickMs) {
     g_contactDown = true;
     g_contactTick = tickMs;
     const uint64_t qpc = QpcMsNow();
     if (g_hidSession.active) {
         g_hidSession.lastTick = tickMs;
-        g_hidSession.lastSampleQpc = qpc;
+        g_hidSession.lastAliveQpc = qpc;
     }
     if (g_reveal.edgeCandidate) {
         g_reveal.lastTick = tickMs;
-        g_reveal.lastSampleQpc = qpc;
+        g_reveal.lastAliveQpc = qpc;
     }
 }
 
@@ -6365,12 +6606,45 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
         if (g_trackedContact.hasIdentifier) {
             // The identifier decides: a slot that now carries a different one is
             // another contact, even at the index the tracked contact last used.
+            // An unused slot can keep or zero its identifier, so a slot that
+            // positively asserts contact wins over one that merely carries the
+            // name; when two assert it, the tracked slot is the one taken and the
+            // ambiguity is logged once.
+            int firstMatch = -1;
+            int trackedMatch = -1;
+            int assertedMatch = -1;
+            int assertedCount = 0;
             for (int i = 0; i < slotCount; ++i) {
-                if (slots[i].hasIdentifier &&
-                    slots[i].identifier == g_trackedContact.identifier) {
-                    trackedSlot = i;
-                    break;
+                if (!slots[i].hasIdentifier ||
+                    slots[i].identifier != g_trackedContact.identifier) {
+                    continue;
                 }
+                if (firstMatch < 0) {
+                    firstMatch = i;
+                }
+                if (i == g_trackedContact.slot) {
+                    trackedMatch = i;
+                }
+                if (SlotContactState(slots[i]) == HidContactState::Contact) {
+                    assertedCount++;
+                    if (assertedMatch < 0 || i == g_trackedContact.slot) {
+                        assertedMatch = i;
+                    }
+                }
+            }
+            if (assertedMatch >= 0) {
+                trackedSlot = assertedMatch;
+                if (assertedCount > 1 && !g_duplicateContactIdLogged) {
+                    g_duplicateContactIdLogged = true;
+                    FileLog(L"hid contact id=%lu declared down in %d slots; "
+                            L"using=%d",
+                            g_trackedContact.identifier, assertedCount,
+                            trackedSlot);
+                }
+            } else {
+                // Nothing asserts contact: the tracked slot is the best evidence
+                // left, else the first slot that carries the name.
+                trackedSlot = trackedMatch >= 0 ? trackedMatch : firstMatch;
             }
         }
         if (trackedSlot < 0 && g_trackedContact.slot < slotCount &&
@@ -6419,14 +6693,31 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
             OnHidSample(0, 0.0f, 0.0f, tickMs);
             return;
         }
+        // A coordinate-only device cannot assert its contact, so the old
+        // fallback's lift rule decides here too, even after the contact is
+        // tracked: Contact Count 0 is the lift (the position fields often keep
+        // their last value), and a zero pair is the no-position report its lift
+        // looks like, not a point at the screen corner.
+        if (device.coordinatePath && countField == HidField::Ok &&
+            topLevelCount == 0) {
+            ForgetTrackedContact();
+            OnHidSample(0, 0.0f, 0.0f, tickMs);
+            return;
+        }
         if (!slot.hasPosition) {
-            // A contact that is asserted or named but carries no point in this
-            // report is still down. It refreshes the liveness clocks without
-            // feeding a position: silence used to end a contact that was being
-            // asserted, and the same finger could then start a second gesture.
-            if (state == HidContactState::Contact || slot.hasIdentifier) {
+            // A contact that is asserted but carries no point in this report is
+            // still down. It refreshes the liveness clock without feeding a
+            // position: silence used to end a contact that was being asserted,
+            // and the same finger could then start a second gesture. The
+            // identifier alone is not evidence: a device whose unused slots keep
+            // or zero their ids would keep a stale finger alive and every other
+            // device out.
+            if (state == HidContactState::Contact) {
                 NoteContactAlive(tickMs);
             }
+            return;
+        }
+        if (device.coordinatePath && slot.atOrigin) {
             return;
         }
         FeedContactPoint(device, slot.rawX, slot.rawY, reportId,
@@ -6807,22 +7098,14 @@ DWORD WINAPI HidInputThread(LPVOID) {
     UnregisterHidUsage(kUsageTouchScreen);
     UnregisterHidUsage(kUsagePen);
 
-    g_hidSession = HidGestureSession{};
-    g_reveal = HidRevealSession{};
-    g_panelOwned.store(false, std::memory_order_relaxed);
+    // One per-activation reset, the same function Wh_ModInit calls, so a clean
+    // re-enable of this pinned image starts from the state the first activation
+    // did. Nothing a gesture left behind survives: the tracked identity, the
+    // latch, the sessions, the close mute, the deferred layout, the tap, the
+    // coast and the debug switches.
+    ResetActivationState();
     // No measurement of this thread's opens is left to run.
     CancelMeasureRequest();
-    // A contact that is still down when the mod unloads must not leave its 1 ms
-    // timer request behind.
-    EndContactTiming();
-    g_contactDown = false;
-    g_openCheckValid = false;
-    g_pendingTapTick = 0;
-    g_pendingTapKind = CloseKind::None;
-    g_pendingTapPull = 0;
-    g_pendingTapSerial = 0;
-    g_coasting.store(false, std::memory_order_relaxed);
-    ResetCoastVelocity();
     FreeHidDevices();
 
     if (IsWindow(hwnd)) {
@@ -6958,14 +7241,335 @@ struct DisplayRectDip {
     float bottom = 0.0f;
 };
 
+// ---------------------------------------------------------------------------
+// Which edge the taskbar is docked to
+//
+// The work area cannot answer this. With auto-hide enabled the shell reserves
+// nothing, so rcWork equals rcMonitor on every side and the work-area inset is 0
+// by design. Measured on this machine with the Windows 11 taskbar auto-hidden at
+// the bottom: work=0,0,1440,900 mon=0,0,1440,900 in DIP, while the bar sits at
+// the bottom. A zero inset is therefore not an edge signal, and the old fallback
+// to the Start window's own rect could only ever answer Left or Top: that window
+// is full screen when it is idle and slides across the screen while the shell
+// animates it in, so it describes the storyboard, not the taskbar.
+//
+// Two sources describe the bar itself, and both are read here:
+//
+// - SHAppBarMessage(ABM_GETTASKBARPOS) is the shell's own dock record: uEdge is
+//   ABE_LEFT/TOP/RIGHT/BOTTOM and rc is the *docked* rectangle, a 48 DIP strip at
+//   the screen edge, reported unchanged while the bar is hidden. Measured here
+//   with the bar auto-hidden: uEdge=3 rc=0,1704,2880,1800. It answers for the
+//   primary taskbar only, so it is consulted on the primary monitor.
+// - Shell_TrayWnd (Shell_SecondaryTrayWnd on the other monitors) is the bar
+//   window. An auto-hidden bar keeps its thickness and slides out along its
+//   axis, leaving a 2 px reveal strip on screen: measured here 0,1798,2880,1894
+//   for the bottom bar. The docked side is therefore the side whose distance to
+//   the monitor edge is within the bar's own thickness plus that strip, and the
+//   bar is thin across that axis.
+//
+// Both are physical pixels, exactly like GetMonitorInfo; the single conversion to
+// DIP is 1 / DpiScaleForWindow, the same path PanelHomeForWindow uses for the
+// work area and the monitor, so no coordinate space is mixed. When neither
+// source names an edge, the work-area inset is the last resort and the probe
+// says so: that answer only exists when the bar reserves space at all.
+//
+// The probe also returns the band the bar reserves along the edge it named, so
+// the axis and the rectangle's anchor come from one measurement and
+// PanelRectAccepted admits the panel by the bar's own span instead of by an inset
+// that auto-hide never provides.
+// ---------------------------------------------------------------------------
+
+// The measured answer of one probe. `source` names the winning one for the log
+// line: "appbar", "bar", "work" or "none". The two rectangles are kept for that
+// line, so a disagreement between the sources is visible where it happens.
+struct TaskbarProbe {
+    bool appBar = false;      // ABM_GETTASKBARPOS answered
+    uint32_t appBarEdge = 0;  // ABE_* it reported
+    bool appBarRect = false;  // ... with a real docked rectangle
+    RECT appBarRectPx{};
+    bool barWindow = false;  // a bar window is docked on this monitor
+    DismissAxis barWindowEdge = DismissAxis::Left;
+    RECT barWindowRectPx{};
+    bool decided = false;
+    DismissAxis edge = DismissAxis::Bottom;
+    const wchar_t* source = L"none";
+    bool band = false;  // the bar's span along `edge`, DIP
+    float bandLow = 0.0f;
+    float bandHigh = 0.0f;
+};
+
+// UI thread only: the probe of the geometry turn in progress. Every publish
+// follows a probe in the same turn (Setup, RunGeometryMeasurement and the
+// SizeChanged handler each probe first), so the band and the axis cannot come
+// from two different measurements.
+TaskbarProbe g_taskbarProbe;
+HMONITOR g_taskbarProbeMonitor = nullptr;
+
+// UI thread only. False until a probe has named an edge at all; a probe that
+// cannot name one keeps `g_dismissAxis` rather than falling back to a side.
+bool g_axisKnown = false;
+bool g_axisKeptLogged = false;
+
+bool AxisFromAppBarEdge(uint32_t edge, DismissAxis& axis) {
+    switch (edge) {
+        case ABE_LEFT:
+            axis = DismissAxis::Left;
+            return true;
+        case ABE_TOP:
+            axis = DismissAxis::Top;
+            return true;
+        case ABE_RIGHT:
+            axis = DismissAxis::Right;
+            return true;
+        case ABE_BOTTOM:
+            axis = DismissAxis::Bottom;
+            return true;
+    }
+    return false;
+}
+
+// The edge one bar rectangle is docked to on this monitor. The bar is thin
+// across its docked axis, so only that axis is a candidate: a full-width bottom
+// bar is flush on left, right and bottom at once, and the 96 px height against
+// the 2880 px width is what picks its real side. An auto-hidden bar has slid out
+// by its own thickness, so the docked side is admitted within one thickness plus
+// the reveal strip that stays on screen (2 px measured here; 8 px covers it at
+// every scale a bar can be measured at). Two candidates at the same distance are
+// ambiguous and answer nothing, which keeps a maximized window from reading as a
+// bar.
+bool AxisFromBarRect(const RECT& bar, const RECT& monitor, DismissAxis& axis) {
+    const long width = bar.right - bar.left;
+    const long height = bar.bottom - bar.top;
+    if (!(width > 0) || !(height > 0)) {
+        return false;
+    }
+
+    constexpr long kRevealSlackPx = 8;
+
+    const auto overlaps = [](long low, long high, long otherLow, long otherHigh) {
+        return low < otherHigh && otherLow < high;
+    };
+
+    int found = 0;
+    long bestDistance = 0;
+    DismissAxis best = DismissAxis::Bottom;
+    const auto consider = [&](DismissAxis candidate, long distance) {
+        if (found == 0 || distance < bestDistance) {
+            found = 1;
+            bestDistance = distance;
+            best = candidate;
+        } else if (distance == bestDistance) {
+            ++found;
+        }
+    };
+
+    if (width < height && overlaps(bar.top, bar.bottom, monitor.top,
+                                   monitor.bottom)) {
+        const long left = std::labs(bar.left - monitor.left);
+        const long right = std::labs(monitor.right - bar.right);
+        if (left <= width + kRevealSlackPx) {
+            consider(DismissAxis::Left, left);
+        }
+        if (right <= width + kRevealSlackPx) {
+            consider(DismissAxis::Right, right);
+        }
+    }
+    if (height < width && overlaps(bar.left, bar.right, monitor.left,
+                                   monitor.right)) {
+        const long top = std::labs(bar.top - monitor.top);
+        const long bottom = std::labs(monitor.bottom - bar.bottom);
+        if (top <= height + kRevealSlackPx) {
+            consider(DismissAxis::Top, top);
+        }
+        if (bottom <= height + kRevealSlackPx) {
+            consider(DismissAxis::Bottom, bottom);
+        }
+    }
+
+    if (found != 1) {
+        return false;
+    }
+    axis = best;
+    return true;
+}
+
+// One bar window per monitor: the primary bar is Shell_TrayWnd, every other
+// monitor's bar is a Shell_SecondaryTrayWnd window. A bar answers only for a
+// monitor it is docked on, so a bar belonging to another monitor fails the
+// overlap test and the next one is tried.
+bool BarWindowForMonitor(const RECT& monitor, RECT& bar, DismissAxis& edge) {
+    HWND primary = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (primary) {
+        RECT rect{};
+        if (GetWindowRect(primary, &rect) &&
+            AxisFromBarRect(rect, monitor, edge)) {
+            bar = rect;
+            return true;
+        }
+    }
+
+    for (HWND current = nullptr;;) {
+        current = FindWindowExW(nullptr, current, L"Shell_SecondaryTrayWnd",
+                                nullptr);
+        if (!current) {
+            break;
+        }
+        RECT rect{};
+        if (!GetWindowRect(current, &rect)) {
+            continue;
+        }
+        if (AxisFromBarRect(rect, monitor, edge)) {
+            bar = rect;
+            return true;
+        }
+    }
+    return false;
+}
+
+// The strip the panel's taskbar-side edge must lie in, in DIP: the band the bar
+// reserves at the screen edge, extended by one bar thickness toward the desktop.
+// The bar's thickness is what the bar itself measures, so auto-hide cannot
+// narrow it (the measured hidden bar is 0,1798,2880,1894 and still occupies the
+// 48 DIP it has when shown), and the extension is a measured fact, not a
+// tolerance: the settled panel sits 12 DIP from the bar's inner edge — inside the
+// band for a top taskbar (`36` against the band `0..48`) and on the desktop side
+// of it for a bottom one (`840` against the band `852..900`) — while the open
+// storyboard's rect is 313 DIP away. Half a monitor is not a bar and answers
+// nothing.
+bool TaskbarBandDip(DismissAxis axis, const RECT& bar, const RECT& monitor,
+                    float scale, float& low, float& high) {
+    if (!(scale > 0.0f)) {
+        return false;
+    }
+
+    const float monLeft = static_cast<float>(monitor.left) / scale;
+    const float monTop = static_cast<float>(monitor.top) / scale;
+    const float monRight = static_cast<float>(monitor.right) / scale;
+    const float monBottom = static_cast<float>(monitor.bottom) / scale;
+    const float width = static_cast<float>(bar.right - bar.left) / scale;
+    const float height = static_cast<float>(bar.bottom - bar.top) / scale;
+
+    switch (axis) {
+        case DismissAxis::Left:
+            if (!(width > 0.0f) || width >= (monRight - monLeft) / 2.0f) {
+                return false;
+            }
+            low = monLeft;
+            high = monLeft + 2.0f * width;
+            return true;
+        case DismissAxis::Top:
+            if (!(height > 0.0f) || height >= (monBottom - monTop) / 2.0f) {
+                return false;
+            }
+            low = monTop;
+            high = monTop + 2.0f * height;
+            return true;
+        case DismissAxis::Right:
+            if (!(width > 0.0f) || width >= (monRight - monLeft) / 2.0f) {
+                return false;
+            }
+            low = monRight - 2.0f * width;
+            high = monRight;
+            return true;
+        case DismissAxis::Bottom:
+            if (!(height > 0.0f) || height >= (monBottom - monTop) / 2.0f) {
+                return false;
+            }
+            low = monBottom - 2.0f * height;
+            high = monBottom;
+            return true;
+    }
+    return false;
+}
+
+// Reads every source once and decides the edge in a fixed order: the shell's
+// dock record first, the bar window second, the work-area inset last. A source
+// that answers differently from an earlier one is left in the struct so the one
+// log line reports both.
+TaskbarProbe ProbeTaskbar(const MONITORINFO& info, float scale) {
+    TaskbarProbe probe;
+    const RECT& monitorRect = info.rcMonitor;
+
+    if (info.dwFlags & MONITORINFOF_PRIMARY) {
+        APPBARDATA data{};
+        data.cbSize = sizeof(data);
+        if (SHAppBarMessage(ABM_GETTASKBARPOS, &data)) {
+            DismissAxis appBarAxis = DismissAxis::Bottom;
+            if (AxisFromAppBarEdge(data.uEdge, appBarAxis)) {
+                probe.appBar = true;
+                probe.appBarEdge = data.uEdge;
+                probe.appBarRect = data.rc.right > data.rc.left &&
+                                   data.rc.bottom > data.rc.top;
+                probe.appBarRectPx = data.rc;
+                probe.decided = true;
+                probe.edge = appBarAxis;
+                probe.source = L"appbar";
+            }
+        }
+    }
+
+    RECT bar{};
+    DismissAxis barAxis = DismissAxis::Bottom;
+    if (BarWindowForMonitor(monitorRect, bar, barAxis)) {
+        probe.barWindow = true;
+        probe.barWindowEdge = barAxis;
+        probe.barWindowRectPx = bar;
+        if (!probe.decided) {
+            probe.decided = true;
+            probe.edge = barAxis;
+            probe.source = L"bar";
+        }
+    }
+
+    // The band follows the decided edge and prefers the docked rectangle: it is
+    // the bar's registered position, while the window may be translated by
+    // auto-hide. The window's own thickness is the same number when the bar is
+    // shown and still the same number when it is hidden.
+    const RECT* bandRect = probe.appBarRect
+                               ? &probe.appBarRectPx
+                               : (probe.barWindow ? &probe.barWindowRectPx
+                                                  : nullptr);
+    if (probe.decided && bandRect) {
+        probe.band = TaskbarBandDip(probe.edge, *bandRect, monitorRect, scale,
+                                    probe.bandLow, probe.bandHigh);
+    }
+
+    if (!probe.decided) {
+        // Last resort, and only when it truly insets: under auto-hide the work
+        // area is the full monitor, so this branch says nothing.
+        const long insetLeft = info.rcWork.left - info.rcMonitor.left;
+        const long insetTop = info.rcWork.top - info.rcMonitor.top;
+        const long insetRight = info.rcMonitor.right - info.rcWork.right;
+        const long insetBottom = info.rcMonitor.bottom - info.rcWork.bottom;
+        const long largest = std::max(std::max(insetLeft, insetTop),
+                                      std::max(insetRight, insetBottom));
+        if (largest > 4) {
+            probe.decided = true;
+            probe.source = L"work";
+            probe.edge = largest == insetLeft
+                             ? DismissAxis::Left
+                             : (largest == insetTop
+                                    ? DismissAxis::Top
+                                    : (largest == insetRight ? DismissAxis::Right
+                                                             : DismissAxis::Bottom));
+        }
+    }
+
+    return probe;
+}
+
 // Where the panel lives: the monitor's work area and the monitor itself. The
-// taskbar is what shrinks the work area, so the panel is attached to the
-// work-area edge on the taskbar's side — or to the monitor edge when the taskbar
-// overlays the screen instead of shrinking it.
+// panel is attached to the taskbar's side of the desktop, so `taskbarBand` names
+// the strip the bar reserves along the dismiss axis; without a probe the work
+// area supplies that strip, which is the same edge when the bar reserves space.
 struct PanelHomeDip {
     DisplayRectDip work;
     DisplayRectDip monitor;
+    bool taskbarBand = false;
+    float taskbarLow = 0.0f;
+    float taskbarHigh = 0.0f;
 };
+
 
 bool MeasurePanelRect(PanelMeasurement& panel) {
     wux::FrameworkElement root = g_root;
@@ -7101,6 +7705,15 @@ bool PanelHomeForWindow(PanelHomeDip& home) {
     home.monitor.top = info.rcMonitor.top / scale;
     home.monitor.right = info.rcMonitor.right / scale;
     home.monitor.bottom = info.rcMonitor.bottom / scale;
+
+    // The strip the bar reserves, from the probe the current turn took. A probe
+    // for another monitor cannot describe this monitor's bar, so the work area
+    // is the band then, exactly as it was before the probe existed.
+    if (g_taskbarProbeMonitor == monitor && g_taskbarProbe.band) {
+        home.taskbarBand = true;
+        home.taskbarLow = g_taskbarProbe.bandLow;
+        home.taskbarHigh = g_taskbarProbe.bandHigh;
+    }
     return true;
 }
 
@@ -7111,13 +7724,15 @@ bool PanelHomeForWindow(PanelHomeDip& home) {
 //   a border that sits exactly on an edge; nothing larger is a layout fact, and
 //   the 24 DIP of kScrollerEndSlopDip is a scroll-position allowance, not a
 //   layout one.
-// - the side against the taskbar lies between the work-area edge and the monitor
-//   edge, because that band is the taskbar: the menu is attached to the
-//   taskbar's side of the desktop, so that edge is not inside the work area and
-//   not past the screen. The band's width is the taskbar's own inset, so the
-//   rule needs no invented tolerance; on a taskbar that does not shrink the work
-//   area (auto-hidden, or overlaying the screen) the band collapses onto the
-//   monitor edge and the test becomes "on the screen edge".
+// - the side against the taskbar lies inside the strip the bar's edge defines:
+//   the menu is attached to the taskbar's side of the desktop, so that edge is
+//   near the screen edge and nowhere near the middle of the screen. The strip
+//   comes from the bar itself (TaskbarProbe), not from the work area, because an
+//   auto-hidden bar reserves no work area at all while still occupying its 48
+//   DIP at the edge and the panel keeps its 12 DIP offset from it. Without a
+//   probe the strip is the work-area inset, which is the same band when the bar
+//   reserves space; the margin only rounds a border that sits exactly on the
+//   strip's inner edge.
 //
 // This is the test that separates the settled frame from the open storyboard's.
 // Measured here (right taskbar, work 0,0,2784,1800, monitor 0,0,2880,1800 at
@@ -7138,27 +7753,45 @@ bool PanelRectAccepted(const PanelMeasurement& panel,
         return false;
     }
 
-    // The band between the work area and the monitor on the taskbar's side.
-    const auto inTaskbarBand = [](float edge, float workEdge,
-                                  float monitorEdge) {
-        const float low = std::min(workEdge, monitorEdge);
-        const float high = std::max(workEdge, monitorEdge);
-        return edge >= low - kPanelAnchorMarginDip &&
-               edge <= high + kPanelAnchorMarginDip;
-    };
+    // The taskbar's side of the panel, and the strip that side must lie in: the
+    // bar's reserved span when the probe measured it, the work-area inset
+    // otherwise.
+    float edge = 0.0f;
+    float low = 0.0f;
+    float high = 0.0f;
     switch (static_cast<DismissAxis>(axis)) {
         case DismissAxis::Left:
-            return inTaskbarBand(panel.left, home.work.left, home.monitor.left);
+            edge = panel.left;
+            low = home.work.left;
+            high = home.monitor.left;
+            break;
         case DismissAxis::Top:
-            return inTaskbarBand(panel.top, home.work.top, home.monitor.top);
+            edge = panel.top;
+            low = home.work.top;
+            high = home.monitor.top;
+            break;
         case DismissAxis::Right:
-            return inTaskbarBand(panel.right, home.work.right,
-                                 home.monitor.right);
+            edge = panel.right;
+            low = home.work.right;
+            high = home.monitor.right;
+            break;
         case DismissAxis::Bottom:
-            return inTaskbarBand(panel.bottom, home.work.bottom,
-                                 home.monitor.bottom);
+            edge = panel.bottom;
+            low = home.work.bottom;
+            high = home.monitor.bottom;
+            break;
+        default:
+            return false;
     }
-    return false;
+    if (home.taskbarBand) {
+        low = home.taskbarLow;
+        high = home.taskbarHigh;
+    }
+
+    const float from = std::min(low, high);
+    const float to = std::max(low, high);
+    return edge >= from - kPanelAnchorMarginDip &&
+           edge <= to + kPanelAnchorMarginDip;
 }
 
 // The one measurement and the one publish point of the geometry.
@@ -7274,17 +7907,21 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
             } else if (!g_panelTrailRejectedLogged) {
                 // The rect was measured but is not a panel: the storyboard has
                 // not placed it, or the layout is between sizes. Nothing from it
-                // is published; the snapshot keeps its last whole value.
+                // is published; the snapshot keeps its last whole value. One line
+                // per open: the next open retries and must be able to speak again.
                 g_panelTrailRejectedLogged = true;
-                FileLog(L"reveal panelTrail rejected %.0f "
+                FileLog(L"reveal panelTrail rejected %.0f axis=%d "
                         L"rect=%.0f,%.0f,%.0f,%.0f work=%.0f,%.0f,%.0f,%.0f "
-                        L"mon=%.0f,%.0f,%.0f,%.0f",
+                        L"mon=%.0f,%.0f,%.0f,%.0f band=%.0f,%.0f",
                         TrailEdge(candidate.layout.axis, panel.left, panel.top,
                                   panel.right, panel.bottom),
-                        panel.left, panel.top, panel.right, panel.bottom,
-                        home.work.left, home.work.top, home.work.right,
-                        home.work.bottom, home.monitor.left, home.monitor.top,
-                        home.monitor.right, home.monitor.bottom);
+                        candidate.layout.axis, panel.left, panel.top,
+                        panel.right, panel.bottom, home.work.left,
+                        home.work.top, home.work.right, home.work.bottom,
+                        home.monitor.left, home.monitor.top, home.monitor.right,
+                        home.monitor.bottom,
+                        home.taskbarBand ? home.taskbarLow : -1.0f,
+                        home.taskbarBand ? home.taskbarHigh : -1.0f);
             }
         }
     }
@@ -7355,11 +7992,14 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
                                std::fabs(trail - previousTrail) > 1.0f;
             if (moved || !g_panelTrailLogged) {
                 g_panelTrailLogged = true;
-                FileLog(L"reveal panelTrail=%.0f rect=%.0f,%.0f,%.0f,%.0f "
-                        L"work=%.0f,%.0f,%.0f,%.0f gen=%u",
-                        trail, candidate.left, candidate.top, candidate.right,
-                        candidate.bottom, home.work.left, home.work.top,
-                        home.work.right, home.work.bottom,
+                FileLog(L"reveal panelTrail=%.0f axis=%d rect=%.0f,%.0f,%.0f,%.0f "
+                        L"work=%.0f,%.0f,%.0f,%.0f band=%.0f,%.0f gen=%u",
+                        trail, candidate.layout.axis, candidate.left,
+                        candidate.top, candidate.right, candidate.bottom,
+                        home.work.left, home.work.top, home.work.right,
+                        home.work.bottom,
+                        home.taskbarBand ? home.taskbarLow : -1.0f,
+                        home.taskbarBand ? home.taskbarHigh : -1.0f,
                         candidate.generation);
             }
         }
@@ -7371,9 +8011,10 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
     // it cannot place.
     if (!g_panelTrailFallbackLogged) {
         g_panelTrailFallbackLogged = true;
-        FileLog(L"reveal panelTrail=%.0f (fallback)",
+        FileLog(L"reveal panelTrail=%.0f axis=%d (fallback)",
                 FallbackTrailDip(candidate.layout.axis,
-                                 candidate.layout.distance));
+                                 candidate.layout.distance),
+                candidate.layout.axis);
     }
     return true;
 }
@@ -8048,19 +8689,16 @@ void CaptureCoreWindowHandle() {
     }
 }
 
-// Chooses the dismiss direction from the side of the work area the Start
-// window is anchored to. Runs on the UI thread, from Setup and from the
-// event-driven refresh. `logAxis` writes the full measurement line: the refresh
-// passes false and speaks only when the axis actually moved, so an unchanged
-// layout does not repeat four rect values on every open.
+// Chooses the dismiss direction from the taskbar itself. Runs on the UI thread,
+// from Setup, from every open and from the work-area/display broadcasts.
+// `logAxis` writes the full measurement line: the refresh passes false and
+// speaks only when the axis actually moved, so an unchanged layout does not
+// repeat four rect values on every open. A probe that cannot name an edge keeps
+// the last answer and says so once per undecided episode; a wrong axis is a
+// visible regression, a stale one that was right is not.
 void UpdateDismissAxis(bool logAxis) {
     HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
     if (!hwnd) {
-        return;
-    }
-
-    RECT windowRect{};
-    if (!GetWindowRect(hwnd, &windowRect)) {
         return;
     }
 
@@ -8078,49 +8716,86 @@ void UpdateDismissAxis(bool logAxis) {
     const RECT& work = info.rcWork;
     const RECT& monitorRect = info.rcMonitor;
 
-    // The Start window is full-screen, so its own rect cannot say which side
-    // the taskbar is on: it touches every monitor edge and the first comparison
-    // would always pick Left. The work area is the reliable signal, because the
-    // taskbar is what shrinks it.
-    DismissAxis axis = DismissAxis::Left;
-    const long insetLeft = work.left - monitorRect.left;
-    const long insetTop = work.top - monitorRect.top;
-    const long insetRight = monitorRect.right - work.right;
-    const long insetBottom = monitorRect.bottom - work.bottom;
-    const long largest = std::max(std::max(insetLeft, insetTop),
-                                  std::max(insetRight, insetBottom));
-    if (largest > 4) {
-        if (largest == insetLeft) {
-            axis = DismissAxis::Left;
-        } else if (largest == insetTop) {
-            axis = DismissAxis::Top;
-        } else if (largest == insetRight) {
-            axis = DismissAxis::Right;
-        } else {
-            axis = DismissAxis::Bottom;
-        }
-    } else if (windowRect.left <= work.left + 4) {
-        // No inset: the taskbar is auto-hidden or on another monitor. Fall back
-        // to the old window-rect heuristic.
-        if (windowRect.top <= work.top + 4) {
-            axis = DismissAxis::Top;
-        }
+    // The window's own rect is not an input: it is full screen while the menu is
+    // idle and slides across the screen while the shell animates it in, so it
+    // describes the storyboard, not the taskbar. The probe reads the sources that
+    // do describe the taskbar, and its result is kept for the publish this same
+    // turn runs, so the axis and the panel band come from one measurement.
+    const TaskbarProbe probe =
+        ProbeTaskbar(info, DpiScaleForWindow(hwnd));
+    // A probe that named nothing keeps the last one for this monitor: the edge in
+    // force is the last one a source named, so the band that describes it is still
+    // the right band. Only a monitor change makes an older probe meaningless.
+    if (probe.decided || g_taskbarProbeMonitor != monitor) {
+        g_taskbarProbe = probe;
+        g_taskbarProbeMonitor = monitor;
     }
 
     const int32_t previousAxis = g_dismissAxis;
-    g_dismissAxis = static_cast<int32_t>(axis);
-    if (logAxis || g_dismissAxis != previousAxis) {
-        FileLog(L"dismiss axis=%d (0=left,1=top,2=right,3=bottom) "
-                L"win=%d,%d,%d,%d work=%d,%d,%d,%d mon=%d,%d,%d,%d",
-                g_dismissAxis, static_cast<int>(windowRect.left),
-                static_cast<int>(windowRect.top),
-                static_cast<int>(windowRect.right),
-                static_cast<int>(windowRect.bottom), static_cast<int>(work.left),
-                static_cast<int>(work.top), static_cast<int>(work.right),
-                static_cast<int>(work.bottom), static_cast<int>(monitorRect.left),
-                static_cast<int>(monitorRect.top),
-                static_cast<int>(monitorRect.right),
-                static_cast<int>(monitorRect.bottom));
+    if (probe.decided) {
+        g_dismissAxis = static_cast<int32_t>(probe.edge);
+        g_axisKnown = true;
+    }
+    // else: keep g_dismissAxis. It is the last edge a source named, or the
+    // initializer before the first answer, and the log line below says which.
+
+    bool log = logAxis || g_dismissAxis != previousAxis;
+    if (!probe.decided) {
+        // One line per undecided episode, not one per open: the sources are read
+        // again on the next open and on the next broadcast.
+        if (g_axisKeptLogged) {
+            log = false;
+        } else {
+            g_axisKeptLogged = true;
+            log = true;
+        }
+        if (log) {
+            FileLog(L"dismiss axis=%d kept, no source named an edge "
+                    L"(0=left,1=top,2=right,3=bottom) %s "
+                    L"appbar=%d rc=%d,%d,%d,%d bar=%d rect=%d,%d,%d,%d "
+                    L"work=%d,%d,%d,%d mon=%d,%d,%d,%d",
+                    g_dismissAxis, g_axisKnown ? L"last-known" : L"initializer",
+                    probe.appBar ? static_cast<int>(probe.appBarEdge) : -1,
+                    static_cast<int>(probe.appBarRectPx.left),
+                    static_cast<int>(probe.appBarRectPx.top),
+                    static_cast<int>(probe.appBarRectPx.right),
+                    static_cast<int>(probe.appBarRectPx.bottom),
+                    probe.barWindow ? static_cast<int>(probe.barWindowEdge) : -1,
+                    static_cast<int>(probe.barWindowRectPx.left),
+                    static_cast<int>(probe.barWindowRectPx.top),
+                    static_cast<int>(probe.barWindowRectPx.right),
+                    static_cast<int>(probe.barWindowRectPx.bottom),
+                    static_cast<int>(work.left), static_cast<int>(work.top),
+                    static_cast<int>(work.right), static_cast<int>(work.bottom),
+                    static_cast<int>(monitorRect.left),
+                    static_cast<int>(monitorRect.top),
+                    static_cast<int>(monitorRect.right),
+                    static_cast<int>(monitorRect.bottom));
+        }
+    } else {
+        g_axisKeptLogged = false;
+        if (log) {
+            FileLog(L"dismiss axis=%d (0=left,1=top,2=right,3=bottom) src=%s "
+                    L"appbar=%d rc=%d,%d,%d,%d bar=%d rect=%d,%d,%d,%d "
+                    L"work=%d,%d,%d,%d mon=%d,%d,%d,%d",
+                    g_dismissAxis, probe.source,
+                    probe.appBar ? static_cast<int>(probe.appBarEdge) : -1,
+                    static_cast<int>(probe.appBarRectPx.left),
+                    static_cast<int>(probe.appBarRectPx.top),
+                    static_cast<int>(probe.appBarRectPx.right),
+                    static_cast<int>(probe.appBarRectPx.bottom),
+                    probe.barWindow ? static_cast<int>(probe.barWindowEdge) : -1,
+                    static_cast<int>(probe.barWindowRectPx.left),
+                    static_cast<int>(probe.barWindowRectPx.top),
+                    static_cast<int>(probe.barWindowRectPx.right),
+                    static_cast<int>(probe.barWindowRectPx.bottom),
+                    static_cast<int>(work.left), static_cast<int>(work.top),
+                    static_cast<int>(work.right), static_cast<int>(work.bottom),
+                    static_cast<int>(monitorRect.left),
+                    static_cast<int>(monitorRect.top),
+                    static_cast<int>(monitorRect.right),
+                    static_cast<int>(monitorRect.bottom));
+        }
     }
 
     // The snapshot is not published here: the caller publishes the whole
@@ -8173,7 +8848,9 @@ bool RefreshGestureGeometry() {
         return false;
     }
 
-    const bool changed = g_dismissAxis != previousAxis ||
+    const bool previouslyInvalid =
+        g_rendererInvalid.load(std::memory_order_acquire);
+    const bool changed = previouslyInvalid || g_dismissAxis != previousAxis ||
                          !SameLayoutDistance(distance, previousDistance);
 
     {
@@ -8192,12 +8869,19 @@ bool RefreshGestureGeometry() {
                         static_cast<unsigned>(e.code()));
                 // The expression still slides by the old axis and travel, so the
                 // published snapshot must keep describing them. A half-applied
-                // write is rolled back as far as the scalar the geometry owns.
+                // write is rolled back as far as the scalar the geometry owns,
+                // and the renderer stays invalid: the property set may carry a
+                // mixture of two layouts, so no gesture may start against it
+                // until a later apply rewrites all three.
                 g_dismissAxis = previousAxis;
+                g_rendererInvalid.store(true, std::memory_order_release);
+                FileLog(L"gesture renderer invalid until a successful reapply");
                 return false;
             } catch (...) {
                 FileLog(L"gesture geometry write failed err=unknown");
                 g_dismissAxis = previousAxis;
+                g_rendererInvalid.store(true, std::memory_order_release);
+                FileLog(L"gesture renderer invalid until a successful reapply");
                 return false;
             }
         }
@@ -8218,6 +8902,11 @@ bool RefreshGestureGeometry() {
     if (changed) {
         g_dismissDistance = distance;
         g_layoutVersion.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (previouslyInvalid) {
+        // This pass rewrote all three scalars from one layout again; the
+        // property set and the committed travel agree from here.
+        g_rendererInvalid.store(false, std::memory_order_release);
     }
 
     // The published snapshot has to match the scalars the expression reads, so it
@@ -8299,54 +8988,93 @@ bool Setup(wux::FrameworkElement const& root) {
     // The property set now carries this travel, so the renderer geometry may be
     // committed to it. A throw above leaves the old value and no renderer.
     g_dismissDistance = distance;
+    g_rendererInvalid.store(false, std::memory_order_release);
 
     // A resize changes the extent the expression slides by, and it may be the
     // first real layout after Setup. The refresh owns the axis check as well, so
     // a root that is laid out again after a taskbar move is corrected here too.
-    g_sizeRoot = root;
-    g_sizeToken = root.SizeChanged(
-        [](winrt::Windows::Foundation::IInspectable const&,
-           wux::SizeChangedEventArgs const&) {
-            try {
-                // A contact owns the panel: the edge must not move under the
-                // finger, so defer the whole layout change instead of
-                // re-anchoring it. The input thread posts the deferred settled
-                // pass when the contact ends.
-                if (g_panelOwned.load(std::memory_order_relaxed)) {
-                    g_measureDeferred.store(true, std::memory_order_relaxed);
-                    // The deferred settled pass is this open's measurement turn,
-                    // so it is the one that writes the once-per-open trail line.
-                    g_panelTrailLogged = false;
-                    FileLog(L"gesture geometry deferred reason=panel-owned gen=%u",
-                            g_openGeneration.load(std::memory_order_relaxed));
-                    return;
-                }
-                if (!RefreshGestureGeometry()) {
-                    return;
-                }
-                // The root was resized by the panel layout, so the rect is
-                // remeasured with the new extent in force. The pass is synchronous
-                // with the layout event, so it needs no epoch of its own: the
-                // snapshot it writes carries the current one.
-                PublishPanelTrailDip(true, 0, 0);
-                // The list sits in the same panel, so a resize moves its rect as
-                // well. Re-measuring only the panel left the old scroller rect
-                // eligible for the rest of this open, and a press outside the new
-                // list read as inside the old one. The pass is settled: the size
-                // is a fact of this layout, and an incomplete search publishes
-                // Unknown and retries.
-                CacheScrollableElement(true,
-                                       g_openGeneration.load(
-                                           std::memory_order_relaxed),
-                                       0);
-            } catch (winrt::hresult_error const& e) {
-                Wh_Log(L"SizeChanged update failed: %08X", e.code());
-            } catch (...) {
-                // Never let an exception escape into XAML.
-            }
-        });
+    //
+    // A registration that survived its revoke keeps its token and its owner:
+    // overwriting them would lose the only handle on a handler that can still
+    // fire. This root then gets no resize handler, and the unload reports the
+    // residual instead of pretending it is gone.
     if (g_sizeToken.value) {
-        g_uiRegistrationCount.fetch_add(1, std::memory_order_relaxed);
+        Wh_Log(L"SizeChanged registration from the previous root is still "
+               L"attached; this root gets no resize handler");
+        FileLog(L"xaml size handler left attached; new registration refused");
+    } else {
+        const uint32_t sizeGeneration =
+            g_setupGeneration.load(std::memory_order_relaxed);
+        g_sizeRoot = root;
+        g_sizeToken = root.SizeChanged(
+            [sizeGeneration](winrt::Windows::Foundation::IInspectable const&,
+                             wux::SizeChangedEventArgs const&) {
+                try {
+                    // A callback from a root this renderer no longer owns must
+                    // touch nothing: its revoke failed once, and the state it
+                    // would measure belongs to a newer layout.
+                    if (sizeGeneration !=
+                        g_setupGeneration.load(std::memory_order_relaxed)) {
+                        return;
+                    }
+                    // A contact owns the panel: the edge must not move under the
+                    // finger, so defer the whole layout change instead of
+                    // re-anchoring it. The input thread posts the deferred
+                    // settled pass when the contact ends. The reservation below
+                    // is the authoritative check: a finger that claims the
+                    // panel while this callback is entering makes the whole
+                    // apply wait for the next deferred pass.
+                    if (g_panelOwned.load(std::memory_order_relaxed)) {
+                        g_measureDeferred.store(true,
+                                                std::memory_order_relaxed);
+                        // The deferred settled pass is this open's measurement
+                        // turn, so it is the one that writes the once-per-open
+                        // trail line.
+                        g_panelTrailLogged = false;
+                        FileLog(L"gesture geometry deferred "
+                                L"reason=panel-owned gen=%u",
+                                g_openGeneration.load(
+                                    std::memory_order_relaxed));
+                        return;
+                    }
+                    LayoutApplyGuard apply;
+                    if (!apply.Begin()) {
+                        g_measureDeferred.store(true,
+                                                std::memory_order_relaxed);
+                        g_panelTrailLogged = false;
+                        FileLog(L"gesture geometry deferred "
+                                L"reason=panel-owned gen=%u",
+                                g_openGeneration.load(
+                                    std::memory_order_relaxed));
+                        return;
+                    }
+                    if (!RefreshGestureGeometry()) {
+                        return;
+                    }
+                    // The root was resized by the panel layout, so the rect is
+                    // remeasured with the new extent in force. The pass is
+                    // synchronous with the layout event, so it needs no epoch of
+                    // its own: the snapshot it writes carries the current one.
+                    PublishPanelTrailDip(true, 0, 0);
+                    // The list sits in the same panel, so a resize moves its
+                    // rect as well. Re-measuring only the panel left the old
+                    // scroller rect eligible for the rest of this open, and a
+                    // press outside the new list read as inside the old one. The
+                    // pass is settled: the size is a fact of this layout, and an
+                    // incomplete search publishes Unknown and retries.
+                    CacheScrollableElement(true,
+                                           g_openGeneration.load(
+                                               std::memory_order_relaxed),
+                                           0);
+                } catch (winrt::hresult_error const& e) {
+                    Wh_Log(L"SizeChanged update failed: %08X", e.code());
+                } catch (...) {
+                    // Never let an exception escape into XAML.
+                }
+            });
+        if (g_sizeToken.value) {
+            g_uiRegistrationCount.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // Everything the input thread reads is published before the root opens. This
@@ -8422,6 +9150,16 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
 
         if (alreadyLoaded) {
             Setup(root);
+        } else if (g_loadedToken.value) {
+            // The previous Loaded registration survived its revoke. Its token is
+            // the only handle on a handler that can still fire, so it is kept:
+            // overwriting it would lose that handle for the rest of the process,
+            // and the unload would report a residual it can never clear. This
+            // root then installs no renderer, and the log says why.
+            Wh_Log(L"Loaded registration from the previous root is still "
+                   L"attached; this root gets no renderer");
+            FileLog(L"xaml loaded handler left attached; new registration "
+                    L"refused");
         } else {
             const winrt::hstring rootClassName = winrt::get_class_name(root);
             FileLog(L"root pending load class=%s", rootClassName.c_str());
@@ -8994,34 +9732,51 @@ void RevokeHandlers() {
     wux::FrameworkElement sizeRoot = g_sizeRoot ? g_sizeRoot : root;
     wux::FrameworkElement loadedRoot = g_loadedRoot ? g_loadedRoot : root;
 
-    if (g_sizeToken.value && sizeRoot) {
-        try {
-            sizeRoot.SizeChanged(g_sizeToken);
-            g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
-        } catch (winrt::hresult_error const& e) {
-            Wh_Log(L"Failed to revoke SizeChanged: %08X %s", e.code(),
-                   e.message().c_str());
-        } catch (...) {
-            Wh_Log(L"Failed to revoke SizeChanged with an unknown exception");
+    if (g_sizeToken.value) {
+        if (!sizeRoot) {
+            Wh_Log(L"SizeChanged registration has no owner to revoke on");
+        } else {
+            try {
+                sizeRoot.SizeChanged(g_sizeToken);
+                g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
+                g_sizeToken = {};
+                g_sizeRoot = nullptr;
+            } catch (winrt::hresult_error const& e) {
+                // The token and its owner stay: the token is the only handle on
+                // a handler that can still fire, and overwriting it with the
+                // next registration would lose it for the process lifetime.
+                Wh_Log(L"Failed to revoke SizeChanged: %08X %s", e.code(),
+                       e.message().c_str());
+            } catch (...) {
+                Wh_Log(L"Failed to revoke SizeChanged with an unknown "
+                       L"exception");
+            }
         }
-        g_sizeToken = {};
+    } else {
+        g_sizeRoot = nullptr;
     }
-    if (g_loadedToken.value && loadedRoot) {
-        try {
-            loadedRoot.Loaded(g_loadedToken);
-            g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
-        } catch (winrt::hresult_error const& e) {
-            Wh_Log(L"Failed to revoke Loaded: %08X %s", e.code(),
-                   e.message().c_str());
-        } catch (...) {
-            Wh_Log(L"Failed to revoke Loaded with an unknown exception");
+    if (g_loadedToken.value) {
+        if (!loadedRoot) {
+            Wh_Log(L"Loaded registration has no owner to revoke on");
+        } else {
+            try {
+                loadedRoot.Loaded(g_loadedToken);
+                g_uiRegistrationCount.fetch_sub(1, std::memory_order_relaxed);
+                g_loadedToken = {};
+                g_loadedRoot = nullptr;
+            } catch (winrt::hresult_error const& e) {
+                Wh_Log(L"Failed to revoke Loaded: %08X %s", e.code(),
+                       e.message().c_str());
+            } catch (...) {
+                Wh_Log(L"Failed to revoke Loaded with an unknown exception");
+            }
         }
-        g_loadedToken = {};
+    } else {
+        g_loadedRoot = nullptr;
     }
 
-    g_sizeRoot = nullptr;
-    g_loadedRoot = nullptr;
-    // Release the XAML reference on the UI thread.
+    // Release the XAML reference on the UI thread. A surviving registration
+    // keeps its own owner reference above, so this one can go.
     g_root = nullptr;
 }
 
@@ -9151,8 +9906,9 @@ void ResetComposition() {
     g_visual = nullptr;
     // The renderer is gone: every gate that asks whether gestures may start
     // reads this, so a gesture cannot run against a property set that no longer
-    // exists.
+    // exists. A half-applied scalar set dies with it.
     g_rendererReady.store(false, std::memory_order_release);
+    g_rendererInvalid.store(false, std::memory_order_release);
     // The old root's dispatcher dies with it; PrepareRootElement captures the
     // next root's before it registers anything on it.
     g_dispatcher = nullptr;
@@ -9194,7 +9950,14 @@ void ModulePinAnchor() {}
 // exists, so no worker can ever resume in unmapped code: Windhawk's unload frees
 // its own reference, and the pin keeps the image mapped anyway. The cost is a
 // module that leaks for the life of the process, which is the point.
-void PinThisModule() {
+//
+// False means the image is not pinned, and no thread may ever start: a worker
+// that outlives the unload would resume in unmapped code. The caller refuses the
+// whole initialisation then.
+bool PinThisModule() {
+    if (g_modulePin) {
+        return true;  // a re-init of the same pinned image
+    }
     HMODULE module = nullptr;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -9202,11 +9965,12 @@ void PinThisModule() {
                            &module)) {
         g_modulePin = module;
         FileLog(L"mod pin image=%p pinned=1", reinterpret_cast<void*>(module));
-        return;
+        return true;
     }
     FileLog(L"mod pin failed err=%u (a thread that outlives the unload would "
             L"resume in unmapped code)",
             static_cast<unsigned>(GetLastError()));
+    return false;
 }
 
 // Takes the one-instance guard for this process. The mutex is named after the
@@ -9215,6 +9979,10 @@ void PinThisModule() {
 // keeps its handle, and a new instance (a new DLL, loaded by a newer Windhawk
 // version) finds the name taken and stands down before it opens a channel,
 // starts a thread or installs a hook.
+//
+// The guard is a prerequisite, not a nicety: without it two instances can write
+// the same IPC records. Both failures answer false and the caller refuses the
+// initialisation.
 bool AcquireInstanceGuard() {
     WCHAR name[128] = {};
     swprintf_s(name, L"%s%lu", kInstanceGuardPrefix,
@@ -9223,14 +9991,16 @@ bool AcquireInstanceGuard() {
     SetLastError(0);
     HANDLE guard = CreateMutexW(nullptr, FALSE, name);
     if (!guard) {
-        // No guard is worse than a guard, but it must not disable the mod: the
-        // pin still keeps a late thread's code mapped.
+        // No exclusion is available: the pin keeps code mapped but says nothing
+        // about a second writer. Install nothing.
         FileLog(L"instance guard unavailable err=%u",
                 static_cast<unsigned>(GetLastError()));
-        return true;
+        return false;
     }
 
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // A live activation owns the name. Its state is its own: nothing is
+        // reset, opened or started here.
         CloseHandle(guard);
         g_secondInstance.store(true, std::memory_order_relaxed);
         FileLog(L"instance guard refused: another instance is live in this "
@@ -9243,6 +10013,7 @@ bool AcquireInstanceGuard() {
     }
 
     g_instanceGuard = guard;
+    FileLog(L"instance guard held name=%s", name);
     return true;
 }
 
@@ -9257,6 +10028,7 @@ void ResetReinitState() {
     // The guard has just been taken, so this instance is the live one: a refusal
     // left in the flag by an earlier load of this same pinned image must not
     // suppress this instance's hooks and threads.
+    g_initRefused.store(false, std::memory_order_relaxed);
     g_secondInstance.store(false, std::memory_order_relaxed);
     g_disabled.store(false, std::memory_order_relaxed);
     g_unloading.store(false, std::memory_order_relaxed);
@@ -9273,7 +10045,10 @@ void ResetReinitState() {
     g_hidStopEvent = nullptr;
     g_uiRegistrationCount.store(0, std::memory_order_relaxed);
     g_moduleEntryCount.store(0, std::memory_order_relaxed);
-    g_rootWasOpen = false;
+    // The input state of the previous activation, in the same function the
+    // input thread calls as it stops. No thread is running now, so this is the
+    // one place both activations meet.
+    ResetActivationState();
     {
         std::lock_guard lock(g_compositionMutex);
         g_settleLease.reset();
@@ -9284,17 +10059,30 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.26.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.27.0 initializing");
 
-    // Before anything else, and before any thread: one instance per process, and
-    // an image the loader may not unmap. Both are what make the unload paths
-    // honest.
-    if (!AcquireInstanceGuard()) {
-        return TRUE;  // nothing was installed, so there is nothing to release
+    // Both acquisitions are prerequisites, and both run before any thread: the
+    // pin keeps a late worker's code mapped, the guard keeps a second instance
+    // out of the same channel. Whichever fails, nothing is installed: no hook,
+    // no channel, no thread.
+    if (!PinThisModule()) {
+        g_initRefused.store(true, std::memory_order_relaxed);
+        FileLog(L"mod init refused: the image could not be pinned; no hook, no "
+                L"channel and no thread installed");
+        return FALSE;
     }
-    if (!g_modulePin) {
-        // A re-init of the same pinned image does not need a second pin.
-        PinThisModule();
+    if (!AcquireInstanceGuard()) {
+        g_initRefused.store(true, std::memory_order_relaxed);
+        if (g_secondInstance.load(std::memory_order_relaxed)) {
+            FileLog(L"mod init refused: the instance guard is held by a live "
+                    L"activation; no hook, no channel and no thread installed");
+        } else {
+            // The pin already succeeded here. It stays for the process
+            // lifetime, which is harmless: it maps code and nothing else.
+            FileLog(L"mod init refused: no instance guard; the image stays "
+                    L"pinned and no hook, no channel and no thread installed");
+        }
+        return FALSE;
     }
     ResetReinitState();
 
@@ -9404,9 +10192,12 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModAfterInit() {
+    if (g_initRefused.load(std::memory_order_relaxed)) {
+        // Wh_ModInit refused its prerequisites: no hook was installed, no
+        // channel was opened, and no thread starts.
+        return;
+    }
     if (g_secondInstance.load(std::memory_order_relaxed)) {
-        // The guard refused this instance: no hook was installed, no channel was
-        // opened, and no thread starts.
         return;
     }
     g_afterInit = true;
@@ -9430,7 +10221,8 @@ void Wh_ModAfterInit() {
 }
 
 void Wh_ModBeforeUninit() {
-    if (g_secondInstance.load(std::memory_order_relaxed)) {
+    if (g_initRefused.load(std::memory_order_relaxed) ||
+        g_secondInstance.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -9503,6 +10295,12 @@ void Wh_ModBeforeUninit() {
 }
 
 void Wh_ModUninit() {
+    if (g_initRefused.load(std::memory_order_relaxed)) {
+        // Wh_ModInit installed nothing. A pinned image with no guard has
+        // nothing to close and no thread to join; the pin is the process's.
+        Wh_Log(L"Refused instance uninitialized");
+        return;
+    }
     if (g_secondInstance.load(std::memory_order_relaxed)) {
         // Nothing was installed by this instance, so there is nothing to free
         // and no guard to release: this instance never took one.

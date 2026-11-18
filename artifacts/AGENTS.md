@@ -2,7 +2,7 @@
 
 > L2 | Parent: ../AGENTS.md
 
-The measurements here are single runs on the same machine: 2880x1800 physical at 200% scaling (1440x900 DIP), taskbar on the left unless a header says otherwise, so 1 DIP = 2 px. The machine's taskbar is on top now — the placement the settle trace ran under — so a capture's placement can differ from the current layout; each file's header names the placement it saw. Read a file's comments first; where the capture method changed, the comment says which loop produced it.
+The measurements here are single runs on the same machine: 2880x1800 physical at 200% scaling (1440x900 DIP), so 1 DIP = 2 px. The captures were taken with the taskbar on the left, then on top, where the native-flyout and settle runs were made; the machine now runs the Windows 11 bar auto-hidden at the bottom, so a capture's placement can differ from the current layout. Each file's header names the placement it saw. Read a file's comments first; where the capture method changed, the comment says which loop produced it.
 
 cursor-follow.csv: `probe_cursor_follow.ps1`'s `ms,x,y` cursor samples in physical pixels, taken every ~8 ms during an injected drag. The cursor is suppressed for the whole contact: all 238 samples of this run are the same point (1834,870), and a move shorter than the polling interval would not appear.
 gesture-shared.csv: `read_shared_gesture.ps1`'s dump of the bridge's `Local\WindhawkStartGestureShared` mapping (`tick,magic,seq,state,edge,src,prov,...`). State 2 is a committed edge gesture; the fields are the v1 `StartGestureShared` layout. Sampling is ~30 ms, so a transition shorter than that is missed.

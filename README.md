@@ -12,7 +12,10 @@ touch/pen swipe-to-dismiss that makes the menu follow the finger.
 Verified on: Windows 11 build 26300.9974, ExplorerPatcher 26100.9711
 (`Start_ShowClassicMode=1`), Windhawk 2.0 alpha, 2880x1800 physical at 200%
 scaling (1440x900 DIP), ELAN2513 touchscreen. The taskbar was on the left for
-the early measurements and has been on top since the vertical-path runs; where a
+the early measurements and on top for the vertical-path runs; it is now the
+Windows 11 native taskbar with auto-hide on, docked at the bottom, so the work
+area equals the full screen (`work=0,0,2880,1800`,
+`mon=0,0,2880,1800`) — the normal state of auto-hide, not a transient. Where a
 measurement depends on the placement, the text names it.
 
 ## Status
@@ -24,7 +27,7 @@ measurement depends on the placement, the text names it.
 | Swipe dismiss with commit/cancel thresholds | working; left, top and bottom taskbars verified |
 | Dismiss animation (slide out, spring back) | working |
 | Pen | `TipSwitch`/`InRange` decoded, hover discarded; not yet exercised by hand |
-| Taskbar on left / top / right / bottom | axis logic present; left, top and bottom verified, the right side exercised earlier through the same path (`axis=2`) |
+| Taskbar on left / top / right / bottom | axis and panel band read from the taskbar's own dock record; left, top and bottom verified, the right side exercised earlier through the same path (`axis=2`) |
 | Mouse drag to dismiss | deliberately not enabled |
 | Reveal (edge swipe to open) following the finger | working, anchored to the panel edge |
 | Windows-key close | animated slide-out; the bridge holds the Hide for the settle the Start mod answers with |
@@ -58,11 +61,18 @@ measurement depends on the placement, the text names it.
    hover and drives nothing, and only the tracked slot's tip going up (or its
    in-range bit clearing) ends the contact while coordinates keep arriving. A
    count-only lift report is not a lift; the 18 ms idle ends the contact instead.
-   A tracked tip-down report that carries no coordinates refreshes the liveness
-   clocks without feeding a position, so the idle cannot end a contact the device
-   is still asserting.
-   A device with no tip and no in-range usage keeps the count/position path, and
-   that fallback is the only place the `(0,0)` no-position heuristic applies.
+   A tracked report that carries no coordinates refreshes the liveness clock
+   only when it asserts contact (`TipSwitch`/`InRange`, or a slot state of
+   Contact), never on identifier presence alone; the liveness clock is separate
+   from the position clock, so that report cannot feed a position, and the idle
+   cannot end a contact the device is still asserting. When several slots carry
+   the tracked identifier, the one that asserts contact wins, and one
+   `hid contact id=... declared down in ... slots; using=...` line records the
+   ambiguity.
+   A device with no tip and no in-range usage keeps the count/position path; its
+   Contact Count and `(0,0)` rules apply in the tracked branch too, because it
+   cannot assert a tip for the tracked slot, and it is the only device family
+   that needs those rules.
    Raw values are mapped to pixels through the logical range of the collection
    the point was read from (`cap.LinkCollection`) and then to DIP through the
    window DPI. `hid usages dev=... tip=... inrange=... count=... buttons=...
@@ -266,10 +276,10 @@ A close exists once its settle starts. `BeginDismissSettle` reports three
 outcomes: not started, started, and started with a lost batch observer
 (`close observer lost kind=...`). A lost observer does not put the panel back:
 the settle runs and its tap is the close, so the panel never flashes back. Only
-a close that provably never started calls `AbandonClose(kind, tapSerial)`
-(`close abandoned kind=...`), which restores the panel and cancels that close's
-own tap and stamp as one operation; the armed tap carries that identity
-(`g_pendingTapSerial`), so a stale serial cannot drop a newer close's tap.
+a close that provably never started calls `AbandonClose(kind)`
+(`close abandoned kind=...`), which restores the panel; that is the whole
+operation, because such a close published no plan and armed no tap, so there is
+nothing to cancel.
 
 Unload is prerequisite-driven. The one stop event is created before any thread
 starts; without it the mod starts no raw-input thread and logs
@@ -282,34 +292,55 @@ waits for that turn, detaches the settle batch's `Completed` handler, and drains
 every counted entry into module code (2 s bound), then frees the composition
 state and the IPC view. A thread or callback that misses its wait leaves every
 resource in place and logs `unload residual=...; process must restart to finish
-unloading`; the timed-out thread handles stay open so a later attempt can join
-them, and the hid-thread case also logs
+unloading`; the timed-out thread's handle stays open so a later attempt can join
+it, a joined thread's handle is closed, and the hid-thread case also logs
 `unload hid thread still running; ipc view leaked` instead of unmapping a
 section the running thread still touches. A counted entry that does not drain
-logs `unload entries outstanding=%d`.
+logs `unload entries outstanding=%d`. A XAML delegate that could not be revoked
+keeps its token, because that token is the only handle on a handler that can
+still fire, and a new root refuses to overwrite that outstanding registration
+(`xaml size handler left attached; new registration refused`, the same for
+`loaded`): the root then gets no renderer, and the unload reports the residual.
+The `SizeChanged` and `Loaded` callbacks capture the setup generation when they
+are registered and return when it has moved, so a late callback from the
+previous root touches nothing.
 
-That drain is only meaningful because the image cannot go away. The module pins
-itself before any thread exists:
-`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+That drain is only meaningful because the image cannot go away. The pin and the
+instance guard are the two prerequisites of `Wh_ModInit`: either failing returns
+failure with `mod init refused: ...; no hook, no channel and no thread
+installed`, and `g_initRefused` short-circuits the later lifecycle callbacks. A
+successful pin
+(`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
 GET_MODULE_HANDLE_EX_FLAG_PIN)` on an address in the module, logged
-`mod pin image=... pinned=1` (or `mod pin failed err=...`). `void Wh_ModUninit`
-cannot veto Windhawk's unload, and the mod held no reference on its own image
-before this pin, so returning from that call would let Windhawk free the module
-while a thread is still inside it. A pinned image cannot be unmapped: the module stays
+`mod pin image=... pinned=1`) is what keeps the image mapped; a failed pin logs
+`mod pin failed err=...` and installs nothing. `void Wh_ModUninit` cannot veto
+Windhawk's unload, and the mod held no reference on its own image before this
+pin, so returning from that call would let Windhawk free the module while a
+thread is still inside it. A pinned image cannot be unmapped: the module stays
 in the process until it exits, by design, and that is what makes late-running
 thread code and late delegate calls safe. The pin keeps code mapped, not
 resources: a residual unload still needs a process restart before anything the
-leaked thread or entry touches can be freed. One instance per process: `Wh_ModInit` takes
-`Local\WindhawkLegacyStartSwipe.instance.<pid>` before it creates the stop
-event, opens the channel or starts a thread. A second instance logs
-`instance guard refused: another instance is live in this process` and installs
-no hook, no thread and no channel; only a clean unload releases the mutex. A
-re-initialisation of the same pinned image after a clean unload resets the
-lifecycle state (`ResetReinitState`). Every entry into module code from the
-compositor or the dispatcher is counted from before it can run: the batch
-completion takes a `ModuleEntryLease` before `batch.End()`, every UI turn that
-touches module state is posted through `PostCountedUiTurn`, and a revoke that
-fails keeps its token and its lease.
+leaked thread or entry touches can be freed. One instance per process:
+`Wh_ModInit` takes `Local\WindhawkLegacyStartSwipe.instance.<pid>` before it
+creates the stop event, opens the channel or starts a thread. The name carries
+the PID, so it excludes another instance in that process, not every process in
+the session. A second instance logs
+`instance guard refused: another instance is live in this process`, resets
+nothing and installs no hook, no thread and no channel; only a clean unload
+releases the mutex. A re-initialisation of the same pinned image after a clean
+unload resets the lifecycle state (`ResetReinitState`) and then runs one
+per-activation reset
+(`ResetActivationState`, logged `activation state reset`), which the input
+thread's exit runs too: the tracked contact, the contact latch, both sessions,
+the close mute, the deferred flag, the pending tap and its serial, the pull
+serial, the coast, both velocity windows, the diagnostic latches and the `anim`
+override all start over. Every entry into module code from the compositor or the
+dispatcher is counted from before it can run: the batch completion takes a
+`ModuleEntryLease` before `batch.End()`, and every UI turn posted through
+`PostCountedUiTurn` is counted. The unload's revocation turn is the exception by
+design: it uses `RunAsync` plus an event and waits for it, not the counted post,
+because the unload must know the revocation ran before it frees the objects that
+turn holds.
 
 A new edge pull during the retract cancels the close on the Start side: the
 armed tap is dropped before it is sent (the record becomes the cancelled kind),
@@ -330,9 +361,11 @@ lift report ends the contact instead: the release line says `src=report`, and th
 leaves without a lift report (`src=idle`). A report that carries only a contact
 count, or no contact field for the tracked slot, says nothing about it, so a
 count-only lift no longer ends a tracked contact; the idle expiry does, with
-`src=idle`, and it also forgets the tracked identity. A report that names the
-tracked contact with its tip still down but carries no point is that contact
-being asserted, not silence: it refreshes the same clocks and moves nothing.
+`src=idle`, and once no session owns the contact the same 18 ms latch clears the
+contact flag and forgets the tracked identity. A report that names the tracked
+contact and asserts it (`TipSwitch` down or `InRange`, or a slot state of
+Contact) but carries no point is not silence: it refreshes the liveness clock
+only and moves nothing.
 Measured layouts on this
 machine: ELAN2513 Col01 touch is five contact collections with `Tip` on each,
 Col05 pen carries tip and in-range, SYNA3580 is five with `Tip` each, and the
@@ -445,12 +478,13 @@ Instead the mod takes over after the shell opens the window:
   Progress = 1 - (finger - panelTrail) / (direction * distance)
   ```
 
-  The trailing edge is measured on the UI thread from the root's visible child
-  (`StartSizingFrame`; ~1053 DIP on a left taskbar, ~200 DIP from the bottom),
-  translated by `ClientToScreen` of the host window's client origin — not by the
-  work-area origin. Axis, `Distance`, the whole panel rectangle, the XAML
-  origin, the work area, the monitor and the edge derived from it are one
-  `GestureGeometry` snapshot behind a short writer lock: the UI thread is the
+  The trailing edge is the panel side facing away from the taskbar — the one
+  that meets the finger. It is measured on the UI thread from the root's visible
+  child (`StartSizingFrame`; ~1053 DIP on a left taskbar, the panel's top edge at
+  289 DIP on this bottom-taskbar layout), translated by `ClientToScreen` of the
+  host window's client origin — not by the work-area origin. Axis, `Distance`,
+  the whole panel rectangle, the XAML origin, the work area and the monitor are
+  one `GestureGeometry` snapshot behind a short writer lock: the UI thread is the
   only writer and holds an `SRWLOCK` exclusively for one struct assignment; the
   input thread tries a shared acquisition per sample and answers its last whole
   copy on contention, because a seqlock's counters do not legalize reading a
@@ -462,16 +496,32 @@ Instead the mod takes over after the shell opens the window:
   from an old rectangle. The trail is derived from the rect by one function, so
   a rect and its edge cannot disagree, and the hit test, the
   follow, the release and that report's log line all describe one panel. The
-  legacy `reveal panelTrail=...` line still prints that derived edge, now with
-  the rect, the work area and the generation. A measurement is accepted only
-  when the rect lies on the monitor and its taskbar-side edge lies inside the
-  taskbar band, between the work-area edge and
-  the monitor edge; one that fails publishes nothing, and the previous rect is
+  legacy `reveal panelTrail=...` line prints that derived edge with the axis, the
+  rect, the work area, the band it was tested against and the generation. A
+  measurement is accepted only when the rect lies on the monitor and its
+  taskbar-side edge lies inside the band the taskbar itself defines: the bar's
+  reserved strip at the screen edge, extended by one bar thickness toward the
+  desktop. The band comes from `SHAppBarMessage(ABM_GETTASKBARPOS)` or from the
+  `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` rectangle, and from the work-area
+  inset only when the probe leaves no band for this monitor; auto-hide makes
+  that inset zero by design. Measured on this bottom-taskbar layout, the settled
+  panel sits 12 DIP inside the bar edge (`840` against `852`), so the band is
+  `804..900` and the open storyboard's rect is rejected whole; a rejection
+  publishes nothing and
+  logs `reveal panelTrail rejected ... axis=... rect=... work=... mon=...
+  band=...` once per open for the settled pass. The previous rect is
   carried over only when the whole layout identity — axis, travel, client
-  origin, work area and monitor — matches (±0.5 DIP on travel). Renderer scalars
+  origin, work area and monitor — matches (±0.5 DIP on travel). The axis is part
+  of that identity, so an axis-only change bumps the token, drops the carried
+  rect and republishes the trail. Renderer scalars
   are written first and `g_dismissDistance` advances only when they took the new
   travel, so a failed or skipped write leaves the applied distance where the
-  compositor holds it. A layout change of any kind — an open, `WM_DISPLAYCHANGE`,
+  compositor holds it; a scalar write that throws after an earlier one landed
+  marks the renderer invalid (`gesture renderer invalid until a successful
+  reapply`) and refuses gestures until a full reapply. The apply reservation
+  (`LayoutApplyGuard`) and the admission claim (`ClaimPanelForAdmission`) are
+  `seq_cst`, so either the layout is deferred whole or that admission is refused
+  and retried on the next report. A layout change of any kind — an open, `WM_DISPLAYCHANGE`,
   `SPI_SETWORKAREA` or `SizeChanged` — is deferred whole while a contact owns the
   panel: renderer scalars, panel rect and scroller cache are applied together by
   one settled pass after the release
@@ -496,7 +546,7 @@ Instead the mod takes over after the shell opens the window:
 - A vertical dismiss (top or bottom taskbar) yields to the menu's own
   scrolling. The mod caches the innermost ScrollViewer under the panel
   (StartUI.AllAppsGridListView; `ScrollableHeight` measured 3664 on the earlier
-  left-side run and 4077 on the current top-taskbar layout, offsets refreshed on
+  left-side run and 4077 on the later top-taskbar run, offsets refreshed on
   ViewChanged) plus its screen rect, in three states. Every remeasure publishes
   `Unknown` first, so a pass that fails or stops short cannot leave a previous
   `Nothing` or `Scrollable` speaking for a tree it no longer describes, and the
@@ -522,16 +572,19 @@ Instead the mod takes over after the shell opens the window:
   allowance a fling needs). Only the unknown state defers. The same contact
   starts the dismiss as soon as its scrolling reaches the end.
 
-  The current layout has the taskbar on top: `dismiss axis=1`, `Distance` 900,
-  panel rect about `236,36..1229,587`, scroller about `309,66..569,586` with
-  `vo=0 sh=4077`. The vertical path is the one exercised in the latest runs.
-  An upward drag inside the panel whose list cannot scroll
-  commits and taps. A drag in the long list scrolls first
-  (`dismiss deferred to scroll vo=0 sh=4077`), the cache follows `ViewChanged`
-  (vo 277/1214/2194/3135), and the same swipe turns into a dismiss once the list
-  reaches its end. A work-area broadcast during a held drag defers the whole
-  turn (`gesture geometry deferred reason=panel-owned gen=5`), and the release
-  keeps the axis and travel it started with.
+  The current layout has the Windows 11 taskbar auto-hidden at the bottom:
+  `dismiss axis=3`, `Distance` 900, panel rect `236,289..1229,840`, so the trail
+  is the panel's top edge at 289 DIP and the band it is tested against is
+  `804..900` (`reveal panelTrail=289 axis=3 ... band=804,900 gen=3`). The
+  vertical path was exercised most fully on the earlier top-taskbar layout:
+  `dismiss axis=1`, panel about `236,36..1229,587`, scroller about
+  `309,66..569,586` with `vo=0 sh=4077`. There an upward drag inside the panel
+  whose list cannot scroll commits and taps. A drag in the long list scrolls
+  first (`dismiss deferred to scroll vo=0 sh=4077`), the cache follows
+  `ViewChanged` (vo 277/1214/2194/3135), and the same swipe turns into a dismiss
+  once the list reaches its end. A work-area broadcast during a held drag defers
+  the whole turn (`gesture geometry deferred reason=panel-owned gen=5`), and the
+  release keeps the axis and travel it started with.
 - Release is decided symmetrically with the dismiss gesture: `travel` is how far
   the finger moved away from the edge since the touch began (the release value,
   not the peak), and the menu opens fully when `travel > 20%` of the distance
@@ -570,13 +623,13 @@ is closed after the down, so the only in-process source is the digitizer itself.
 ## Mods
 
 - **`mods/start-menu-legacy-swipe.wh.cpp`** (`StartMenuExperienceHost.exe`,
-  0.26.0) — the shipping mod described above.
+  0.27.0) — the shipping mod described above.
 - **`mods/msgprobe.wh.cpp`** — diagnostic: logs `WM_POINTER*` and mouse messages
   pulled from the message queue. Proved the queue dead end. Not needed at runtime.
 - **`mods/inputprobe.wh.cpp`** — diagnostic: raw HID decoding without the gesture
   logic. **Do not enable it together with the shipping mod**: Raw Input allows one
   sink per usage per process, and inputprobe takes the stream for itself.
-- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`, 0.12.0) —
+- **`mods/start-menu-touch-gesture-bridge.wh.cpp`** (`explorer.exe`, 0.13.0) —
   hooks `CStartExperienceManager::Hide`. Only a Hide on a `tapped` close record
   the bridge has not consumed, inside the record's 800 ms window and not older
   than the newest open tick it saw, runs at once (`hide passed (gesture)`); the
@@ -589,10 +642,19 @@ is closed after the down, so the only in-process source is the digitizer itself.
   so it cannot start a settle under the next menu. A dropped gesture close
   publishes the cancelled kind, which takes the keyboard path. Publishes the
   taskbar-edge gesture handle/state from `twinui.pcshell.dll` to shared memory,
-  which the shipping mod does not read. On unload it keeps new Hides out, waits
-  up to 500 ms for in-flight `Hide` calls to drain, then closes the v2 channel
-  (`ipc close`); a Hide that outlives the drain keeps every handle
+  which the shipping mod does not read. The in-flight `Hide` count is a
+  `HideCallLease` (RAII, exactly one release per frame, taken before the hook
+  reads anything). On unload it keeps new Hides out, waits up to 500 ms for
+  in-flight `Hide` calls to drain, then closes the v2 channel (`ipc close`); a
+  Hide that outlives the drain keeps every handle
   (`ipc unload residual hides=...; the v2 channel stays until explorer exits`).
+  The host order was established from the installed engine's upstream tag
+  (`Windhawk v2.0.0-alpha.8`, `src/windhawk/engine/mods_manager.cpp`): disable
+  hooks, `Wh_ModUninit`, `ThreadsCallStackWaitForRegions(..., 200, 400)`, remove
+  hooks, `FreeLibrary`, with that wait's result discarded — so the timeout is
+  reachable, the residual is real, and the module's code after `Wh_ModUninit` is
+  the host's responsibility. That is why the bridge keeps the handles and does
+  not pin its image.
   The `Local\WindhawkStartGestureShared` mapping stays for the process lifetime
   on purpose, because a consumer and a late gesture callback may still hold its
   view. **Enable it together with the Start mod**
@@ -677,7 +739,8 @@ is enabled, without an explorer restart on this build.
   curve.
 - `tools/settle_track.ps1` — pull the menu half open, hold, release, and track
   the panel's bottom edge for 500 ms; its release time comes from `End-Contact`,
-  so `t=0` is the UP and not the end of the preceding capture.
+  so `t=0` is the UP and not the end of the preceding capture. Its start point
+  and scan band are the top-taskbar geometry.
 
 The raw tables behind the Windows 11 fit are in `artifacts/`:
 `native-flyout-open.csv` and `native-flyout-close.csv` are the per-frame
@@ -730,9 +793,23 @@ publishes the close record.
 ## Known limits and risks
 
 - The left, top and bottom taskbars are verified on this machine, and the right
-  side was exercised earlier through the same path (`axis=2`). `UpdateDismissAxis`
-  maps the taskbar edge to a dismiss direction and both the translation and the
-  reveal anchor are axis-aware.
+  side was exercised earlier through the same path (`axis=2`). The dismiss axis
+  and the panel band come from the taskbar itself, never from the Start window's
+  rect. `SHAppBarMessage(ABM_GETTASKBARPOS)` is the primary source (`uEdge` and
+  its docked rectangle, reported unchanged while the bar is hidden); the
+  `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` rectangle is the cross-check (the bar
+  must be flush to the edge **and** thin across it, so a full-width bottom bar is
+  not mistaken for a side one); the work-area inset names the axis only when it
+  truly insets, because auto-hide makes it zero by design. An inconclusive
+  probe keeps the last axis and band, logs once per undecided episode with what
+  each source said (`dismiss axis=... kept, no source named an edge ...`), and
+  retries on the next open or broadcast; it never silently means `Left`.
+  Measured on this layout:
+  `dismiss axis=3 (0=left,1=top,2=right,3=bottom) src=appbar appbar=3
+  rc=0,1704,2880,1800 bar=3 rect=0,1798,2880,1894 work=0,0,2880,1800
+  mon=0,0,2880,1800`. The band is the bar's strip extended by one bar thickness
+  toward the desktop, the axis is part of the layout identity, and both the
+  translation and the reveal anchor are axis-aware.
 - The reveal and the dismiss share the 20% (10% vertical) travel and the
   0.45 DIP/ms session-average thresholds, but their visual anchors differ (panel
   edge vs. drag start), so the same physical travel reads as a different
@@ -752,6 +829,10 @@ publishes the close record.
   and a count-only lift report does not end it either: the 18 ms idle does.
 - Composition translation does not move XAML hit-testing: while the menu is
   dragged, the content still receives touches at its original position.
+- After a disable/enable without restarting `StartMenuExperienceHost.exe`, the
+  reused XAML root means no new `PrepareRootElement` and no renderer: a new
+  contact is tracked but cannot drive the panel until the host restarts. The
+  restart in "Build and install" is the workaround, not just advice.
 - A gesture close is a real Windows tap at the end of its retract: the shell's key
   handler performs the hide and updates its Start toggle. A Win press during the
   retract closes the menu early — the plan is current, so the bridge gives that
@@ -767,6 +848,13 @@ publishes the close record.
   is logged (`hide delayed reason=1 retract=520 lead=550` on the left taskbar of
   this machine, whose 1440 DIP travel hits the 520 ms clamp); the Windows-key
   close reported 1 on this build. The gesture path does not wait.
+- Two limits here are code-path arguments, not measurements. With the CLI as the
+  lever, the bridge's drain/residual path cannot be reached: CLI-plus-engine
+  latency exceeds the 660 ms maximum hold of the shipped pair (100 ms answer wait
+  plus the 560 ms fallback; the shipped settle is clamped to 520 ms), while a
+  tap-to-cloaked run measured 574-592 ms. The two handles a reload leaves (the
+  gesture mapping and its event) are below explorer's handle-count noise (±60).
+  Both are reasoned from the code paths above, not observed as failures.
 - The close record is an 800 ms window. A gesture close publishes the plan at
   its release and the `tapped` record immediately before the tap; a dropped close
   publishes the cancelled kind at once, and the tap's deadline republication is
