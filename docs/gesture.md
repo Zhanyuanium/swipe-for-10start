@@ -99,10 +99,13 @@ Instead the mod takes over after the shell opens the window:
      read even when a new contact is already down, because that contact cannot
      be the pull that opened the menu and may be refused on its next report.
   3. **Contested continuation.** This open follows a close whose `Hide` already
-     left under a pull that took the panel back: the settle starts from the
+     left with the panel above the hidden rest: the settle starts from the
      panel's live position, the close's own settle value, and not from 0
      (`win open continued from=... dur=...`). The ticket is one commit release
      old (300 ms) and a panel the close took to the hidden rest does not qualify.
+     With the close's deferral in place no follow activates inside a close, so
+     this is a guard, not the routine reopen: a pull that waits for a close is
+     deferred and takes over live (or late) after the landing.
   4. **Keyboard settle.** None of the three preceded the open, so it plays from
      rest.
 
@@ -248,28 +251,73 @@ too. Without that state the next report of the same contact dragged the panel
 back and its release settled the menu open over a close that was already
 running.
 
-A close exists once its settle starts. A contact that lands during the retract
-cancels it before the shell is touched: the armed tap is dropped on that first
-report, whatever its point (a pull whose first point misses the band never
-reaches the candidate path, so the deadline check alone missed it), and the
-panel the close had already retracted is brought back from its live position,
-because a menu left open at `Progress` 0 has no pane. The contact records
-`startedOpen = 0` while the close is in flight, so a pull that starts above the
-band is adopted from its own down point once it has travelled 24 DIP instead of
-staying inert. The close record that coordinates this with the explorer-side
+A close exists once its settle starts. A close owns `Progress` from then until
+the window is observed cloaked (`win close observed`), at most 600 ms;
+`CloseInFlight` is that one answer, and every admission, takeover and settle
+reads it. Two shapes, one owner each:
+
+- **Cancel path.** A gesture close still has a `Hide` this mod can abort: its
+  Windows tap is armed and runs at the end of the settle. The first report of a
+  contact that lands during that settle drops the tap, whatever its point (a pull
+  whose first point misses the band never reaches the candidate path, so the
+  deadline check alone missed it), and the close is over before the shell is
+  touched: no `Hide` runs, the toggle is never advanced, the suppression ends
+  with the drop and the panel comes back from where the close had it (an open
+  settle from the live position, because a menu left open at `Progress` 0 has no
+  pane). The admission names it (`reveal admit ... reason=cancelled`). This is
+  the whole window in which the shell can still be spared the close, and — as
+  [limits.md](limits.md) records — the only shape the shell can reopen from after
+  that close's own gesture.
+- **Deferral.** Every other close already has its `Hide` in the shell's or the
+  bridge's hand: a keyboard close, a Start-button or click-away close (both
+  arrive as the bridge's retract request), or a gesture close whose tap already
+  fired. A pull that lands there is recorded, not admitted:
+  `reveal admit ... ok=1 reason=deferred`, no `Progress` write, no pull
+  generation, no cancel stamp, no mute, and `startedOpen = 0` while the close is
+  in flight, so a pull that starts above the band is adopted from its own down
+  point once it has travelled 24 DIP. The candidate is otherwise live: its
+  reports keep its travel, its end-speed window and its liveness clock, and the
+  close's landing releases it (`reveal defer released candidate=... down=...`).
+  The open then runs the ordinary path — a live takeover from its own down point
+  when the contact is still down, or the `RevealLateRelease` record when it
+  lifted first, whose `age` starts at the landing rather than the lift
+  (`readyQpc`), because the pull had to wait for the close it must not fight.
+  `ActivateRevealFollow` refuses while `CloseInFlight`, so no follow can write
+  `Progress` under a retract. That second writer was the flash, and whoever wrote
+  last decided whether a replay followed.
+
+A contact still on the glass when a close starts is muted instead (the mute is
+read from the contact latch and either gesture family before either owner is
+cleared), because that contact is the one the close interrupted, not the pull
+that opens the next menu.
+
+The close-contested ticket remains as the guard for an open whose panel the close
+did not take to the hidden rest: `win open continued from=... dur=...` settles
+from the live position instead of 0. The deferral normally prevents the follow
+that stamped it, so in the measured shapes no ticket is stamped and the guard
+stays silent. The close record that coordinates the tap with the explorer-side
 bridge is in [ipc.md](ipc.md).
 
-A close whose tap has already fired is not cancellable: the Hide belongs to the
-shell or to the bridge that is holding it, and the menu can go away under a pull
-that has taken the panel back. The reopen that follows is then the same pull
-coming back, not a new open. The follow marks the close contested when it
-activates inside the close's suppression window, and its commit release stamps a
-ticket that lasts one release (300 ms). The open consumes it and settles from
-the panel's live position (`win open continued from=... dur=...`) instead of the
-keyboard settle from 0, so one pull produces one motion up and the panel is never
-rewound to the bottom. A panel the close took all the way to the hidden rest has
-nothing to continue, and that open settles from 0 as it always did. The next
-close clears the ticket.
+Measured on this build (bottom auto-hidden bar, 852 DIP travel, a 10 ms strip
+capture of the panel's top edge at x 1900..2100 px): forty runs, ten per close
+kind, a pull at +24..+219 ms after the close, fast (512 DIP in 130 ms) and slow
+(512 DIP in 1200 ms). Every run ran one open path. Gesture kind: the cancel,
+the window never cloaks (the cloak watch records one `0` for the whole run) and
+the panel rises from 1511-1691 px to the 526 px rest with no reversal. Win key,
+Start button and click-away: `reason=deferred`, `win close observed`, the
+deferral released at the landing and `reveal takeover from=0.252` — the visible
+entry — then the panel rises from 1577-1690 px to 526 px; 28 of 30 runs had no
+reversal, and the two exceptions were one frame of 6 DIP at the end of a slow
+pull, where the shell's own presentation settles onto the finger. Every run had
+the top edge at the 526 px rest exactly 700 ms after the lift, and its `state
+open=1 progress=1.000 motion=0` line says the live position is at rest with no
+animation. The window's own bottom edge is 1704 px and the reopen's first
+detected frame is 1577-1690 px, one or two 10 ms frames into a rise that the log
+starts at the entry, so the panel enters at the edge and not part-way open. Four
+more runs released the pull after the landing but before the shell's open: the
+deferred record was consumed with `age=14-193` measured from the landing,
+`from=0.000` and one open path (`reveal adopt late`), with the same one-rise
+verdict and the 526 px rest.
 
 The other half is the state itself: a window that is uncloaked with the panel at
 the hidden rest is not an open menu, and no path leaves that pair standing. A
