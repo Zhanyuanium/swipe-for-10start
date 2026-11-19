@@ -71,22 +71,40 @@ Instead the mod takes over after the shell opens the window:
   menu appears under it (`reveal adopt ...`), continuing from the panel's live
   position at the finger. A tap has no travel and is not adopted; a contact
   that began on the open panel is a dismiss and never adopts.
-- When the menu opens under a contact, exactly one of three paths runs, in this
+- When the menu opens under a contact, exactly one of four paths runs, in this
   order:
 
   1. **Live takeover.** A contact still down that has travelled
      `kAdoptTravelDip` (24 DIP) along the opening axis takes the open over: a
      candidate is promoted at the open (`PromoteRevealContact`) instead of
      waiting for a report it may never get, and a contact with no candidate is
-     adopted (`reveal adopt ...`). Either way the follow starts from the
-     contact's own down point and logs `reveal takeover from=...`, the position
-     the takeover replaced. A tap, or a finger resting at the edge, has not
-     travelled 24 DIP and is not promoted.
+     adopted (`reveal adopt ...`). Either way the follow starts at the visible
+     edge and then chases the finger, and logs
+     `reveal takeover from=... offset=...`: `from` is the position the panel
+     shows at that instant — the visible entry while the shell's window was
+     cloaked, the live position if it was already above the entry — and `offset`
+     is the gap it inherited (`mapped_at_activation - from`). The entry is held
+     for the first presentation (`kRevealEntryHoldMs`, 30 ms), so the first
+     visible frame is the edge, and then each report moves the visible position
+     toward the absolute mapped position at `kSettleSpeedDipPerMs` (2.2 DIP/ms)
+     and never past it, so the panel closes the gap in `30 + gap / 2.2`
+     milliseconds (600 DIP in ~303 ms) and then stays glued; the
+     absolute mapping itself keeps measuring travel, the commit test, `max=` and
+     the end-speed window. A constant subtraction is not used: it left the panel
+     permanently short and unable to pass `1 - offset`. A
+     tap, or a finger resting at the edge, has not travelled 24 DIP and is not
+     promoted.
   2. **Late release.** No takeover ran and the pull already lifted: the
      `RevealLateRelease` record below carries it across the open. The record is
      read even when a new contact is already down, because that contact cannot
      be the pull that opened the menu and may be refused on its next report.
-  3. **Keyboard settle.** Neither ran, so the open plays from rest.
+  3. **Contested continuation.** This open follows a close whose `Hide` already
+     left under a pull that took the panel back: the settle starts from the
+     panel's live position, the close's own settle value, and not from 0
+     (`win open continued from=... dur=...`). The ticket is one commit release
+     old (300 ms) and a panel the close took to the hidden rest does not qualify.
+  4. **Keyboard settle.** None of the three preceded the open, so it plays from
+     rest.
 
   The suppression test is that actual takeover — `gestureOwnsProgress` is
   `g_reveal.active` — never the existence of a candidate, so a candidate the
@@ -123,7 +141,7 @@ Instead the mod takes over after the shell opens the window:
   cannot be the pull that opened the menu. An open that finds none runs the
   keyboard settle from rest as before.
 - Ten interleaved pulls — fast pull, lift, 200 ms, second touch at the edge —
-  split across the three paths: five consumed the record (`age=204-228`), two
+  split across the paths: five consumed the record (`age=204-228`), two
   promoted a live candidate, and none opened without an adopt, a late record or
   a takeover; no `remaining=0` no-op appeared.
 - A candidate that has not travelled 24 DIP does not own the open, so a tap on
@@ -140,30 +158,40 @@ Instead the mod takes over after the shell opens the window:
   line stays silent, so a tap is silent. Measured: a pull from 60 DIP inside the
   screen logged `travel=448`, and no keyboard settle played because the menu
   never opened under it.
-- Once the menu is open and the contact is still down, every report drives
-  `Progress` from the **absolute** finger position and the panel's trailing
-  edge:
+- Once the menu is open and the contact is still down, the trail mapping reads
+  the finger against the panel's trailing edge:
 
   ```
-  Progress = 1 - (finger - panelTrail) / (direction * distance)
+  mapped = 1 - (finger - panelTrail) / (direction * distance)
   ```
 
   The trailing edge is the panel side facing away from the taskbar — the one
   that meets the finger. How it is measured, and the band it is accepted
-  against, is in [geometry.md](geometry.md). With that anchor the panel edge
-  equals the finger: measured within 0.5 DIP residual at 150, 450 and 800 DIP
-  on the left taskbar, and within 5 DIP of the finger on the bottom.
+  against, is in [geometry.md](geometry.md). With that anchor, a panel that
+  tracks the finger meets it: measured within 0.5 DIP residual at 150, 450 and
+  800 DIP on the left taskbar, and within 5 DIP on the bottom. The follow starts
+  at the **visible entry** (`RevealEntryProgress`: the smallest progress whose
+  translated trail edge sits on the work area's edge, derived from `Distance`,
+  the measured trail and the work area, not a constant), not the off-screen rest,
+  holds it for the first presentation (30 ms), and then **chases** `mapped` at
+  `kSettleSpeedDipPerMs` (2.2 DIP/ms) without passing it, so the gap closes in
+  `30 + gap / 2.2` ms. A settle may start at 0
+  because it spends time crossing the hidden travel; a follow spends the finger's
+  travel, so it starts at the entry, and a constant subtraction is rejected
+  because it left the panel permanently short. The mapping keeps its other jobs
+  unchanged: travel, the commit test, `max=` and the speed window all read
+  `mapped`.
 - The takeover resets the end-speed window and then replays the contact's own
-  last eight positioned reports through the same trail mapping, so the release
-  seam reads one continuous series across the open. Without that replay a
-  takeover one or two reports before the lift left a window of one or two
-  samples, the answer was 0, and the panel started from rest while the finger
-  was still moving; auto-hide made it common, because the pull first reveals
-  the bar and the menu opens late. Measured on this build: a moving release
-  reports `vel=0.71-0.75` DIP/ms, and the same pull with auto-hide off reports
-  0.75 from the screen edge and 0.71 from 20 DIP in. A finger that rested
-  before the open repeats one value, so the window stays flat and the release
-  is `vel=0.00`.
+  last eight positioned reports through the same trail mapping, in mapped units:
+  the window is the finger's, and the chase deliberately moves at the planner's
+  rate instead of the finger's. Without that replay a takeover one or two reports
+  before the lift left a window of one or two samples, the answer was 0, and the
+  panel started from rest while the finger was still moving; auto-hide made it
+  common, because the pull first reveals the bar and the menu opens late.
+  Measured on this build: a moving release reports `vel=0.71-0.75` DIP/ms, and
+  the same pull with auto-hide off reports 0.75 from the screen edge and 0.71
+  from 20 DIP in. A finger that rested before the open repeats one value, so the
+  window stays flat and the release is `vel=0.00`.
 - A contact that starts inside the band while the menu is open is the tail of
   the pull that opened it, not a drag of the panel: once it has moved
   `kBandTailTravelDip` (8 DIP) away from the taskbar it starts no dismiss and
@@ -191,10 +219,17 @@ Instead the mod takes over after the shell opens the window:
   the end of that retract, so a short slow pull, or pulling out and pushing
   back, does not open the menu; the bridge passes that Hide at once because the
   `tapped` record says the panel is already gone. The settle starts at the
-  end-window component toward the target, not at that average: a short pull
-  that stopped before lifting settles from rest, and a pull-back whose last
-  move goes toward the taskbar is clamped to 0 for the same reason (the
-  `vel window` diagnostic shows that negative slope).
+  position the panel actually shows (`TakeProgressNow()`, the chased visible
+  value) and at the end-window component toward the target, not at that average:
+  a live takeover that held before lifting settles from wherever the chase had
+  reached (a held 512 DIP flick has already closed its gap, so `remaining` is the
+  last 112 DIP and the planner gives the 160 ms floor), a short pull that
+  stopped before lifting settles from rest, and a pull-back whose last move goes
+  toward the taskbar is clamped to 0 for the same reason (the `vel window`
+  diagnostic shows that negative slope).
+  The release line prints that visible progress and the offset it was rebased by
+  (`open follow ... progress=... offset=...`); `travel` and `max` stay the
+  finger's real motion.
 
 An earlier version anchored progress to the frame in which the menu was first
 seen open and used the root width as the distance; that lagged the finger by
@@ -213,6 +248,43 @@ too. Without that state the next report of the same contact dragged the panel
 back and its release settled the menu open over a close that was already
 running.
 
-A close exists once its settle starts, and a new edge pull during the retract
-cancels it before the shell is touched. The close record that coordinates this
-with the explorer-side bridge is in [ipc.md](ipc.md).
+A close exists once its settle starts. A contact that lands during the retract
+cancels it before the shell is touched: the armed tap is dropped on that first
+report, whatever its point (a pull whose first point misses the band never
+reaches the candidate path, so the deadline check alone missed it), and the
+panel the close had already retracted is brought back from its live position,
+because a menu left open at `Progress` 0 has no pane. The contact records
+`startedOpen = 0` while the close is in flight, so a pull that starts above the
+band is adopted from its own down point once it has travelled 24 DIP instead of
+staying inert. The close record that coordinates this with the explorer-side
+bridge is in [ipc.md](ipc.md).
+
+A close whose tap has already fired is not cancellable: the Hide belongs to the
+shell or to the bridge that is holding it, and the menu can go away under a pull
+that has taken the panel back. The reopen that follows is then the same pull
+coming back, not a new open. The follow marks the close contested when it
+activates inside the close's suppression window, and its commit release stamps a
+ticket that lasts one release (300 ms). The open consumes it and settles from
+the panel's live position (`win open continued from=... dur=...`) instead of the
+keyboard settle from 0, so one pull produces one motion up and the panel is never
+rewound to the bottom. A panel the close took all the way to the hidden rest has
+nothing to continue, and that open settles from 0 as it always did. The next
+close clears the ticket.
+
+The other half is the state itself: a window that is uncloaked with the panel at
+the hidden rest is not an open menu, and no path leaves that pair standing. A
+close whose `Hide` landed, or a reopen whose settle never ran, shows the window
+with `Progress` 0: nothing of the menu is on screen, every pull is refused
+`reason=open` (the window is shown) and muted as a band tail, and the menu stays
+dead until a press on the panel runs a dismiss cancel. The visibility poll owns
+the pair. Once the close's suppression has ended and no settle, coast, follow or
+dismiss drag moves the panel, it logs `win open unhealed progress=...` and
+settles the panel up from its live position. The band admission applies the same
+reading: `reason=open` refuses only a panel at rest, and a pull that lands on the
+shown window with the panel low is admitted as the reveal (`reason=unhealed`), so
+repeated pulls cannot all be muted. The poll reads the live position with
+`PeekProgressNow`, never `TakeProgressNow`, because it is also where the
+late-release settle starts; taking that settle at its first millisecond pins the
+hidden rest (measured: `progress take settle at=0.000 elapsed=0
+caller=contested` right after `reveal adopt late`), which is exactly how the dead
+state was made.

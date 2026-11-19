@@ -47,7 +47,34 @@ report, pinned by the next report or ended by the release), pins that value as
 the new base and clears the record. The value written as an animation's base is
 the **target**, so while that animation runs nothing may read it as a position:
 every interruption — retract, dismiss cancel, reveal takeover and drag
-takeover — starts from the owner's answer.
+takeover — starts from the owner's answer. `TakeVisibleProgressNow()` wraps it
+for the settles that start while the shell's window may still be cloaked: the
+recorded base of a process that has not shown the panel yet is the open rest (1),
+and a hidden panel's only visible value for a settle is the off-screen rest, so
+that sentinel answers 0. It is the settle rule; the live follow starts at
+`RevealEntryProgress` instead and then chases its target (below), because a
+follow must not spend the finger's travel on the hidden part of the motion.
+
+A live takeover is the one interruption whose start is not a motion the panel
+ever showed: the shell uncloaks the window 60-250 ms into the pull, so the
+finger's absolute mapped position is 0.76-1.00. `ActivateRevealFollow` starts the
+panel at the **visible entry** — `RevealEntryProgress`, the smallest progress
+whose translated trail edge sits on the work area's edge), holds it for the first
+presentation (`kRevealEntryHoldMs`, 30 ms) so the first visible frame is exactly
+the screen edge, and from there each report moves the visible position toward
+the absolute mapped position at `kSettleSpeedDipPerMs`
+(2.2 DIP/ms, the planner's own speed) without passing it:
+`visible += clamp(mapped - visible, -2.2*dt/Distance, +2.2*dt/Distance)`. The
+entry rather than 0 matters because this is a follow: a settle spends time
+crossing the hidden travel, but a follow would spend the finger's travel, and at
+0 the panel sat one hidden travel behind the finger for the whole gesture. The chase rather than a constant subtraction matters because a
+constant left the panel permanently short (0.25-0.27 visible at 450-560 DIP of
+finger travel): with the chase the gap closes in `gap / 2.2` ms — 600 DIP in
+~303 ms, 100 DIP in ~75 ms, the 30 ms entry hold included — and the panel then
+stays glued to a finger that moves at 0.5-5 DIP/ms. The release settle starts from `TakeProgressNow()` — the
+chased position at that instant — at the measured end speed, so a held 512 DIP
+flick has already closed its gap and plans the 160 ms floor, while a fast flick
+released mid-catch-up plans whatever travel is still left.
 
 ## The two shipped parameter sets
 
@@ -96,13 +123,14 @@ style does.
 
 The reveal seeds that window at its takeover. `ActivateRevealFollow` resets it
 and replays the contact's own last eight positioned reports through the same
-trail mapping before the first insert, so a menu that opens one or two reports
-before the lift still measures the finger. Without the replay the window held
-one or two samples, the answer was 0, and the panel started from rest under a
-moving finger; auto-hide made that common, because the pull reveals the bar
-before the menu opens. Measured on this build: a moving release reports
-`vel=0.71-0.75` DIP/ms, and a finger that rested before the open still reports
-`vel=0.00`.
+trail mapping, in mapped units: the window belongs to the finger, and the chase
+moves at the planner's rate instead of the finger's, so the two must not be
+mixed. A menu that opens one or two reports before the lift still measures the
+finger. Without the replay the window held one or two samples, the answer was 0,
+and the panel started from rest under a moving finger; auto-hide made that
+common, because the pull reveals the bar before the menu opens. Measured on this
+build: a moving release reports `vel=0.71-0.75` DIP/ms, and a finger that rested
+before the open still reports `vel=0.00`.
 
 The same replay measures a pull that lifts before the menu opens, and the
 closed→open path starts its settle at the speed that record measured: the
@@ -110,15 +138,24 @@ release measured it at the lift, over the same 8-30 ms window from the
 same reports, so the freshness and span checks are the ones already described.
 The position is the other half and it is not taken from the record: no animation
 runs through the cloak, so the panel is still at the off-screen rest when the
-window is presented, and `TakeProgressNow()` is where the settle starts — the
-record's mapped position describes a panel that was never on screen. Starting
-there made the first presented frame 82 % open.
-Measured: ten fast pulls the shell opened 223-256 ms after the lift all started
-at `vel=4.00-4.48` DIP/ms, and a short slow one at `vel=0.30`, so the seam is
-the finger's even when the menu arrives a quarter of a second later. The open
-runs exactly one of three paths — live takeover, this record, keyboard settle —
-so no open plays two animations or none. The window and what clears the record
-are in [gesture.md](gesture.md).
+window is presented, and `TakeVisibleProgressNow()` is where the settle starts —
+the record's mapped position describes a panel that was never on screen. Starting
+there made the first presented frame 82 % open. That settle and the live follow
+differ on purpose: the settle has no finger and spends time crossing the hidden
+travel, while the follow starts at the visible entry and spends the finger's
+travel chasing the mapped position. Measured: ten fast pulls the shell opened
+223-256 ms after the lift all started at `vel=4.00-4.48` DIP/ms, and a short slow
+one at `vel=0.30`, so the seam is the finger's even when the menu arrives a
+quarter of a second later. The open runs exactly one of four paths — live
+takeover, this record, the contested continuation of a close whose Hide already
+left, keyboard settle — so no open plays two animations or none. The fourth path
+exists because a close's `Hide` cannot be cancelled: a pull that took the panel
+back during the close leaves a ticket at its commit release, and the reopen
+settles from the panel's live position (`win open continued from=... dur=...`)
+instead of starting the keyboard settle at 0, which would rewind a panel that was
+already up. A ticket whose panel the close took to the hidden rest does not
+qualify and settles from 0. The window
+and what clears the record are in [gesture.md](gesture.md).
 
 A release that is moving away from its target is honestly 0. The component is
 projected onto the settle direction and clamped at 0 (`TowardTarget`), so a
