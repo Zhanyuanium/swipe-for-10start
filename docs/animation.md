@@ -76,6 +76,15 @@ chased position at that instant — at the measured end speed, so a held 512 DIP
 flick has already closed its gap and plans the 160 ms floor, while a fast flick
 released mid-catch-up plans whatever travel is still left.
 
+One owner is also a close's rule, not only a gesture's: while `CloseInFlight` is
+true no path may take or write `Progress` (`ActivateRevealFollow` refuses, the
+coast and every settle are skipped, the poll starts no open), and the position
+the close's own retract reaches is the one the next open continues from. A pull
+that lands in that window is deferred and writes nothing, so the retract's curve
+is never interrupted by a second writer. Measured over forty close-then-pull
+runs: one open path each, and the panel's top at the 526 px rest exactly 700 ms
+after the lift.
+
 ## The two shipped parameter sets
 
 Two parameter sets ship, chosen by the **Menu animation style** setting
@@ -146,15 +155,18 @@ travel, while the follow starts at the visible entry and spends the finger's
 travel chasing the mapped position. Measured: ten fast pulls the shell opened
 223-256 ms after the lift all started at `vel=4.00-4.48` DIP/ms, and a short slow
 one at `vel=0.30`, so the seam is the finger's even when the menu arrives a
-quarter of a second later. The open runs exactly one of four paths — live
-takeover, this record, the contested continuation of a close whose Hide already
-left, keyboard settle — so no open plays two animations or none. The fourth path
-exists because a close's `Hide` cannot be cancelled: a pull that took the panel
-back during the close leaves a ticket at its commit release, and the reopen
-settles from the panel's live position (`win open continued from=... dur=...`)
-instead of starting the keyboard settle at 0, which would rewind a panel that was
-already up. A ticket whose panel the close took to the hidden rest does not
-qualify and settles from 0. The window
+quarter of a second later. The open runs exactly one of four paths — live takeover, this record, the
+contested continuation of a close whose Hide already left, keyboard settle — so
+no open plays two animations or none. A pull that lands during a close does not
+take `Progress` at all: it is deferred (its candidate keeps its travel, its speed
+window and its record, and writes nothing) until the window is observed cloaked,
+and only then does one of those paths run, from the position the panel has at
+that instant. That is what keeps one owner: with the deferral in place a follow
+never activates inside a close, so the ticket the contested continuation reads is
+not stamped in the measured shapes and the path stays a guard for an open whose
+panel the close did not take to the hidden rest (`win open continued from=...
+dur=...`). Starting the keyboard settle at 0 over a panel that is already up was
+the rewind that guard exists to prevent. The window
 and what clears the record are in [gesture.md](gesture.md).
 
 A release that is moving away from its target is honestly 0. The component is
@@ -172,8 +184,13 @@ build.
 The keyboard path runs the same settle: a closed→open transition that no
 gesture owns calls `BeginGestureSettle(0, 1, 0)`, the gesture open from rest,
 so a Win-key open logs `settle style=... dir=open vel=0.00 dur=...` and then
-`win open dur=...`. One curve serves every open and every close, and the
-travel plans the keyboard open's duration exactly as it does a gesture's:
+`win open dur=...`. An open the shell performs while a close this mod started was
+still in flight is the one exception to "from rest": it logs
+`win open during close progress=...` for the state it found, drops the
+suppression, and settles from the panel's live position
+(`win open during close from=... dur=...`), so the retract's last frame is
+continued instead of replayed. One curve serves every open and every close, and
+the travel plans the keyboard open's duration exactly as it does a gesture's:
 520 ms at the 1440 DIP travel of this layout, 409 ms for the 900 DIP panel.
 `AnimationStyle` applies to it unchanged; `GestureStartSpeedPercent` has no
 finger speed to scale, so the keyboard open always starts from rest. A Win

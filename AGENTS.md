@@ -13,7 +13,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 
-Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.34.0) runs in
+Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.35.0) runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
 every XAML/DirectManipulation source on this UI is empty (see docs/input.md). The
 tracked contact is named by the HID Contact Identifier (`0x0D/0x51`) when the
@@ -51,9 +51,10 @@ one. The open runs exactly one of four paths, in this order: a live takeover (a
 contact still down that has travelled `kAdoptTravelDip`, 24 DIP — a candidate
 promoted at the open instead of waiting for a report it may never get, or a
 contact with none adopted, both from their own down point), the late release
-record below, the contested continuation of a close whose Hide already left
-(the settle starts where the pull had the panel, not at 0), or the keyboard
-settle. A tap or a finger resting at the edge has
+record below, the guarded continuation of a close whose Hide already left with
+the panel above the hidden rest (the settle starts where the pull had the panel,
+not at 0; the deferral below normally replaces it, because no follow activates
+inside a close), or the keyboard settle. A tap or a finger resting at the edge has
 not travelled 24 DIP and is not promoted. `gestureOwnsProgress` is
 `g_reveal.active`, that takeover itself and never a candidate, so a candidate the
 open never reaches cannot take the animation away. A live takeover starts at the
@@ -153,21 +154,30 @@ attempts. A gesture close then taps `VK_LWIN` at the end of that settle: the
 shell's own key handler performs the hide, so the Start toggle stays in step and
 no re-arm tap exists. A keyboard close instead has the bridge hold
 `CStartExperienceManager::Hide` for the settle the Start side answers with. A
-new pull during the settle drops the tap before the shell is touched: the drop
-runs on the contact's first report whatever its point (a pull whose first point
-misses the band never reaches the candidate path), and the close's retracted
-panel is brought back from its live position because a menu left open at
-`Progress` 0 has no pane. The same contact also records `startedOpen = 0` while
-`g_suppressRestoreUntil` is ahead, so a pull that starts above the band is
-adopted from its own down point instead of staying inert. A close whose tap has
-already fired is not cancellable: the Hide is in the shell's or the bridge's
-hand, and the reopen that follows is that pull coming back, not a new open. The
-follow marks the close contested when it activates inside the suppression window
-and the commit release stamps a one-release, 300 ms ticket; the open consumes it
-and settles from the panel's live position (`win open continued from=...
-dur=...`) instead of the keyboard settle from 0, so one pull produces one motion
-up. A panel the close took to the hidden rest has nothing to continue and
-settles from 0 as before. A shown window whose panel sits off it is the one
+close owns `Progress` until the window is observed cloaked (`CloseInFlight`), and
+one rule decides every pull that lands in that window. A gesture close's tap is
+still this mod's own: the contact's first report drops it before the shell is
+touched, whatever its point (a pull whose first point misses the band never
+reaches the candidate path), the suppression ends with the drop, and the close's
+retracted panel is brought back from its live position because a menu left open
+at `Progress` 0 has no pane (`reveal admit ... reason=cancelled`). Every other
+close already has its Hide in the shell's or the bridge's hand (a keyboard close,
+a Start-button or click-away close, or a gesture close whose tap already fired),
+so a pull there is deferred: `reason=deferred`, no `Progress` write, no pull
+generation, no cancel stamp, no mute, `startedOpen = 0` while the suppression is
+ahead (a pull above the band is adopted from its own down point), tracked with
+its travel and end-speed window, released at the landing (`reveal defer released
+candidate=... down=...`) and served by the open's live takeover or by its
+`RevealLateRelease` record, whose age starts at the landing. That two-owner shape
+— a follow writing `Progress` under the retract — was the flash, and whoever
+wrote last decided whether a replay followed. The contested ticket remains as a
+guard for an open whose panel the close left above the hidden rest
+(`win open continued from=... dur=...`); with the deferral no follow activates
+inside a close, so no ticket is stamped in the measured shapes. A pull that lifts
+before the landing, and a Win or Start press during the retract, are shell-side
+limits: the shell drops the press and cancels a contact-less Show
+(`hide reason=7`), so the menu stays closed; the same press 120 ms after the
+landing opens it with one `win open dur=409`. A shown window whose panel sits off it is the one
 state no path may leave standing: a close whose `Hide` landed, or a reopen whose
 settle never ran, leaves the window uncloaked with `Progress` 0, so nothing of
 the menu is on screen while every pull is refused `reason=open` and muted as a

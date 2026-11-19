@@ -90,23 +90,41 @@
   reused XAML root means no new `PrepareRootElement` and no renderer: a new
   contact is tracked but cannot drive the panel until the host restarts. The
   restart in the install instructions is the workaround, not just advice.
-- A gesture close is a real Windows tap at the end of its retract: the shell's key
-  handler performs the hide and updates its Start toggle. A Win press during the
-  retract closes the menu early — the plan is current, so the bridge gives that
-  Hide the keyboard lead — and the Start side drops the armed tap when the
-  request arrives. A press just after that hide lands in the shell's own settle
-  and is ignored; the toggle is not advanced, and the next press opens the menu.
-  A press 50 ms after the menu reports closed opens it and animates the panel in.
-  A contact that lands during the retract drops the tap on its first report and
-  brings the panel back from its live position, so that close never hides the
-  menu. A close whose tap already fired cannot be recalled: the shell or the
-  bridge holds the Hide, and no API in this design can withdraw it (returning
-  `S_OK` from the bridge without calling the original broke the Start toggle).
-  The reopen that follows such a close continues the panel from its live
-  position, but the shell's own show request still presents the window: the
-  measurement `anim=0` proves the request is the step that draws the pane, so the
-  mod does not drop it. The user therefore sees the menu hide once and come back
-  at the position the pull had reached, never a second settle from 0.
+- A close is only cancellable while its `Hide` is still this mod's. A gesture
+  close arms one Windows tap at the end of its retract; a contact that lands
+  before it runs drops the tap on its first report, so that close never hides the
+  menu and the panel comes back from its live position (`reveal admit ...
+  reason=cancelled`), one owner and one motion. A Win press during that retract
+  closes the menu early instead — the plan is current, so the bridge gives that
+  Hide the keyboard lead, and the Start side drops the armed tap when the request
+  arrives — and the shell's own gesture then will not reopen it: measured, the
+  shell issued `show` after the hide and hid again 194 ms later (`hide
+  reason=7`) with the finger still down, so a pull that begins after that tap
+  leaves the menu closed. Nothing in this design can withdraw a `Hide` the shell
+  or the bridge already holds (returning `S_OK` from the bridge without calling
+  the original broke the Start toggle).
+- A Windows-key or Start-button open during a close's retract does not reach the
+  shell while the shell's held Hide is in flight: the press is dropped, no `show`
+  line appears and the window never uncloaks (measured at +40/+150/+250/+300/
+  +320/+340/+360/+380 ms after the close, for all three close kinds). The
+  boundary is the Hide's completion, the answered retract plus the bridge's 30 ms
+  margin (439 ms here): a press at +400 opens the menu with one
+  `win open dur=409` from rest and one rise to the 526 px rest, its
+  press-to-first-visible-frame delay 38-191 ms; a press at +600 shows in 38 ms.
+  After the landing the auto-hidden bar is gone within ~240 ms, so a Start-button
+  press later than that finds no button to press until the bar is hovered up
+  again. The shell's own
+  transition is the gate, not this mod: the Start side has nothing to react to,
+  and the bridge sees neither `show` nor `hide` for the dropped press. The
+  `show` request is also the step that draws the pane (`anim=0` measurement), so
+  the mod does not drop it.
+- A pull that lifts before the close lands is not served, for the same reason:
+  the shell starts its edge gesture only after the `Hide`, finds no contact,
+  issues `show` and cancels it 17 ms later (`hide reason=7`), and the menu stays
+  closed. The deferral still records it (`reveal defer released candidate=0
+  down=0`) and its `RevealLateRelease` record is ready at the landing, but no open
+  arrives to consume it. A pull still down at the landing opens the menu — the
+  shape the owner reported, and the one the deferral serves.
 - A shown window with the panel at the hidden rest is not a menu, and it was
   reachable: the visibility poll read the live position with the taking reader
   (`TakeProgressNow`) after it had just started the late-release settle, so the
@@ -179,6 +197,19 @@
   release removes. A very fast flick released before the chase finishes hands the
   settle a shorter remaining travel, which is correct: the settle plans what is
   still off its target, not the gap the finger skipped.
+- A click on the taskbar consumes the shell's edge-gesture session, so the pull
+  that follows it right away opens nothing at all. Measured: one click on the
+  bar, then three pulls — each was admitted (`reveal admit ... reason=admitted`)
+  and released with `reveal candidate released unopened travel=447/452/438`, and
+  nothing followed: no `reveal adopt late`, no `win open`, no `justOpened`. The
+  fourth pull opened normally. Nothing is left stuck on this side (a later pull
+  writes its own record, and an unconsumed one expires in 300 ms), so the menu is
+  missing because the shell never performed the open. The bar click does not need
+  to be inside the reveal band for this: it happens with the bar at the bottom,
+  and with a top or side bar — where the bar itself lies inside the band and the
+  click is admitted as a band candidate (`reveal admit x=... y=31 band=0,96`) —
+  the outcome is the same. Pull again, or wait about a second, after clicking the
+  taskbar.
 - The root hook is gated, not opportunistic: the file version of `StartUI_.dll`
   must be exactly `10.0.22621.3733` **and** the target prologue plus its `E8`
   call target must match. Anything else logs one line
