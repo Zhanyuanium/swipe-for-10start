@@ -130,7 +130,7 @@ top one — the allowance a fling needs); otherwise the press is rejected with
 naming the region that took the drag. Measured on the tiles:
 `vo=87 sh=98 region=TileListView` kept the menu open, and the same contact
 became the dismiss once they reached their end (`commit=1`,
-`close tap kind=dismiss`); the app list behaves as before, and a press in the
+`close dismiss kind=dismiss`); the app list behaves as before, and a press in the
 panel margin dismisses with no deferral. The rejection starts no session, so
 the contact latch is untouched and the next down starts from a clean state.
 
@@ -184,14 +184,14 @@ deferred there rather than dismissed.
 
 ## Measured layouts
 
-The current layout has the Windows 11 taskbar auto-hidden at the bottom:
-`dismiss axis=3`, `Distance` 900, panel rect `236,289..1229,840` on the host
-that logged it, so the trail is the panel's top edge — about 277-289 DIP on
-this layout, 277 on one host and 289 on another — and the band it is tested
-against is `804..900` (`reveal panelTrail=289 axis=3 ... band=804,900 gen=3`).
-The band is the same while the bar is hidden, because the probe reads the dock
-record and the window's own thickness: the dock rect `0,1704,2880,1800` and
-the hidden window `0,1798,2880,1894` are both 96 px across, which is 48 DIP.
+The current layout is **docked** (auto-hide off): `dismiss axis=3`, `Distance`
+900, work `0,0,1440,852`, tray `0,852..1440,900`, panel
+`236,265..1229,840`, so the trail is the panel's top edge at **265 DIP** and the
+band it is tested against is `804..900` (`reveal panelTrail=265 axis=3 ...
+work=0,0,1440,852 band=804,900`). The bar is always visible; the tray window is
+48 DIP thick at the bottom edge. The earlier auto-hidden layout (work
+`0,0,1440,900`, panel `236,167..1229,840`, trail 167, hidden window at
+`0,1798,2880,1894`) is historical and its numbers are not these.
 
 The survey on this layout measured two regions: the app list
 (`AllAppsGridListView`, `sh=4065`) and the tile grid's internal viewer

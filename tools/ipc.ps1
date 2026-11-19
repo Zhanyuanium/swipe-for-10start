@@ -35,9 +35,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_v2_State'
-$CommandEventName = 'Local\SwipeFor10Start_v2_Cmd'
-$CommandMutexName = 'Local\SwipeFor10Start_v2_CmdWrite'
+$StateName = 'Local\SwipeFor10Start_v4_State'
+$CommandEventName = 'Local\SwipeFor10Start_v4_Cmd'
+$CommandMutexName = 'Local\SwipeFor10Start_v4_CmdWrite'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -60,11 +60,41 @@ $OffsetRetractRequestDeadline = 600
 $OffsetRetractPlanSeq = 608
 $OffsetRetractPlanRequest = 616
 $OffsetRetractCancelSeq = 624
-$OffsetOpenSeq = 632
-$OffsetOpenTick = 640
-$OffsetInitState = 648
-$OffsetLayoutBytes = 652
-$StateBytes = 672
+$OffsetOpenSeq = 536
+$OffsetOpenTick = 544
+$OffsetInitState = 552
+$OffsetLayoutBytes = 556
+$OffsetIntentSeq = 568
+$OffsetIntentTick = 576
+$OffsetIntentKind = 584
+$OffsetIntentTrigger = 588
+$OffsetIntentMethod = 592
+$OffsetIntentFlags = 596
+$OffsetIntentOpen = 600
+$OffsetIntentAckSeq = 608
+$OffsetIntentAckFor = 616
+$OffsetIntentAckState = 624
+$OffsetIntentAckDuration = 628
+$OffsetIntentAckEntry = 632
+$OffsetIntentAckHr = 636
+$OffsetExecSeq = 640
+$OffsetExecTick = 648
+$OffsetExecKind = 656
+$OffsetExecMethod = 660
+$OffsetExecFlags = 664
+$OffsetExecExecuteAt = 672
+$OffsetExecOpen = 680
+$OffsetExecTarget = 688
+$OffsetExecAckSeq = 696
+$OffsetExecAckFor = 704
+$OffsetExecAckState = 712
+$OffsetExecAckHr = 716
+$OffsetExecAckVisible = 720
+$OffsetControllerOwning = 724
+$OffsetControllerOpen = 728
+$OffsetControllerPhase = 736
+$OffsetControllerTouch = 740
+$StateBytes = 744
 
 function Open-State {
     try {
@@ -115,12 +145,12 @@ if ($State) {
         $version = $view.ReadUInt32($OffsetVersion)
         $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
         $initState = $view.ReadInt32($OffsetInitState)
-        if ($initState -ne 2 -or $magic -ne 0x53313053 -or $version -ne 2 -or
+        if ($initState -ne 2 -or $magic -ne 0x53313053 -or $version -ne 4 -or
             $layoutBytes -ne $StateBytes) {
             $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
                        'initState={3}') -f $magic, $version, $layoutBytes,
                        $initState
-            throw ("The section '$StateName' is not a ready v2 layout this " +
+            throw ("The section '$StateName' is not a ready v3 layout this " +
                    "tool reads: $detail. Nothing was printed.")
         }
 
@@ -137,30 +167,44 @@ if ($State) {
                 tick = $view.ReadInt64($OffsetCmdTick)
             }
         }
-        $close = Read-Record $view $OffsetCloseSeq {
-            [pscustomobject]@{
-                tick   = $view.ReadInt64($OffsetCloseTick)
-                kind   = $view.ReadInt32($OffsetCloseKind)
-                delay  = $view.ReadInt32($OffsetCloseDelayMs)
-                tapped = $view.ReadInt32($OffsetCloseTapped)
-                pull   = $view.ReadInt32($OffsetClosePull)
-            }
-        }
-        $retractRequest = Read-Record $view $OffsetRetractRequestSeq {
-            [pscustomobject]@{
-                tick     = $view.ReadInt64($OffsetRetractRequestTick)
-                open     = $view.ReadInt64($OffsetRetractRequestOpen)
-                deadline = $view.ReadInt64($OffsetRetractRequestDeadline)
-            }
-        }
-        $plan = Read-Record $view $OffsetRetractPlanSeq {
-            [pscustomobject]@{
-                ms      = $view.ReadInt32($OffsetRetractPlanMs)
-                request = $view.ReadInt64($OffsetRetractPlanRequest)
-            }
-        }
         $open = Read-Record $view $OffsetOpenSeq {
             $view.ReadInt64($OffsetOpenTick)
+        }
+        $intent = Read-Record $view $OffsetIntentSeq {
+            [pscustomobject]@{
+                kind    = $view.ReadInt32($OffsetIntentKind)
+                trigger = $view.ReadInt32($OffsetIntentTrigger)
+                method  = $view.ReadInt32($OffsetIntentMethod)
+                flags   = $view.ReadInt32($OffsetIntentFlags)
+                open    = $view.ReadInt64($OffsetIntentOpen)
+            }
+        }
+        $intentAck = Read-Record $view $OffsetIntentAckSeq {
+            [pscustomobject]@{
+                for      = $view.ReadInt64($OffsetIntentAckFor)
+                state    = $view.ReadInt32($OffsetIntentAckState)
+                duration = $view.ReadInt32($OffsetIntentAckDuration)
+                entry    = $view.ReadInt32($OffsetIntentAckEntry)
+                hr       = $view.ReadInt32($OffsetIntentAckHr)
+            }
+        }
+        $exec = Read-Record $view $OffsetExecSeq {
+            [pscustomobject]@{
+                kind      = $view.ReadInt32($OffsetExecKind)
+                method    = $view.ReadInt32($OffsetExecMethod)
+                flags     = $view.ReadInt32($OffsetExecFlags)
+                executeAt = $view.ReadInt64($OffsetExecExecuteAt)
+                open      = $view.ReadInt64($OffsetExecOpen)
+                target    = $view.ReadInt64($OffsetExecTarget)
+            }
+        }
+        $execAck = Read-Record $view $OffsetExecAckSeq {
+            [pscustomobject]@{
+                command = $view.ReadInt64($OffsetExecAckFor)
+                state   = $view.ReadInt32($OffsetExecAckState)
+                hr      = $view.ReadInt32($OffsetExecAckHr)
+                visible = $view.ReadInt32($OffsetExecAckVisible)
+            }
         }
 
         [pscustomobject]@{
@@ -171,15 +215,20 @@ if ($State) {
             cmdSeq     = $(if ($cmd) { $cmd.Seq } else { 'unstable' })
             cmdText    = $(if ($cmd) { $cmd.Value.text } else { 'unstable' })
             cmdTick    = $(if ($cmd) { $cmd.Value.tick } else { 'unstable' })
-            closeSeq   = $(if ($close) { $close.Seq } else { 'unstable' })
-            close      = $(if ($close) { "kind=$($close.Value.kind) tapped=$($close.Value.tapped) pull=$($close.Value.pull) delay=$($close.Value.delay) tick=$($close.Value.tick)" } else { 'unstable' })
-            retractRequestSeq      = $(if ($retractRequest) { $retractRequest.Seq } else { 'unstable' })
-            retractRequest         = $(if ($retractRequest) { "open=$($retractRequest.Value.open) tick=$($retractRequest.Value.tick) deadline=$($retractRequest.Value.deadline)" } else { 'unstable' })
-            retractPlanSeq         = $(if ($plan) { $plan.Seq } else { 'unstable' })
-            retractPlan            = $(if ($plan) { "ms=$($plan.Value.ms) request=$($plan.Value.request)" } else { 'unstable' })
-            retractCancelSeq     = $view.ReadInt64($OffsetRetractCancelSeq)
             openSeq    = $(if ($open) { $open.Seq } else { 'unstable' })
             openTick   = $(if ($open) { $open.Value } else { 'unstable' })
+            intentSeq  = $(if ($intent) { $intent.Seq } else { 'unstable' })
+            intent     = $(if ($intent) { "kind=$($intent.Value.kind) trigger=$($intent.Value.trigger) method=$($intent.Value.method) flags=$($intent.Value.flags) open=$($intent.Value.open)" } else { 'unstable' })
+            intentAckSeq = $(if ($intentAck) { $intentAck.Seq } else { 'unstable' })
+            intentAck  = $(if ($intentAck) { "for=$($intentAck.Value.for) state=$($intentAck.Value.state) duration=$($intentAck.Value.duration) entry=$($intentAck.Value.entry) hr=$($intentAck.Value.hr)" } else { 'unstable' })
+            execSeq    = $(if ($exec) { $exec.Seq } else { 'unstable' })
+            exec       = $(if ($exec) { "kind=$($exec.Value.kind) method=$($exec.Value.method) flags=$($exec.Value.flags) executeAt=$($exec.Value.executeAt) open=$($exec.Value.open) target=$($exec.Value.target)" } else { 'unstable' })
+            execAckSeq = $(if ($execAck) { $execAck.Seq } else { 'unstable' })
+            execAck    = $(if ($execAck) { "command=$($execAck.Value.command) state=$($execAck.Value.state) hr=$($execAck.Value.hr) visible=$($execAck.Value.visible)" } else { 'unstable' })
+            controllerOwning = $view.ReadInt32($OffsetControllerOwning)
+            controllerOpen   = $view.ReadInt64($OffsetControllerOpen)
+            controllerPhase  = $view.ReadInt32($OffsetControllerPhase)
+            controllerTouch  = $view.ReadInt32($OffsetControllerTouch)
         } | Format-List
         $view.Dispose()
     } finally {
@@ -243,7 +292,7 @@ try {
             throw ("The section '$StateName' is not ready " +
                    "(initState=$initState); nothing was sent.")
         }
-        if ($magic -ne 0x53313053 -or $version -ne 2 -or
+        if ($magic -ne 0x53313053 -or $version -ne 4 -or
             $layoutBytes -ne $StateBytes) {
             $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
                        'initState={3}') -f $magic, $version, $layoutBytes,

@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Decides the shell's Start close from explorer and publishes the live Win10 Start edge-gesture handle and state
-// @version         0.17.0
+// @version         0.20.0
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
@@ -16,75 +16,54 @@
 Explorer-side half of the touch-swipe bridge for the ExplorerPatcher legacy
 Windows 10 Start menu.
 
-The mod calls no hide of its own and presses no key. Where the shell decides to
-close the Start menu, this mod decides whether that close may happen now, must
-wait for the panel's retract, or must not happen at all, and it asks the Start
-side which one applies. The Start side owns both closes: a keyboard close is the
-user's Windows tap, a gesture close is a Windows tap it sends at the end of its
-retract.
+The mod owns the Start toggle on the explorer side. It keeps its own open
+boolean, re-reads the window's cloak (`IsStartWindowVisible`) before every
+decision, and calls the shell's own primitives — `XamlLauncher::ShowStartView`
+to open, `XamlLauncher::Dismiss` to close — so the shell keeps every visual and
+state transition. Nothing here writes the launcher's state.
 
-The decision point is `twinui.pcshell.dll`
-`XamlLauncherState::HideStartAndCortana(this, method)` (RVA `0x24BCB0` on
-10.0.26100.9949), one frame above the `CStartExperienceManager::Hide` this mod
-used to hold. All three shell closes enter it: the Windows key (`Dismiss(1)` ->
-`HideStartAndCortana(1)`), the taskbar Start button (`Dismiss(7)`, once
-measured 6), and the click-away, which enters `HideStartAndCortana(7)` directly
-through a delegate. It is also the one point where skipping the call equals "the
-user never asked": the launcher's state (5 = open) is written by this function
-and completed by the view's `Hidden` event, while `CStartExperienceManager::Hide`
-writes no state at all. Holding `Hide` therefore stranded the state at 9 and
-left the Windows key dead for the rest of the menu; holding here keeps it at 5
-for the whole hold, and cancelling here leaves it at 5 with no compensation.
+The triggers and their entries:
 
-What the hook does, per dismiss method:
+- The Windows key and the shell hook enter `XamlLauncher::OnHotkeyInvoke`
+  (RVA `0x14195C`): the launcher is `self + 0x18`. A bare press toggles through
+  the decision. A press with Shift/Ctrl/Alt held is a combination: with the menu
+  open it is forwarded as an external takeover and never animates, with the menu
+  closed it is swallowed and never opens Start. This is a hard gate; the Start
+  side's own gesture tap is recognised first from its `tapped` close record and
+  passed through.
+- The taskbar Start button does **not** call `XamlLauncher::OnStartButtonPressed`
+  on this build, although that hook is installed and probed. It calls
+  `ShowStartView` / `Dismiss` directly (the open arrives with show method 16 or
+  11, the close with dismiss method 6). Those two primitives are hooked, and a
+  call this mod did not make is logged as `own decide trigger=foreign ...`.
+- A click outside enters `XamlLauncherState`'s dismiss handler
+  (`0x24FC50` on this build) and calls `HideStartAndCortana(7)` directly; an
+  older delegate (`0x4916D0`) does the same. Both are closes of ours and animate.
+- `DismissSynchronouslyWithoutTransition` (lock, display change) and any caller
+  this build does not recognise pass through at once, with only a cloak resync.
+  A lock is never delayed. Win+Tab enters as method 5 and passes the same way.
 
-- A close the Start side's own Windows tap causes is passed through at once
-  (`close passed method=... reason=gesture`). The tapped close record is read
-  exactly as before: fresh within 800 ms, not older than the newest open
-  generation, not already consumed.
-- Method 7 is the synchronous dismiss: display changes and the lock screen call
-  `DismissSynchronouslyWithoutTransition`, and the measured click-away enters
-  with the same method. It is never held — a lock must not wait for a slide-out.
-  It is decided from the Start side's standing reveal claim (`revealOpen` /
-  `revealTick` in the v2 section): while a reveal contact drives the panel and
-  the claim is fresh and bound to the menu on screen, the close is cancelled
-  (`close cancelled method=7 ...`); otherwise it passes at once
-  (`close passed method=7 ...`).
-- Every other method is the user's Windows key or the Start button. The mod
-  publishes the `retract` request on the v2 channel, bound to the open
-  generation it read and with a 700 ms deadline, and waits up to 100 ms for the
-  answer. The answer is one of three: a duration (hold the original for that
-  duration plus 30 ms, `hide delayed reason=... retract=... lead=...`), the
-  no-settle sentinel (nothing to animate: pass at once,
-  `hide passed reason=... retract=none`), or `cancel` (a reveal owns the panel:
-  return without calling the original, `close cancelled method=... ...`).
-- No channel, a failed request, no answer or a request the Start side refused
-  as stale all call the original at once. That is the fallback: a close is never
-  left hanging on a mod that is not there. An earlier build held the fixed
-  560 ms lead when no answer arrived; the arbiter has no reason to wait for an
-  animation nobody planned, so the fallback is now immediate and a disabled or
-  absent Start mod costs no delay.
+Every close executes in one place: `XamlLauncherState::HideStartAndCortana`
+(RVA `0x24BCB0`), one frame above `CStartExperienceManager::Hide`. The mod asks
+the Start side for the retract duration over the v2 channel, holds the original
+for that duration plus 30 ms (`own close animated ... retract=... lead=...`),
+and calls it. The answer is a duration or the no-settle sentinel; there is no
+cancel answer and no reveal claim any more, because every close closes. A reveal
+contact that was driving the panel becomes a deferred pull in the Start mod: the
+menu closes, and the pull may open the next one. A close the Start side's own
+Windows tap causes is passed at once (`reason=gesture`).
 
-The two hooks divide the work by layer, and only the decision hook waits:
+A press during a close is a reopen. The decision entry sets a latch and the
+`OnStartHidden` event serves it from the settled closed state
+(`own reopen served after close`). The immediate `ShowStartView` was measured to
+wedge the UI thread when the shell delivered the press inside its own Hide, so
+the latch is the whole action there; the owner accepted that wait.
 
-- `XamlLauncherState::HideStartAndCortana` is where the pause lives. Holding it
-  keeps the launcher's state at 5, and cancelling it never writes the state.
-- `CStartExperienceManager::Hide` is observed only: it logs `hide reason=...`
-  and clears the published gesture record, and every path calls it. Its old hold
-  is gone; a second hold would delay every close twice.
-
-Refusing a close does not make a Win press inside an already committed close
-reopen the menu. Measured: during a close the state passes 5 -> 9 -> 11, and
-both 9 and 11 are in `IsStartVisible`'s visible set, so the queued press becomes
-`HideStartAndCortana(11, 1)` and returns in the same millisecond with no `Hide`.
-That is the shell's own rule about a double toggle, not a hook's, and the
-arbiter does not try to fix it.
-
-Measured on this build, `Hide` is not the whole close: the shell keeps its Start
-toggle in the key handler. Both closes now go through that handler, so the
-toggle is always in step and the next Windows press after the close opens the
-menu. The old programmatic hide plus a 120 ms re-arm tap is gone; that tap raced
-a user press inside its window, which is the bug this protocol removes.
+External takeovers (`Win+Tab`, the lock/display method-7 path, and a modified
+Windows press the Win hook can recognise) pass through immediately: no close
+record, no retract plan, no hold, no animation. Their only reaction is the cloak
+resync. The Start side drops a pull at the window close such a takeover causes
+(`reveal dropped (window closed by shell)`) instead of reopening it.
 
 The mod also observes the taskbar-edge gesture path in `twinui.pcshell.dll`,
 then publishes the live `GestureAnimationData` handle (source/provider id), the
@@ -96,8 +75,9 @@ edge, the start point and the gesture state to shared memory:
 A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
 shipping Start mod does not read it. Its live couplings are the close stamp, the
-retract request/answer pair and the reveal claim described below, all in
+retract request/answer pair and the open generation, all in
 `Local\SwipeFor10Start_v2_*` (see `swipe_ipc_shared.h`).
+
 
 Hooked functions are forwarded unchanged except for the close decision above.
 The mod creates no windows, threads or COM objects. It refuses to initialize
@@ -115,13 +95,14 @@ Notes:
   hook is installed, the loaded module must report that exact file version
   (and, when readable, the PE timestamp of the loaded image must match the file
   on disk). Otherwise the mod logs one mismatch line and installs nothing.
-- The close-decision hook is additionally probed before it is installed: the
-  target must lie in an executable section of the loaded image, its first 24
-  bytes must equal the build's prologue, and its body must still carry the
-  manager call site (`[this+0x38]->+0x40`) the state machine was read from. Each
-  failure logs its own line (`close hook skipped ...`) and only that hook is
-  left out; the observation hooks keep working, and a close is then not
-  animated at all instead of being held by a hook that cannot decide.
+- Every own hook is probed before it is installed: the target must lie in an
+  executable section of the loaded image, its first 24 bytes must equal the
+  build's prologue, its body must still carry the landmark the decision was read
+  from, and the direct call sites the executor depends on must still target the
+  functions they name. Each failure logs its own
+  `own hook skipped name=... build=... ...` line and only that hook is left out;
+  the observer hooks keep working, and a close is then not animated instead of
+  being delayed by a hook that cannot decide.
 - Hooks are installed only after `twinui.pcshell.dll` is loaded, via a
   `LoadLibraryExW` hook plus the module check in `Wh_ModAfterInit`.
 - The sequence field is a seqlock: a reader must retry when it is odd or when
@@ -265,91 +246,46 @@ The close record and the retract pair:
 // ==/WindhawkModReadme==
 
 /*
- * [INPUT]: depends on twinui.pcshell.dll 10.0.26100.9949 in explorer.exe for
- *   TouchEdgeGestureProcessor::InputGestureOperationStarted/Ended,
- *   EdgeAnimationRelationshipManager::ReportEdgeGesture,
- *   CStartExperienceManager::SetAnimationData/Show/Hide, and for
- *   XamlLauncherState::HideStartAndCortana, the decision every shell close
- *   passes through; on version.dll for the build gate; on LoadLibraryExW from
- *   kernelbase.dll for the late module load; on GetModuleHandleExW from
- *   kernelbase.dll, which must succeed before this mod installs anything, and
- *   which pins this image for the process lifetime; on the shared-memory
- *   contract in start_gesture_shared.h; on the channel in swipe_ipc_shared.h,
- *   whose close record carries a tapped gesture stamp (the tap's own close),
- *   whose retract request/answer pair carries the settle duration or the cancel
- *   a requested close needs, and whose reveal claim carries the Start side's
- *   standing "a reveal drives the panel" answer a method-7 close is decided
- *   from without waiting. A generation of 0 means the Start side published no
- *   open, so no request may name it and no close stamp can be bound.
- * [OUTPUT]: the `Local\WindhawkStartGestureShared` mapping and its auto-reset
- *   event, holding the edge, the gesture handle and the state under a seqlock;
- *   a `bridge.log` line per state transition; the close decision itself: one
- *   retract request per requested close on the Start mod's channel, marked done
- *   when that close is over, a synchronous hold of the original
- *   HideStartAndCortana for the answered duration plus a 30 ms margin, or a
- *   return without the original when the answer is cancel, or the original at
- *   once when nothing answered. The decision lines are
- *   `close passed method=... state=...`, `close passed method=... state=...
- *   reason=gesture`, `close cancelled method=... state=...`,
- *   `hide delayed reason=... retract=... lead=...` and
- *   `hide passed reason=... state=... retract=none|unanswered`. The observation
- *   hook on CStartExperienceManager::Hide logs `hide reason=...` for every Hide
- *   that actually runs and never waits. The v2 channel is closed on disable, and
- *   only at quiescence: the disable flag keeps new closes out and the unload
- *   waits, with no deadline, until every close already inside either hook has
- *   left, then closes the channel (`ipc close`) and returns. Because the lease
- *   spans the whole hook, the original call included, that same zero is the only
- *   condition under which this mod hands trampoline removal back to the host: a
- *   frame still about to call the original holds a lease, so no timeout can
- *   stand in for the count. The two outcomes are `drained` (zero, channel
- *   closed, returned) and `stalled` (still nonzero, and the unload keeps
- *   waiting; nothing else happens). 500 ms is where the wait first says a call
- *   is late (`ipc unload drain over 500 ms closes=...`), and every 10 s after
- *   that it reports `ipc unload stalled closes=... waited=... ms`. The price is
- *   paid in the host: a close that does not return, because the shell call under
- *   it never came back or a debugger suspended its thread, blocks the Windhawk
- *   reload until it resumes. The count is a lifetime guard for that channel, not
- *   a barrier between two closes: it counts the frames inside the two close
- *   hooks through an RAII lease that every exit path releases, so a re-entrant
- *   call on one thread balances per frame, and a call that has entered the
- *   detour but not yet taken its lease is invisible to it. Windhawk does not
- *   drain the hook before `Wh_ModUninit`: at 2.0.0-alpha.8 `ModsManager` calls
- *   `Wh_ModUninit` and only then waits for threads inside the mod image
- *   (`ThreadsCallStackWaitForRegions(..., 200, 400)`) before freeing the module,
- *   and that wait is bounded and unchecked. This mod therefore refuses to
- *   initialize unless its own image is pinned
- *   (`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
- *   GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`), which keeps
- *   the return address and the lease destructor of an uncounted frame valid; the
- *   host's wait covers an uncounted frame's trampoline when it can see the
- *   frame, and a scan blind to it covers nothing. A re-enable re-initialises the
- *   same image and refuses while the previous activation still has a close
- *   inside — reachable only through that uncounted entry window, because a
- *   drained unload returns at zero; otherwise the lifecycle flags are reset
- *   (logged `activation state reset`), the gesture mapping is reused, and a v2
- *   channel an earlier activation left open is handed on rather than opened
- *   again. The gesture mapping keeps the process-lifetime behaviour below. No
- *   exported symbols.
- * [POS]: explorer-side half of the legacy Start gesture work. It owns the close
- *   decision one frame above the command layer: XamlLauncherState::
- *   HideStartAndCortana is the one entry every close reaches (Windows key,
- *   Start button, click-away, display change and lock), the one place where
- *   skipping the call leaves the launcher's open/closed state untouched, and
- *   therefore the only place a close may be refused. CStartExperienceManager::
- *   Hide is observed only; its old hold is gone because a hold there stranded
- *   the launcher state at 9. The shipping Start mod answers the request and
- *   publishes the reveal claim; the shared gesture memory is not read by it.
- *   The channel's handles are released when the mod can prove no close is inside
- *   it; the older gesture mapping is kept for the process lifetime because its
- *   consumer maps it independently. An unconsumed fresh stamp is evidence of
- *   correlation, not proof of cause: the plan-versus-tapped distinction is what
- *   makes the gesture path correct, and the binding only keeps a stamp of a
- *   menu that is gone from passing a later close. The drain runs inside
- *   `Wh_ModUninit` and returns only at quiescence, so the reload blocks instead
- *   of running under a live frame: the image is pinned as a prerequisite
- *   because a hook-only mod cannot wait for its own caller, the pin covers an
- *   entry the count cannot see, and the drain covers the trampoline of every
- *   counted frame.
+ * [INPUT]: twinui.pcshell.dll 10.0.26100.9949 in explorer.exe: the launcher
+ *   singleton at +0x948E80 (the outer object; the execution interface is
+ *   +0x18), ShowStartView +0x141AF0, Dismiss +0x25D670, IsVisible +0x1F9B40,
+ *   XamlLauncher::OnHotkeyInvoke +0x14195C, XamlLauncherState::OnStartShown/
+ *   OnStartHidden, HideStartAndCortana +0x24BCB0, and CStartExperienceManager::
+ *   Show/Hide for the observation lines. The launcher thread is the thread that
+ *   runs OnHotkeyInvoke (measured tid=7108); the taskbar thread is a different
+ *   thread and a show there fail-fasts explorer (measured). Also depends on
+ *   swipe_ipc_shared.h v3 for the intent/ack, executor command/ack, open
+ *   generation and controller flags, and on start_gesture_shared.h for the
+ *   diagnostic animation ids.
+ * [OUTPUT]: the hidden executor window WindhawkSwipeExecutor_<WndProc> on the
+ *   launcher thread, fed by a worker on the Exec event; every command logs
+ *   `exec show|dismiss|visible seq=... launcher=... state=0x... hr=... visible=...`,
+ *   and the launcher read refuses `reason=not-ready` when `[+0x160] <= 0x10000`.
+ *   One decision per non-touch trigger: `own win decide`/`own button decide` and
+ *   `intent kind=... trigger=... seq=...` for the Win key, the Start button
+ *   (ShowStartView method 11 / Dismiss method 6) and the click-away
+ *   (HideStartAndCortana method 7); IntentShouldClose is the only toggle rule
+ *   (controller phase 1 -> close, phase 2 -> reopen, else the cloak and the
+ *   internal state). A press is never lost: a hide in flight (state 9/11) or a
+ *   dismiss already armed is latched (one slot, tick) and served as the same
+ *   open intent at `own state event=hidden` (`own press served wait=...`,
+ *   31-110 ms); a second press replaces the slot. The click-away the shell
+ *   issues while the window is appearing (state 1/3) and the Hide(7) inside our
+ *   own ShowStartView in state 1/3 are the pointer-away check and are swallowed
+ *   (`reason=opening`/`reason=own-show`). The shell's own show/dismiss is
+ *   swallowed only while `controllerOwning` and only as a duplicate (method
+ *   16/other dismiss); the opening touch's click-away is swallowed while
+ *   `controllerTouch`. External takeovers (Win+Tab, lock/display, a forwarded
+ *   modified press) publish `intent=external` and pass at once. The v4 channel
+ *   closes on unload at counted quiescence (`ipc unload drained`); the
+ *   process-lifetime gesture mapping is kept for its independent consumer.
+ * [POS]: the explorer-side executor and trigger adapter. It does not decide a
+ *   toggle: the Start side consumes the intents, runs the one mirrored settle,
+ *   and publishes `exec show`/`exec dismiss`/`exec cancel`. The bridge performs
+ *   the shell call on the launcher's own thread and confirms with IsVisible
+ *   (honest 0 right after Show, 1 at the 300 ms probe; 0 after Dismiss). The
+ *   image is pinned as an init prerequisite; a reinstall gets a new window class
+ *   name so no old WndProc can receive the new channel's commands.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -364,8 +300,19 @@ The close record and the retract pair:
 #include <cstdlib>
 #include <cstring>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define OWN_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define OWN_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
+
 #include "start_gesture_shared.h"
 #include "swipe_ipc_shared.h"
+
+void EnsureExecutorWindow();
+void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
+                         uint32_t flags);
 
 namespace {
 
@@ -380,6 +327,47 @@ constexpr uintptr_t kShowVa = 0x180254C90;
 constexpr uintptr_t kHideVa = 0x1803C5960;
 // XamlLauncherState::HideStartAndCortana, the decision every shell close reaches.
 constexpr uintptr_t kHideStartAndCortanaVa = 0x18024BCB0;
+// The two decision entries (XamlLauncher): the Windows key / shell hook and the
+// taskbar Start button. Both are plain member functions; the launcher pointer is
+// `self` for the button and `self + 0x18` for the hotkey.
+constexpr uintptr_t kOnHotkeyInvokeVa = 0x18014195C;
+constexpr uintptr_t kOnStartButtonPressedVa = 0x180492C90;
+// The execution primitives: XamlLauncher::Dismiss (a forwarder to the state's
+// DismissStartAndCortana) and XamlLauncher::ShowStartView (no state gate).
+constexpr uintptr_t kDismissVa = 0x18025D670;
+constexpr uintptr_t kShowStartViewVa = 0x180141AF0;
+// The launcher state's two events. OnStartShown completes an open (state = 5);
+// OnStartHidden completes a close (9 -> 0xA, 0x11 -> 0, 0xB -> 0, 0xE -> 7).
+constexpr uintptr_t kOnStartShownVa = 0x180141DF0;
+constexpr uintptr_t kOnStartHiddenVa = 0x180065E70;
+// The three call sites that reach HideStartAndCortana, used as the caller
+// discriminator. Ordinary is the direct call from DismissStartAndCortana
+// (0x499252); ClickAway is the delegate sub_4916D0 (0x4916E2); Lock is
+// DismissSynchronouslyWithoutTransition (0x48F7FB, method 7). The recorded value
+// is the return address (call site + 5), so a runtime match is exact.
+constexpr uintptr_t kHideCallerOrdinaryVa = 0x499257;
+constexpr uintptr_t kHideCallerClickAwayVa = 0x4916EB;
+constexpr uintptr_t kHideCallerLockVa = 0x48F804;
+// The click-away measured on this layout: a desktop click enters
+// XamlLauncherState's dismiss handler at 0x24FC50, which calls
+// HideStartAndCortana(7) directly at 0x24FDDE. It is a close of ours and must
+// animate; the lock path above is the only method-7 close that passes.
+constexpr uintptr_t kHideCallerAwayVa = 0x24FDE3;
+constexpr uintptr_t kClickAwayHandlerVa = 0x18024FC50;
+// The three functions those return addresses belong to, used by the probe.
+constexpr uintptr_t kDismissStartAndCortanaVa = 0x1804991C0;
+constexpr uintptr_t kClickAwayDelegateVa = 0x1804916D0;
+constexpr uintptr_t kLockDismissVa = 0x18048F7C0;
+// The launcher keeps its IXamlLauncherState interface at +0x160 (the hotkey's
+// outer object keeps the launcher at +0x18, and the same state at +0x178).
+constexpr uintptr_t kLauncherStatePointerOffset = 0x160;
+constexpr uintptr_t kHotkeyLauncherOffset = 0x18;
+// The hotkey's special open flag: with this byte set the shell opens the tray
+// surface instead of the Start view, so that press is passed through.
+constexpr uintptr_t kHotkeyShellOpenFlagOffset = 0x161;
+// InternalState, read from the IXamlLauncherState interface for the close
+// transient test and for the logs. Never written, never the open truth.
+constexpr uintptr_t kLauncherInternalStateOffset = 0x28;
 
 constexpr wchar_t kTwinuiModuleName[] = L"twinui.pcshell.dll";
 
@@ -394,50 +382,76 @@ constexpr uint8_t kHideStartAndCortanaPrologue[] = {
     0x20, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24,
     0x00, 0xFE, 0xFF, 0xFF, 0x48, 0x81};
 
-// InternalState, read from the IXamlLauncherState interface this function
-// receives: the same dword the function reads on entry and writes 9 into before
-// it calls the manager. Read for the log only.
-constexpr uintptr_t kLauncherStateOffset = 0x28;
-
 // The body bytes the probe requires beyond the prologue: the transient state
 // write (`mov dword ptr [rcx+28],9`), the manager load (`mov rcx,[rdi+38]`) and
 // its Hide slot (`mov rax,[rax+40]`). A build whose state machine moved but
 // whose prologue survived is still refused.
 constexpr size_t kHideStartAndCortanaProbeBytes = 0x400;
 
-// The synchronous dismiss method: display changes and the lock screen enter
-// through DismissSynchronouslyWithoutTransition, and the measured click-away
-// enters with the same method. Such a close may not wait for a slide-out.
-constexpr uint32_t kDismissMethodSynchronous = 7;
+// The prologues of the four own hooks and the three close entrants, from
+// twinui.pcshell.dll 10.0.26100.9949. A probe compares the first 24 bytes before
+// a hook is installed; a mismatch logs `own hook skipped ...` and only that hook
+// is left out.
+constexpr uint8_t kOnHotkeyInvokePrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x7C, 0x24,
+    0x20, 0x55, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC, 0x70,
+    0x8B, 0xFA, 0x48, 0x8B, 0xD9, 0x48};
+constexpr uint8_t kOnStartButtonPressedPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24,
+    0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
+    0x41, 0x8B, 0xF0, 0x48, 0x8B, 0x89};
+constexpr uint8_t kDismissPrologue[] = {
+    0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x89, 0x60, 0x01,
+    0x00, 0x00, 0x48, 0x85, 0xC9, 0x75, 0x07, 0xB8, 0x90,
+    0x04, 0x07, 0x80, 0xEB, 0x0E, 0x48};
+constexpr uint8_t kShowStartViewPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41,
+    0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x70, 0xFF,
+    0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x90};
+constexpr uint8_t kOnStartShownPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24,
+    0x18, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24,
+    0x00, 0xFF, 0xFF, 0xFF, 0x48, 0x81};
+constexpr uint8_t kOnStartHiddenPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC,
+    0x40, 0x48, 0x8B, 0xF9, 0x48, 0x8D, 0x59, 0x40, 0x8B,
+    0x03, 0x89, 0x44, 0x24, 0x20, 0x8B};
+constexpr uint8_t kClickAwayDelegatePrologue[] = {
+    0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x10, 0x48,
+    0x8B, 0x88, 0xA8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x01,
+    0x48, 0x8B, 0x40, 0x48, 0xE8, 0x25};
+constexpr uint8_t kLockDismissPrologue[] = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
+    0x48, 0x8B, 0x89, 0x60, 0x01, 0x00, 0x00, 0x48, 0x85,
+    0xC9, 0x75, 0x07, 0xB8, 0x90, 0x04};
+constexpr uint8_t kClickAwayHandlerPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x20, 0x44, 0x89, 0x44, 0x24,
+    0x18, 0x89, 0x54, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41,
+    0x56, 0x41, 0x57, 0x48, 0x83, 0xEC};
+constexpr uint8_t kDismissStartAndCortanaPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC,
+    0x20, 0x83, 0x64, 0x24, 0x38, 0x00, 0x8B, 0xFA, 0x48,
+    0x8B, 0xD9, 0x89, 0x91, 0x18, 0x01};
 
-// How long the answer may take. The request wakes the Start mod's input thread
-// through an event, so an answer normally arrives in a few milliseconds; this
-// bound only covers a Start side that is busy or gone.
-constexpr uint64_t kRetractPlanWaitMs = 100;
-// Added to the answered duration: the answer is published a moment after the
-// animation starts, and the wait's 10 ms slicing can add one step.
-constexpr uint64_t kHideLeadMarginMs = 30;
-// The Start side's "no settle started" answer, its "cancel the close" answer,
-// and the corrupt-value cap.
-constexpr int32_t kRetractPlanNoSettleMs = 1;
-constexpr int32_t kRetractPlanCancel = 2;
-constexpr uint64_t kRetractPlanMaxMs = 2000;
+// The Windows-key dismiss method (the shell's own measurement) and the method a
+// Win+Tab close carries. Method 5 is an external takeover: it is never held and
+// never animated.
+constexpr uint32_t kDismissMethodWin = 1;
+constexpr uint32_t kDismissMethodWinTab = 5;
+constexpr uint32_t kDismissMethodStartButton = 6;
+constexpr uint32_t kDismissMethodClickAway = 7;
 
-// How long a published retract request stays valid for the Start side. The
-// bridge's own hold after publishing is at most kRetractPlanWaitMs plus the
-// answered duration (a full 900 DIP panel answers 409 ms, so 539 ms), and it
-// marks the request done when that close is over, so this deadline is the
-// backstop for a lost marker, not the usual end: a request can never reach a
-// settle after the close it was written for is over.
-constexpr uint64_t kRetractRequestWindowMs = 700;
+// How long a reopen asked for during a close keeps its latch. The immediate
+// ShowStartView can be overwritten by the close's late Hidden event; the latch
+// serves the open again from the settled closed state. It is cleared at the next
+// decision that sees state 5 (the reopen is settled), when it is served, or when
+// this window expires. The window covers the longest retract (520 ms) plus the
+// shell's own Hide and one press, with margin.
+constexpr uint64_t kOwnReopenLatchMs = 1200;
 
-// A tapped close is consumed by exactly one Hide. The Start side publishes the
-// plan at the release, marks the same record `tapped` with a fresh sequence
-// immediately before it sends the Windows key, so the Hide that follows is the
-// tap's own and needs no wait. A tapped record older than this window belongs to
-// a close that is over, and a tap whose Hide never came leaves its record valid
-// for this window and no longer; the plan alone never passes a Hide.
-constexpr uint64_t kCloseStampFreshMs = 800;
+// The M2 retract wait and its tapped-close stamp are retired. The M3 executor
+// schedules the dismiss from the duration the Start side plans, and the Start
+// side owns the single suppression that keeps a heal from restoring the panel.
 
 // The hide waits in 10 ms steps, so the wait can end early when the mod is being
 // disabled under it.
@@ -456,10 +470,36 @@ constexpr DWORD kIpcUnloadStallReportMs = 10000;
 // the two lifetimes there. The gesture mapping and its event, unlike this
 // channel, stay for the whole process lifetime.
 SwipeIpcChannel g_ipc;
-// The highest tapped close this hook has consumed. Seeded from the channel at
-// attach, so a tap written before this process belongs to someone else's close.
-LONG64 g_handledCloseSeq = 0;
 
+// M3 executor: one hidden window on explorer's shell UI thread. The hooks post a
+// message and return; the WndProc reads the Start side's command and calls the
+// launcher with an empty stack. `t_execCall` marks our own call so the primitive
+// hooks pass it through instead of reading it as a shell trigger.
+std::atomic<HWND> g_execWindow{nullptr};
+DWORD g_execThreadId = 0;
+std::atomic<DWORD> g_execHookThread{0};
+thread_local int t_execCall = 0;
+HANDLE g_execStopEvent = nullptr;
+HANDLE g_execWorker = nullptr;
+constexpr UINT kExecMessage = WM_APP + 0x5A;
+constexpr UINT_PTR kExecDismissTimer = 0x5358;
+constexpr UINT_PTR kExecProbeTimer = 0x5359;
+constexpr UINT_PTR kPressLatchTimer = 0x535A;
+constexpr uint64_t kPressLatchTimeoutMs = 400;
+constexpr uint64_t kPressLatchRetryMs = 100;
+constexpr uintptr_t kLauncherSingletonRva = 0x948E80;
+constexpr uintptr_t kLauncherStateOffset = 0x160;
+constexpr uintptr_t kLauncherIsVisibleRva = 0x1F9B40;
+constexpr uint64_t kLauncherStateReadyFloor = 0x10000;
+
+using LauncherIsVisibleFn = HRESULT(WINAPI*)(void*, BOOL*);
+LONG64 g_pendingDismissSeq = 0;   // UI thread only
+uint64_t g_pendingDismissOpen = 0;  // UI thread only
+LONG64 g_pendingShowSeq = 0;       // UI thread only
+// The confirmation probe: IsVisible right after Show returns is too early (the
+// window is cloaked until the shell's own show animation runs), so the answer is
+// read again 120 ms later on the same thread and logged with the command it
+// belongs to.
 struct Point {
     float x;
     float y;
@@ -482,7 +522,7 @@ std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_disabled{false};
 // Set only after Wh_SetFunctionHook accepted the close-decision hook, so no
 // close is ever arbitrated on a build where that hook was refused.
-std::atomic<bool> g_arbiterEnabled{false};
+std::atomic<bool> g_closeHookEnabled{false};
 // Close-hook frames currently inside, entry to exit: the decision hook's
 // HideStartAndCortana and the observation hook's Hide. Wh_ModUninit closes the
 // v2 channel only when this is zero, and Wh_ModInit refuses to re-activate this
@@ -739,11 +779,17 @@ void FileLog(const wchar_t* format, ...) {
     WCHAR path[MAX_PATH] = {};
     swprintf_s(path, L"%s\\bridge.log", storage);
 
-    WCHAR line[1024] = {};
+    WCHAR message[900] = {};
     va_list args;
     va_start(args, format);
-    vswprintf_s(line, ARRAYSIZE(line), format, args);
+    vswprintf_s(message, ARRAYSIZE(message), format, args);
     va_end(args);
+
+    // Every line starts with the system tick, so lines from the two processes
+    // can be ordered against each other and against an injected input.
+    WCHAR line[1024] = {};
+    swprintf_s(line, ARRAYSIZE(line), L"t=%llu %s",
+               static_cast<unsigned long long>(GetTickCount64()), message);
 
     char utf8[2048] = {};
     int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8,
@@ -1153,8 +1199,13 @@ using Show_t = HRESULT (*)(void*, uint8_t, uint8_t, uint32_t);
 Show_t Show_Original = nullptr;
 
 HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
-    FileLog(L"show a=%u b=%u c=%u", static_cast<unsigned int>(a),
-            static_cast<unsigned int>(b), static_cast<unsigned int>(c));
+    FileLog(L"show a=%u b=%u c=%u tid=%u", static_cast<unsigned int>(a),
+            static_cast<unsigned int>(b), static_cast<unsigned int>(c),
+            GetCurrentThreadId());
+    // The shell's own show is the launcher thread's proof: create the executor
+    // window here when a touch-first open never reached OnHotkeyInvoke.
+    g_execHookThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    EnsureExecutorWindow();
 
     // Only a Show that follows a real gesture handle publication is a
     // gesture-driven open. A normal mouse/keyboard open must not look like a
@@ -1196,288 +1247,519 @@ void ClearSharedGestureState(const wchar_t* reason) {
     g_startPointTick.store(0, std::memory_order_relaxed);
 }
 
-// Gives the Start side the time its retract needs. The steps stay at 10 ms so a
-// mod that is being disabled mid-wait ends the delay at once instead of holding
-// the hide for a retract nothing will draw.
-void WaitForRetractLead(uint64_t leadMs) {
-    const ULONGLONG deadline = GetTickCount64() + leadMs;
-    while (!g_disabled.load(std::memory_order_relaxed)) {
-        const ULONGLONG now = GetTickCount64();
-        if (now >= deadline) {
-            break;
-        }
-        Sleep(static_cast<DWORD>(
-            std::min<ULONGLONG>(kHidePollMs, deadline - now)));
-    }
-}
-
-// Consumes the Start side's tapped record when it belongs to this Hide. The
-// sequence number is the whole protocol: a tapped record this hook has not seen
-// is a gesture close whose Windows tap is going down right now, so this Hide is
-// that tap's and needs no wait; a tapped record it has seen is a later keyboard
-// close. The plan alone never passes: it is published at the release, up to a
-// full settle before the tap exists, so a Hide during that settle is the user's
-// own Windows press and gets its own lead. A cancelled record never taps at all.
-//
-// The record names no menu, so two more tests bind it to one. It must be newer
-// than the sequence this process seeded at attach, and it must not be older than
-// the newest open generation this hook has seen: a stamp written before that
-// open belongs to a menu that is gone, and would otherwise pass an unrelated
-// Hide under the menu the user has since opened. The channel also asks the Start
-// side to cancel its stamp when it publishes a new open; the test above does not
-// depend on it. With no known open generation nothing can be bound, so the stamp
-// is refused and the Hide takes the keyboard path.
-bool ConsumeGestureStamp(bool openKnown, uint64_t openTick) {
-    if (!g_ipc.state || !openKnown) {
-        return false;
-    }
-
-    // One snapshot, so the kind, the tapped flag and the tick can never come
-    // from two different publishes.
-    SwipeIpcCloseSnapshot close{};
-    if (!SwipeIpcReadClose(&g_ipc, &close)) {
-        return false;
-    }
-    if (close.seq == 0 || close.seq == g_handledCloseSeq) {
-        return false;
-    }
-    if (close.tapped == 0 || close.kind != kSwipeCloseKindGesture) {
-        return false;
-    }
-
-    const uint64_t now = GetTickCount64();
-    if (now > close.tick && now - close.tick > kCloseStampFreshMs) {
-        // The tap that wrote this is long over; the Hide in hand is a keyboard
-        // close and gets its own lead.
-        return false;
-    }
-    if (close.tick < openTick) {
-        // Stamped before the menu now on screen was published: a tap whose Hide
-        // never came. The current menu's own tap is always newer than its open.
-        return false;
-    }
-
-    g_handledCloseSeq = close.seq;
-    return true;
-}
-
-// Waits for the Start side's answer to this request. Only an answer whose
-// sequence number echoes the request counts, so an answer to an earlier close
-// can never satisfy this one, and no timestamp is involved. Returns 0 when no
-// answer arrived inside kRetractPlanWaitMs; otherwise the answered value, which
-// is the planned duration, kRetractPlanNoSettleMs, or kRetractPlanCancel.
-int32_t WaitForRetractPlan(LONG64 request) {
-    if (!g_ipc.state || !g_ipc.retractPlanEvent) {
-        return 0;
-    }
-
-    const ULONGLONG deadline = GetTickCount64() + kRetractPlanWaitMs;
-    for (;;) {
-        const ULONGLONG now = GetTickCount64();
-        if (now >= deadline) {
-            return 0;
-        }
-
-        // Slices keep the disabled check: a mod that is being unloaded must not
-        // hold the shell's UI thread.
-        const DWORD wait = WaitForSingleObject(
-            g_ipc.retractPlanEvent,
-            static_cast<DWORD>(
-                std::min<ULONGLONG>(kHidePollMs, deadline - now)));
-        if (wait == WAIT_OBJECT_0) {
-            // The answer is copied as one seqlock record and accepted only when
-            // it echoes this request, so an answer to an earlier close can never
-            // satisfy this one and no half-written answer is read.
-            SwipeIpcRetractPlan plan{};
-            if (!SwipeIpcReadRetractPlan(&g_ipc, &plan)) {
-                continue;
-            }
-            if (plan.request != request) {
-                continue;  // an answer to an earlier request
-            }
-            if (plan.settleMs == kRetractPlanCancel ||
-                plan.settleMs == kRetractPlanNoSettleMs) {
-                return plan.settleMs;
-            }
-            return plan.settleMs > 0 &&
-                           static_cast<uint64_t>(plan.settleMs) <=
-                               kRetractPlanMaxMs
-                       ? plan.settleMs
-                       : kRetractPlanNoSettleMs;
-        }
-        if (g_disabled.load(std::memory_order_relaxed)) {
-            return 0;
-        }
-        if (wait != WAIT_TIMEOUT) {
-            return 0;
-        }
-    }
-}
-
-// True while the Start side's reveal claim covers the menu this close belongs
-// to: a claim published for an open tick, still inside its lease. A stale claim,
-// a claim of an older menu, a section that never carried one and a channel that
-// does not exist all answer false, so nothing can wedge a close.
-bool RevealClaimsPanel(bool openKnown, uint64_t openTick) {
-    if (!g_ipc.state || !openKnown) {
-        return false;
-    }
-
-    SwipeIpcRevealClaim claim{};
-    if (!SwipeIpcReadRevealClaim(&g_ipc, &claim)) {
-        return false;
-    }
-    if (claim.open == 0 ||
-        claim.open != static_cast<uint32_t>(openTick)) {
-        return false;
-    }
-
-    const uint32_t now = static_cast<uint32_t>(GetTickCount64());
-    return static_cast<uint32_t>(now - claim.tick) <= kSwipeRevealClaimLeaseMs;
-}
 
 using HideStartAndCortana_t = void (*)(void*, uint32_t);
 HideStartAndCortana_t HideStartAndCortana_Original = nullptr;
 // ---------------------------------------------------------------------------
-// The close decision
-//
-// Every shell close passes through XamlLauncherState::HideStartAndCortana one
-// frame above the manager's Hide. That is the only point where skipping the call
-// means "the user never asked": this function writes the launcher's transient
-// state (5 -> 9) and the view's Hidden event completes it (9 -> 0xA), so a close
-// that is refused here leaves both the state and the window untouched, and a
-// close that is held here keeps the state at 5 for the whole hold. A hold on
-// CStartExperienceManager::Hide instead writes no state and strands it at 9,
-// which is still in IsStartVisible's visible set: that was the dead Windows key.
-//
-// The Start side answers over the v2 channel. A requested close (the Windows key
-// and the Start button) publishes a retract request and waits for one of three
-// answers: a duration, the no-settle sentinel, or cancel. The synchronous
-// method 7 (display change, lock, and the measured click-away) may not wait for a
-// slide-out at all, so it is decided from the standing reveal claim instead.
-//
-// Nothing is cached: no manager pointer, no worker, no timer. Every close is the
-// shell's own call on its own thread, and a close that finds no Start side runs
-// at once.
+// The Start toggle this mod owns
 // ---------------------------------------------------------------------------
+//
+// The shell's launcher decides open vs close from InternalState, and while a
+// close runs it still calls state 9/11 "visible", so a second press is swallowed
+// instead of reversing the close. This mod therefore keeps its own boolean and
+// calls the shell's own open/close primitives itself:
+//
+// - truth is the window's cloak (IsStartWindowVisible, vtable +0x70), never
+//   InternalState: state 9/11 is "closing", not "open";
+// - the Shown/Hidden events mirror the boolean between presses, and every
+//   decision re-reads the cloak, so a divergence is one `own state resync` line
+//   and never a stuck toggle;
+// - a press while the menu is open and settled closes it; a press while it is
+//   closing (state 9/11) asks for an open again, whose immediate call is latched
+//   in case the close's Hidden event lands last;
+// - the close itself is executed in one place: the HideStartAndCortana hook,
+//   where every shell close converges. The decision entries only call
+//   Dismiss/ShowStartView; the executor serves the retract and calls the
+//   original. Win+Tab, the lock/display sync dismiss and a forwarded modified
+//   press are external takeovers: they pass at once with only a resync.
+//
+// Nothing here writes InternalState and nothing caches a manager or a state
+// pointer across calls.
+
+enum class OwnTrigger : int {
+    None = 0,
+    Win,
+    StartButton,
+    ClickAway,
+    Foreign,
+    Shell,
+};
+
+enum class OwnCaller : int {
+    Ordinary = 0,  // DismissStartAndCortana: Win, Start button, our Dismiss
+    ClickAway,     // the delegate sub_4916D0
+    Lock,          // DismissSynchronouslyWithoutTransition (lock, display)
+    Unknown,       // never held: an unrecognised close passes at once
+};
+
+const wchar_t* OwnCallerName(OwnCaller caller) {
+    switch (caller) {
+        case OwnCaller::Ordinary:
+            return L"ordinary";
+        case OwnCaller::ClickAway:
+            return L"clickaway";
+        case OwnCaller::Lock:
+            return L"lock";
+        default:
+            return L"unknown";
+    }
+}
+
+using DismissFn = HRESULT (*)(void*, uint32_t);
+using ShowStartViewFn = HRESULT (*)(void*, uint32_t, uint32_t);
+
+DismissFn g_dismiss = nullptr;
+ShowStartViewFn g_showStartView = nullptr;
+uintptr_t g_twinuiBase = 0;
+
+// Guards the boolean and the latch. Every hook runs on explorer's UI thread, but
+// the unload and a re-init run elsewhere, so the transitions are serialised; the
+// lock is never held across a shell call or a wait.
+SRWLOCK g_ownLock = SRWLOCK_INIT;
+bool g_ownOpen = false;
+bool g_ownPendingOpen = false;
+uint64_t g_ownPendingTick = 0;
+void* g_ownLauncher = nullptr;
+// The trigger of the close this thread's Dismiss call is executing, for the
+// executor's log only. Set around the Dismiss call, cleared after it returns.
+OwnTrigger g_ownCloseTrigger = OwnTrigger::None;
+
+std::atomic<bool> g_ownWinEnabled{false};
+std::atomic<bool> g_ownButtonEnabled{false};
+std::atomic<bool> g_ownEventsEnabled{false};
+std::atomic<bool> g_ownPrimitivesEnabled{false};
+// The tick of the last reopen the latch served. A dismiss that the shell raises
+// during that presentation (the close's late race, measured at state 3 within
+// 15 ms of the serve) is the open it is racing, not a close of the user's.
+std::atomic<uint64_t> g_ownReopenServedTick{0};
+// One pending reopen timer. The latch cannot be served from inside the close's
+// call stack: ShowStartView there is swallowed by the completing hide (measured
+// on this layout: show at +15 ms, cloak at +31 ms, state stuck at 3, no Shown),
+// and the earlier attempt from inside the Hide wedged the UI thread. A thread
+// timer fires on the same UI thread after the current message has unwound.
+std::atomic<bool> g_ownReopenTimerArmed{false};
+constexpr UINT kOwnReopenTimerId = 0x5357;  // 'SW'
+constexpr UINT kOwnReopenServeDelayMs = 180;
+
+
+// The one-shot mark a forwarded modified press leaves for the synchronous close
+// it causes. Thread-local by construction: the close the original call performs
+// runs on the same thread, nested inside it. The mark is consumed by the first
+// matching executor frame and restored by the guard, so a later or unrelated
+// call on the same thread cannot inherit it. See OnHotkeyInvoke_Hook.
+thread_local uint32_t t_ownExternalMethod = 0;
+
+// Set while this thread is inside a call this mod's own decision made. The
+// Dismiss/ShowStartView observation hooks use it to tell their own call from a
+// foreign caller (the taskbar's Start button on this build calls the launcher's
+// Dismiss/ShowStartView directly, not OnStartButtonPressed).
+thread_local int t_ownDecisionCall = 0;
+
+// Set by the Dismiss observation hook around a foreign close, so the executor
+// names the trigger it is serving. Thread-local and scoped; it cannot outlive
+// the synchronous original call it marks.
+thread_local bool t_ownForeignClose = false;
+
+// Non-zero while this thread is anywhere inside the close executor, the wait
+// and the original call included. A press delivered by the message pump inside
+// the shell Hide is nested here; its reopen must be latched, not presented,
+// because ShowStartView from under the Hide does not return (measured).
+thread_local int t_ownCloseExecutor = 0;
+
+struct OwnCloseExecutorGuard {
+    OwnCloseExecutorGuard() { ++t_ownCloseExecutor; }
+    ~OwnCloseExecutorGuard() { --t_ownCloseExecutor; }
+    OwnCloseExecutorGuard(const OwnCloseExecutorGuard&) = delete;
+    OwnCloseExecutorGuard& operator=(const OwnCloseExecutorGuard&) = delete;
+};
+
+struct OwnDecisionCallGuard {
+    OwnDecisionCallGuard() { ++t_ownDecisionCall; }
+    ~OwnDecisionCallGuard() { --t_ownDecisionCall; }
+    OwnDecisionCallGuard(const OwnDecisionCallGuard&) = delete;
+    OwnDecisionCallGuard& operator=(const OwnDecisionCallGuard&) = delete;
+};
+
+struct OwnForeignCloseGuard {
+    bool previous;
+    OwnForeignCloseGuard() : previous(t_ownForeignClose) {
+        t_ownForeignClose = true;
+    }
+    ~OwnForeignCloseGuard() { t_ownForeignClose = previous; }
+    OwnForeignCloseGuard(const OwnForeignCloseGuard&) = delete;
+    OwnForeignCloseGuard& operator=(const OwnForeignCloseGuard&) = delete;
+};
+
+struct OwnExternalForwardGuard {
+    uint32_t previous;
+    explicit OwnExternalForwardGuard(uint32_t method)
+        : previous(t_ownExternalMethod) {
+        t_ownExternalMethod = method;
+    }
+    ~OwnExternalForwardGuard() { t_ownExternalMethod = previous; }
+
+    OwnExternalForwardGuard(const OwnExternalForwardGuard&) = delete;
+    OwnExternalForwardGuard& operator=(const OwnExternalForwardGuard&) = delete;
+};
+
+// Consumes the mark, and only for the method it was armed with. One-shot: a
+// second close nested inside the same original call is a different request and
+// is decided on its own.
+bool OwnTakeExternalForward(uint32_t method) {
+    if (t_ownExternalMethod == 0 || t_ownExternalMethod != method) {
+        return false;
+    }
+    t_ownExternalMethod = 0;
+    return true;
+}
+
+void* OwnStateOf(void* launcher) {
+    if (!launcher) {
+        return nullptr;
+    }
+    return *reinterpret_cast<void* const*>(
+        static_cast<const uint8_t*>(launcher) + kLauncherStatePointerOffset);
+}
+
+// The launcher state's IsStartWindowVisible (IXamlLauncherState vtable +0x70):
+// the shell's own answer to "is the panel on screen", which follows the cloak.
+bool OwnIsVisible(void* state) {
+    if (!state) {
+        return false;
+    }
+    void** vtable = *reinterpret_cast<void***>(state);
+    if (!vtable) {
+        return false;
+    }
+    const auto fn =
+        reinterpret_cast<bool (*)(void*)>(vtable[0x70 / sizeof(void*)]);
+    return fn && fn(state);
+}
+
+uint32_t OwnInternalState(void* state) {
+    return state ? *reinterpret_cast<const volatile uint32_t*>(
+                       static_cast<const uint8_t*>(state) +
+                       kLauncherInternalStateOffset)
+                 : 0;
+}
+
+OwnCaller OwnResolveCaller(void* returnAddress) {
+    if (!g_twinuiBase) {
+        return OwnCaller::Unknown;
+    }
+    const uintptr_t rva =
+        reinterpret_cast<uintptr_t>(returnAddress) - g_twinuiBase;
+    if (rva == kHideCallerOrdinaryVa) {
+        return OwnCaller::Ordinary;
+    }
+    if (rva == kHideCallerClickAwayVa) {
+        return OwnCaller::ClickAway;
+    }
+    if (rva == kHideCallerAwayVa) {
+        return OwnCaller::ClickAway;
+    }
+    if (rva == kHideCallerLockVa) {
+        return OwnCaller::Lock;
+    }
+    return OwnCaller::Unknown;
+}
+
+struct OwnSnapshot {
+    bool open;
+    uint32_t state;
+};
+
+// Reads the cloak truth before a decision and adopts it. A divergence is logged
+// once, with both values; the shell is always right. The pending reopen is
+// cleared here when the menu is settled open (state 5), which is the only proof
+// that the reopen the latch exists for has landed; a latch older than its window
+// is forgotten instead.
+OwnSnapshot OwnSync(void* launcher) {
+    void* state = OwnStateOf(launcher);
+    const bool shellOpen = OwnIsVisible(state);
+    const uint32_t internal = OwnInternalState(state);
+    const uint64_t now = GetTickCount64();
+
+    bool resync = false;
+    bool expired = false;
+    {
+        AcquireSRWLockExclusive(&g_ownLock);
+        if (shellOpen != g_ownOpen) {
+            resync = true;
+            g_ownOpen = shellOpen;
+        }
+        if (g_ownPendingOpen) {
+            if (shellOpen && internal == 5) {
+                g_ownPendingOpen = false;
+            } else if (now > g_ownPendingTick &&
+                       now - g_ownPendingTick > kOwnReopenLatchMs) {
+                g_ownPendingOpen = false;
+                expired = true;
+            }
+        }
+        g_ownLauncher = launcher;
+        ReleaseSRWLockExclusive(&g_ownLock);
+    }
+
+    if (resync) {
+        FileLog(L"own state resync cached=%d shell=%d", shellOpen ? 0 : 1,
+                shellOpen ? 1 : 0);
+    }
+    if (expired) {
+        FileLog(L"own reopen expired");
+    }
+    return OwnSnapshot{shellOpen, internal};
+}
+
+// The same adoption after a close the executor passed or served. It reads the
+// state the hook received, which is the IXamlLauncherState interface.
+void OwnResyncFromState(void* state) {
+    const bool shellOpen = OwnIsVisible(state);
+    bool resync = false;
+    {
+        AcquireSRWLockExclusive(&g_ownLock);
+        if (shellOpen != g_ownOpen) {
+            resync = true;
+            g_ownOpen = shellOpen;
+        }
+        ReleaseSRWLockExclusive(&g_ownLock);
+    }
+    if (resync) {
+        FileLog(L"own state resync cached=%d shell=%d", shellOpen ? 0 : 1,
+                shellOpen ? 1 : 0);
+    }
+}
+
+// OnStartShown: the state is 5 and the panel is on screen. The reopen latch is
+// deliberately not cleared here: the close the reopen raced may still deliver
+// its Hidden event after this, which is the case the latch serves. OwnSync
+// clears it at the next decision that sees state 5.
+void OwnEventShown() {
+    bool changed = false;
+    bool pending = false;
+    {
+        AcquireSRWLockExclusive(&g_ownLock);
+        if (!g_ownOpen) {
+            g_ownOpen = true;
+            changed = true;
+        }
+        pending = g_ownPendingOpen;
+        ReleaseSRWLockExclusive(&g_ownLock);
+    }
+    if (changed) {
+        FileLog(L"own state event=shown open=1 pending=%d tid=%u", pending ? 1 : 0,
+                GetCurrentThreadId());
+    }
+}
+
+// The latch is served after the whole close call stack has unwound: a
+// ShowStartView issued from inside `HideStartAndCortana`/`Dismiss` is swallowed
+// by the completing hide on this layout (measured: show at +15 ms, cloak at
+// +31 ms, state stuck at 3, no Shown event), and an earlier attempt from inside
+// the shell's Hide wedged the UI thread. A thread timer on the shell's UI thread
+// fires after the current message returns; the presentation is then made from a
+// clean stack, verified against the cloak, and retried once.
+void ArmReopenServe();
+
+void ServePendingReopenNow() {
+    bool serve = false;
+    void* launcher = nullptr;
+    {
+        AcquireSRWLockExclusive(&g_ownLock);
+        if (g_ownPendingOpen) {
+            const uint64_t now = GetTickCount64();
+            if (now <= g_ownPendingTick ||
+                now - g_ownPendingTick <= kOwnReopenLatchMs) {
+                serve = g_ownLauncher != nullptr;
+                launcher = g_ownLauncher;
+            }
+            g_ownPendingOpen = false;
+        }
+        ReleaseSRWLockExclusive(&g_ownLock);
+    }
+    if (!serve) {
+        return;
+    }
+
+    OwnDecisionCallGuard ownCall;
+    const auto show = [launcher]() -> HRESULT {
+        return g_showStartView ? g_showStartView(launcher, kDismissMethodWin, 0)
+                               : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    };
+    HRESULT hr = show();
+    int retried = 0;
+    void* state = OwnStateOf(launcher);
+    if (state) {
+        // The presentation is asynchronous; give the Shown event its beat.
+        for (int i = 0; i < 30 && !OwnIsVisible(state); ++i) {
+            Sleep(10);
+        }
+        if (!OwnIsVisible(state)) {
+            // The Show was swallowed or refused; one retry is the spec's
+            // latch-and-retry-once.
+            hr = show();
+            retried = 1;
+        }
+    }
+    g_ownReopenServedTick.store(GetTickCount64(), std::memory_order_relaxed);
+    FileLog(L"own reopen served after close hr=%08X retry=%d",
+            static_cast<unsigned>(hr), retried);
+}
+
+void CALLBACK OwnReopenTimerProc(HWND, UINT, UINT_PTR id, DWORD) {
+    if (id != kOwnReopenTimerId) {
+        return;
+    }
+    KillTimer(nullptr, kOwnReopenTimerId);
+    g_ownReopenTimerArmed.store(false, std::memory_order_relaxed);
+    if (g_disabled.load(std::memory_order_relaxed) ||
+        g_initRefused.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // A counted entry: the unload waits for a presentation that is in flight.
+    const CloseCallLease timerCall;
+    ServePendingReopenNow();
+}
+
+void ArmReopenServe() {
+    if (g_disabled.load(std::memory_order_relaxed) ||
+        g_initRefused.load(std::memory_order_relaxed)) {
+        return;
+    }
+    bool pending = false;
+    {
+        AcquireSRWLockExclusive(&g_ownLock);
+        pending = g_ownPendingOpen;
+        ReleaseSRWLockExclusive(&g_ownLock);
+    }
+    if (!pending) {
+        return;  // a close with no press behind it arms nothing
+    }
+    if (g_ownReopenTimerArmed.exchange(true, std::memory_order_acq_rel)) {
+        return;  // one timer is already pending
+    }
+    if (SetTimer(nullptr, kOwnReopenTimerId, kOwnReopenServeDelayMs,
+                 OwnReopenTimerProc) == 0) {
+        g_ownReopenTimerArmed.store(false, std::memory_order_relaxed);
+    }
+}
+
+// OnStartHidden, after the original wrote the settled closed state. The menu is
+// closed now, so the boolean follows. The serve is armed here only when the
+// Hidden arrives on its own stack; a Hidden raised inside the close's own
+// original is followed by the executor's tail, which arms the same one timer.
+void OwnEventHidden() {
+    bool changed = false;
+    {
+        AcquireSRWLockExclusive(&g_ownLock);
+        if (g_ownOpen) {
+            g_ownOpen = false;
+            changed = true;
+        }
+        ReleaseSRWLockExclusive(&g_ownLock);
+    }
+    if (changed) {
+        FileLog(L"own state event=hidden open=0 tid=%u", GetCurrentThreadId());
+    }
+    // Arm after every Hidden, whichever close hook raised it. The timer fires on
+    // this UI thread after the current message has unwound, so the presentation
+    // never runs inside the shell's Hide or the close's executor frame.
+    ArmReopenServe();
+}
 
 // XamlLauncherState::HideStartAndCortana(void* self, uint32_t method)
 // twinui.pcshell.dll 26100.9949, RVA 0x24BCB0. The function reads the dismiss
 // method in edx, writes the transient state at [self+0x28] and calls the
 // manager's Hide through [self+0x38]; it returns nothing.
 void HideStartAndCortana_Hook(void* self, uint32_t method) {
-    // The lease covers the whole frame: the channel reads, the waits and the
-    // original call. It is released on every exit, so an early return or a throw
-    // out of FileLog cannot strand the count Wh_ModUninit drains.
     const CloseCallLease closeCall;
-    const uint32_t state =
-        self ? *reinterpret_cast<const volatile uint32_t*>(
-                   static_cast<const uint8_t*>(self) + kLauncherStateOffset)
-             : 0;
-
     auto callOriginal = [self, method]() {
         if (HideStartAndCortana_Original) {
             HideStartAndCortana_Original(self, method);
         }
     };
-
-    if (!g_arbiterEnabled.load(std::memory_order_relaxed) ||
+    if (!g_closeHookEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed)) {
-        // A close during teardown is the shell's own, and a build whose hook was
-        // refused never arbitrates: it runs exactly as it would without the mod.
         callOriginal();
         return;
     }
-
-    // The newest menu open this hook has seen, read once and used by every path:
-    // the tapped close is bound to it, the requested close sends it with its
-    // request, and the reveal claim is bound to its tick. No published generation
-    // (ERROR_NOT_READY), no stable copy, or no channel at all leaves both at 0:
-    // the request then carries 0, which the Start side refuses, and no close
-    // stamp and no claim can pass either.
-    uint64_t openGeneration = 0;
-    uint64_t openTick = 0;
-    DWORD openError = 0;
-    const bool openKnown =
-        SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick, &openError);
-    if (!openKnown && g_ipc.state) {
-        // Only a channel that exists can have a record problem worth naming.
-        FileLog(L"hide open generation unavailable err=%u",
-                static_cast<unsigned int>(openError));
-    }
-
-    if (method == kDismissMethodSynchronous) {
-        // Display changes and the lock screen enter with this method, and so
-        // does the click-away. None of them may wait: a lock request that waits
-        // for a retract delays the lock screen. Only a fresh claim cancels it.
-        if (RevealClaimsPanel(openKnown, openTick)) {
-            FileLog(L"close cancelled method=%u state=%u reason=reveal", method,
-                    state);
+    if (t_execCall > 0) {
+        const uint32_t execState = OwnInternalState(self);
+        if (method == kDismissMethodClickAway &&
+            (execState == 1 || execState == 3)) {
+            // Our own Show is still on the stack and the shell is closing the
+            // window it is just presenting because the pointer is outside it.
+            // That is the pointer-away check, not a user click; swallowing it is
+            // what lets the requested open land.
+            FileLog(L"exec swallow hide method=7 state=%u reason=own-show",
+                    execState);
             return;
         }
-        FileLog(L"close passed method=%u state=%u", method, state);
+        FileLog(L"exec pass hide method=%u state=%u reason=executor", method,
+                execState);
         callOriginal();
+        OwnResyncFromState(self);
         return;
     }
 
-    if (ConsumeGestureStamp(openKnown, openTick)) {
-        // The Start side tapped at the end of its own retract, so this close is
-        // already too late to cut an animation and is the one that must run.
-        FileLog(L"close passed method=%u state=%u reason=gesture", method, state);
+    const OwnCaller caller = OwnResolveCaller(OWN_RETURN_ADDRESS());
+    if (caller == OwnCaller::Lock || caller == OwnCaller::Unknown ||
+        method == kDismissMethodWinTab || OwnTakeExternalForward(method)) {
+        FileLog(L"intent external trigger=hide caller=%s method=%u", 
+                OwnCallerName(caller), method);
+        PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
+                            method, 0);
         callOriginal();
+        OwnResyncFromState(self);
         return;
     }
 
+    // Every other Hide reaching this hook is a close trigger — the click-away,
+    // the shell's Windows key when the decision hook passed it, or a Start-button
+    // path — not a duplicate of a close the controller already runs. It is
+    // published even while the controller owns the panel; the controller decides
+    // whether it is a new close or a reopen.
+    //
+    // The one exception is the opening touch: when a contact at the band pulls
+    // the menu out, the shell sees that same contact outside the freshly shown
+    // window and issues its click-away close. It is the finger that opened the
+    // menu, not a press outside it, and it is swallowed until the controller's
+    // open has landed.
+    // The opening window is not a click-away target yet. The shell issues a
+    // method-7 close while the window is still appearing when the pointer is
+    // outside it (a keyboard open with the mouse parked on the desktop, or the
+    // pointer that opened it); that close would hide the menu the user just
+    // asked for. Swallow it only in the opening states; a click-away on the
+    // settled panel (state 5) is a real trigger.
+    const uint32_t currentState = OwnInternalState(self);
+    if (method == kDismissMethodClickAway &&
+        (currentState == 1 || currentState == 3)) {
+        FileLog(L"intent ignore trigger=clickaway method=%u state=%u "
+                L"reason=opening",
+                method, currentState);
+        return;
+    }
+    if (method == kDismissMethodClickAway &&
+        SwipeIpcControllerTouch(&g_ipc)) {
+        FileLog(L"intent ignore trigger=clickaway method=%u reason=touch-owner",
+                method);
+        return;
+    }
     if (!g_ipc.state) {
-        // No Start side to ask: the close is the shell's and runs at once. This
-        // is the whole fallback, and it is what a disabled or absent Start mod
-        // leaves behind.
-        FileLog(L"close passed method=%u state=%u reason=nochannel", method,
-                state);
+        FileLog(L"exec pass hide method=%u reason=nochannel", method);
         callOriginal();
+        OwnResyncFromState(self);
         return;
     }
 
-    const LONG64 request =
-        SwipeIpcRequestRetract(&g_ipc, openGeneration, kRetractRequestWindowMs);
-    if (request == 0) {
-        FileLog(L"hide retract request failed");
-        callOriginal();
-        return;
-    }
-
-    const int32_t answer = WaitForRetractPlan(request);
-    if (answer == kRetractPlanCancel) {
-        // A reveal contact drives the panel: the menu must stay open where the
-        // finger has it. The original is never called, so no state is written,
-        // no window is cloaked and the next press is an ordinary close.
-        SwipeIpcClearRetractRequest(&g_ipc, request);
-        FileLog(L"close cancelled method=%u state=%u reason=reveal", method,
-                state);
-        return;
-    }
-
-    if (answer > kRetractPlanCancel) {
-        const uint64_t lead =
-            static_cast<uint64_t>(answer) + kHideLeadMarginMs;
-        FileLog(L"hide delayed reason=%u retract=%d lead=%llu", method, answer,
-                static_cast<unsigned long long>(lead));
-        WaitForRetractLead(lead);
-    } else {
-        // The Start side answered that nothing is running, or nothing answered
-        // inside the wait: there is no slide to serve, so the close happens now
-        // instead of waiting for one that will never start.
-        FileLog(L"hide passed reason=%u state=%u retract=%s", method, state,
-                answer == kRetractPlanNoSettleMs ? L"none" : L"unanswered");
-    }
-
-    // This close is served. A request the Start side reads from now on belongs
-    // to no close of this menu and is marked done here, so it cannot start a
-    // settle later.
-    SwipeIpcClearRetractRequest(&g_ipc, request);
-    callOriginal();
+    const int32_t trigger = caller == OwnCaller::ClickAway
+                                ? kSwipeTriggerClickAway
+                                : kSwipeTriggerWin;
+    PublishBridgeIntent(kSwipeIntentClose, trigger, method, 0);
+    FileLog(L"intent close trigger=%s method=%u state=%u",
+            trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win", method,
+            OwnInternalState(self));
 }
-
 // CStartExperienceManager::Hide(void* self, uint32_t reason) -> HRESULT
 // twinui.pcshell.dll 26100.9949, RVA 0x3C5960, vtable slot after Show.
 //
@@ -1497,6 +1779,384 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
     ClearSharedGestureState(L"Hide");
     return Hide_Original ? Hide_Original(self, reason) : S_OK;
 }
+
+// ---------------------------------------------------------------------------
+// The decision hooks: Windows key, Start button, and the two state events
+// ---------------------------------------------------------------------------
+
+// One toggle decision for every trigger. While the controller owns a transition
+// its phase decides: an open in flight is closed, a close in flight is reopened.
+// Otherwise the shell's own state and the cloak decide, and a shell close
+// (9/11) is a reopen. No trigger has its own rule.
+bool IntentShouldClose(const OwnSnapshot& own) {
+    const int32_t phase = SwipeIpcControllerPhase(&g_ipc);
+    if (phase == 1) {
+        return true;
+    }
+    if (phase == 2) {
+        return false;
+    }
+    if (own.open) {
+        return true;
+    }
+    return own.state == 1 || own.state == 3 || own.state == 5;
+}
+
+// ---------------------------------------------------------------------------
+// The press latch: a press that lands while the shell is already hiding
+// ---------------------------------------------------------------------------
+//
+// The shell's state 9/11 is a hide that has claimed the panel: ShowStartView
+// from there is a no-op, and the shell's own Hide for the same press does
+// nothing. Neither the cancel path (the dismiss is already issued) nor a new
+// show can serve the press, so it is latched here and served as the same open
+// intent once the hide has landed (OnStartHidden, or the closed cloak for a
+// landing the event missed). One slot; a newer press replaces the older one and
+// says so. The wait is bounded by the hide, not by a fixed delay.
+
+struct PressLatch {
+    bool pending = false;
+    uint64_t tick = 0;
+    int32_t kind = kSwipeIntentOpen;
+    int32_t trigger = kSwipeTriggerWin;
+    uint32_t method = 0;
+    uint32_t flags = 0;
+};
+
+PressLatch g_pressLatch;  // launcher thread only
+
+const wchar_t* PressTriggerName(int32_t trigger) {
+    switch (trigger) {
+        case kSwipeTriggerStartButton:
+            return L"startbutton";
+        case kSwipeTriggerClickAway:
+            return L"clickaway";
+        case kSwipeTriggerTouch:
+            return L"touch";
+        case kSwipeTriggerOverride:
+            return L"override";
+        default:
+            return L"win";
+    }
+}
+
+bool ShellHideInFlight(const OwnSnapshot& own) {
+    return own.state == 9 || own.state == 11;
+}
+
+void* LatchedLauncher() {
+    AcquireSRWLockExclusive(&g_ownLock);
+    void* launcher = g_ownLauncher;
+    ReleaseSRWLockExclusive(&g_ownLock);
+    return launcher;
+}
+
+void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
+                uint32_t flags) {
+    const uint64_t now = GetTickCount64();
+    if (g_pressLatch.pending) {
+        FileLog(L"own press latch replaced old_tick=%llu old_wait=%llu state=%u",
+                static_cast<unsigned long long>(g_pressLatch.tick),
+                static_cast<unsigned long long>(now - g_pressLatch.tick),
+                own.state);
+    }
+    g_pressLatch = PressLatch{true, now, kSwipeIntentOpen, trigger, method, flags};
+    FileLog(L"own press latched state=%u trigger=%s tick=%llu "
+            L"(hide in flight)",
+            own.state, PressTriggerName(trigger),
+            static_cast<unsigned long long>(now));
+    if (g_execWindow.load(std::memory_order_relaxed)) {
+        SetTimer(g_execWindow.load(std::memory_order_relaxed), kPressLatchTimer,
+                 kPressLatchTimeoutMs, nullptr);
+    }
+}
+
+// Serves the latched press once the hide has landed. The hidden event is the
+// normal reason; the timer's retry is the safety net for a landing the event
+// missed (the press arrived between our settle and the shell's hidden event).
+bool ServeLatchedPress(const wchar_t* reason) {
+    if (!g_pressLatch.pending) {
+        return false;
+    }
+    void* launcher = LatchedLauncher();
+    if (!launcher) {
+        return false;
+    }
+    const OwnSnapshot own = OwnSync(launcher);
+    if (own.open || ShellHideInFlight(own)) {
+        return false;
+    }
+    const PressLatch latch = g_pressLatch;
+    g_pressLatch = PressLatch{};
+    const uint64_t wait = GetTickCount64() - latch.tick;
+    PublishBridgeIntent(kSwipeIntentOpen, latch.trigger, latch.method,
+                        latch.flags);
+    FileLog(L"own press served wait=%llu state=%u trigger=%s reason=%s",
+            static_cast<unsigned long long>(wait), own.state,
+            PressTriggerName(latch.trigger), reason);
+    return true;
+}
+
+using OnHotkeyInvoke_t = HRESULT (*)(void*, uint32_t);
+OnHotkeyInvoke_t OnHotkeyInvoke_Original = nullptr;
+
+// XamlLauncher::OnHotkeyInvoke(self, flags): the Windows key and the shell hook.
+// `self` is the outer object; the launcher is `self + 0x18`. The function carries
+// no key information, so a combination can only be recognised by the modifier
+// state at entry. That check is a hard gate for the open direction: a modified
+// press must never open Start. For the close direction, a modified press that is
+// forwarded passes through as an external takeover; one that cannot be
+// recognised falls back to the ordinary close, which may animate it.
+HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
+    const CloseCallLease closeCall;
+    if (!g_ownWinEnabled.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
+                                       : S_OK;
+    }
+
+    void* launcher = static_cast<uint8_t*>(self) + kHotkeyLauncherOffset;
+    // The thread that runs OnHotkeyInvoke is the launcher's execution thread:
+    // the shell's own open ran ShowStartView and OnStartShown here (measured
+    // tid=23660), while the taskbar thread is a different one. The executor
+    // window is created on this thread and only there.
+    g_execHookThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    EnsureExecutorWindow();
+    const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool control = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    FileLog(L"own win enter flags=%u shift=%d ctrl=%d alt=%d tid=%u",
+            flags, shift ? 1 : 0, control ? 1 : 0, alt ? 1 : 0,
+            GetCurrentThreadId());
+
+    if (shift || control || alt) {
+        const OwnSnapshot own = OwnSync(launcher);
+        if (own.open) {
+            PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
+                                kDismissMethodWin, flags);
+            FileLog(L"own win pass reason=external open=1 state=%u", own.state);
+            OwnExternalForwardGuard guard(kDismissMethodWin);
+            return OnHotkeyInvoke_Original
+                       ? OnHotkeyInvoke_Original(self, flags)
+                       : S_OK;
+        }
+        FileLog(L"own win pass reason=external open=0 state=%u (no open)",
+                own.state);
+        PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
+                            kDismissMethodWin, flags);
+        return S_OK;
+    }
+
+    if (static_cast<const uint8_t*>(self)[kHotkeyShellOpenFlagOffset] != 0) {
+        // The shell's own tray reopen: not the Start toggle, and it has side
+        // effects this mod does not reproduce.
+        FileLog(L"own win pass reason=shell-open-flag");
+        return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
+                                       : S_OK;
+    }
+
+    const OwnSnapshot own = OwnSync(launcher);
+    if (g_pressLatch.pending && !ShellHideInFlight(own)) {
+        // The landing event was missed and this newer press is the one the user
+        // means. The older slot is superseded, not served later.
+        FileLog(L"own press latch superseded old_wait=%llu state=%u",
+                static_cast<unsigned long long>(GetTickCount64() -
+                                                g_pressLatch.tick),
+                own.state);
+        g_pressLatch = PressLatch{};
+    }
+    const int32_t kind =
+        IntentShouldClose(own) ? kSwipeIntentClose : kSwipeIntentOpen;
+    FileLog(L"own win decide state=%u open=%d kind=%s phase=%d", own.state,
+            own.open ? 1 : 0,
+            kind == kSwipeIntentClose ? L"close" : L"open",
+            SwipeIpcControllerPhase(&g_ipc));
+    // The state decides the one path: a close still settling (phase 2, no
+    // dismiss armed) is genuinely cancellable and is published now; a shell hide
+    // in flight, or the dismiss already armed and due, cannot be cancelled any
+    // more and is latched until it lands.
+    if (kind == kSwipeIntentOpen &&
+        (ShellHideInFlight(own) || g_pendingDismissSeq != 0)) {
+        LatchPress(own, kSwipeTriggerWin, kDismissMethodWin, flags);
+        return S_OK;
+    }
+    PublishBridgeIntent(kind, kSwipeTriggerWin, kDismissMethodWin, flags);
+    return S_OK;
+}
+using OnStartButtonPressed_t = HRESULT (*)(void*, uint32_t, uint32_t);
+OnStartButtonPressed_t OnStartButtonPressed_Original = nullptr;
+
+// XamlLauncher::OnStartButtonPressed(self, showMethod, dismissMethod): `self` is
+// the launcher and the function is a pure toggle. Nothing else reaches it, so
+// there is no combination to gate.
+HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
+                                  uint32_t dismissMethod) {
+    const CloseCallLease closeCall;
+    if (!g_ownButtonEnabled.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return OnStartButtonPressed_Original
+                   ? OnStartButtonPressed_Original(self, showMethod,
+                                                   dismissMethod)
+                   : S_OK;
+    }
+
+    FileLog(L"own button enter show=%u dismiss=%u state=%u",
+            showMethod, dismissMethod, OwnInternalState(OwnStateOf(self)));
+    const OwnSnapshot own = OwnSync(self);
+    const int32_t kind =
+        IntentShouldClose(own) ? kSwipeIntentClose : kSwipeIntentOpen;
+    FileLog(L"own button decide state=%u open=%d kind=%s phase=%d", own.state,
+            own.open ? 1 : 0,
+            kind == kSwipeIntentClose ? L"close" : L"open",
+            SwipeIpcControllerPhase(&g_ipc));
+    if (kind == kSwipeIntentOpen &&
+        (ShellHideInFlight(own) || g_pendingDismissSeq != 0)) {
+        LatchPress(own, kSwipeTriggerStartButton, showMethod, 0);
+        return S_OK;
+    }
+    PublishBridgeIntent(kind, kSwipeTriggerStartButton,
+                        kind == kSwipeIntentClose ? dismissMethod : showMethod,
+                        0);
+    return S_OK;
+}
+
+using OnStartShown_t = void (*)(void*);
+OnStartShown_t OnStartShown_Original = nullptr;
+
+// XamlLauncherState::OnStartShown(self): `self` is the launcher state object;
+// its IXamlLauncherState interface is `self + 0x18` and its InternalState is
+// `[self + 0x40]`, which is the same dword the interface reads at +0x28.
+void OnStartShown_Hook(void* self) {
+    const CloseCallLease closeCall;
+    if (OnStartShown_Original) {
+        OnStartShown_Original(self);
+    }
+    if (!g_ownEventsEnabled.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    OwnEventShown();
+}
+
+using OnStartHidden_t = void (*)(void*);
+OnStartHidden_t OnStartHidden_Original = nullptr;
+
+// XamlLauncherState::OnStartHidden(self): runs after the original, so the state
+// is already the settled closed value and the latch's ShowStartView cannot be
+// overwritten by this transition again.
+void OnStartHidden_Hook(void* self) {
+    const CloseCallLease closeCall;
+    if (OnStartHidden_Original) {
+        OnStartHidden_Original(self);
+    }
+    if (!g_ownEventsEnabled.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    OwnEventHidden();
+    // The landing the latch exists for. If the cloak has already flipped, the
+    // press becomes the same open intent a normal press would have published.
+    ServeLatchedPress(L"hidden");
+}
+
+// XamlLauncher::Dismiss / XamlLauncher::ShowStartView. The taskbar's Start
+// button on this build does not call OnStartButtonPressed: it calls these
+// launcher methods directly (measured: the open arrives as the manager's Show
+// with no decision-hook frame; the close arrives as method 6 through
+// DismissStartAndCortana). These two hooks are the decision layer's observation
+// of such a caller: they log the same `own decide` line with trigger=foreign,
+// resync the truth, and then let the call run. Our own decision calls are
+// excluded by the thread-local guard, so they take the ordinary path.
+using DismissHook_t = HRESULT (*)(void*, uint32_t);
+DismissHook_t Dismiss_Original = nullptr;
+
+HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
+    const CloseCallLease closeCall;
+    if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed) || t_execCall > 0 ||
+        t_ownDecisionCall > 0) {
+        return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
+    }
+    g_execHookThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    EnsureExecutorWindow();
+    const OwnSnapshot own = OwnSync(launcher);
+    // The Start button's close is a trigger, not a duplicate: it arrives through
+    // this primitive with method 6 and must reach the controller even while the
+    // controller owns the panel. Only the shell's own duplicate close (any other
+    // method) is swallowed during that ownership.
+    if (method == kDismissMethodStartButton) {
+        PublishBridgeIntent(kSwipeIntentClose, kSwipeTriggerStartButton,
+                            method, 0);
+        FileLog(L"intent close trigger=startbutton method=%u state=%u", method,
+                own.state);
+        return S_OK;
+    }
+    if (SwipeIpcControllerOwning(&g_ipc)) {
+        FileLog(L"exec swallow dismiss method=%u state=%u reason=owning",
+                method, own.state);
+        return S_OK;
+    }
+    if (!g_ipc.state) {
+        return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
+    }
+    const HRESULT hr =
+        Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
+    OwnResyncFromState(OwnStateOf(launcher));
+    return hr;
+}
+
+using ShowStartViewHook_t = HRESULT (*)(void*, uint32_t, uint32_t);
+ShowStartViewHook_t ShowStartView_Original = nullptr;
+
+HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
+    const CloseCallLease closeCall;
+    if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed) || t_execCall > 0 ||
+        t_ownDecisionCall > 0) {
+        return ShowStartView_Original
+                   ? ShowStartView_Original(launcher, method, flags)
+                   : E_FAIL;
+    }
+    g_execHookThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    EnsureExecutorWindow();
+    const OwnSnapshot own = OwnSync(launcher);
+    // The Start button's open is a trigger too (method 11); it must reach the
+    // controller while the controller owns a close, so it is decided here before
+    // the duplicate suppression. Method 16 is the shell's own edge gesture: it
+    // is swallowed only when the controller's own show already owns the panel.
+    if (method == 11) {
+        const int32_t kind = IntentShouldClose(own) ? kSwipeIntentClose
+                                                    : kSwipeIntentOpen;
+        FileLog(L"intent %s trigger=startbutton method=%u flags=%u state=%u "
+                L"phase=%d",
+                kind == kSwipeIntentClose ? L"close" : L"open", method, flags,
+                own.state, SwipeIpcControllerPhase(&g_ipc));
+        if (kind == kSwipeIntentOpen &&
+            (ShellHideInFlight(own) || g_pendingDismissSeq != 0)) {
+            LatchPress(own, kSwipeTriggerStartButton, method, flags);
+            return S_OK;
+        }
+        PublishBridgeIntent(kind, kSwipeTriggerStartButton, method, flags);
+        return S_OK;
+    }
+    if (SwipeIpcControllerOwning(&g_ipc)) {
+        FileLog(L"exec swallow show method=%u flags=%u state=%u reason=owning",
+                method, flags, own.state);
+        return S_OK;
+    }
+    if (!g_ipc.state) {
+        return ShowStartView_Original
+                   ? ShowStartView_Original(launcher, method, flags)
+                   : E_FAIL;
+    }
+    const HRESULT hr = ShowStartView_Original
+                           ? ShowStartView_Original(launcher, method, flags)
+                           : E_FAIL;
+    OwnResyncFromState(OwnStateOf(launcher));
+    return hr;
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Hook installation
@@ -1581,6 +2241,225 @@ bool ImageRangeExecutable(HMODULE module, uintptr_t rva, size_t bytes) {
 // build's prologue, and its body still carries the manager call site the state
 // machine was traced through. Each failure has its own line, and only the close
 // hook is left out; the observation hooks keep working.
+
+// ---------------------------------------------------------------------------
+// Own-hook probes
+//
+// A fixed RVA is only trusted after four checks: the range is executable code of
+// the loaded image, the prologue matches this build, the body still carries the
+// landmark the decision was read from, and every direct call site the executor
+// depends on still targets the function it names. A failure logs one line with
+// the hook's name and leaves only that hook out.
+// ---------------------------------------------------------------------------
+
+bool PrologueMatches(HMODULE module, uintptr_t rva, const uint8_t* expected,
+                     size_t count) {
+    if (!ImageRangeExecutable(module, rva, count)) {
+        return false;
+    }
+    const uint8_t* code = reinterpret_cast<const uint8_t*>(module) + rva;
+    return std::memcmp(code, expected, count) == 0;
+}
+
+bool BodyContains(HMODULE module, uintptr_t rva, size_t span,
+                  const uint8_t* needle, size_t count) {
+    if (count == 0 || span < count || !ImageRangeExecutable(module, rva, span)) {
+        return false;
+    }
+    const uint8_t* code = reinterpret_cast<const uint8_t*>(module) + rva;
+    for (size_t i = 0; i + count <= span; i++) {
+        if (std::memcmp(code + i, needle, count) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DirectCallTargets(HMODULE module, uintptr_t callRva, uintptr_t targetRva) {
+    if (!ImageRangeExecutable(module, callRva, 5)) {
+        return false;
+    }
+    const uint8_t* code = reinterpret_cast<const uint8_t*>(module) + callRva;
+    if (code[0] != 0xE8) {
+        return false;
+    }
+    int32_t displacement = 0;
+    std::memcpy(&displacement, code + 1, sizeof(displacement));
+    return callRva + 5 + static_cast<int64_t>(displacement) == targetRva;
+}
+
+// XamlLauncher::OnHotkeyInvoke: `[self+0x178]` is the state, `vtable+0x68` is
+// IsStartVisible, `Dismiss(self+0x18, 1)` is the close and
+// `ShowStartView(self+0x18, 1, flags)` the open.
+bool OnHotkeyInvokeProbe(HMODULE module) {
+    const uintptr_t rva = kOnHotkeyInvokeVa - kTwinuiPreferredBase;
+    const uint8_t stateLoad[] = {0x48, 0x8B, 0x89, 0x78, 0x01, 0x00, 0x00};
+    const uint8_t isVisible[] = {0x48, 0x8B, 0x40, 0x68};
+    const uint8_t launcherBias[] = {0x48, 0x8D, 0x4B, 0x18};
+    if (!PrologueMatches(module, rva, kOnHotkeyInvokePrologue,
+                         sizeof(kOnHotkeyInvokePrologue)) ||
+        !BodyContains(module, rva, 0x400, stateLoad, sizeof(stateLoad)) ||
+        !BodyContains(module, rva, 0x400, isVisible, sizeof(isVisible)) ||
+        !BodyContains(module, rva, 0x400, launcherBias,
+                      sizeof(launcherBias)) ||
+        !DirectCallTargets(module, 0x1419A2, 0x25D670) ||
+        !DirectCallTargets(module, 0x141AC9, 0x141AF0)) {
+        FileLog(L"own hook skipped name=win build=10.0.26100.9949 body moved");
+        Wh_Log(L"OnHotkeyInvoke does not carry the state, launcher bias and "
+               L"Dismiss/ShowStartView calls this hook was written for; the "
+               L"Windows-key hook is refused");
+        return false;
+    }
+    return true;
+}
+
+// XamlLauncher::OnStartButtonPressed: `[self+0x160]` is the state, the visible
+// branch calls the state's DismissStartAndCortana (vtable+0x40) and the else
+// branch calls ShowStartView.
+bool OnStartButtonPressedProbe(HMODULE module) {
+    const uintptr_t rva = kOnStartButtonPressedVa - kTwinuiPreferredBase;
+    const uint8_t stateLoad[] = {0x48, 0x8B, 0x89, 0x60, 0x01, 0x00, 0x00};
+    const uint8_t isVisible[] = {0x48, 0x8B, 0x40, 0x68};
+    const uint8_t dismissSlot[] = {0x48, 0x8B, 0x40, 0x40};
+    if (!PrologueMatches(module, rva, kOnStartButtonPressedPrologue,
+                         sizeof(kOnStartButtonPressedPrologue)) ||
+        !BodyContains(module, rva, 0x100, stateLoad, sizeof(stateLoad)) ||
+        !BodyContains(module, rva, 0x100, isVisible, sizeof(isVisible)) ||
+        !BodyContains(module, rva, 0x100, dismissSlot, sizeof(dismissSlot)) ||
+        !DirectCallTargets(module, 0x492CFA, 0x141AF0)) {
+        FileLog(L"own hook skipped name=startbutton build=10.0.26100.9949 "
+                L"body moved");
+        Wh_Log(L"OnStartButtonPressed does not carry the state, the dismiss "
+               L"slot and the ShowStartView call this hook was written for; "
+               L"the Start-button hook is refused");
+        return false;
+    }
+    return true;
+}
+
+bool DismissProbe(HMODULE module) {
+    const uintptr_t rva = kDismissVa - kTwinuiPreferredBase;
+    const uint8_t stateLoad[] = {0x48, 0x8B, 0x89, 0x60, 0x01, 0x00, 0x00};
+    const uint8_t dismissSlot[] = {0x48, 0x8B, 0x40, 0x40};
+    if (!PrologueMatches(module, rva, kDismissPrologue,
+                         sizeof(kDismissPrologue)) ||
+        !BodyContains(module, rva, 0x40, stateLoad, sizeof(stateLoad)) ||
+        !BodyContains(module, rva, 0x40, dismissSlot,
+                      sizeof(dismissSlot))) {
+        FileLog(L"own hook skipped name=dismiss build=10.0.26100.9949 body "
+                L"moved");
+        return false;
+    }
+    return true;
+}
+
+bool ShowStartViewProbe(HMODULE module) {
+    const uintptr_t rva = kShowStartViewVa - kTwinuiPreferredBase;
+    const uint8_t stateCheck[] = {0x48, 0x83, 0xB9, 0x60, 0x01,
+                                  0x00, 0x00, 0x00};
+    const uint8_t showSlot[] = {0x48, 0x8B, 0x40, 0x38};
+    if (!PrologueMatches(module, rva, kShowStartViewPrologue,
+                         sizeof(kShowStartViewPrologue)) ||
+        !BodyContains(module, rva, 0x400, stateCheck, sizeof(stateCheck)) ||
+        !BodyContains(module, rva, 0x400, showSlot, sizeof(showSlot))) {
+        FileLog(L"own hook skipped name=showstartview build=10.0.26100.9949 "
+                L"body moved");
+        return false;
+    }
+    return true;
+}
+
+// The event hooks read the state object at [self+0x40] (the same dword the
+// IXamlLauncherState interface reads at +0x28). OnStartShown writes 5 there;
+// OnStartHidden completes the known transitions.
+bool OnStartShownProbe(HMODULE module) {
+    const uintptr_t rva = kOnStartShownVa - kTwinuiPreferredBase;
+    const uint8_t stateBias[] = {0x48, 0x8D, 0x77, 0x40};
+    const uint8_t stateFive[] = {0xC7, 0x06, 0x05, 0x00, 0x00, 0x00};
+    if (!PrologueMatches(module, rva, kOnStartShownPrologue,
+                         sizeof(kOnStartShownPrologue)) ||
+        !BodyContains(module, rva, 0x600, stateBias, sizeof(stateBias)) ||
+        !BodyContains(module, rva, 0x600, stateFive, sizeof(stateFive))) {
+        FileLog(L"own hook skipped name=shown build=10.0.26100.9949 body "
+                L"moved");
+        return false;
+    }
+    return true;
+}
+
+bool OnStartHiddenProbe(HMODULE module) {
+    const uintptr_t rva = kOnStartHiddenVa - kTwinuiPreferredBase;
+    const uint8_t stateBias[] = {0x48, 0x8D, 0x59, 0x40};
+    const uint8_t stateTen[] = {0xC7, 0x03, 0x0A, 0x00, 0x00, 0x00};
+    const bool prologue = PrologueMatches(module, rva, kOnStartHiddenPrologue,
+                                          sizeof(kOnStartHiddenPrologue));
+    const bool bias =
+        BodyContains(module, rva, 0x100, stateBias, sizeof(stateBias));
+    const bool ten =
+        BodyContains(module, rva, 0x100, stateTen, sizeof(stateTen));
+    if (!prologue || !bias || !ten) {
+        FileLog(L"own hook skipped name=hidden build=10.0.26100.9949 "
+                L"prologue=%d bias=%d ten=%d",
+                prologue ? 1 : 0, bias ? 1 : 0, ten ? 1 : 0);
+        return false;
+    }
+    return true;
+}
+
+// The three entrances the caller discriminator names. Each is proven twice: the
+// function body is the one the RVA was read from, and the return address the
+// hook will see is the instruction after a call that is still there.
+bool HideCallerSitesProbe(HMODULE module) {
+    // The caller constants are RVAs; only the three function starts below are
+    // preferred VAs.
+    const uintptr_t ordinaryRva = kHideCallerOrdinaryVa - 5;
+    const uintptr_t clickAwayRva = kHideCallerClickAwayVa - 5;
+    const uintptr_t lockRva = kHideCallerLockVa - 5;
+    const uint8_t vtableSlot[] = {0x48, 0x8B, 0x40, 0x48};
+
+    const bool ordinary =
+        PrologueMatches(module, kDismissStartAndCortanaVa - kTwinuiPreferredBase,
+                        kDismissStartAndCortanaPrologue,
+                        sizeof(kDismissStartAndCortanaPrologue)) &&
+        DirectCallTargets(module, ordinaryRva,
+                          kHideStartAndCortanaVa - kTwinuiPreferredBase);
+    const bool clickAway =
+        PrologueMatches(module, kClickAwayDelegateVa - kTwinuiPreferredBase,
+                        kClickAwayDelegatePrologue,
+                        sizeof(kClickAwayDelegatePrologue)) &&
+        BodyContains(module, clickAwayRva - 4, 4, vtableSlot,
+                     sizeof(vtableSlot)) &&
+        DirectCallTargets(module, clickAwayRva, 0x76E010);
+    const uint8_t lockSite[] = {0xBA, 0x07, 0x00, 0x00, 0x00, 0x48,
+                                0x8B, 0x01, 0x48, 0x8B, 0x40, 0x48};
+    const bool lock =
+        PrologueMatches(module, kLockDismissVa - kTwinuiPreferredBase,
+                        kLockDismissPrologue,
+                        sizeof(kLockDismissPrologue)) &&
+        BodyContains(module, kLockDismissVa - kTwinuiPreferredBase,
+                     0x60, lockSite, sizeof(lockSite)) &&
+        DirectCallTargets(module, lockRva, 0x76E010);
+
+    const uint8_t awaySite[] = {0xBA, 0x07, 0x00, 0x00, 0x00, 0x48,
+                                0x8B, 0x01, 0x48, 0x8B, 0x40, 0x48};
+    const bool away =
+        PrologueMatches(module, kClickAwayHandlerVa - kTwinuiPreferredBase,
+                        kClickAwayHandlerPrologue,
+                        sizeof(kClickAwayHandlerPrologue)) &&
+        BodyContains(module, kClickAwayHandlerVa - kTwinuiPreferredBase, 0x200,
+                     awaySite, sizeof(awaySite)) &&
+        DirectCallTargets(module, kHideCallerAwayVa - 5, 0x76E010);
+
+    if (!ordinary || !clickAway || !lock || !away) {
+        FileLog(L"own hook skipped name=callers build=10.0.26100.9949 "
+                L"ordinary=%d clickaway=%d lock=%d away=%d",
+                ordinary ? 1 : 0, clickAway ? 1 : 0, lock ? 1 : 0,
+                away ? 1 : 0);
+        return false;
+    }
+    return true;
+}
+
 bool HideStartAndCortanaProbe(HMODULE module) {
     const uintptr_t functionRva = kHideStartAndCortanaVa - kTwinuiPreferredBase;
     if (!ImageRangeExecutable(module, functionRva,
@@ -1702,7 +2581,7 @@ void InstallExplorerHooks(HMODULE module) {
                 reinterpret_cast<void**>(&Show_Original),
                 L"CStartExperienceManager::Show");
 
-    // The decision hook first, so the observation hook below can never be the
+    // The close executor first, so the observation hook below can never be the
     // only one installed on a build whose state machine moved: the close is then
     // not animated at all instead of being delayed by a hook that cannot decide.
     if (HideStartAndCortanaProbe(module) &&
@@ -1710,8 +2589,76 @@ void InstallExplorerHooks(HMODULE module) {
                     reinterpret_cast<void*>(HideStartAndCortana_Hook),
                     reinterpret_cast<void**>(&HideStartAndCortana_Original),
                     L"XamlLauncherState::HideStartAndCortana")) {
-        g_arbiterEnabled.store(true, std::memory_order_relaxed);
-        FileLog(L"close arbiter installed rva=24bcb0");
+        g_closeHookEnabled.store(true, std::memory_order_relaxed);
+        // The caller discriminator is what keeps the lock screen out of the
+        // animation. Without all three proven sites, every close is
+        // unattributable and would pass at once; that is why the executor stays
+        // installed but the decision hooks below are refused.
+        g_twinuiBase = base;
+        if (!HideCallerSitesProbe(module)) {
+            FileLog(L"own close executor installed without caller probe; every "
+                    L"close passes as unplanned");
+        }
+        FileLog(L"close trigger hook installed rva=24bcb0");
+    }
+
+    // The primitives the two decision hooks call. Probed together: a decision
+    // that can only close or only open would be half a toggle.
+    const bool primitives =
+        g_closeHookEnabled.load(std::memory_order_relaxed) && DismissProbe(module) &&
+        ShowStartViewProbe(module);
+    if (primitives) {
+        g_dismiss = reinterpret_cast<DismissFn>(at(kDismissVa));
+        g_showStartView = reinterpret_cast<ShowStartViewFn>(at(kShowStartViewVa));
+        if (InstallHook(at(kDismissVa),
+                        reinterpret_cast<void*>(Dismiss_Hook),
+                        reinterpret_cast<void**>(&Dismiss_Original),
+                        L"XamlLauncher::Dismiss") &&
+            InstallHook(at(kShowStartViewVa),
+                        reinterpret_cast<void*>(ShowStartView_Hook),
+                        reinterpret_cast<void**>(&ShowStartView_Original),
+                        L"XamlLauncher::ShowStartView")) {
+            g_ownPrimitivesEnabled.store(true, std::memory_order_relaxed);
+            FileLog(L"own hooks installed name=primitives");
+        }
+    } else {
+        FileLog(L"own hook skipped name=primitives build=10.0.26100.9949");
+    }
+
+    // Both decisions share the one owner state. Each hook is probed and installed
+    // alone: a refused Windows-key hook leaves the Start button working and the
+    // shell's own decision for the key, and the reverse.
+    if (primitives && OnHotkeyInvokeProbe(module) &&
+        InstallHook(at(kOnHotkeyInvokeVa),
+                    reinterpret_cast<void*>(OnHotkeyInvoke_Hook),
+                    reinterpret_cast<void**>(&OnHotkeyInvoke_Original),
+                    L"XamlLauncher::OnHotkeyInvoke")) {
+        g_ownWinEnabled.store(true, std::memory_order_relaxed);
+        FileLog(L"own hook installed name=win rva=14195c");
+    }
+    if (primitives && OnStartButtonPressedProbe(module) &&
+        InstallHook(at(kOnStartButtonPressedVa),
+                    reinterpret_cast<void*>(OnStartButtonPressed_Hook),
+                    reinterpret_cast<void**>(&OnStartButtonPressed_Original),
+                    L"XamlLauncher::OnStartButtonPressed")) {
+        g_ownButtonEnabled.store(true, std::memory_order_relaxed);
+        FileLog(L"own hook installed name=startbutton rva=492c90");
+    }
+
+    // The events only mirror the boolean and serve the reopen latch. Both are
+    // probed together: a Shown without a Hidden would show an open that no close
+    // ever clears.
+    if (OnStartShownProbe(module) && OnStartHiddenProbe(module) &&
+        InstallHook(at(kOnStartShownVa),
+                    reinterpret_cast<void*>(OnStartShown_Hook),
+                    reinterpret_cast<void**>(&OnStartShown_Original),
+                    L"XamlLauncherState::OnStartShown") &&
+        InstallHook(at(kOnStartHiddenVa),
+                    reinterpret_cast<void*>(OnStartHidden_Hook),
+                    reinterpret_cast<void**>(&OnStartHidden_Original),
+                    L"XamlLauncherState::OnStartHidden")) {
+        g_ownEventsEnabled.store(true, std::memory_order_relaxed);
+        FileLog(L"own hooks installed name=events");
     }
 
     InstallHook(at(kHideVa), reinterpret_cast<void*>(Hide_Hook),
@@ -1754,6 +2701,14 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
     if (module && !g_explorerHooked.load(std::memory_order_relaxed)) {
         if (module == GetModuleHandleW(kTwinuiModuleName)) {
             TryInstallFromLoadedModules(true);
+            // The shell UI thread owns the taskbar; only create the executor
+            // window on it. If this load ran elsewhere, the first decision hook
+            // creates the window on the correct thread.
+            const DWORD shellThread = GetWindowThreadProcessId(
+                FindWindowW(L"Shell_TrayWnd", nullptr), nullptr);
+            if (shellThread == 0 || shellThread == GetCurrentThreadId()) {
+                EnsureExecutorWindow();
+            }
         }
     }
 
@@ -1825,8 +2780,30 @@ void ResetReinitState() {
     g_disabled.store(false, std::memory_order_relaxed);
     g_afterInit.store(false, std::memory_order_relaxed);
     g_explorerHooked.store(false, std::memory_order_relaxed);
-    g_arbiterEnabled.store(false, std::memory_order_relaxed);
+    g_closeHookEnabled.store(false, std::memory_order_relaxed);
     g_startPointTick.store(0, std::memory_order_relaxed);
+    // The decision layer's per-activation state: a re-enable starts with no
+    // cached toggle, no latch, no forwarded mark and no primitives from the
+    // previous activation.
+    g_ownWinEnabled.store(false, std::memory_order_relaxed);
+    g_ownButtonEnabled.store(false, std::memory_order_relaxed);
+    g_ownEventsEnabled.store(false, std::memory_order_relaxed);
+    g_ownPrimitivesEnabled.store(false, std::memory_order_relaxed);
+    g_ownReopenServedTick.store(0, std::memory_order_relaxed);
+    g_dismiss = nullptr;
+    g_showStartView = nullptr;
+    g_twinuiBase = 0;
+    t_ownExternalMethod = 0;
+    t_ownDecisionCall = 0;
+    t_ownForeignClose = false;
+    t_ownCloseExecutor = 0;
+    AcquireSRWLockExclusive(&g_ownLock);
+    g_ownOpen = false;
+    g_ownPendingOpen = false;
+    g_ownPendingTick = 0;
+    g_ownLauncher = nullptr;
+    g_ownCloseTrigger = OwnTrigger::None;
+    ReleaseSRWLockExclusive(&g_ownLock);
     // A failed gesture mapping is retried by the next activation, as it was
     // when every activation loaded a fresh image. A ready one is kept: the
     // section and this process's view of it are still valid.
@@ -1838,8 +2815,453 @@ void ResetReinitState() {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// M3 executor: hidden window, launcher read, commands
+// ---------------------------------------------------------------------------
+
+// `s_pLauncher` holds the outer XamlLauncher object. The execution entry points
+// take its IXamlLauncher subobject, `outer + 0x18` — the same pointer the shell
+// passes to ShowStartView/Dismiss and the one the decision hooks call `launcher`.
+// Measured in explorer: outer vtable twinui+0x77E1C0 has `[+0x160] = 0`, while
+// `[outer+0x18+0x160]` is the live IXamlLauncherState whose vtable+0x38 is
+// `XamlLauncherState::ShowStartView` at twinui+0x26F780. Reading the state from
+// the outer object returns the 0x80070490 path; the subobject is the interface.
+void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr) {
+    if (stateOut) {
+        *stateOut = 0;
+    }
+    if (outerOut) {
+        *outerOut = nullptr;
+    }
+    if (!g_twinuiBase) {
+        return nullptr;
+    }
+    void** slot = reinterpret_cast<void**>(
+        g_twinuiBase + kLauncherSingletonRva);
+    void* outer = *slot;
+    if (outerOut) {
+        *outerOut = outer;
+    }
+    if (!outer) {
+        return nullptr;
+    }
+    void* launcher = static_cast<uint8_t*>(outer) + kHotkeyLauncherOffset;
+    const uint64_t state = *reinterpret_cast<uint64_t*>(
+        static_cast<uint8_t*>(launcher) + kLauncherStateOffset);
+    if (stateOut) {
+        *stateOut = state;
+    }
+    if (state <= kLauncherStateReadyFloor) {
+        return nullptr;
+    }
+    return launcher;
+}
+
+void AnswerExec(LONG64 sequence, int32_t state, HRESULT hr, int visible) {
+    if (sequence > 0) {
+        SwipeIpcAnswerExec(&g_ipc, sequence, state, hr, visible);
+    }
+}
+
+bool LauncherVisibleNow(void* launcher) {
+    if (!launcher || !g_twinuiBase) {
+        return false;
+    }
+    const LauncherIsVisibleFn isVisible = reinterpret_cast<LauncherIsVisibleFn>(
+        g_twinuiBase + kLauncherIsVisibleRva);
+    BOOL visible = FALSE;
+    isVisible(launcher, &visible);
+    return visible != FALSE;
+}
+
+void ArmVisibleProbe(LONG64 sequence) {
+    g_pendingShowSeq = sequence;
+    if (g_execWindow.load(std::memory_order_relaxed)) {
+        SetTimer(g_execWindow.load(std::memory_order_relaxed), kExecProbeTimer,
+                 300, nullptr);
+    }
+}
+
+void ExecuteShow(const SwipeIpcExecCommand& command) {
+    uint64_t state = 0;
+    void* outer = nullptr;
+    void* launcher = LauncherNow(&state, &outer);
+    if (!launcher) {
+        FileLog(L"exec show seq=%lld refused outer=%p launcher=%p state=0x%llX "
+                L"reason=not-ready",
+                static_cast<long long>(command.seq), outer, launcher,
+                static_cast<unsigned long long>(state));
+        AnswerExec(command.seq, kSwipeAckRefused,
+                   HRESULT_FROM_WIN32(ERROR_NOT_FOUND), 0);
+        return;
+    }
+    ++t_execCall;
+    const HRESULT hr = g_showStartView
+                           ? g_showStartView(launcher, command.method ? command.method : 1,
+                                             command.flags)
+                           : E_FAIL;
+    // IsVisible right after the call is honest but early: the shell's show is
+    // still running and the window is cloaked, so the answer is 0 here. The
+    // confirmation is read again by the probe timer on this same thread.
+    const bool visible = LauncherVisibleNow(launcher);
+    --t_execCall;
+    FileLog(L"exec show seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
+            L"visible=%d",
+            static_cast<long long>(command.seq), outer, launcher,
+            static_cast<unsigned long long>(state),
+            static_cast<unsigned>(hr), visible ? 1 : 0);
+    AnswerExec(command.seq, SUCCEEDED(hr) ? kSwipeAckExecuted : kSwipeAckRefused,
+               hr, visible ? 1 : 0);
+    if (SUCCEEDED(hr)) {
+        ArmVisibleProbe(command.seq);
+    }
+}
+
+void ExecuteDismiss(const SwipeIpcExecCommand& command) {
+    // A pending show probe belongs to a window this dismiss is about to hide; its
+    // answer would describe the close, not the open.
+    g_pendingShowSeq = 0;
+    if (g_execWindow.load(std::memory_order_relaxed)) {
+        KillTimer(g_execWindow.load(std::memory_order_relaxed), kExecProbeTimer);
+    }
+    uint64_t state = 0;
+    void* outer = nullptr;
+    void* launcher = LauncherNow(&state, &outer);
+    if (!launcher) {
+        FileLog(L"exec dismiss seq=%lld refused outer=%p launcher=%p "
+                L"state=0x%llX reason=not-ready",
+                static_cast<long long>(command.seq), outer, launcher,
+                static_cast<unsigned long long>(state));
+        AnswerExec(command.seq, kSwipeAckRefused,
+                   HRESULT_FROM_WIN32(ERROR_NOT_FOUND), 0);
+        return;
+    }
+    ++t_execCall;
+    const HRESULT hr =
+        g_dismiss ? g_dismiss(launcher, command.method ? command.method : 1)
+                  : E_FAIL;
+    // The hide is synchronous enough that this answer is the confirmation: the
+    // window is expected to be invisible when Dismiss returns.
+    const bool visible = LauncherVisibleNow(launcher);
+    --t_execCall;
+    FileLog(L"exec dismiss seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
+            L"visible=%d",
+            static_cast<long long>(command.seq), outer, launcher,
+            static_cast<unsigned long long>(state),
+            static_cast<unsigned>(hr), visible ? 1 : 0);
+    AnswerExec(command.seq, SUCCEEDED(hr) ? kSwipeAckExecuted : kSwipeAckRefused,
+               hr, visible ? 1 : 0);
+}
+
+void ExecuteDueDismiss() {
+    if (g_pendingDismissSeq == 0) {
+        return;
+    }
+    SwipeIpcExecCommand command{};
+    if (!SwipeIpcReadExec(&g_ipc, &command)) {
+        return;
+    }
+    if (command.seq != g_pendingDismissSeq ||
+        command.kind != kSwipeExecDismiss) {
+        FileLog(L"exec dismiss seq=%lld superseded by %lld",
+                static_cast<long long>(g_pendingDismissSeq),
+                static_cast<long long>(command.seq));
+        g_pendingDismissSeq = 0;
+        g_pendingDismissOpen = 0;
+        return;
+    }
+    g_pendingDismissSeq = 0;
+    g_pendingDismissOpen = 0;
+    ExecuteDismiss(command);
+}
+
+void ExecutePendingCommand() {
+    SwipeIpcExecCommand command{};
+    if (!SwipeIpcReadExec(&g_ipc, &command) || command.seq == 0) {
+        return;
+    }
+    if (command.kind == kSwipeExecCancel) {
+        if (g_pendingDismissSeq != 0 &&
+            (command.target == 0 || command.target == g_pendingDismissSeq)) {
+            KillTimer(g_execWindow.load(), kExecDismissTimer);
+            FileLog(L"exec cancel seq=%lld target=%lld",
+                    static_cast<long long>(command.seq),
+                    static_cast<long long>(g_pendingDismissSeq));
+            AnswerExec(command.seq, kSwipeAckExecuted, S_OK, 0);
+            g_pendingDismissSeq = 0;
+            g_pendingDismissOpen = 0;
+        } else {
+            AnswerExec(command.seq, kSwipeAckExecuted, S_OK, 0);
+        }
+        return;
+    }
+    if (g_pendingDismissSeq != 0 && command.seq != g_pendingDismissSeq) {
+        KillTimer(g_execWindow.load(), kExecDismissTimer);
+        g_pendingDismissSeq = 0;
+        g_pendingDismissOpen = 0;
+    }
+    if (command.kind == kSwipeExecShow) {
+        ExecuteShow(command);
+        return;
+    }
+    if (command.kind == kSwipeExecDismiss) {
+        if (command.seq == g_pendingDismissSeq) {
+            // The worker posts once per Exec event, and the auto-reset event can
+            // deliver the same record twice when a second signal lands during
+            // the read. The record is already armed; arming it again would log a
+            // second time and reset the same deadline.
+            return;
+        }
+        const uint64_t now = GetTickCount64();
+        if (command.executeAt > now) {
+            g_pendingDismissSeq = command.seq;
+            g_pendingDismissOpen = command.open;
+            SetTimer(g_execWindow.load(), kExecDismissTimer,
+                     static_cast<UINT>(command.executeAt - now), nullptr);
+            FileLog(L"exec dismiss seq=%lld armed in=%llu ms",
+                    static_cast<long long>(command.seq),
+                    static_cast<unsigned long long>(command.executeAt - now));
+            return;
+        }
+        ExecuteDismiss(command);
+    }
+}
+
+LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
+                                    LPARAM lParam) {
+    if (message == kExecMessage) {
+        ExecutePendingCommand();
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kExecDismissTimer) {
+        KillTimer(window, kExecDismissTimer);
+        ExecuteDueDismiss();
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kExecProbeTimer) {
+        KillTimer(window, kExecProbeTimer);
+        uint64_t state = 0;
+        void* outer = nullptr;
+        void* launcher = LauncherNow(&state, &outer);
+        const bool visible = LauncherVisibleNow(launcher);
+        FileLog(L"exec visible seq=%lld launcher=%p state=0x%llX visible=%d",
+                static_cast<long long>(g_pendingShowSeq), launcher,
+                static_cast<unsigned long long>(state), visible ? 1 : 0);
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kPressLatchTimer) {
+        KillTimer(window, kPressLatchTimer);
+        if (!ServeLatchedPress(L"timeout") && g_pressLatch.pending) {
+            // The hide has not landed yet. Retry; the hidden event is the normal
+            // serve point, this only covers a landing it missed.
+            SetTimer(window, kPressLatchTimer,
+                     static_cast<UINT>(kPressLatchRetryMs), nullptr);
+        }
+        return 0;
+    }
+    if (message == WM_CLOSE) {
+        DestroyWindow(window);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) {
+        if (g_execWindow.load() == window) {
+            g_execWindow.store(nullptr);
+        }
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+void EnsureExecutorWindow() {
+    if (g_execWindow.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // The class is unique per activation. A Windhawk reinstall maps a new image
+    // at a new base while the old one stays pinned; a fixed class name would
+    // return ERROR_CLASS_ALREADY_EXISTS and CreateWindowEx would use the old
+    // image's WndProc, whose channel and globals belong to the previous
+    // activation. Naming the class by this image's WndProc address keeps every
+    // activation's window on its own procedure.
+    static wchar_t className[64] = L"";
+    if (!className[0]) {
+        swprintf_s(className, L"WindhawkSwipeExecutor_%p",
+                   reinterpret_cast<void*>(&ExecutorWindowProc));
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW windowClass{};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = ExecutorWindowProc;
+        windowClass.hInstance = GetModuleHandleW(nullptr);
+        windowClass.lpszClassName = className;
+        if (!RegisterClassExW(&windowClass) &&
+            GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            FileLog(L"exec window class failed err=%u", GetLastError());
+            return;
+        }
+        registered = true;
+    }
+    HWND window = CreateWindowExW(0, className, L"", 0, 0, 0, 0,
+                                  0, HWND_MESSAGE, nullptr,
+                                  GetModuleHandleW(nullptr), nullptr);
+    if (!window) {
+        FileLog(L"exec window create failed err=%u", GetLastError());
+        return;
+    }
+    g_execWindow.store(window, std::memory_order_relaxed);
+    g_execThreadId = GetCurrentThreadId();
+    FileLog(L"exec window hwnd=%p tid=%u class=%s", window, g_execThreadId,
+            className);
+}
+
+LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && !g_execWindow.load(std::memory_order_relaxed)) {
+        EnsureExecutorWindow();
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
+    if (g_execWindow.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    const DWORD target = g_execHookThread.load(std::memory_order_relaxed);
+    if (target == 0) {
+        // No launcher-thread hook has run yet. A touch-first open falls back to
+        // the shell's own gesture; the first OnHotkeyInvoke or OnStartShown
+        // creates the window.
+        return false;
+    }
+    if (target == GetCurrentThreadId()) {
+        EnsureExecutorWindow();
+        return g_execWindow.load(std::memory_order_relaxed) != nullptr;
+    }
+
+    HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, ExecutorThreadHook, nullptr,
+                                   target);
+    if (!hook) {
+        FileLog(L"exec window hook failed err=%u", GetLastError());
+        return false;
+    }
+    const ULONGLONG start = GetTickCount64();
+    while (!g_execWindow.load(std::memory_order_relaxed) &&
+           GetTickCount64() - start < timeoutMs) {
+        Sleep(5);
+    }
+    UnhookWindowsHookEx(hook);
+    const bool ready = g_execWindow.load(std::memory_order_relaxed) != nullptr;
+    if (!ready) {
+        FileLog(L"exec window deferred: launcher thread %u did not pump in "
+                L"%llu ms",
+                target, static_cast<unsigned long long>(timeoutMs));
+    }
+    return ready;
+}
+
+DWORD WINAPI ExecutorWorkerProc(LPVOID) {
+    // The executor must live on explorer's shell UI thread — the thread that owns
+    // Shell_TrayWnd and pumps the launcher's state machine. Creating the window
+    // from a hook frame puts it on whichever thread called the hook, which is not
+    // that one, and its messages are then never dispatched. A one-shot
+    // WH_GETMESSAGE hook runs this creation on the tray thread, and the window's
+    // messages are dispatched by the same loop afterwards.
+    CreateExecutorWindowOnUiThread(2000);
+
+    HANDLE events[2] = {g_execStopEvent, g_ipc.execEvent};
+    for (;;) {
+        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        if (wait == WAIT_OBJECT_0) {
+            return 0;
+        }
+        if (wait != WAIT_OBJECT_0 + 1) {
+            return 0;
+        }
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        for (int i = 0; i < 50 && !window; ++i) {
+            Sleep(1);
+            window = g_execWindow.load(std::memory_order_relaxed);
+        }
+        if (!window) {
+            FileLog(L"exec command dropped: no window");
+            CreateExecutorWindowOnUiThread(500);
+            window = g_execWindow.load(std::memory_order_relaxed);
+            if (!window) {
+                continue;
+            }
+        }
+        if (!PostMessageW(window, kExecMessage, 0, 0)) {
+            FileLog(L"exec command post failed err=%u", GetLastError());
+        }
+    }
+}
+
+void StartExecutorWorker() {
+    if (g_execWorker || !g_ipc.execEvent) {
+        return;
+    }
+    g_execStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_execStopEvent) {
+        FileLog(L"exec worker stop event failed err=%u", GetLastError());
+        return;
+    }
+    g_execWorker = CreateThread(nullptr, 0, ExecutorWorkerProc, nullptr, 0,
+                                nullptr);
+    if (!g_execWorker) {
+        FileLog(L"exec worker thread failed err=%u", GetLastError());
+        CloseHandle(g_execStopEvent);
+        g_execStopEvent = nullptr;
+        return;
+    }
+    FileLog(L"exec worker started");
+}
+
+void StopExecutorWorker() {
+    if (!g_execWorker) {
+        return;
+    }
+    SetEvent(g_execStopEvent);
+    const DWORD wait = WaitForSingleObject(g_execWorker, 2000);
+    if (wait == WAIT_OBJECT_0) {
+        CloseHandle(g_execWorker);
+        g_execWorker = nullptr;
+    }
+    if (g_execStopEvent) {
+        CloseHandle(g_execStopEvent);
+        g_execStopEvent = nullptr;
+    }
+    HWND window = g_execWindow.load();
+    if (window) {
+        PostMessageW(window, WM_CLOSE, 0, 0);
+    }
+}
+
+void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
+                         uint32_t flags) {
+    if (!g_ipc.state) {
+        return;
+    }
+    uint64_t open = 0;
+    uint64_t openTick = 0;
+    SwipeIpcReadOpen(&g_ipc, &open, &openTick);
+    const LONG64 sequence =
+        SwipeIpcPublishIntent(&g_ipc, kind, trigger, method, flags, open);
+    FileLog(L"intent kind=%s trigger=%s seq=%lld open=%llu method=%u flags=%u",
+            kind == kSwipeIntentOpen
+                ? L"open"
+                : (kind == kSwipeIntentClose ? L"close" : L"external"),
+            trigger == kSwipeTriggerWin
+                ? L"win"
+                : (trigger == kSwipeTriggerStartButton
+                       ? L"startbutton"
+                       : (trigger == kSwipeTriggerClickAway ? L"clickaway"
+                                                            : L"override")),
+            static_cast<long long>(sequence),
+            static_cast<unsigned long long>(open), method, flags);
+}
+
+
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.17.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.20.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
@@ -1893,18 +3315,14 @@ BOOL Wh_ModInit() {
     DWORD ipcError = 0;
     const bool channelOpen = g_ipc.state != nullptr;
     if (!channelOpen && !SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
-        Wh_Log(L"Swipe IPC channel unavailable (%u); a keyboard close takes the "
-               L"fixed lead",
+        Wh_Log(L"Swipe IPC channel unavailable (%u); the shell's own path "
+               L"serves every trigger",
                static_cast<unsigned>(ipcError));
     } else {
-        // A tap published before this process attached belongs to a close this
-        // hook never saw: seed the watermark so only a later tap can pass.
-        SwipeIpcCloseSnapshot close{};
-        g_handledCloseSeq = SwipeIpcReadClose(&g_ipc, &close)
-                                ? close.seq
-                                : SwipeIpcLoad64(&g_ipc.state->closeSeq);
-        FileLog(L"ipc open created=%d close=%lld", created ? 1 : 0,
-                static_cast<long long>(g_handledCloseSeq));
+        FileLog(L"ipc open created=%d", created ? 1 : 0);
+    }
+    if (g_ipc.state) {
+        StartExecutorWorker();
     }
 
     HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
@@ -1963,6 +3381,10 @@ void Wh_ModUninit() {
     if (g_initRefused.load(std::memory_order_relaxed)) {
         return;
     }
+
+    // The executor worker posts to the hidden window and never touches the
+    // launcher itself; stop it before the channel and the window go away.
+    StopExecutorWorker();
 
     // Two channels, two lifetimes, for two reasons.
     //
