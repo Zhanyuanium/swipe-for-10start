@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
-// @description     Publishes the live Win10 Start edge-gesture handle and state from explorer for the StartMenuExperienceHost side
-// @version         0.16.0
+// @description     Decides the shell's Start close from explorer and publishes the live Win10 Start edge-gesture handle and state
+// @version         0.17.0
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
@@ -16,41 +16,69 @@
 Explorer-side half of the touch-swipe bridge for the ExplorerPatcher legacy
 Windows 10 Start menu.
 
-The mod calls no hide of its own and presses no key. The Start side owns both
-closes: a keyboard close is the user's Windows tap, a gesture close is a Windows
-tap the Start mod sends at the end of its retract. This mod only decides how
-long the shell's key handler must wait for the panel.
+The mod calls no hide of its own and presses no key. Where the shell decides to
+close the Start menu, this mod decides whether that close may happen now, must
+wait for the panel's retract, or must not happen at all, and it asks the Start
+side which one applies. The Start side owns both closes: a keyboard close is the
+user's Windows tap, a gesture close is a Windows tap it sends at the end of its
+retract.
 
-- A gesture close publishes a plan at its release, and a fresh record marked
-  `tapped` immediately before it sends the Windows key. Only the tapped record
-  names the Hide that needs no wait, because only it proves the tap is already
-  on its way. When that Hide arrives on a tapped record this hook has not
-  consumed, the panel is already gone; the hook logs
-  `hide passed (gesture)` and calls the original at once. A Hide that arrives
-  while only the plan is current is the user's own Windows press during the
-  settle, a keyboard close, and gets the lead below.
-- A gesture close that a new edge pull cancels before its tap publishes the
-  cancelled kind at once, so no Hide in between is ever mistaken for the tap's.
-- The close record names no menu, so a tapped record is accepted only when it is
-  newer than the sequence this process seeded at attach and was stamped at or
-  after the newest open generation it has seen. That alone keeps a tap whose Hide
-  never came from passing an unrelated Hide under the next menu; the channel also
-  asks the Start side to cancel its stamp when it publishes a new open. Both
-  ticks come from one clock, so only a tap and an open inside the same ~16 ms
-  tick cannot be ordered: an unconsumed fresh stamp is evidence of correlation,
-  not proof of cause, and the plan-versus-tapped distinction is what carries the
-  correctness.
-- Any other Hide is a keyboard close: the mod publishes the `retract` request on
-  the channel and waits for the Start mod's answer with the settle it
-  just planned, then holds the shell for exactly that duration plus a 30 ms
-  margin. The request carries the menu-open generation the hook saw and a
-  deadline, so a request that reaches the Start side late cannot start a settle
-  under the menu the user opened next; the hook marks the request done when the
-  Hide it held completes. A menu with no published generation sends 0, which is
-  never a valid generation and which the Start side refuses. A Start mod that
-  cannot answer costs a 100 ms wait and then a fixed 560 ms lead. A request that
-  cannot be published skips the wait, because a delay without a retract would
-  only slow the close down.
+The decision point is `twinui.pcshell.dll`
+`XamlLauncherState::HideStartAndCortana(this, method)` (RVA `0x24BCB0` on
+10.0.26100.9949), one frame above the `CStartExperienceManager::Hide` this mod
+used to hold. All three shell closes enter it: the Windows key (`Dismiss(1)` ->
+`HideStartAndCortana(1)`), the taskbar Start button (`Dismiss(7)`, once
+measured 6), and the click-away, which enters `HideStartAndCortana(7)` directly
+through a delegate. It is also the one point where skipping the call equals "the
+user never asked": the launcher's state (5 = open) is written by this function
+and completed by the view's `Hidden` event, while `CStartExperienceManager::Hide`
+writes no state at all. Holding `Hide` therefore stranded the state at 9 and
+left the Windows key dead for the rest of the menu; holding here keeps it at 5
+for the whole hold, and cancelling here leaves it at 5 with no compensation.
+
+What the hook does, per dismiss method:
+
+- A close the Start side's own Windows tap causes is passed through at once
+  (`close passed method=... reason=gesture`). The tapped close record is read
+  exactly as before: fresh within 800 ms, not older than the newest open
+  generation, not already consumed.
+- Method 7 is the synchronous dismiss: display changes and the lock screen call
+  `DismissSynchronouslyWithoutTransition`, and the measured click-away enters
+  with the same method. It is never held — a lock must not wait for a slide-out.
+  It is decided from the Start side's standing reveal claim (`revealOpen` /
+  `revealTick` in the v2 section): while a reveal contact drives the panel and
+  the claim is fresh and bound to the menu on screen, the close is cancelled
+  (`close cancelled method=7 ...`); otherwise it passes at once
+  (`close passed method=7 ...`).
+- Every other method is the user's Windows key or the Start button. The mod
+  publishes the `retract` request on the v2 channel, bound to the open
+  generation it read and with a 700 ms deadline, and waits up to 100 ms for the
+  answer. The answer is one of three: a duration (hold the original for that
+  duration plus 30 ms, `hide delayed reason=... retract=... lead=...`), the
+  no-settle sentinel (nothing to animate: pass at once,
+  `hide passed reason=... retract=none`), or `cancel` (a reveal owns the panel:
+  return without calling the original, `close cancelled method=... ...`).
+- No channel, a failed request, no answer or a request the Start side refused
+  as stale all call the original at once. That is the fallback: a close is never
+  left hanging on a mod that is not there. An earlier build held the fixed
+  560 ms lead when no answer arrived; the arbiter has no reason to wait for an
+  animation nobody planned, so the fallback is now immediate and a disabled or
+  absent Start mod costs no delay.
+
+The two hooks divide the work by layer, and only the decision hook waits:
+
+- `XamlLauncherState::HideStartAndCortana` is where the pause lives. Holding it
+  keeps the launcher's state at 5, and cancelling it never writes the state.
+- `CStartExperienceManager::Hide` is observed only: it logs `hide reason=...`
+  and clears the published gesture record, and every path calls it. Its old hold
+  is gone; a second hold would delay every close twice.
+
+Refusing a close does not make a Win press inside an already committed close
+reopen the menu. Measured: during a close the state passes 5 -> 9 -> 11, and
+both 9 and 11 are in `IsStartVisible`'s visible set, so the queued press becomes
+`HideStartAndCortana(11, 1)` and returns in the same millisecond with no `Hide`.
+That is the shell's own rule about a double toggle, not a hook's, and the
+arbiter does not try to fix it.
 
 Measured on this build, `Hide` is not the whole close: the shell keeps its Start
 toggle in the key handler. Both closes now go through that handler, so the
@@ -67,26 +95,33 @@ edge, the start point and the gesture state to shared memory:
 
 A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
-shipping Start mod does not read it. Its live couplings are the close stamp and
-the retract request/answer pair described below, both in
+shipping Start mod does not read it. Its live couplings are the close stamp, the
+retract request/answer pair and the reveal claim described below, all in
 `Local\SwipeFor10Start_v2_*` (see `swipe_ipc_shared.h`).
 
-Hooked functions are forwarded unchanged except for the keyboard wait described
-below. The mod creates no windows, threads or COM objects. It refuses to
-initialize unless its own image can be pinned, and on unload it waits, with no
-deadline, until every Hide that is inside the hook has left, and closes the
-channel only then. A Hide that does not return therefore holds the whole Windhawk
+Hooked functions are forwarded unchanged except for the close decision above.
+The mod creates no windows, threads or COM objects. It refuses to initialize
+unless its own image can be pinned, and on unload it waits, with no deadline,
+until every close-hook frame that is inside has left, and closes the channel
+only then. A frame that does not return therefore holds the whole Windhawk
 reload until it does; that is the price of never handing the host a trampoline a
 live frame can still call.
 
 Notes:
 - Windhawk compiles the mod from stdin, so the repository `mods` folder is
-  passed via `@compilerOptions -I...` to resolve `start_gesture_shared.h`.
-  Update that path if the repository is moved.
+  passed via `@compilerOptions -I...` to resolve `start_gesture_shared.h` and
+  `swipe_ipc_shared.h`. Update that path if the repository is moved.
 - RVAs are specific to `twinui.pcshell.dll` 26100.9949 (x86-64). Before any
   hook is installed, the loaded module must report that exact file version
   (and, when readable, the PE timestamp of the loaded image must match the file
   on disk). Otherwise the mod logs one mismatch line and installs nothing.
+- The close-decision hook is additionally probed before it is installed: the
+  target must lie in an executable section of the loaded image, its first 24
+  bytes must equal the build's prologue, and its body must still carry the
+  manager call site (`[this+0x38]->+0x40`) the state machine was read from. Each
+  failure logs its own line (`close hook skipped ...`) and only that hook is
+  left out; the observation hooks keep working, and a close is then not
+  animated at all instead of being held by a hook that cannot decide.
 - Hooks are installed only after `twinui.pcshell.dll` is loaded, via a
   `LoadLibraryExW` hook plus the module check in `Wh_ModAfterInit`.
 - The sequence field is a seqlock: a reader must retry when it is odd or when
@@ -103,20 +138,20 @@ Notes:
   the Start mod logs one `ipc open created=... close=...` at init, one
   `activation state reset` when a re-enable re-initialises the pinned image (a
   refused one logs `mod init refused: ...` and installs nothing instead), and
-  one `hide open generation unavailable err=...` for a Hide that found no
+  one `hide open generation unavailable err=...` for a close that found no
   published open generation (0 is never a generation).
 - The two channels have two lifetimes. The v2 channel (the section mapping and
   view, the mutex and the three events) is closed when the mod is disabled, and
-  only then: the disable flag keeps new Hides out of it, and the unload waits for
-  every Hide that already entered to leave before it closes anything. That wait
-  has no deadline, so its outcome is one of two. `drained`: the count reached
-  zero, the channel is closed, the unload returns. `stalled`: the count is still
-  nonzero and nothing else happens — no close, no return, no handle left behind.
-  The price of `stalled` is exact: a Hide that does not return, because the shell
-  call under it never came back or a debugger suspended its thread, holds the
-  Windhawk reload until it resumes. A re-enable of the pinned image reuses a
-  channel an earlier activation left open instead of opening a second one over
-  it.
+  only then: the disable flag keeps new closes out of it, and the unload waits
+  for every close that already entered to leave before it closes anything. That
+  wait has no deadline, so its outcome is one of two. `drained`: the count
+  reached zero, the channel is closed, the unload returns. `stalled`: the count
+  is still nonzero and nothing else happens — no close, no return, no handle
+  left behind. The price of `stalled` is exact: a close that does not return,
+  because the shell call under it never came back or a debugger suspended its
+  thread, holds the Windhawk reload until it resumes. A re-enable of the pinned
+  image reuses a channel an earlier activation left open instead of opening a
+  second one over it.
   The gesture mapping and its event stay for the rest of the explorer process
   lifetime instead: a consumer maps them independently, and an in-flight gesture
   callback may still hold the view, so unmapping them is unsafe. The image is
@@ -125,22 +160,22 @@ Notes:
   older image's pair to process exit. That is two handles per pinned image,
   deliberate; process exit reclaims them.
 - The in-flight count buys the unload's close, and one more thing. The lease
-  spans the whole hook, the `Hide_Original` call included, so a count of zero
-  also says that no frame of this hook can still need the MinHook trampoline.
-  That zero is the only condition on which this mod hands trampoline removal back
-  to the host: a frame that is still about to call the original holds a lease, so
+  spans both close hooks, the original calls included, so a count of zero also
+  says that no frame of either hook can still need the MinHook trampoline. That
+  zero is the only condition on which this mod hands trampoline removal back to
+  the host: a frame that is still about to call its original holds a lease, so
   no timeout can stand in for the count, and a timeout that expired under a live
   frame would return to the host a frame whose trampoline it is about to free.
-  An ordinary unload is quiet at once, because every wait inside the hook ends
+  An ordinary unload is quiet at once, because every wait inside the hooks ends
   within one 10 ms step of the disable flag; a wait long enough to be noticed
-  means a frame that cannot run at all. 500 ms is where the wait first reports one
-  (`ipc unload drain over 500 ms hides=...`), and from then on it reports every
-  10 s (`ipc unload stalled hides=... waited=... ms`) until the count reaches
-  zero. Both lines are diagnostics: neither ends the wait and neither changes
-  what happens next.
-- The count answers "is a Hide still inside", never "this Hide runs after that
-  one": two Hides on different threads hold it at once, and a re-entrant Hide on
-  one thread holds one lease per frame, so it balances by itself. The lease is
+  means a frame that cannot run at all. 500 ms is where the wait first reports
+  one (`ipc unload drain over 500 ms closes=...`), and from then on it reports
+  every 10 s (`ipc unload stalled closes=... waited=... ms`) until the count
+  reaches zero. Both lines are diagnostics: neither ends the wait and neither
+  changes what happens next.
+- The count answers "is a close still inside", never "this close runs after that
+  one": two closes on different threads hold it at once, and a re-entrant close
+  on one thread holds one lease per frame, so it balances by itself. The lease is
   taken before the hook reads anything and released on every exit, so a path
   that returns early and an exception out of `FileLog` both release it exactly
   once. A call that has entered the detour but has not yet taken its lease is
@@ -173,7 +208,7 @@ Notes:
   only the host's scan can cover that.
 - The pin is a prerequisite. `Wh_ModInit` returns `FALSE` when it fails and logs
   `mod init refused: the image could not be pinned; no hook, no channel and no
-  thread installed`; a shell-owned `Hide` thread needs valid return code as much
+  thread installed`; a shell-owned close thread needs valid return code as much
   as a worker would, so installing a hook over an image that may go away is not
   an option. Success is
   `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -183,8 +218,8 @@ Notes:
   re-enable re-initialises the same pinned DLL, and a version change leaves the
   old image mapped as well. Against a return into unmapped code, that mapping is
   the cheaper of the two risks.
-- A re-enable refuses while the previous activation still has a Hide inside:
-  `mod init refused: a Hide from the previous activation is still inside; no
+- A re-enable refuses while the previous activation still has a close inside:
+  `mod init refused: a close from the previous activation is still inside; no
   hook, no channel and no thread installed`. Clearing `g_disabled` and
   re-pointing the globals under that frame would hand it a half-reset module, so
   the old state stays exactly as the unload left it. A drained unload returns at
@@ -194,45 +229,38 @@ Notes:
   mapping, and the init logs `activation state reset`; a ready mapping and a
   channel an earlier activation left open are reused rather than rebuilt.
 
-The delayed Hide:
+The close record and the retract pair:
 
-- Both closes are Windows taps, so every Hide this hook sees was decided by the
-  shell's own key handler. No manager pointer is cached, no worker exists, and no
-  call is made on the shell's behalf. Every Show and Hide logs one line
-  (`show a=... b=... c=...`, `hide reason=...`) before the delay decision.
-- A gesture close publishes its plan at its release and a tapped record the
-  moment its Windows tap goes down; only the tapped one names the tap's own Hide,
-  so the hook logs `hide passed (gesture)` and calls the original at once for it.
-  A tapped Hide never waits: no publisher in this repository writes a nonzero
-  close delay, and the lead that remains is the keyboard close's alone.
-- A plan or a cancel never passes a Hide: the tap is the record that carries
-  `tapped`, and the plan stays current for the whole settle. A user's Windows
-  press during that settle is therefore a keyboard close and gets its own lead,
-  and a close a new pull cancels publishes the cancelled kind at once, not at the
-  tap's deadline.
-- A keyboard close publishes the `retract` request on the same channel and wakes
-  the Start mod through its request event. The request names the menu-open
-  generation this hook read and a deadline; that mod plans its settle from the
-  panel's current `Progress` only while that generation is current and the
-  deadline has not passed, then answers with the duration (or the no-settle
-  sentinel) under the request's sequence number. When this hook's Hide completes
-  it marks the request done, so a request whose close is over cannot start a
-  settle under the next menu. The hook waits for that answer, logs
-  `hide delayed reason=... retract=... lead=...` and
-  holds the original for the answered duration plus 30 ms, so the shell hides
-  after the slide has landed instead of cutting it. The wait for the answer is
-  bounded at 100 ms; a missing answer or the sentinel falls back to the fixed
-  560 ms lead. Both waits step in 10 ms so a mod being disabled ends them at
-  once. When the request cannot be published the hide runs immediately: a delay
-  without a retract would only slow the close down.
-- The original always runs. An earlier version returned `S_OK` without it;
-  measured, the shell's Start toggle then stayed one close ahead and the Windows
-  key and the taskbar Start button stopped working until
-  `StartMenuExperienceHost.exe` restarted.
+- A gesture close publishes its plan at its release and a fresh record marked
+  `tapped` immediately before it sends the Windows key. Only the tapped record
+  names the tap's own close, so the decision hook passes it at once
+  (`close passed ... reason=gesture`). A plan or a cancel never passes: the tap
+  is the record that carries `tapped`, and the plan stays current for the whole
+  settle. A Hide that arrives while only the plan is current is the user's own
+  Windows press during the settle and takes the request path, exactly as before.
+- A gesture close that a new edge pull cancels before its tap publishes the
+  cancelled kind at once, so no close in between is ever mistaken for the tap's.
+- The close record names no menu, so a tapped record is accepted only when it is
+  newer than the sequence this process seeded at attach and was stamped at or
+  after the newest open generation it has seen. That alone keeps a tap whose Hide
+  never came from passing an unrelated close under the next menu; the channel also
+  asks the Start side to cancel its stamp when it publishes a new open. Both
+  ticks come from one clock, so only a tap and an open inside the same ~16 ms
+  tick cannot be ordered: an unconsumed fresh stamp is evidence of correlation,
+  not proof of cause, and the plan-versus-tapped distinction is what carries the
+  correctness.
+- Any other close publishes the `retract` request and then waits for the Start
+  mod's answer, as described above. Every waited close marks its request done
+  before it returns, so a request whose close is over cannot start a settle
+  under the next menu.
 - `Hide` is `HRESULT (void* this, uint32_t reason)` on
   twinui.pcshell.dll 26100.9949. The prologue reads `rcx` (this) and `edx`
   (reason), compares `edx` with 7 and returns 0 on success or the negative
   HRESULT of the failing inner call. It never reads `r8` or `r9`.
+- `HideStartAndCortana` is `void (void* this, uint32_t method)`. This is the
+  interface whose state dword sits at `this+0x28`: the function reads it on
+  entry and writes 9 there before it calls the manager. The hook reads it for
+  the log only; it never writes it.
 */
 // ==/WindhawkModReadme==
 
@@ -240,30 +268,35 @@ The delayed Hide:
  * [INPUT]: depends on twinui.pcshell.dll 10.0.26100.9949 in explorer.exe for
  *   TouchEdgeGestureProcessor::InputGestureOperationStarted/Ended,
  *   EdgeAnimationRelationshipManager::ReportEdgeGesture,
- *   CStartExperienceManager::SetAnimationData/Show/Hide; on version.dll for the
- *   build gate; on LoadLibraryExW from kernelbase.dll for the late module load;
- *   on GetModuleHandleExW from kernelbase.dll, which must succeed before this
- *   mod installs anything, and which pins this image for the process lifetime;
- *   on the shared-memory contract in start_gesture_shared.h; on the channel in
- *   swipe_ipc_shared.h, whose close record carries a tapped gesture stamp (the
- *   tap's own Hide) and whose retract request/answer pair carries the settle
- *   duration a keyboard close needs, bound to the menu-open generation the
- *   request was written for. A generation of 0 means the Start side published no
- *   open, so no request may name it and no close stamp can be bound; both then
- *   fall back to the fixed lead.
+ *   CStartExperienceManager::SetAnimationData/Show/Hide, and for
+ *   XamlLauncherState::HideStartAndCortana, the decision every shell close
+ *   passes through; on version.dll for the build gate; on LoadLibraryExW from
+ *   kernelbase.dll for the late module load; on GetModuleHandleExW from
+ *   kernelbase.dll, which must succeed before this mod installs anything, and
+ *   which pins this image for the process lifetime; on the shared-memory
+ *   contract in start_gesture_shared.h; on the channel in swipe_ipc_shared.h,
+ *   whose close record carries a tapped gesture stamp (the tap's own close),
+ *   whose retract request/answer pair carries the settle duration or the cancel
+ *   a requested close needs, and whose reveal claim carries the Start side's
+ *   standing "a reveal drives the panel" answer a method-7 close is decided
+ *   from without waiting. A generation of 0 means the Start side published no
+ *   open, so no request may name it and no close stamp can be bound.
  * [OUTPUT]: the `Local\WindhawkStartGestureShared` mapping and its auto-reset
  *   event, holding the edge, the gesture handle and the state under a seqlock;
- *   a `bridge.log` line per state transition; one `retract` request on the Start
- *   mod's channel, marked done when its Hide completes, and a wait in
- *   CStartExperienceManager::Hide for the settle duration the Start mod answers
- *   with plus a 30 ms margin, so a Windows-key close slides the panel out before
- *   the window is hidden; a `hide delayed reason=... retract=... lead=...` line
- *   per keyboard close; a `hide passed (gesture)` line and the original
- *   call at once for a Hide on a tapped stamp that is newer than the attach
- *   watermark and not older than the newest open generation, because the Start
- *   side taps before the shell's key handler hides. The v2 channel is closed on
- *   disable, and only at quiescence: the disable flag keeps new Hides out and
- *   the unload waits, with no deadline, until every Hide already inside has
+ *   a `bridge.log` line per state transition; the close decision itself: one
+ *   retract request per requested close on the Start mod's channel, marked done
+ *   when that close is over, a synchronous hold of the original
+ *   HideStartAndCortana for the answered duration plus a 30 ms margin, or a
+ *   return without the original when the answer is cancel, or the original at
+ *   once when nothing answered. The decision lines are
+ *   `close passed method=... state=...`, `close passed method=... state=...
+ *   reason=gesture`, `close cancelled method=... state=...`,
+ *   `hide delayed reason=... retract=... lead=...` and
+ *   `hide passed reason=... state=... retract=none|unanswered`. The observation
+ *   hook on CStartExperienceManager::Hide logs `hide reason=...` for every Hide
+ *   that actually runs and never waits. The v2 channel is closed on disable, and
+ *   only at quiescence: the disable flag keeps new closes out and the unload
+ *   waits, with no deadline, until every close already inside either hook has
  *   left, then closes the channel (`ipc close`) and returns. Because the lease
  *   spans the whole hook, the original call included, that same zero is the only
  *   condition under which this mod hands trampoline removal back to the host: a
@@ -271,17 +304,17 @@ The delayed Hide:
  *   stand in for the count. The two outcomes are `drained` (zero, channel
  *   closed, returned) and `stalled` (still nonzero, and the unload keeps
  *   waiting; nothing else happens). 500 ms is where the wait first says a call
- *   is late (`ipc unload drain over 500 ms hides=...`), and every 10 s after
- *   that it reports `ipc unload stalled hides=... waited=... ms`. The price is
- *   paid in the host: a Hide that does not return, because the shell call under
+ *   is late (`ipc unload drain over 500 ms closes=...`), and every 10 s after
+ *   that it reports `ipc unload stalled closes=... waited=... ms`. The price is
+ *   paid in the host: a close that does not return, because the shell call under
  *   it never came back or a debugger suspended its thread, blocks the Windhawk
  *   reload until it resumes. The count is a lifetime guard for that channel, not
- *   a barrier between two Hides: it counts the Hides inside `Hide_Hook` through
- *   an RAII lease that every exit path releases, so a re-entrant call on one
- *   thread balances per frame, and a call that has entered the detour but not
- *   yet taken its lease is invisible to it. Windhawk does not drain the hook
- *   before `Wh_ModUninit`: at 2.0.0-alpha.8 `ModsManager` calls `Wh_ModUninit`
- *   and only then waits for threads inside the mod image
+ *   a barrier between two closes: it counts the frames inside the two close
+ *   hooks through an RAII lease that every exit path releases, so a re-entrant
+ *   call on one thread balances per frame, and a call that has entered the
+ *   detour but not yet taken its lease is invisible to it. Windhawk does not
+ *   drain the hook before `Wh_ModUninit`: at 2.0.0-alpha.8 `ModsManager` calls
+ *   `Wh_ModUninit` and only then waits for threads inside the mod image
  *   (`ThreadsCallStackWaitForRegions(..., 200, 400)`) before freeing the module,
  *   and that wait is bounded and unchecked. This mod therefore refuses to
  *   initialize unless its own image is pinned
@@ -290,33 +323,33 @@ The delayed Hide:
  *   the return address and the lease destructor of an uncounted frame valid; the
  *   host's wait covers an uncounted frame's trampoline when it can see the
  *   frame, and a scan blind to it covers nothing. A re-enable re-initialises the
- *   same image and refuses while the previous activation still has a Hide inside
- *   — reachable only through that uncounted entry window, because a drained
- *   unload returns at zero; otherwise the lifecycle flags are reset (logged
- *   `activation state reset`), the gesture mapping is reused, and a v2 channel an
- *   earlier activation left open is handed on rather than opened again. The
- *   gesture mapping keeps the process-lifetime behaviour below. Every path calls
- *   the original Hide; nothing is pressed and no hide is requested. No exported
- *   symbols.
- * [POS]: explorer-side half of the legacy Start gesture work. It observes the
- *   shell's own hide decision and decides whether that Hide still needs the
- *   retract lead. Both closes are Windows taps performed by the Start side, and
- *   a gesture close is tapped only after its retract; the shell's Start toggle is
- *   always updated by its key handler, so this mod needs no manager pointer,
- *   worker thread, timer or re-arm tap. The shipping Start mod does not read the
- *   shared gesture memory; the close record, the open generation and the
- *   retract request/answer pair in the swipe_ipc_shared.h channel are the
- *   couplings that are live today. That channel's handles are released when the
- *   mod can prove no Hide is inside it; the older gesture mapping is kept for
- *   the process lifetime because its consumer maps it independently. An
- *   unconsumed fresh stamp is evidence of correlation, not proof of cause: the
- *   plan-versus-tapped distinction is what makes the gesture path correct, and
- *   the binding only keeps a stamp of a menu that is gone from passing a later
- *   Hide. The drain runs inside `Wh_ModUninit` and returns only at quiescence, so
- *   the reload blocks instead of running under a live frame: the image is pinned
- *   as a prerequisite because a hook-only mod cannot wait for its own caller, the
- *   pin covers an entry the count cannot see, and the drain covers the trampoline
- *   of every counted frame.
+ *   same image and refuses while the previous activation still has a close
+ *   inside — reachable only through that uncounted entry window, because a
+ *   drained unload returns at zero; otherwise the lifecycle flags are reset
+ *   (logged `activation state reset`), the gesture mapping is reused, and a v2
+ *   channel an earlier activation left open is handed on rather than opened
+ *   again. The gesture mapping keeps the process-lifetime behaviour below. No
+ *   exported symbols.
+ * [POS]: explorer-side half of the legacy Start gesture work. It owns the close
+ *   decision one frame above the command layer: XamlLauncherState::
+ *   HideStartAndCortana is the one entry every close reaches (Windows key,
+ *   Start button, click-away, display change and lock), the one place where
+ *   skipping the call leaves the launcher's open/closed state untouched, and
+ *   therefore the only place a close may be refused. CStartExperienceManager::
+ *   Hide is observed only; its old hold is gone because a hold there stranded
+ *   the launcher state at 9. The shipping Start mod answers the request and
+ *   publishes the reveal claim; the shared gesture memory is not read by it.
+ *   The channel's handles are released when the mod can prove no close is inside
+ *   it; the older gesture mapping is kept for the process lifetime because its
+ *   consumer maps it independently. An unconsumed fresh stamp is evidence of
+ *   correlation, not proof of cause: the plan-versus-tapped distinction is what
+ *   makes the gesture path correct, and the binding only keeps a stamp of a
+ *   menu that is gone from passing a later close. The drain runs inside
+ *   `Wh_ModUninit` and returns only at quiescence, so the reload blocks instead
+ *   of running under a live frame: the image is pinned as a prerequisite
+ *   because a hook-only mod cannot wait for its own caller, the pin covers an
+ *   entry the count cannot see, and the drain covers the trampoline of every
+ *   counted frame.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -345,19 +378,37 @@ constexpr uintptr_t kReportEdgeGestureVa = 0x1806F63BC;
 constexpr uintptr_t kSetAnimationDataVa = 0x1803C7740;
 constexpr uintptr_t kShowVa = 0x180254C90;
 constexpr uintptr_t kHideVa = 0x1803C5960;
+// XamlLauncherState::HideStartAndCortana, the decision every shell close reaches.
+constexpr uintptr_t kHideStartAndCortanaVa = 0x18024BCB0;
 
 constexpr wchar_t kTwinuiModuleName[] = L"twinui.pcshell.dll";
 
 // The build the RVAs above were derived from.
 constexpr unsigned kTwinuiVersion[4] = {10, 0, 26100, 9949};
 
-// A keyboard close is a Windows tap by the user. Hide is where the shell takes
-// the Start window away; the panel needs time to retract, so the hide waits for
-// it. The wait is normally the duration the Start side answers with; this fixed
-// lead is what remains when no answer arrives: a Start mod that is not running,
-// a broken channel, a settle that did not start. A full 900+ DIP panel needs
-// 409 ms at the 2.2 DIP/ms the Start mod plans with.
-constexpr uint64_t kHideLeadMs = 560;
+// The first bytes of HideStartAndCortana on that build: `mov [rsp+18],rbx;
+// mov [rsp+20],rsi; push rbp; push rdi; push r14; lea rbp,[rsp-0x200];
+// sub rsp,...`.
+constexpr uint8_t kHideStartAndCortanaPrologue[] = {
+    0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24,
+    0x20, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24,
+    0x00, 0xFE, 0xFF, 0xFF, 0x48, 0x81};
+
+// InternalState, read from the IXamlLauncherState interface this function
+// receives: the same dword the function reads on entry and writes 9 into before
+// it calls the manager. Read for the log only.
+constexpr uintptr_t kLauncherStateOffset = 0x28;
+
+// The body bytes the probe requires beyond the prologue: the transient state
+// write (`mov dword ptr [rcx+28],9`), the manager load (`mov rcx,[rdi+38]`) and
+// its Hide slot (`mov rax,[rax+40]`). A build whose state machine moved but
+// whose prologue survived is still refused.
+constexpr size_t kHideStartAndCortanaProbeBytes = 0x400;
+
+// The synchronous dismiss method: display changes and the lock screen enter
+// through DismissSynchronouslyWithoutTransition, and the measured click-away
+// enters with the same method. Such a close may not wait for a slide-out.
+constexpr uint32_t kDismissMethodSynchronous = 7;
 
 // How long the answer may take. The request wakes the Start mod's input thread
 // through an event, so an answer normally arrives in a few milliseconds; this
@@ -366,15 +417,18 @@ constexpr uint64_t kRetractPlanWaitMs = 100;
 // Added to the answered duration: the answer is published a moment after the
 // animation starts, and the wait's 10 ms slicing can add one step.
 constexpr uint64_t kHideLeadMarginMs = 30;
-// The Start side's "no settle started" answer, and the corrupt-value cap.
+// The Start side's "no settle started" answer, its "cancel the close" answer,
+// and the corrupt-value cap.
 constexpr int32_t kRetractPlanNoSettleMs = 1;
+constexpr int32_t kRetractPlanCancel = 2;
 constexpr uint64_t kRetractPlanMaxMs = 2000;
 
 // How long a published retract request stays valid for the Start side. The
 // bridge's own hold after publishing is at most kRetractPlanWaitMs plus the
-// fixed lead (650 ms), and it marks the request done when that Hide completes,
-// so this deadline is the backstop for a lost marker, not the usual end: a
-// request can never reach a settle after the close it was written for is over.
+// answered duration (a full 900 DIP panel answers 409 ms, so 539 ms), and it
+// marks the request done when that close is over, so this deadline is the
+// backstop for a lost marker, not the usual end: a request can never reach a
+// settle after the close it was written for is over.
 constexpr uint64_t kRetractRequestWindowMs = 700;
 
 // A tapped close is consumed by exactly one Hide. The Start side publishes the
@@ -426,15 +480,16 @@ static_assert(sizeof(GestureAnimationData) == 16,
 std::atomic<bool> g_explorerHooked{false};
 std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_disabled{false};
-// Set only after Wh_SetFunctionHook accepted the Hide hook, so a hide is never
-// delayed on a build where the hook was refused.
-std::atomic<bool> g_hideDelayEnabled{false};
-// Hides currently inside Hide_Hook, entry to exit. Wh_ModUninit closes the v2
-// channel only when this is zero, and Wh_ModInit refuses to re-activate this
+// Set only after Wh_SetFunctionHook accepted the close-decision hook, so no
+// close is ever arbitrated on a build where that hook was refused.
+std::atomic<bool> g_arbiterEnabled{false};
+// Close-hook frames currently inside, entry to exit: the decision hook's
+// HideStartAndCortana and the observation hook's Hide. Wh_ModUninit closes the
+// v2 channel only when this is zero, and Wh_ModInit refuses to re-activate this
 // image while it is not. It is a lifetime guard for that channel, not a barrier
-// between two Hides: it answers "is a Hide still inside", never "this Hide runs
-// after that one".
-std::atomic<int> g_hideCalls{0};
+// between two closes: it answers "is a close still inside", never "this close
+// runs after that one".
+std::atomic<int> g_closeCalls{0};
 
 // Set when Wh_ModInit refused to install anything, so the later lifecycle
 // callbacks leave the live activation's channel and count alone. Wh_ModInit's
@@ -442,27 +497,27 @@ std::atomic<int> g_hideCalls{0};
 // them anyway harmless.
 std::atomic<bool> g_initRefused{false};
 
-// Counts one Hide_Hook call for as long as that call is inside the hook, the
+// Counts one close-hook frame for as long as that frame is inside the hook, the
 // original call included. The lease is taken before the hook reads anything and
 // released on every exit, including unwinding, so no path can leave the count
 // stranded.
 //
-// Two Hides on different threads hold a lease at the same time, and a
-// re-entrant Hide on one thread holds one lease per frame, so it balances by
+// Two closes on different threads hold a lease at the same time, and a
+// re-entrant close on one thread holds one lease per frame, so it balances by
 // itself. The count reaching zero is `drained`, and it is the only condition on
 // which Wh_ModUninit closes the channel or returns; because the lease spans the
-// `Hide_Original` call it also settles the trampoline question for every counted
+// original call it also settles the trampoline question for every counted
 // frame: a frame that is still about to call the original holds a lease, so the
 // unload does not return under it and no timeout may stand in for the count. The
 // one window the count cannot see is an entry that has not yet run the
 // constructor below; the pinned image keeps that frame's own code and the
 // destructor mapped, and its trampoline use is the host's unload to cover.
-struct HideCallLease {
-    HideCallLease() { g_hideCalls.fetch_add(1, std::memory_order_acq_rel); }
-    ~HideCallLease() { g_hideCalls.fetch_sub(1, std::memory_order_acq_rel); }
+struct CloseCallLease {
+    CloseCallLease() { g_closeCalls.fetch_add(1, std::memory_order_acq_rel); }
+    ~CloseCallLease() { g_closeCalls.fetch_sub(1, std::memory_order_acq_rel); }
 
-    HideCallLease(const HideCallLease&) = delete;
-    HideCallLease& operator=(const HideCallLease&) = delete;
+    CloseCallLease(const CloseCallLease&) = delete;
+    CloseCallLease& operator=(const CloseCallLease&) = delete;
 };
 
 enum : int {
@@ -1208,19 +1263,19 @@ bool ConsumeGestureStamp(bool openKnown, uint64_t openTick) {
 
 // Waits for the Start side's answer to this request. Only an answer whose
 // sequence number echoes the request counts, so an answer to an earlier close
-// can never satisfy this one, and no timestamp is involved. Returns false when
-// no answer arrived inside kRetractPlanWaitMs; `settleMs` is left at the
-// no-settle sentinel when the Start side answered that nothing started.
-bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
+// can never satisfy this one, and no timestamp is involved. Returns 0 when no
+// answer arrived inside kRetractPlanWaitMs; otherwise the answered value, which
+// is the planned duration, kRetractPlanNoSettleMs, or kRetractPlanCancel.
+int32_t WaitForRetractPlan(LONG64 request) {
     if (!g_ipc.state || !g_ipc.retractPlanEvent) {
-        return false;
+        return 0;
     }
 
     const ULONGLONG deadline = GetTickCount64() + kRetractPlanWaitMs;
     for (;;) {
         const ULONGLONG now = GetTickCount64();
         if (now >= deadline) {
-            return false;
+            return 0;
         }
 
         // Slices keep the disabled check: a mod that is being unloaded must not
@@ -1230,9 +1285,9 @@ bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
             static_cast<DWORD>(
                 std::min<ULONGLONG>(kHidePollMs, deadline - now)));
         if (wait == WAIT_OBJECT_0) {
-            // The plan is copied as one seqlock record and accepted only when it
-            // echoes this request, so an answer to an earlier close can never
-            // satisfy this one and no half-written plan is read.
+            // The answer is copied as one seqlock record and accepted only when
+            // it echoes this request, so an answer to an earlier close can never
+            // satisfy this one and no half-written answer is read.
             SwipeIpcRetractPlan plan{};
             if (!SwipeIpcReadRetractPlan(&g_ipc, &plan)) {
                 continue;
@@ -1240,33 +1295,188 @@ bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
             if (plan.request != request) {
                 continue;  // an answer to an earlier request
             }
-            *settleMs =
-                plan.settleMs > 0 &&
-                        static_cast<uint64_t>(plan.settleMs) <= kRetractPlanMaxMs
-                    ? plan.settleMs
-                    : kRetractPlanNoSettleMs;
-            return true;
+            if (plan.settleMs == kRetractPlanCancel ||
+                plan.settleMs == kRetractPlanNoSettleMs) {
+                return plan.settleMs;
+            }
+            return plan.settleMs > 0 &&
+                           static_cast<uint64_t>(plan.settleMs) <=
+                               kRetractPlanMaxMs
+                       ? plan.settleMs
+                       : kRetractPlanNoSettleMs;
         }
         if (g_disabled.load(std::memory_order_relaxed)) {
-            return false;
+            return 0;
         }
         if (wait != WAIT_TIMEOUT) {
-            return false;
+            return 0;
         }
     }
 }
+
+// True while the Start side's reveal claim covers the menu this close belongs
+// to: a claim published for an open tick, still inside its lease. A stale claim,
+// a claim of an older menu, a section that never carried one and a channel that
+// does not exist all answer false, so nothing can wedge a close.
+bool RevealClaimsPanel(bool openKnown, uint64_t openTick) {
+    if (!g_ipc.state || !openKnown) {
+        return false;
+    }
+
+    SwipeIpcRevealClaim claim{};
+    if (!SwipeIpcReadRevealClaim(&g_ipc, &claim)) {
+        return false;
+    }
+    if (claim.open == 0 ||
+        claim.open != static_cast<uint32_t>(openTick)) {
+        return false;
+    }
+
+    const uint32_t now = static_cast<uint32_t>(GetTickCount64());
+    return static_cast<uint32_t>(now - claim.tick) <= kSwipeRevealClaimLeaseMs;
+}
+
+using HideStartAndCortana_t = void (*)(void*, uint32_t);
+HideStartAndCortana_t HideStartAndCortana_Original = nullptr;
 // ---------------------------------------------------------------------------
-// Delayed Hide
+// The close decision
 //
-// A gesture close taps the Windows key at the end of its retract, so the Hide
-// that tap causes needs no wait: the panel is already gone. The tapped record
-// names that case, and only the tap publishes it. A keyboard close publishes the
-// `retract` request and then waits for the Start mod's answer: that mod plans the
-// settle from the panel's travel and publishes its duration, so the shell is held
-// for exactly as long as the slide takes. Without an answer the fixed lead
-// applies. No worker, manager pointer, timer or re-arm tap is involved: every
-// Hide is the shell's own call, on its own thread.
+// Every shell close passes through XamlLauncherState::HideStartAndCortana one
+// frame above the manager's Hide. That is the only point where skipping the call
+// means "the user never asked": this function writes the launcher's transient
+// state (5 -> 9) and the view's Hidden event completes it (9 -> 0xA), so a close
+// that is refused here leaves both the state and the window untouched, and a
+// close that is held here keeps the state at 5 for the whole hold. A hold on
+// CStartExperienceManager::Hide instead writes no state and strands it at 9,
+// which is still in IsStartVisible's visible set: that was the dead Windows key.
+//
+// The Start side answers over the v2 channel. A requested close (the Windows key
+// and the Start button) publishes a retract request and waits for one of three
+// answers: a duration, the no-settle sentinel, or cancel. The synchronous
+// method 7 (display change, lock, and the measured click-away) may not wait for a
+// slide-out at all, so it is decided from the standing reveal claim instead.
+//
+// Nothing is cached: no manager pointer, no worker, no timer. Every close is the
+// shell's own call on its own thread, and a close that finds no Start side runs
+// at once.
 // ---------------------------------------------------------------------------
+
+// XamlLauncherState::HideStartAndCortana(void* self, uint32_t method)
+// twinui.pcshell.dll 26100.9949, RVA 0x24BCB0. The function reads the dismiss
+// method in edx, writes the transient state at [self+0x28] and calls the
+// manager's Hide through [self+0x38]; it returns nothing.
+void HideStartAndCortana_Hook(void* self, uint32_t method) {
+    // The lease covers the whole frame: the channel reads, the waits and the
+    // original call. It is released on every exit, so an early return or a throw
+    // out of FileLog cannot strand the count Wh_ModUninit drains.
+    const CloseCallLease closeCall;
+    const uint32_t state =
+        self ? *reinterpret_cast<const volatile uint32_t*>(
+                   static_cast<const uint8_t*>(self) + kLauncherStateOffset)
+             : 0;
+
+    auto callOriginal = [self, method]() {
+        if (HideStartAndCortana_Original) {
+            HideStartAndCortana_Original(self, method);
+        }
+    };
+
+    if (!g_arbiterEnabled.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        // A close during teardown is the shell's own, and a build whose hook was
+        // refused never arbitrates: it runs exactly as it would without the mod.
+        callOriginal();
+        return;
+    }
+
+    // The newest menu open this hook has seen, read once and used by every path:
+    // the tapped close is bound to it, the requested close sends it with its
+    // request, and the reveal claim is bound to its tick. No published generation
+    // (ERROR_NOT_READY), no stable copy, or no channel at all leaves both at 0:
+    // the request then carries 0, which the Start side refuses, and no close
+    // stamp and no claim can pass either.
+    uint64_t openGeneration = 0;
+    uint64_t openTick = 0;
+    DWORD openError = 0;
+    const bool openKnown =
+        SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick, &openError);
+    if (!openKnown && g_ipc.state) {
+        // Only a channel that exists can have a record problem worth naming.
+        FileLog(L"hide open generation unavailable err=%u",
+                static_cast<unsigned int>(openError));
+    }
+
+    if (method == kDismissMethodSynchronous) {
+        // Display changes and the lock screen enter with this method, and so
+        // does the click-away. None of them may wait: a lock request that waits
+        // for a retract delays the lock screen. Only a fresh claim cancels it.
+        if (RevealClaimsPanel(openKnown, openTick)) {
+            FileLog(L"close cancelled method=%u state=%u reason=reveal", method,
+                    state);
+            return;
+        }
+        FileLog(L"close passed method=%u state=%u", method, state);
+        callOriginal();
+        return;
+    }
+
+    if (ConsumeGestureStamp(openKnown, openTick)) {
+        // The Start side tapped at the end of its own retract, so this close is
+        // already too late to cut an animation and is the one that must run.
+        FileLog(L"close passed method=%u state=%u reason=gesture", method, state);
+        callOriginal();
+        return;
+    }
+
+    if (!g_ipc.state) {
+        // No Start side to ask: the close is the shell's and runs at once. This
+        // is the whole fallback, and it is what a disabled or absent Start mod
+        // leaves behind.
+        FileLog(L"close passed method=%u state=%u reason=nochannel", method,
+                state);
+        callOriginal();
+        return;
+    }
+
+    const LONG64 request =
+        SwipeIpcRequestRetract(&g_ipc, openGeneration, kRetractRequestWindowMs);
+    if (request == 0) {
+        FileLog(L"hide retract request failed");
+        callOriginal();
+        return;
+    }
+
+    const int32_t answer = WaitForRetractPlan(request);
+    if (answer == kRetractPlanCancel) {
+        // A reveal contact drives the panel: the menu must stay open where the
+        // finger has it. The original is never called, so no state is written,
+        // no window is cloaked and the next press is an ordinary close.
+        SwipeIpcClearRetractRequest(&g_ipc, request);
+        FileLog(L"close cancelled method=%u state=%u reason=reveal", method,
+                state);
+        return;
+    }
+
+    if (answer > kRetractPlanCancel) {
+        const uint64_t lead =
+            static_cast<uint64_t>(answer) + kHideLeadMarginMs;
+        FileLog(L"hide delayed reason=%u retract=%d lead=%llu", method, answer,
+                static_cast<unsigned long long>(lead));
+        WaitForRetractLead(lead);
+    } else {
+        // The Start side answered that nothing is running, or nothing answered
+        // inside the wait: there is no slide to serve, so the close happens now
+        // instead of waiting for one that will never start.
+        FileLog(L"hide passed reason=%u state=%u retract=%s", method, state,
+                answer == kRetractPlanNoSettleMs ? L"none" : L"unanswered");
+    }
+
+    // This close is served. A request the Start side reads from now on belongs
+    // to no close of this menu and is marked done here, so it cannot start a
+    // settle later.
+    SwipeIpcClearRetractRequest(&g_ipc, request);
+    callOriginal();
+}
 
 // CStartExperienceManager::Hide(void* self, uint32_t reason) -> HRESULT
 // twinui.pcshell.dll 26100.9949, RVA 0x3C5960, vtable slot after Show.
@@ -1275,99 +1485,159 @@ bool WaitForRetractPlan(LONG64 request, int32_t* settleMs) {
 // `edx` with 7; r8 and r9 are written before they are read, so the function
 // takes two arguments. Both return paths set eax: 0 on success, the negative
 // HRESULT of a failing inner call otherwise, so the return type is HRESULT.
+//
+// Observation only, and every path calls the original. The pause belongs to the
+// decision hook above: a hold here would delay the same close a second time, and
+// a return without the original would strand the launcher's state at 9.
 HRESULT Hide_Hook(void* self, uint32_t reason) {
-    // The lease covers the whole call: the channel reads, the waits and the
-    // original call. It is released on every exit, so an early return or an
-    // exception out of FileLog cannot strand the count that Wh_ModUninit drains.
-    const HideCallLease hideCall;
+    // The lease covers the whole call, so the unload's count includes this frame
+    // and its trampoline use for as long as it can run.
+    const CloseCallLease closeCall;
     FileLog(L"hide reason=%u", reason);
     ClearSharedGestureState(L"Hide");
-
-    // The shell's key handler decided this hide from a Windows tap. A gesture
-    // close publishes its plan at the release and marks the same record tapped
-    // immediately before its own Windows tap, so the Hide that tap causes is
-    // already too late to cut the animation and runs at once. A keyboard close
-    // (no record, a plan or a cancel, a record this hook already consumed, one
-    // older than the window, one stamped before the menu now open) requests the
-    // retract through the channel and waits for the Start mod's answer. Only that
-    // mod knows the panel's travel, so the wait is its planned settle plus one
-    // margin; no answer at all falls back to the fixed lead, which covers the
-    // full 409 ms slide.
-    //
-    // This hook always calls the original. An earlier version returned S_OK to
-    // cancel a hide when the user pulled the menu open again; measured, the
-    // shell's Start toggle then stayed one close ahead and the Windows key and
-    // the taskbar Start button stopped working until the host restarted. A close
-    // is cancelled on the Start side instead, by not sending its tap.
-    if (g_hideDelayEnabled.load(std::memory_order_relaxed) &&
-        !g_disabled.load(std::memory_order_relaxed)) {
-        // The newest menu open this hook has seen, read once and used by both
-        // paths: the stamped Hide is bound to it, and the keyboard path sends it
-        // with its request. No published generation (ERROR_NOT_READY), no stable
-        // copy, or no channel at all leaves both at 0: the request then carries
-        // 0, which the Start side refuses, and no close stamp can pass either,
-        // so this Hide takes the fixed lead.
-        uint64_t openGeneration = 0;
-        uint64_t openTick = 0;
-        DWORD openError = 0;
-        const bool openKnown =
-            SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick, &openError);
-        if (!openKnown) {
-            openGeneration = 0;
-            openTick = 0;
-            if (g_ipc.state) {
-                // Only a channel that exists can have a record problem worth
-                // naming; without one, `hide retract request failed` already
-                // says why this Hide takes the fixed lead.
-                FileLog(L"hide open generation unavailable err=%u",
-                        static_cast<unsigned int>(openError));
-            }
-        }
-
-        if (ConsumeGestureStamp(openKnown, openTick)) {
-            // The Start side tapped after its retract, so the panel is already
-            // gone: no wait belongs to this Hide.
-            FileLog(L"hide passed (gesture)");
-        } else {
-            const LONG64 request = SwipeIpcRequestRetract(
-                &g_ipc, openGeneration, kRetractRequestWindowMs);
-            if (request != 0) {
-                int32_t settleMs = kRetractPlanNoSettleMs;
-                const bool answered = WaitForRetractPlan(request, &settleMs);
-                const bool planned = answered &&
-                                     settleMs > kRetractPlanNoSettleMs;
-                const uint64_t lead =
-                    planned ? static_cast<uint64_t>(settleMs) +
-                                  kHideLeadMarginMs
-                            : kHideLeadMs;
-
-                if (planned) {
-                    FileLog(L"hide delayed reason=%u retract=%d lead=%llu",
-                            reason, settleMs,
-                            static_cast<unsigned long long>(lead));
-                } else {
-                    FileLog(L"hide delayed reason=%u retract=%s lead=%llu",
-                            reason, answered ? L"none" : L"unanswered",
-                            static_cast<unsigned long long>(lead));
-                }
-                WaitForRetractLead(lead);
-                // This Hide is over. A request the Start side reads from now on
-                // belongs to no close of this menu and is marked done here, so it
-                // cannot start a settle later.
-                SwipeIpcClearRetractRequest(&g_ipc, request);
-            } else {
-                FileLog(L"hide retract request failed");
-            }
-        }
-    }
-
-    const HRESULT result = Hide_Original ? Hide_Original(self, reason) : S_OK;
-    return result;
+    return Hide_Original ? Hide_Original(self, reason) : S_OK;
 }
 
 // ---------------------------------------------------------------------------
 // Hook installation
 // ---------------------------------------------------------------------------
+
+// True when [rva, rva + bytes) lies inside an executable section of the loaded
+// image and inside its SizeOfImage. Both probe reads use fixed RVAs, so this is
+// what separates "this build is not the supported one" from "the address is not
+// code at all": without it a shorter or differently laid-out image faults while
+// the gate is still deciding.
+//
+// Every read is bounded by a value already read from the mapped header page: the
+// DOS header, the NT signature, the optional header and the section table all
+// live in the first page of every image the loader maps. An image whose header
+// is not there is refused like any other unreadable target.
+bool ImageRangeExecutable(HMODULE module, uintptr_t rva, size_t bytes) {
+    if (!module || bytes == 0) {
+        return false;
+    }
+
+    constexpr size_t kHeaderPage = 0x1000;
+    const auto* base = reinterpret_cast<const uint8_t*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return false;
+    }
+
+    const size_t ntOffset = static_cast<size_t>(dos->e_lfanew);
+    if (ntOffset < sizeof(IMAGE_DOS_HEADER) ||
+        ntOffset + sizeof(IMAGE_NT_HEADERS64) > kHeaderPage) {
+        return false;
+    }
+
+    const auto* nt =
+        reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + ntOffset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        nt->FileHeader.NumberOfSections == 0) {
+        return false;
+    }
+
+    const size_t sizeOfImage = nt->OptionalHeader.SizeOfImage;
+    if (sizeOfImage == 0 || rva > sizeOfImage || bytes > sizeOfImage - rva) {
+        return false;
+    }
+
+    const size_t sectionTable = ntOffset + sizeof(DWORD) +
+                                sizeof(IMAGE_FILE_HEADER) +
+                                nt->FileHeader.SizeOfOptionalHeader;
+    const size_t sectionBytes = static_cast<size_t>(
+                                    nt->FileHeader.NumberOfSections) *
+                                sizeof(IMAGE_SECTION_HEADER);
+    if (sectionTable > kHeaderPage || sectionBytes > kHeaderPage ||
+        sectionTable + sectionBytes > kHeaderPage) {
+        return false;
+    }
+
+    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+        base + sectionTable);
+    for (size_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+        const IMAGE_SECTION_HEADER& section = sections[i];
+        const uint64_t start = section.VirtualAddress;
+        const uint64_t span = std::max<uint64_t>(section.Misc.VirtualSize,
+                                                 section.SizeOfRawData);
+        if (span == 0 || rva < start || rva - start >= span) {
+            continue;
+        }
+        if (bytes > span - (rva - start)) {
+            continue;
+        }
+        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Confirms that the target is the function the decision was read from: the
+// address is executable code of the loaded image, its first bytes match the
+// build's prologue, and its body still carries the manager call site the state
+// machine was traced through. Each failure has its own line, and only the close
+// hook is left out; the observation hooks keep working.
+bool HideStartAndCortanaProbe(HMODULE module) {
+    const uintptr_t functionRva = kHideStartAndCortanaVa - kTwinuiPreferredBase;
+    if (!ImageRangeExecutable(module, functionRva,
+                              kHideStartAndCortanaProbeBytes)) {
+        FileLog(L"close hook skipped (target not readable)");
+        Wh_Log(L"twinui.pcshell.dll does not map the HideStartAndCortana "
+               L"address into an executable section of the image; the close "
+               L"hook is refused");
+        return false;
+    }
+
+    const auto* code = reinterpret_cast<const uint8_t*>(module) + functionRva;
+    for (size_t i = 0; i < sizeof(kHideStartAndCortanaPrologue); i++) {
+        if (code[i] != kHideStartAndCortanaPrologue[i]) {
+            FileLog(L"close hook skipped build=10.0.26100.9949 prologue "
+                    L"mismatch");
+            Wh_Log(L"twinui.pcshell.dll 10.0.26100.9949 does not carry the "
+                   L"HideStartAndCortana prologue this hook was written for; "
+                   L"the close hook is refused");
+            return false;
+        }
+    }
+
+    // The three body markers: the transient write 5 -> 9, the manager load from
+    // this object's +0x38 and the Hide slot +0x40. They are what proves the
+    // function still moves the state the decision depends on.
+    const uint8_t stateNine[] = {0xC7, 0x41, 0x28, 0x09, 0x00, 0x00, 0x00};
+    const uint8_t managerLoad[] = {0x48, 0x8B, 0x4F, 0x38};
+    const uint8_t hideSlot[] = {0x48, 0x8B, 0x40, 0x40};
+    bool foundState = false;
+    bool foundManager = false;
+    bool foundSlot = false;
+    for (size_t i = 0; i + sizeof(stateNine) <= kHideStartAndCortanaProbeBytes;
+         i++) {
+        if (!foundState &&
+            std::memcmp(code + i, stateNine, sizeof(stateNine)) == 0) {
+            foundState = true;
+        }
+        if (!foundManager &&
+            std::memcmp(code + i, managerLoad, sizeof(managerLoad)) == 0) {
+            foundManager = true;
+        }
+        if (!foundSlot && std::memcmp(code + i, hideSlot, sizeof(hideSlot)) == 0) {
+            foundSlot = true;
+        }
+    }
+    if (!foundState || !foundManager || !foundSlot) {
+        FileLog(L"close hook skipped build=10.0.26100.9949 state machine moved");
+        Wh_Log(L"twinui.pcshell.dll 10.0.26100.9949 carries the "
+               L"HideStartAndCortana prologue but not the state write and "
+               L"manager call this hook was written for; the close hook is "
+               L"refused");
+        return false;
+    }
+
+    return true;
+}
 
 bool InstallHook(void* target, void* hook, void** original,
                  const wchar_t* name) {
@@ -1432,11 +1702,21 @@ void InstallExplorerHooks(HMODULE module) {
                 reinterpret_cast<void**>(&Show_Original),
                 L"CStartExperienceManager::Show");
 
-    if (InstallHook(at(kHideVa), reinterpret_cast<void*>(Hide_Hook),
-                    reinterpret_cast<void**>(&Hide_Original),
-                    L"CStartExperienceManager::Hide")) {
-        g_hideDelayEnabled.store(true, std::memory_order_relaxed);
+    // The decision hook first, so the observation hook below can never be the
+    // only one installed on a build whose state machine moved: the close is then
+    // not animated at all instead of being delayed by a hook that cannot decide.
+    if (HideStartAndCortanaProbe(module) &&
+        InstallHook(at(kHideStartAndCortanaVa),
+                    reinterpret_cast<void*>(HideStartAndCortana_Hook),
+                    reinterpret_cast<void**>(&HideStartAndCortana_Original),
+                    L"XamlLauncherState::HideStartAndCortana")) {
+        g_arbiterEnabled.store(true, std::memory_order_relaxed);
+        FileLog(L"close arbiter installed rva=24bcb0");
     }
+
+    InstallHook(at(kHideVa), reinterpret_cast<void*>(Hide_Hook),
+                reinterpret_cast<void**>(&Hide_Original),
+                L"CStartExperienceManager::Hide");
 }
 
 void TryInstallFromLoadedModules(bool apply) {
@@ -1491,8 +1771,8 @@ void ModulePinAnchor() {}
 // The pinned image, once per process. A re-init of the same image keeps it.
 HMODULE g_modulePin = nullptr;
 
-// Pins this image until the process terminates. A Hide frame that returns after
-// Wh_ModUninit still needs its own return address and the HideCallLease
+// Pins this image until the process terminates. A close-hook frame that returns
+// after Wh_ModUninit still needs its own return address and the CloseCallLease
 // destructor to be valid, and a hook-only mod cannot wait for its caller the way
 // a threaded mod can. The pin covers exactly that: this image's code, its
 // globals and the lease destructor.
@@ -1534,18 +1814,18 @@ bool PinThisModule() {
 // the previous activation left behind is cleared here, so the second init
 // installs its hooks again instead of believing they are still there.
 //
-// Wh_ModInit calls this only when g_hideCalls is zero: a Hide from the previous
+// Wh_ModInit calls this only when g_closeCalls is zero: a close from the previous
 // activation that is still inside would otherwise see g_disabled cleared and the
 // globals re-pointed under it. A refused activation never reaches this function.
 // A drained unload returns at zero, so that refusal is reachable only through the
-// entry window the count cannot see; g_hideCalls itself is still deliberately not
+// entry window the count cannot see; g_closeCalls itself is still deliberately not
 // touched, because such a frame owns its lease and that count must say so.
 void ResetReinitState() {
     g_initRefused.store(false, std::memory_order_relaxed);
     g_disabled.store(false, std::memory_order_relaxed);
     g_afterInit.store(false, std::memory_order_relaxed);
     g_explorerHooked.store(false, std::memory_order_relaxed);
-    g_hideDelayEnabled.store(false, std::memory_order_relaxed);
+    g_arbiterEnabled.store(false, std::memory_order_relaxed);
     g_startPointTick.store(0, std::memory_order_relaxed);
     // A failed gesture mapping is retried by the next activation, as it was
     // when every activation loaded a fresh image. A ready one is kept: the
@@ -1559,21 +1839,21 @@ void ResetReinitState() {
 }  // namespace
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.16.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.17.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
     // previous activation's lifecycle flags must be cleared explicitly — but
     // only once nothing of that activation is still running. A drained unload
-    // returns at zero, so a Hide can still be inside only through the entry
+    // returns at zero, so a close can still be inside only through the entry
     // window the count cannot see; clearing g_disabled and re-pointing the
     // globals under that frame would hand it a half-reset module, so this
     // activation refuses and leaves the previous state exactly as the unload
     // left it. The next enable tries again.
     const bool reinit = g_modulePin != nullptr;
-    if (reinit && g_hideCalls.load(std::memory_order_acquire) != 0) {
+    if (reinit && g_closeCalls.load(std::memory_order_acquire) != 0) {
         g_initRefused.store(true, std::memory_order_relaxed);
-        FileLog(L"mod init refused: a Hide from the previous activation is "
+        FileLog(L"mod init refused: a close from the previous activation is "
                 L"still inside; no hook, no channel and no thread installed");
         return FALSE;
     }
@@ -1583,7 +1863,7 @@ BOOL Wh_ModInit() {
         FileLog(L"activation state reset");
     }
 
-    // A prerequisite, before the channel and the hooks: a Hide frame that
+    // A prerequisite, before the channel and the hooks: a close frame that
     // outlives the unload must return into mapped code, and a shell-owned thread
     // needs valid return code as much as a worker would. Nothing is installed
     // when this fails; see PinThisModule.
@@ -1601,7 +1881,7 @@ BOOL Wh_ModInit() {
     // events exist before the first Hide, and a Start mod that attaches later
     // joins the same ones. This is the only call: SwipeIpcOpen may sleep for its
     // init budget while the other side finishes a claim, so it must not run on
-    // a hook. A failure here means every Hide takes the fixed lead for the life
+    // a hook. A failure here means every close runs at once for the life
     // of this attachment, which the budget makes reachable only for a section
     // that cannot be initialised at all.
     //
@@ -1666,10 +1946,10 @@ void Wh_ModBeforeUninit() {
     if (g_initRefused.load(std::memory_order_relaxed)) {
         return;
     }
-    // This must be set before Windhawk removes the hooks. The Hide hook reads it
-    // in its wait loop, so a hide that is being held ends its wait at once. A
-    // Hide that enters after this point skips the channel; one that is already
-    // inside holds its lease until it returns. The v2 channel is closed in
+    // This must be set before Windhawk removes the hooks. Both close hooks read
+    // it: a close that is being held ends its wait at once, and a close that
+    // enters after this point skips the channel; one that is already inside
+    // holds its lease until it returns. The v2 channel is closed in
     // Wh_ModUninit, after that flag and after the drain.
     g_disabled = true;
     g_startPointTick.store(0, std::memory_order_relaxed);
@@ -1700,29 +1980,29 @@ void Wh_ModUninit() {
     //
     // The v2 channel is closed, because its objects are named and its records
     // belong to the other process: g_ipc is unmapped and its mapping, mutex and
-    // three events are closed once no Hide hook can still be inside them.
-    // g_disabled was set in Wh_ModBeforeUninit, so no new Hide decision reaches
-    // the channel; g_hideCalls names the Hides that are already inside. Their
+    // three events are closed once no close hook can still be inside them.
+    // g_disabled was set in Wh_ModBeforeUninit, so no new close decision reaches
+    // the channel; g_closeCalls names the closes that are already inside. Their
     // waits end within one kHidePollMs step of that flag, so an ordinary unload
     // is drained at once.
     //
     // The wait below has no deadline, and that is the whole point. The lease
-    // spans the whole call, the original Hide included, so a count of zero also
-    // proves that no frame of this hook can still need the MinHook trampoline.
+    // spans the whole frame, the original calls included, so a count of zero also
+    // proves that no frame of either hook can still need the MinHook trampoline.
     // Windhawk removes the hooks and frees their trampolines as soon as this
     // function returns, so returning with a frame still about to call
-    // Hide_Original would hand the host a frame whose trampoline it is about to
+    // the original would hand the host a frame whose trampoline it is about to
     // free. A timeout cannot stand in for the count: it would expire under
     // exactly that frame. The two outcomes are `drained` — the count reached
     // zero, the channel is closed, this call returns — and `stalled` — the count
     // is still nonzero and nothing else happens: no close, no return, no handle
-    // left behind. The price is paid where it is owed: a Hide that does not
+    // left behind. The price is paid where it is owed: a close that does not
     // return, because the shell call under it never came back or a debugger
     // suspended its thread, blocks the Windhawk reload until it resumes.
     //
     // kIpcUnloadMarkMs and kIpcUnloadStallReportMs are diagnostics only. Neither
     // grants anything and neither ends the wait. The reports go through FileLog,
-    // so a Hide wedged inside FileLog keeps them out of the file; that changes no
+    // so a close wedged inside FileLog keeps them out of the file; that changes no
     // outcome, because this call is blocked either way.
     //
     // The pin and the count are not the same cover. The pin keeps an entry that
@@ -1741,8 +2021,8 @@ void Wh_ModUninit() {
     bool markLogged = false;
     ULONGLONG nextStallReport = 0;
     for (;;) {
-        const int hides = g_hideCalls.load(std::memory_order_acquire);
-        if (hides == 0) {
+        const int closes = g_closeCalls.load(std::memory_order_acquire);
+        if (closes == 0) {
             break;
         }
         const ULONGLONG now = GetTickCount64();
@@ -1750,12 +2030,12 @@ void Wh_ModUninit() {
             now - drainStart >= static_cast<ULONGLONG>(kIpcUnloadMarkMs)) {
             markLogged = true;
             nextStallReport = now + kIpcUnloadStallReportMs;
-            FileLog(L"ipc unload drain over %u ms hides=%d",
-                    static_cast<unsigned>(kIpcUnloadMarkMs), hides);
+            FileLog(L"ipc unload drain over %u ms closes=%d",
+                    static_cast<unsigned>(kIpcUnloadMarkMs), closes);
         }
         if (markLogged && now >= nextStallReport) {
             nextStallReport = now + kIpcUnloadStallReportMs;
-            FileLog(L"ipc unload stalled hides=%d waited=%llu ms", hides,
+            FileLog(L"ipc unload stalled closes=%d waited=%llu ms", closes,
                     static_cast<unsigned long long>(now - drainStart));
         }
         Sleep(kHidePollMs);

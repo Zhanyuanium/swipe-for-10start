@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.35.0
+// @version         0.36.0
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -637,7 +637,7 @@ What it does:
   spared a close, and the only shape it can reopen from after that close's own
   gesture. A pull that begins later is deferred, and the shell has to open the
   menu for it: measured on this build, a Windows-key or Start-button press whose
-  release lands inside the shell's held Hide (before the answered retract plus
+  release lands inside the held close decision (before the answered retract plus
   the bridge's 30 ms margin, ~400 ms after the close starts here) is dropped:
   no `show`, no uncloak, nothing this mod could react to. The same press at or
   after that boundary opens the menu with one `win open dur=409` (press to first
@@ -826,19 +826,29 @@ Debug channel (kept in the build):
   milliseconds instead of waiting for a poll. The event is manual-reset and this
   side resets it, so a command published while one is running is not lost.
 - The `retract` request is its own event, not a command: the bridge publishes a
-  sequence number right before it holds `CStartExperienceManager::Hide`, and
-  this side plans the settle from the current `Progress` and answers with its
-  duration on the same channel. `retract=<settleMs>` names the animation that
-  just started; the "no settle" sentinel says that nothing started, so the
-  bridge keeps its own default lead. The answer echoes the request's sequence
-  number, so an answer to an earlier close can never satisfy a later one. The
-  request carries the menu-open generation the bridge saw and a deadline, so a
-  request that outlived its close is answered with the sentinel and starts
-  nothing, and the bridge marks its request done when that Hide completes. Open
-  generation 0 is not a menu: `SwipeIpcReadOpen` reports `ERROR_NOT_READY`
-  instead of a snapshot, and this side refuses a request that names 0 exactly
-  like one whose generation is gone, so a keyboard close can never start a settle
-  for a menu that never published an open.
+  sequence number right before it holds the launcher's close decision
+  (`XamlLauncherState::HideStartAndCortana`), and this side either plans the
+  settle from the current `Progress` and answers with its duration on the same
+  channel, or — while a reveal contact owns the panel — answers `cancel` and
+  changes nothing: no close record, no tap, no suppression, no `Progress`
+  write. `retract=<settleMs>` names the animation that just started; the
+  "no settle" sentinel says that nothing started, so the bridge closes at once;
+  `cancel` says the close must not happen. The answer echoes the request's
+  sequence number, so an answer to an earlier close can never satisfy a later
+  one. The request carries the menu-open generation the bridge saw and a
+  deadline, so a request that outlived its close is answered with the sentinel
+  and starts nothing, and the bridge marks its request done when that close is
+  over. Open generation 0 is not a menu: `SwipeIpcReadOpen` reports
+  `ERROR_NOT_READY` instead of a snapshot, and this side refuses a request that
+  names 0 exactly like one whose generation is gone, so a keyboard close can
+  never start a settle for a menu that never published an open.
+- The `reveal claim` is the same ownership answer without a request: the open
+  tick of the menu a reveal drives, or 0, plus the tick of its last refresh,
+  published every 50 ms while `g_reveal.active` (and once more as 0 when it
+  ends). The bridge decides a method-7 close — display change, lock, click-away
+  — from it alone, because that close may not wait: a claim inside its 250 ms
+  lease and bound to the menu on screen cancels the close, anything else lets it
+  through. A Start side that stops refreshing therefore stops cancelling.
 - The section outlives either process, so both sides record the sequence numbers
   at attach and act only on what is newer. That is what the one-second freshness
   check on the old command file did: a request that predates this process
@@ -1111,9 +1121,10 @@ Known risks:
   plus the bridge's 30 ms margin. The answer can only be sent after the
   bridge's request has reached this thread, so the shell hides one margin after
   the settle has run to its end, never while it is still moving. When the answer
-  never arrives (the mod is disabled, the settle did not start) the bridge waits
-  its own 560 ms instead: that covers the 520 ms clamp plus the 30 ms margin, so
-  even a panel whose whole travel hits the clamp keeps its last frames.
+  never arrives (the mod is disabled, the settle did not start, the request is
+  stale) the bridge closes at once instead of waiting for an animation nobody
+  planned; when the answer is `cancel` it does not close at all, because a
+  reveal contact owns the panel.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -1454,10 +1465,15 @@ Known risks:
  *   (`p`, `t`, `e`, `anim`, `state`) that apply a Progress value, the XAML
  *   translation, the visual offset or the animation mode, or log the window's
  *   cloak state and the live position without changing either, and the
- *   answer to the bridge's retract request (its planned duration, or the
- *   no-settle sentinel) published on the same channel the moment the requested
- *   settle starts, so the bridge can hold the shell's Hide for exactly that
- *   duration; no exported symbols.
+ *   answer to the bridge's retract request (its planned duration, the
+ *   no-settle sentinel, or `cancel` when a reveal contact owns the panel)
+ *   published on the same channel the moment the requested settle starts — or
+ *   immediately for a cancel, which changes nothing — so the bridge can hold the
+ *   launcher's close for exactly that duration or refuse it; the reveal claim
+ *   (`revealOpen`/`revealTick`), refreshed while `g_reveal.active` and bound to
+ *   the open tick of the menu it drives, which is how the bridge decides a
+ *   method-7 close (display change, lock, click-away) without waiting; no
+ *   exported symbols.
  * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
  *   pointer and DirectManipulation paths with raw HID decoding, owns two
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
@@ -4028,6 +4044,26 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 LONG64 g_ipcCommandSeq = 0;
 LONG64 g_ipcRetractSeq = 0;
 
+// The low 32 bits of the open tick this process last published, and the reveal
+// claim's last write: input thread only. `g_revealClaimOpen` is the open tick the
+// claim names (0 = no claim), `g_revealClaimTick` the tick of its last refresh.
+uint32_t g_ipcOpenTickLow = 0;
+uint32_t g_revealClaimOpen = 0;
+uint32_t g_revealClaimTick = 0;
+
+// The reveal's standing claim on the panel, mirrored to the explorer bridge. A
+// method-7 close (display change, lock, click-away) may not wait for an answer,
+// so the bridge decides that one from this record alone: the tick of the menu
+// open the reveal belongs to, or 0 when no reveal drives the panel. The input
+// thread refreshes it from every report and every idle tick (both pass through
+// PublishPanelOwnership), and the bridge treats a record older than
+// kSwipeRevealClaimLeaseMs as no claim, so a stopped Start side cannot wedge a
+// close. The write is skipped while the value is unchanged and the record is
+// still fresh, which keeps the section quiet. The body sits with the follow
+// state it reads; only these declarations are needed here.
+bool RevealOwnsPanel();
+void PublishRevealClaim();
+
 void OpenIpcChannel() {
     bool created = false;
     DWORD error = 0;
@@ -4041,6 +4077,14 @@ void OpenIpcChannel() {
     // must be newer than anything the previous one could have written.
     g_ipcCommandSeq = SwipeIpcLoad64(&g_ipc.state->cmdSeq);
     g_ipcRetractSeq = SwipeIpcLoad64(&g_ipc.state->retractRequestSeq);
+    // Withdraw any reveal claim the previous activation left: no reveal drives
+    // this process's panel yet, and nothing is running that could race the
+    // write. The open binding would keep it from covering a later menu, but a
+    // claim that names no reveal is not worth leaving readable.
+    g_ipcOpenTickLow = 0;
+    g_revealClaimOpen = 0;
+    g_revealClaimTick = 0;
+    PublishRevealClaim();
     FileLog(L"ipc open created=%d cmd=%lld retract=%lld", created ? 1 : 0,
             static_cast<long long>(g_ipcCommandSeq),
             static_cast<long long>(g_ipcRetractSeq));
@@ -4297,20 +4341,28 @@ void ApplyPendingCommand() {
     ApplyDebugCommands(text);
 }
 
-// The bridge asks how long the retract it just triggered lasts, and holds
-// CStartExperienceManager::Hide until the answer arrives. The close is already
+// The bridge asks how long the retract it just triggered lasts, and holds the
+// launcher's close decision until the answer arrives. The close is already
 // decided, so the panel slides out on the same settle a committed dismiss uses.
 // Only this process can plan it: the travel belongs to the panel, not the shell.
+//
+// A reveal contact that drives the panel answers `cancel` instead: the menu must
+// stay open where the finger has it, so no close record is published, no tap is
+// armed, no suppression opens and no Progress is written. The bridge then returns
+// without calling the shell's decision, which leaves the launcher's state at 5 —
+// the next press is an ordinary close. The cancel answer is here as well as in
+// the standing claim the bridge reads for a method-7 close, because the request
+// path must decide on its own if the two race.
 //
 // The request is refused, with the no-settle answer, when it belongs to a menu
 // that is gone: a generation that is not the current open generation, a deadline
 // that has passed, a request the bridge already marked done, or one this process
 // handled before. A late request must never start a settle under the menu the
-// user opened since; the bridge then keeps its own fixed lead.
+// user opened since; the bridge then closes at once.
 void ApplyRetractRequest() {
     SwipeIpcRetractRequest request{};
     if (!SwipeIpcReadRetractRequest(&g_ipc, &request)) {
-        return;  // no stable record: the bridge falls back to its fixed lead
+        return;  // no stable record: the bridge closes at once
     }
     if (request.seq == 0 || request.seq == g_ipcRetractSeq) {
         return;
@@ -4341,6 +4393,17 @@ void ApplyRetractRequest() {
     if (g_unloading.load(std::memory_order_relaxed) ||
         !RendererReady()) {
         AnswerRetract(request.seq, kSwipeRetractPlanNone);
+        return;
+    }
+
+    // A reveal owns the panel: the close must not happen. Nothing is changed —
+    // no close record, no tap, no suppression, no Progress write — and the
+    // answer goes out before the diagnostic line because the bridge is waiting.
+    if (RevealOwnsPanel()) {
+        if (!AnswerRetract(request.seq, kSwipeRetractPlanCancel)) {
+            FileLog(L"retract answer failed dur=cancel");
+        }
+        FileLog(L"debug retract cancelled (reveal owns)");
         return;
     }
 
@@ -5738,6 +5801,14 @@ void ResetActivationState() {
 
     g_suppressOpenAnim.store(false, std::memory_order_relaxed);
     g_animLogCount.store(0, std::memory_order_relaxed);
+
+    // No reveal of this activation drives anything any more. Withdrawing the
+    // claim here also covers the input thread's own exit, where the channel is
+    // still open; the lease covers a thread that never reaches this line.
+    g_ipcOpenTickLow = 0;
+    g_revealClaimOpen = 0;
+    g_revealClaimTick = 0;
+    PublishRevealClaim();
 
     EndContactTiming();
     FileLog(L"activation state reset");
@@ -7346,6 +7417,31 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     BeginHidSession(geometry, xDip, yDip, tickMs);
 }
 
+// The reveal's standing claim on the panel; see the declaration beside
+// g_ipcOpenTickLow. `g_reveal.active` is the takeover, exactly the condition the
+// request path answers cancel on, so the bridge's method-7 decision and the
+// requested close can never disagree about what "a reveal owns the panel" means.
+bool RevealOwnsPanel() {
+    return g_reveal.active;
+}
+
+void PublishRevealClaim() {
+    if (!g_ipc.state) {
+        return;
+    }
+    const uint32_t now = static_cast<uint32_t>(GetTickCount64());
+    const uint32_t open = RevealOwnsPanel() ? g_ipcOpenTickLow : 0;
+    if (open == g_revealClaimOpen && g_revealClaimTick != 0 &&
+        static_cast<uint32_t>(now - g_revealClaimTick) <
+            kSwipeRevealClaimRefreshMs) {
+        return;
+    }
+    if (SwipeIpcPublishRevealClaim(&g_ipc, open, now)) {
+        g_revealClaimOpen = open;
+        g_revealClaimTick = now;
+    }
+}
+
 // Publishes whether a live contact owns the panel edge. The UI side re-reads it
 // when a measurement runs, so a request recorded on an idle panel cannot move the
 // edge under a finger that started in between.
@@ -7359,6 +7455,11 @@ void PublishPanelOwnership() {
     // flag, and their handshake is what keeps a layout change out from under a
     // gesture that has just started.
     g_panelOwned.store(owned, std::memory_order_seq_cst);
+    // The same state, in the form the explorer side reads without waiting: a
+    // close on the synchronous method must decide from this record, and the
+    // refresh that keeps it inside its lease rides every report and every idle
+    // tick.
+    PublishRevealClaim();
     if (!owned && g_measureDeferred.exchange(false, std::memory_order_relaxed) &&
         !g_unloading.load(std::memory_order_relaxed)) {
         // The change that was held back is applied once now: renderer scalars,
@@ -7950,6 +8051,10 @@ void PollRootVisibility(uint64_t tickMs) {
         // 20 ms poll below is the only delay, and no user closes a menu they have
         // not seen yet.
         SwipeIpcPublishOpen(&g_ipc, tickMs);
+        // The reveal claim is bound to this open: a claim published for the
+        // previous menu can never cancel a close of this one. The claim's own
+        // refresh happens on this tick's report/idle path, after any adoption.
+        g_ipcOpenTickLow = static_cast<uint32_t>(tickMs);
         // The open publish also cancels the close stamp the previous menu left.
         // The bridge refuses a stamp older than the open tick, but an
         // unconsumed tapped record from the previous menu can still be the
@@ -12211,7 +12316,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.35.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.36.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance

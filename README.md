@@ -25,9 +25,12 @@ Two mods ship together, and both are needed for the full experience:
   itself: edge-pull to open, follow the finger, drag to dismiss, and the
   animation.
 - **Start menu touch gesture bridge** (`start-menu-touch-gesture-bridge`) —
-  runs in Explorer and makes closing the menu with the Windows key or by
-  clicking away play the same slide-out. Without it the menu still closes, but
-  instantly.
+  runs in Explorer and decides what a close from outside the gesture does: the
+  Windows key and the Start button play the slide-out, a click away closes at
+  once (the same close decision carries the lock screen, which must never
+  wait), and a close that arrives while your finger is still pulling the menu
+  out is refused, so the menu stays with your finger. Without the bridge the
+  menu still closes, but instantly.
 
 ## Install
 

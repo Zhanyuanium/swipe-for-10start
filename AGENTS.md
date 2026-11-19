@@ -13,7 +13,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 
-Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.35.0) runs in
+Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.36.0) runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
 every XAML/DirectManipulation source on this UI is empty (see docs/input.md). The
 tracked contact is named by the HID Contact Identifier (`0x0D/0x51`) when the
@@ -256,35 +256,50 @@ panel until the host restarts. The Start mod publishes the close record
 three times (plan at the arm, `tapped` immediately before the tap, cancelled
 when a new pull drops it) and writes the cancelled kind
 again with every new open generation, so no `tapped` stamp survives into the next
-menu. It answers a bridge `retract` request with the duration it just planned, or
+menu. It answers a bridge `retract` request with the duration it just planned,
 with the no-settle sentinel when the request's open generation is not current,
 names generation 0, its 700 ms deadline passed, or the bridge already marked it
-done; `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.16.0) runs in
-`explorer.exe`, passes the Hide at once for an unconsumed `tapped` record and
-otherwise holds it for that answered duration plus 30 ms, or 560 ms when no
-answer arrives. It binds a `tapped` stamp to the open tick it read and refuses
-one older than that open; a fresh stamp is correlation, not causal identity, and
-a Hide caused by the tap is inferred, not proven. On unload it keeps new Hides
-out and waits for every counted `Hide` call to leave before it closes the v2
-channel: the count is a `HideCallLease` (RAII, exactly one release per frame)
-that spans the original call too, so zero is what makes both that close and the
-trampoline use safe, and the wait has no deadline and one exit. It is a guarantee
-about **counted** frames: a thread already inside the detour but paused before its
-first increment is outside any counter the hook body can keep, and that window
-belongs to the host's hook-removal boundary. Zero logs
-`ipc unload drained waited=... ms`, closes the v2 channel (`ipc close`) and
-returns; that is `drained`. 500 ms is where a call still inside is reported, once
-(`ipc unload drain over 500 ms hides=...`), and every 10 s after that the wait
-reports `ipc unload stalled hides=... waited=... ms`; `stalled` is a periodic
-status, not an outcome, since the same unload can report it and then reach zero and
-log `drained`. A Hide that does not return, because the shell
-call under it never came back or a debugger suspended its thread, blocks the
-Windhawk reload until it resumes. Measured on this machine: the disable landed
-inside a 439 ms hold (`hide delayed reason=1 retract=409 lead=439`) and the drain
-reached zero at `ipc unload drained waited=16 ms`, then `ipc close`; the CLI
-returns in 30 ms while the engine applies the unload about 440 ms later, so the
-drain is reachable and the `stalled` branch stays code-path only, because nothing
-available makes `Hide_Original` or `FileLog` hang.
+done, or with `cancel` when a reveal contact drives the panel — and then changes
+nothing: no close record, no tap, no suppression, no `Progress` write. It also
+publishes the standing reveal claim (`revealOpen` = the open tick a reveal
+belongs to, or 0; `revealTick` refreshed at most every 50 ms, stale after
+250 ms), which is the only answer a method-7 close is decided from.
+`mods/start-menu-touch-gesture-bridge.wh.cpp` (0.17.0) runs in
+`explorer.exe` and decides at `XamlLauncherState::HideStartAndCortana`
+(`twinui.pcshell.dll` RVA `0x24BCB0`), one frame above the
+`CStartExperienceManager::Hide` it used to hold: it passes a `tapped` gesture
+close at once, decides method 7 (display change, lock, click-away) from the
+reveal claim and never holds it, and for every other method publishes the
+request and holds the original for the answered duration plus 30 ms or passes at
+once for the sentinel, no answer or no channel. Skipping that call writes no
+state, so a cancelled close leaves the launcher at 5; a hold on `Hide` stranded
+it at 9, which `IsStartVisible` still reports visible. It binds a `tapped` stamp
+to the open tick it read and refuses one older than that open; a fresh stamp is
+correlation, not causal identity, and a close caused by the tap is inferred, not
+proven. The hook is probed before it is installed — executable section,
+prologue, and the state write plus manager call site in the body — and a failure
+logs its own `close hook skipped ...` line and leaves only that hook out. On
+unload it keeps new closes out and waits for every counted close-hook frame to
+leave before it closes the v2 channel: the count is a `CloseCallLease` (RAII,
+exactly one release per frame, over both close hooks) that spans the original
+call too, so zero is what makes both that close and the trampoline use safe, and
+the wait has no deadline and one exit. It is a guarantee about **counted**
+frames: a thread already inside the detour but paused before its first increment
+is outside any counter the hook body can keep, and that window belongs to the
+host's hook-removal boundary. Zero logs `ipc unload drained waited=... ms`,
+closes the v2 channel (`ipc close`) and returns; that is `drained`. 500 ms is
+where a call still inside is reported, once (`ipc unload drain over 500 ms
+closes=...`), and every 10 s after that the wait reports `ipc unload stalled
+closes=... waited=... ms`; `stalled` is a periodic status, not an outcome, since
+the same unload can report it and then reach zero and log `drained`. A close that
+does not return, because the shell call under it never came back or a debugger
+suspended its thread, blocks the Windhawk reload until it resumes. Measured on
+this machine: the disable landed inside a 439 ms hold (`hide delayed reason=1
+retract=409 lead=439`) and the drain reached zero at `ipc unload drained
+waited=16 ms`, then `ipc close`; the CLI returns in 30 ms while the engine
+applies the unload about 440 ms later, so the drain is reachable and the
+`stalled` branch stays code-path only, because nothing available makes the
+original call or `FileLog` hang.
 Windhawk 2.0.0-alpha.8 disables the hooks, calls `Wh_ModUninit`, then waits
 `ThreadsCallStackWaitForRegions(..., 200, 400)` before removing hooks and
 `FreeLibrary`, and discards that wait's result: "the scan found the frame" and
@@ -294,16 +309,17 @@ the host's. The bridge pins its own image as a prerequisite
 GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`); a failed pin
 returns FALSE and installs nothing (`mod init refused: the image could not be
 pinned; no hook, no channel and no thread installed`, or `mod pin failed
-err=...`), because a shell-owned `Hide` thread needs valid return code as much as
+err=...`), because a shell-owned close thread needs valid return code as much as
 a worker would, and the pin keeps a frame that returns after `Wh_ModUninit` in
 mapped code with its lease still releasing. A re-enable re-initialises the same
-image and refuses while `g_hideCalls` is nonzero (`mod init refused: a Hide from
-the previous activation is still inside; ...`); otherwise `ResetReinitState()`
-clears `g_disabled`, `g_afterInit`, `g_explorerHooked`, `g_hideDelayEnabled` and
-`g_startPointTick`, retries a failed gesture mapping, leaves `g_hideCalls` alone,
-and logs `activation state reset`; a drained unload closes the channel before
-`Wh_ModUninit` returns, so a re-enable opens a fresh one, and `Wh_ModInit` still
-reuses a channel `g_ipc` already holds instead of mapping a second one over it.
+image and refuses while `g_closeCalls` is nonzero (`mod init refused: a close
+from the previous activation is still inside; ...`); otherwise
+`ResetReinitState()` clears `g_disabled`, `g_afterInit`, `g_explorerHooked`,
+`g_arbiterEnabled` and `g_startPointTick`, retries a failed gesture mapping,
+leaves `g_closeCalls` alone, and logs `activation state reset`; a drained unload
+closes the channel before `Wh_ModUninit` returns, so a re-enable opens a fresh
+one, and `Wh_ModInit` still reuses a channel `g_ipc` already holds instead of
+mapping a second one over it.
 The older `start_gesture_shared.h` mapping stays for the process lifetime on
 purpose, because a consumer and a late gesture callback may still hold its view.
 The two processes talk only through `mods/swipe_ipc_shared.h` (v2): one session-local
