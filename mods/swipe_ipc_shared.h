@@ -149,14 +149,27 @@
 // name it. A request that reaches the Start side with generation 0 is refused
 // exactly like one from a menu that is gone.
 //
-// Retract request (bridge -> Start) and plan (Start -> bridge): the request
+// Retract request (bridge -> Start) and answer (Start -> bridge): the request
 // carries the open generation the bridge saw, its own tick and a deadline; the
-// plan echoes the request's sequence number and carries the settle the Start
-// side planned, or kSwipeRetractPlanNone. The Start side answers a request only
-// when it is newer than everything it handled, bound to the current open
-// generation, still inside its deadline, and not marked done. The bridge marks
-// its request done when the Hide it was holding completes, so a request whose
-// close is over cannot start a settle under the menu the user opens next.
+// answer echoes the request's sequence number and carries one of three answers —
+// the settle the Start side planned, kSwipeRetractPlanNone when nothing started,
+// or kSwipeRetractPlanCancel when a reveal owns the panel and the close must not
+// happen at all. The Start side answers a request only when it is newer than
+// everything it handled, bound to the current open generation, still inside its
+// deadline, and not marked done. The bridge marks its request done when the
+// close it served is over, so a request whose close is over cannot start a
+// settle under the menu the user opens next.
+//
+// Reveal claim (Start -> bridge): the standing "a reveal contact drives the
+// panel right now" record, published without a request. A close that arrives on
+// the launcher's synchronous dismiss method (7: display change, lock, and the
+// click-away on this build) is decided from this record alone, because such a
+// close may not wait for an answer. The record carries the open tick the reveal
+// belongs to and the tick of its last refresh; a record older than
+// kSwipeRevealClaimLeaseMs, or bound to an older menu, is no claim at all, so a
+// Start side that died cannot wedge the launcher's close. It lives in the
+// reserved words of the layout, so sizeof(SwipeIpcState) stays 672 and the
+// version stays 2.
 
 constexpr wchar_t kSwipeIpcStateName[] =
     L"Local\\SwipeFor10Start_v2_State";
@@ -181,6 +194,19 @@ constexpr int32_t kSwipeCloseKindGesture = 1;
 
 // retractPlanMs when the Start side could not start a settle.
 constexpr int32_t kSwipeRetractPlanNone = 1;
+// retractPlanMs when a reveal owns the panel: the close must not happen. The
+// bridge returns without calling the shell's decision, so the menu stays open,
+// the state stays where it was and the next close is decided afresh.
+constexpr int32_t kSwipeRetractPlanCancel = 2;
+
+// How long a published reveal claim stays valid. The Start side refreshes it
+// while a reveal drives the panel and clears it when the reveal ends, so this
+// bound only covers a Start side that stopped refreshing: a stale claim is "not
+// owned", and the close passes.
+constexpr uint32_t kSwipeRevealClaimLeaseMs = 250;
+// The slowest refresh of a live claim. The input thread ticks every 5 ms; 50 ms
+// keeps the writer quiet while leaving a five-fold margin under the lease.
+constexpr uint32_t kSwipeRevealClaimRefreshMs = 50;
 
 // initState values; see "Who initialises the section" above.
 constexpr LONG kSwipeIpcBlank = 0;
@@ -226,11 +252,11 @@ struct SwipeIpcState {
     // Bridge -> Start, then the answer back. Both are seqlock records.
     volatile LONG64 retractRequestSeq;
     volatile LONG64 retractRequestTick;
-    volatile LONG retractPlanMs;      // kSwipeRetractPlanNone, or planned ms
-    volatile LONG reserved0;
+    volatile LONG retractPlanMs;      // kSwipeRetractPlan* value
+    volatile LONG revealSeq;          // the reveal claim's seqlock counter
     volatile LONG64 retractRequestOpen;      // open generation the bridge saw
     volatile LONG64 retractRequestDeadline;  // tick after which it is void
-    volatile LONG64 retractPlanSeq;          // the plan's seqlock counter
+    volatile LONG64 retractPlanSeq;          // the answer's seqlock counter
     volatile LONG64 retractPlanRequest;      // echoes the request's sequence
     volatile LONG64 retractCancelSeq;        // highest request the bridge ended
 
@@ -244,7 +270,12 @@ struct SwipeIpcState {
     volatile LONG layoutBytes;
     volatile LONG64 initTick;
 
-    volatile LONG64 reserved[1];
+    // Start -> bridge, under revealSeq. `revealOpen` is the low 32 bits of the
+    // open tick the reveal belongs to, or 0 when no reveal drives the panel;
+    // `revealTick` is the low 32 bits of GetTickCount64 at the last refresh.
+    // See "Reveal claim" above.
+    volatile LONG revealOpen;
+    volatile LONG revealTick;
 };
 
 static_assert(offsetof(SwipeIpcState, magic) == 0, "layout");
@@ -261,6 +292,7 @@ static_assert(offsetof(SwipeIpcState, closePull) == 564, "layout");
 static_assert(offsetof(SwipeIpcState, retractRequestSeq) == 568, "layout");
 static_assert(offsetof(SwipeIpcState, retractRequestTick) == 576, "layout");
 static_assert(offsetof(SwipeIpcState, retractPlanMs) == 584, "layout");
+static_assert(offsetof(SwipeIpcState, revealSeq) == 588, "layout");
 static_assert(offsetof(SwipeIpcState, retractRequestOpen) == 592, "layout");
 static_assert(offsetof(SwipeIpcState, retractRequestDeadline) == 600,
               "layout");
@@ -272,6 +304,8 @@ static_assert(offsetof(SwipeIpcState, openTick) == 640, "layout");
 static_assert(offsetof(SwipeIpcState, initState) == 648, "layout");
 static_assert(offsetof(SwipeIpcState, layoutBytes) == 652, "layout");
 static_assert(offsetof(SwipeIpcState, initTick) == 656, "layout");
+static_assert(offsetof(SwipeIpcState, revealOpen) == 664, "layout");
+static_assert(offsetof(SwipeIpcState, revealTick) == 668, "layout");
 static_assert(sizeof(SwipeIpcState) == 672, "layout");
 
 struct SwipeIpcChannel {
@@ -726,9 +760,10 @@ inline LONG64 SwipeIpcReadRetractCancel(SwipeIpcChannel* channel) {
                           : 0;
 }
 
-// Publishes the duration of the settle that just started, or
-// kSwipeRetractPlanNone when none did. `requestSequence` is the release: the
-// bridge accepts only an answer that echoes its own request.
+// Publishes the answer to a retract request: the duration of the settle that just
+// started, kSwipeRetractPlanNone when none did, or kSwipeRetractPlanCancel when a
+// reveal owns the panel and the close must not happen. `requestSequence` is the
+// release: the bridge accepts only an answer that echoes its own request.
 inline bool SwipeIpcAnswerRetract(SwipeIpcChannel* channel,
                                   LONG64 requestSequence, int32_t settleMs) {
     if (!channel->state || requestSequence <= 0) {
@@ -765,4 +800,69 @@ inline bool SwipeIpcReadRetractPlan(SwipeIpcChannel* channel,
     record.seq = sequence;
     *out = record;
     return true;
+}
+
+// A copy of the reveal claim. `open` and `tick` are the low halves of the two
+// GetTickCount64 values the Start side wrote; both are compared modulo 2^32.
+struct SwipeIpcRevealClaim {
+    int32_t seq;
+    uint32_t open;  // open tick the reveal belongs to; 0 = no claim
+    uint32_t tick;  // tick of the last refresh
+};
+
+// Publishes the reveal claim. `openTick` is the tick the Start side published as
+// the menu's open (the same value the bridge reads from openTick), or 0 to
+// withdraw the claim; `nowTick` is the refresh's tick. Called on the Start side's
+// input thread only, and only when the value changed or the refresh is due.
+inline bool SwipeIpcPublishRevealClaim(SwipeIpcChannel* channel,
+                                       uint32_t openTick, uint32_t nowTick) {
+    if (!channel->state) {
+        return false;
+    }
+
+    // The 32-bit form of SwipeIpcBeginWrite: an odd counter is a dead writer's,
+    // so it is stepped to the next odd value and never back to the even one it
+    // left behind.
+    volatile LONG* sequence = &channel->state->revealSeq;
+    const LONG current = InterlockedCompareExchange(sequence, 0, 0);
+    if ((current & 1) != 0) {
+        InterlockedExchangeAdd(sequence, 2);
+    } else {
+        InterlockedIncrement(sequence);
+    }
+    channel->state->revealOpen = static_cast<LONG>(openTick);
+    channel->state->revealTick = static_cast<LONG>(nowTick);
+    InterlockedIncrement(sequence);
+    return true;
+}
+
+// Copies the reveal claim as one record. False means no stable copy exists; the
+// caller then has no claim.
+inline bool SwipeIpcReadRevealClaim(SwipeIpcChannel* channel,
+                                    SwipeIpcRevealClaim* out) {
+    if (!channel->state) {
+        return false;
+    }
+
+    volatile LONG* sequence = &channel->state->revealSeq;
+    for (int attempt = 0; attempt < kSwipeIpcReadAttempts; ++attempt) {
+        const LONG before = InterlockedCompareExchange(sequence, 0, 0);
+        if ((before & 1) != 0) {
+            MemoryBarrier();
+            continue;  // a write is in progress
+        }
+
+        SwipeIpcRevealClaim record{};
+        record.open = static_cast<uint32_t>(channel->state->revealOpen);
+        record.tick = static_cast<uint32_t>(channel->state->revealTick);
+        MemoryBarrier();
+        if (InterlockedCompareExchange(sequence, 0, 0) != before) {
+            continue;  // the record moved under the copy
+        }
+
+        record.seq = static_cast<int32_t>(before);
+        *out = record;
+        return true;
+    }
+    return false;
 }

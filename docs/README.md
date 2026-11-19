@@ -27,7 +27,7 @@ it.
 | [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the taskbar band, the adoption of a late open and the record a lift before it leaves, the live takeover's visible entry and its 2.2 DIP/ms chase of the finger, the close-ownership rule (a close owns `Progress` until the window is observed cloaked; a gesture close whose tap is still armed is cancelled and its panel comes back, every other pull is deferred, released at the landing and served live or late, and the one-open-path order), the shell's own limits on an open during a close, the unhealed-window rule (a shown window with the panel off it is healed, and a pull there opens), the commit thresholds, what a close does to a live gesture. |
 | [animation.md](animation.md) | The damped-spring settle: both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam and the offset-carrying window replay at a reveal takeover or a late release, the one-owner rule (a deferred pull writes nothing while a close is in flight) and the from-live settle of an open the shell performs during a close, the two shipped styles, and the native Quick Settings flyout measurement behind the 1.72 fit. |
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
-| [ipc.md](ipc.md) | The v2 shared-memory channel, the open generation, the plan/tapped/cancelled close record, the retract request/answer, and the bridge's `Hide` policy and unload drain. |
+| [ipc.md](ipc.md) | The v2 shared-memory channel, the open generation, the plan/tapped/cancelled close record, the retract request and its three answers (duration, none, cancel), the reveal claim, the close decision at `XamlLauncherState::HideStartAndCortana` (method 7 never held, immediate fallback), and the bridge's unload drain over both close hooks. |
 | [lifecycle.md](lifecycle.md) | The image pin, the per-process instance guard, the counted module entries, the unload order and its residuals, re-initialisation, and the host's unload boundary. |
 | [testing.md](testing.md) | The PowerShell/Python probes and injectors, and the captured measurements in `artifacts/`. |
 | [limits.md](limits.md) | Known limits and risks, and the hardware checks still owed (one finger end to end, two fingers in both lift orders, pen by hand, right-side taskbar by hand). |
@@ -37,11 +37,16 @@ it.
 Two mods ship together (full member list in
 [../mods/AGENTS.md](../mods/AGENTS.md)):
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.35.0) — runs in
-  `StartMenuExperienceHost.exe`; the whole gesture, follow and animation.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.16.0) — runs in
-  `explorer.exe`; hooks `CStartExperienceManager::Hide` so keyboard and
-  click-away closes play the same slide-out.
+- `mods/start-menu-legacy-swipe.wh.cpp` (0.36.0) — runs in
+  `StartMenuExperienceHost.exe`; the whole gesture, follow and animation, and
+  the answer to the bridge's close question: a retract duration, no settle, or
+  `cancel` while a reveal owns the panel.
+- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.17.0) — runs in
+  `explorer.exe`; decides at `XamlLauncherState::HideStartAndCortana` whether a
+  Windows-key, Start-button or click-away close runs now, waits for the
+  retract, or is refused. A click-away is never held (the lock screen shares its
+  method 7), so only the Windows key and the Start button animate their
+  close.
 
 Everything else in `mods/` (`msgprobe`, `inputprobe`,
 `start-menu-touch-gesture-probe`, `start-menu-touch-gesture-consumer`) is

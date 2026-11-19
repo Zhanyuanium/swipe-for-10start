@@ -17,9 +17,9 @@ On release the dismiss commits when the release position passed 20% of the
 distance (10% on a vertical axis, where the same drag also scrolls the area
 under the press) or the session-average speed exceeded 0.45 DIP/ms; a commit
 animates `Progress` to 0 and arms a `VK_LWIN` tap (down 60 ms, up) for the end
-of that retract. That tap is the shell's own Start toggle: its key handler
-performs `CStartExperienceManager::Hide`, so the next Windows press opens the
-menu and no re-arm tap exists. Every outcome — dismiss, cancelled reveal,
+of that retract. That tap is the shell's own Start toggle: its close is the one
+the bridge's decision passes as a gesture close, so the next Windows press opens
+the menu and no re-arm tap exists. Every outcome — dismiss, cancelled reveal,
 reveal commit and dismiss cancel — runs one settle: a damped spring that starts
 at the component of the release speed toward the target, measured over the
 widest eligible window of the last reports — 8-30 ms wide, taken backward from
@@ -268,10 +268,11 @@ reads it. Two shapes, one owner each:
   the whole window in which the shell can still be spared the close, and — as
   [limits.md](limits.md) records — the only shape the shell can reopen from after
   that close's own gesture.
-- **Deferral.** Every other close already has its `Hide` in the shell's or the
-  bridge's hand: a keyboard close, a Start-button or click-away close (both
-  arrive as the bridge's retract request), or a gesture close whose tap already
-  fired. A pull that lands there is recorded, not admitted:
+- **Deferral.** Every other close already has its close in the shell's hand: a
+  keyboard close, a Start-button or click-away close (both arrive as the bridge's
+  retract request, and are refused instead while a reveal owns the panel), or a
+  gesture close whose tap already fired. A pull that lands there is recorded, not
+  admitted:
   `reveal admit ... ok=1 reason=deferred`, no `Progress` write, no pull
   generation, no cancel stamp, no mute, and `startedOpen = 0` while the close is
   in flight, so a pull that starts above the band is adopted from its own down

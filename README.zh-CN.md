@@ -16,7 +16,7 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 两个模组配套发布，两个都装才有完整体验：
 
 - **Start menu legacy swipe**（`start-menu-legacy-swipe`）——负责手势本身：边缘划入打开、跟随手指、拖动关闭，以及滑动动画。
-- **Start menu touch gesture bridge**（`start-menu-touch-gesture-bridge`）——运行在 Explorer 中，使菜单在按 Windows 键或点击别处关闭时也播放滑出动画。没有它，菜单照常关闭，只是瞬间消失。
+- **Start menu touch gesture bridge**（`start-menu-touch-gesture-bridge`）——运行在 Explorer 中，决定来自手势之外的关闭怎么执行：按 Windows 键或点开始按钮时播放滑出动画，点击别处则立即关闭（同一个关闭决策也承载锁屏，锁屏绝不能被拖住），而手指还在把菜单拉出时到来的关闭会被拒绝，菜单留在手指下。没有它，菜单照常关闭，只是瞬间消失。
 
 ## 安装
 

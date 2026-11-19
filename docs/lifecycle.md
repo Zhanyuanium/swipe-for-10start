@@ -91,19 +91,19 @@ hooks (`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
 GET_MODULE_HANDLE_EX_FLAG_PIN)`, `mod pin image=... pinned=1`); a failed pin
 logs `mod pin failed err=...` and returns FALSE from `Wh_ModInit` (`mod init
 refused: the image could not be pinned; no hook, no channel and no thread
-installed`), because a shell-owned `Hide` thread needs valid return code as
+installed`), because a shell-owned close thread needs valid return code as
 much as a worker would. The pin keeps that module's code and the
-`HideCallLease` destructor mapped for a frame that returns after
+`CloseCallLease` destructor mapped for a frame that returns after
 `Wh_ModUninit`; the trampoline under a frame is the host's allocation, and a
 scan blind to the frame is outside what any mod can fix — the hazard is
 reduced, not eliminated.
 
 A re-enable re-initialises the same image without the loader resetting
-anything, and refuses while a Hide from the previous activation is still inside
-(`mod init refused: a Hide from the previous activation is still inside;
+anything, and refuses while a close from the previous activation is still inside
+(`mod init refused: a close from the previous activation is still inside;
 ...`); otherwise `ResetReinitState()` clears `g_disabled`, `g_afterInit`,
-`g_explorerHooked`, `g_hideDelayEnabled` and `g_startPointTick`, retries a
-failed gesture mapping, leaves `g_hideCalls` alone, and logs `activation state
+`g_explorerHooked`, `g_arbiterEnabled` and `g_startPointTick`, retries a
+failed gesture mapping, leaves `g_closeCalls` alone, and logs `activation state
 reset`; a drained unload closes the channel before it returns, so a re-enable
 opens a fresh one. `Wh_ModInit` still reuses a channel `g_ipc` already holds
 instead of mapping a second one over it.
