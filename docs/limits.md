@@ -1,227 +1,82 @@
-# Known limits, risks, and the hardware checks still owed
+# Limits and risks
 
-> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
-> Part of [docs/README.md](README.md).
+> M3. Each item is a measured limit, a shell-imposed rule or a hardware check
+> still owed. Nothing here is speculative.
 
-## Outstanding hardware checks
+## Shell-imposed
 
-- **One physical finger.** A single down, drag, stationary hold and lift, with the
-  log showing one owner, no early idle release, `vel=0.00` after the hold, exactly
-  one release, and the next touch admitted at once. The virtual digitizer always
-  sends coordinates and an asserted tip, so it cannot stand in for this.
-- **Two physical fingers.** Keep one finger dragging while the other lands and
-  lifts, then reverse which one lifts first. No position jump, no false release, no
-  transfer of the tracked contact to an inactive slot. The recorded device dump
-  shows the ELAN declares a Tip per contact collection, but slot reuse and report
-  cadence are only establishable by hand.
-- **Pen.** `TipSwitch`/`InRange` are decoded and a hover is discarded, but no pen
-  has produced a report since the decode changed.
-- **Taskbar on the right.** The left, top and bottom taskbars are verified on this
-  machine; the right side was exercised through the same path (`axis=2`) with
-  injected input only, never by hand.
+- **The first visible frame is 245–268 ms after `ShowStartView` in the worst
+  case.** The shell owns the cloak; the docked keyboard open measured its first
+  pixel at +190 ms from the key. DWM attribute 13 returns `E_ACCESSDENIED`
+  without the shell's IAM ticket; the owning process cannot acquire it before the
+  shell's own uncloak (measured: the window was already uncloaked when the ticket
+  was obtained, `before=0`). Early uncloak is not attempted: it may reveal an
+  unpainted window. This is the accepted cap.
+- **The launcher must be attached.** `[outer+0x18+0x160] > 0x10000`; zero means
+  no `IXamlLauncherState`. The constructor's sentinel is `0x100`. A first open
+  after a fresh logon can therefore be refused; the shell's own gesture then
+  opens the menu and creates the executor window for the next one.
+- **The launcher thread is not the taskbar thread.** A `ShowStartView` on the
+  taskbar thread fail-fasts explorer (`0xC0000409` at `twinui+0x1BB010`);
+  measured. The executor creates its window on the thread that runs
+  `OnHotkeyInvoke` / the shell's own `ShowStartView`, and refuses a window on any
+  other.
+- **A reinstalled Windhawk image leaves its window class behind.** The class is
+  named after the image's WndProc, so a new activation does not inherit the old
+  image's procedure and its closed channel.
+- **A press that lands inside the shell's hide is a no-op show.** The bridge
+  latches it (one slot) and serves it as the same open intent at the landing
+  (`own press served wait=...`, 31–110 ms measured), so the key is never lost.
+  The shell still owns the 245–268 ms cloak after the serve, and a press that
+  lands after the hide is a normal open.
 
-## Known limits and risks
+## The touch show
 
-- The left, top and bottom taskbars are verified on this machine, and the right
-  side was exercised earlier through the same path (`axis=2`). The dismiss axis
-  and the panel band come from the taskbar itself, never from the Start window's
-  rect. `SHAppBarMessage(ABM_GETTASKBARPOS)` is the primary source (`uEdge` and
-  its docked rectangle, reported unchanged while the bar is hidden); the
-  `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` rectangle is the cross-check (the bar
-  must be flush to the edge **and** thin across it, so a full-width bottom bar is
-  not mistaken for a side one); the work-area inset names the axis only when it
-  truly insets, because auto-hide makes it zero by design. An inconclusive
-  probe keeps the last axis and band, logs once per undecided episode with what
-  each source said (`dismiss axis=... kept, no source named an edge ...`), and
-  retries on the next open or broadcast; it never silently means `Left`.
-  Measured on this layout:
-  `dismiss axis=3 (0=left,1=top,2=right,3=bottom) src=appbar appbar=3
-  rc=0,1704,2880,1800 bar=3 rect=0,1798,2880,1894 work=0,0,2880,1800
-  mon=0,0,2880,1800`. The band is the bar's strip extended by one bar thickness
-  toward the desktop, the axis is part of the layout identity, and both the
-  translation and the reveal anchor are axis-aware.
-- The same band is the strip a reveal candidate may start in, and it is wider
-  than the strip the shell's own edge gesture opens from (about 20 DIP). A pull
-  that starts deeper is admitted, the shell does not open the menu under it, and
-  the release logs `reveal candidate released unopened travel=...` and moves
-  nothing; below 24 DIP of travel that line is silent, so a tap stays a tap.
-  A pull the shell does open for and that still reached the menu without a
-  candidate — a fresh process before the first snapshot carried a band, a
-  refused admission, or a taskbar probe that named no edge — is adopted at
-  24 DIP of travel instead of animated from 0. A contact that starts in that
-  band while the menu is open is the opening pull's tail: while it stays at
-  least 8 DIP away from the taskbar, measured from its own down point, it starts
-  no dismiss and settles nothing (`dismiss skipped band tail travel=...`), and a
-  press that starts on the panel takes the ordinary dismiss path from its first
-  sample.
-- A pull that lifts before the shell opens the menu is carried by one record for
-  300 ms, and 300 ms is a measured bound, not a guarantee: the open arrived
-  107-251 ms after the lift here, and a shell that took longer — a loaded
-  machine, a cold start — finds no record and runs the keyboard settle from
-  rest, so that pull pauses and then opens instead of carrying the hand. The
-  record also needs 24 DIP of travel and a measured distance; a shorter release
-  has nothing to carry.
-- The scroll gate is a survey of at most six regions. A viewer beyond the sixth
-  is dropped and only the deepest six are kept
-  (`scroller overflow (kept 6 deepest regions)`), so a press inside the dropped
-  viewer finds no region and starts a dismiss. A region whose `ViewChanged`
-  registration cannot be made keeps the rect and offsets of the pass that read
-  it, so its end-of-list numbers can go stale for the rest of that open.
-- The reveal and the dismiss share the 20% (10% vertical) travel and the
-  0.45 DIP/ms session-average thresholds, but their visual anchors differ (panel
-  edge vs. drag start), so the same physical travel reads as a different
-  `progress` in each; the decision uses travel, not progress.
-- The panel trailing edge is measured from the root's visible child; if the menu
-  layout changes (another panel becomes the first visible child) the anchor needs
-  revisiting. The XAML coordinate space starts at `ClientToScreen` of the host
-  window's client origin, not at the window rect and not at the work-area origin;
-  the window rect alone is 95 px of error here.
-- Progress is inserted on a 0.5 DIP movement threshold; a finer threshold costs
-  extra property writes on the input thread. At 200% scaling 0.5 DIP is exactly
-  1 px (1 DIP = 2 px), so the follow can still step by one pixel: the threshold is
-  not sub-pixel.
-- A new contact is chosen from a report's real contacts by proximity to the last
-  raw position; two fingers moving together can confuse which one starts the
-  gesture. Once tracked, another slot or another device cannot move or end it,
-  and a count-only lift report does not end it either: the 18 ms idle does.
-- Composition translation does not move XAML hit-testing: while the menu is
-  dragged, the content still receives touches at its original position.
-- After a disable/enable without restarting `StartMenuExperienceHost.exe`, the
-  reused XAML root means no new `PrepareRootElement` and no renderer: a new
-  contact is tracked but cannot drive the panel until the host restarts. The
-  restart in the install instructions is the workaround, not just advice.
-- A close is only cancellable before its decision has been released: a gesture
-  close arms one Windows tap at the end of its retract; a contact that lands
-  before it runs drops the tap on its first report, so that close never hides the
-  menu and the panel comes back from its live position (`reveal admit ...
-  reason=cancelled`), one owner and one motion. A Win press during that retract
-  closes the menu early instead — the plan is current, so the bridge holds that
-  close for the answered retract, and the Start side drops the armed tap when the
-  request arrives — and the shell's own gesture then will not reopen it: measured,
-  the shell issued `show` after the hide and hid again 194 ms later (`hide
-  reason=7`) with the finger still down, so a pull that begins after that tap
-  leaves the menu closed. Nothing in this design can withdraw a close the shell
-  or the bridge has already released (returning `S_OK` from the bridge without
-  calling the original broke the Start toggle).
-- A Windows-key or Start-button open during a close's retract does not reach the
-  shell while the close decision is held: the press is dropped, no `show`
-  line appears and the window never uncloaks (measured at +40/+150/+250/+300/
-  +320/+340/+360/+380 ms after the close, for all three close kinds). The
-  boundary is the decision's release, the answered retract plus the bridge's 30 ms
-  margin (439 ms here): a press at +400 opens the menu with one
-  `win open dur=409` from rest and one rise to the 526 px rest, its
-  press-to-first-visible-frame delay 38-191 ms; a press at +600 shows in 38 ms.
-  After the landing the auto-hidden bar is gone within ~240 ms, so a Start-button
-  press later than that finds no button to press until the bar is hovered up
-  again. The shell's own
-  transition is the gate, not this mod: the Start side has nothing to react to,
-  and the bridge sees neither `show` nor `hide` for the dropped press. The
-  `show` request is also the step that draws the pane (`anim=0` measurement), so
-  the mod does not drop it.
-- A pull that lifts before the close lands is not served, for the same reason:
-  the shell starts its edge gesture only after the close, finds no contact,
-  issues `show` and cancels it 17 ms later (`hide reason=7`), and the menu stays
-  closed. The deferral still records it (`reveal defer released candidate=0
-  down=0`) and its `RevealLateRelease` record is ready at the landing, but no open
-  arrives to consume it. A pull still down at the landing opens the menu — the
-  shape the owner reported, and the one the deferral serves.
-- A shown window with the panel at the hidden rest is not a menu, and it was
-  reachable: the visibility poll read the live position with the taking reader
-  (`TakeProgressNow`) after it had just started the late-release settle, so the
-  take evaluated the new curve at 0 ms, stopped it and pinned 0. Measured:
-  `reveal adopt late ... from=0.000`, then
-  `progress take settle at=0.000 elapsed=0 dur=409 caller=contested`, then
-  `win open unhealed progress=0.000` every second, every pull refused
-  `reason=open` and muted as a band tail, until a press on the panel ran a dismiss
-  cancel. The poll now peeks (`PeekProgressNow`), the band admission refuses
-  `reason=open` only when the panel is at rest, and the unhealed check settles the
-  panel up from its live position when nothing owns it and the close's
-  suppression has ended. The cost is one extra position read per poll and one
-  settle up when the pair is found; the alternative — a menu that is shown but
-  has no pane — is not a state the mod may leave behind.
-- The bridge holds every close decision
-  (`XamlLauncherState::HideStartAndCortana`) for the settle the Start mod answered
-  with, plus 30 ms, and that wait runs on explorer's UI thread: the Windows key
-  and the Start button slide out, and the taskbar is blocked for that time
-  (409 ms for the 900 DIP panel, plus up to 100 ms of answer wait when no answer
-  arrives; method 7 — display change, lock screen and click-away — passes at once
-  and is never held, so a click-away no longer animates). The dismiss `method`
-  argument is logged (`hide delayed reason=1 retract=520 lead=550` on the left
-  taskbar of this machine, whose 1440 DIP travel hits the 520 ms clamp); the
-  Windows-key close reported 1 on this build. The gesture path does not wait.
-- The bridge's drain was reached, so it is measured, not hypothetical, and its
-  marks are not a bound. An elevated agent disabled the bridge within ~2 ms of a
-  trigger file and tapped Win 333 ms later, and the unload landed inside the
-  439 ms hold: `hide reason=1`, `hide delayed reason=1 retract=409 lead=439`,
-  `ipc unload drained waited=16 ms`, `ipc close`. The CLI does return early — it
-  was measured at 30 ms — while the engine applies the unload about 440 ms later;
-  the 16 ms is the held wait ending at `g_disabled`, plus the drain's 10 ms poll
-  step. The drain is therefore reachable, measured at
-  `waited=16 ms`; the `stalled` branch stays code-path only, because nothing
-  available makes `Hide_Original` or `FileLog` hang. The two handles one pinned
-  image keeps (the gesture mapping and its event) are below explorer's
-  handle-count noise (±60), so that instrument cannot see a two-handle effect, and
-  a version change leaves the older image's pair too. That limit is reasoned from
-  the code, not observed as a failure.
-- The close record is an 800 ms window. A gesture close publishes the plan at
-  its release and the `tapped` record immediately before the tap; a dropped close
-  publishes the cancelled kind at once, and the tap's deadline republication is
-  only the fallback. A Windows-key close that lands after the `tapped` record is
-  a second Hide under the same stamp and takes the keyboard lead; one that lands
-  while only the plan is current is a keyboard close too. Only `tapped` passes a
-  Hide without a wait.
-- A gesture close that the user cancels by pulling the menu open again drops its
-  armed tap before the shell is touched, so no `Hide` runs and the toggle is
-  never advanced. The panel is already retracted and is driven purely by the
-  follow from then on: it keeps the live position the retract had reached (the
-  takeover's `from`) when that position is above the visible entry, and the
-  finger's motion advances it from there, instead of snapping to the absolute
-  mapped position. When the retract has finished (the panel is cloaked or below
-  the entry), the follow starts at the entry and the panel appears from the
-  screen edge.
-- The live takeover starts at the visible entry and then chases the finger, so
-  for a moment the panel is behind by the gap it inherited, and the cost is the
-  catch-up time: `30 + gap / 2.2` ms at the planner's rate (the 30 ms entry hold
-  plus the gap). The entry is derived, not fixed: `RevealEntryProgress` puts the
-  panel's top on the work area's bottom, so it is 0.289 with the root at 900 DIP
-  and 0.249 with the root at 852 DIP (the bar shown at the open shrinks the root),
-  and the measured runs take their value from the same snapshot the follow reads.
-  A 90 DIP slow pull whose open arrives under the finger
-  takes `offset=0.118` (root 900); the gap is the 90 DIP of pre-open travel plus
-  the 16 DIP between the band's admit point and the screen bottom, and it closes
-  in ~78 ms; a 560 DIP fast pull closes its 634 DIP gap in ~318 ms. While
-  the chase
-  runs the panel trails the finger by the remaining gap, and once it is closed
-  the panel is glued (a finger moves at 0.5-5 DIP/ms). A constant subtraction is
-  the rejected alternative: it never closes, so the panel stayed at 0.25-0.27
-  visible with the finger at 450-560 DIP and could not pass `1 - offset`. The
-  other alternative — starting at the mapped position — is the teleport this
-  release removes. A very fast flick released before the chase finishes hands the
-  settle a shorter remaining travel, which is correct: the settle plans what is
-  still off its target, not the gap the finger skipped.
-- A click on the taskbar consumes the shell's edge-gesture session, so the pull
-  that follows it right away opens nothing at all. Measured: one click on the
-  bar, then three pulls — each was admitted (`reveal admit ... reason=admitted`)
-  and released with `reveal candidate released unopened travel=447/452/438`, and
-  nothing followed: no `reveal adopt late`, no `win open`, no `justOpened`. The
-  fourth pull opened normally. Nothing is left stuck on this side (a later pull
-  writes its own record, and an unconsumed one expires in 300 ms), so the menu is
-  missing because the shell never performed the open. The bar click does not need
-  to be inside the reveal band for this: it happens with the bar at the bottom,
-  and with a top or side bar — where the bar itself lies inside the band and the
-  click is admitted as a band candidate (`reveal admit x=... y=31 band=0,96`) —
-  the outcome is the same. Pull again, or wait about a second, after clicking the
-  taskbar.
-- The root hook is gated, not opportunistic: the file version of `StartUI_.dll`
-  must be exactly `10.0.22621.3733` **and** the target prologue plus its `E8`
-  call target must match. Anything else logs one line
-  (`startui root hook skipped build=... expected=10.0.22621.3733`, or
-  `... prologue mismatch`) and installs no hook; without the root there is no
-  renderer, so no gesture starts. Before either probe reads, it proves the
-  inspected range lies in an executable section of the loaded image (DOS and NT
-  headers, `SizeOfImage`, the section table); a range that does not logs
-  `startui root hook skipped (target not readable)` or
-  `startui anim hook skipped (target not readable)`, which is distinct from a
-  build or signature mismatch. A different build needs a new RVA and new
-  reference bytes.
-- The digitizer mapping assumes the touch panel covers the primary monitor.
+- **The digitizer may go quiet during the uncloak and during a close.** The
+  18 ms idle release would end the candidate before the open adopts it; while a
+  touch show is in flight (`controllerTouch`/`g_intentOpenActive`), or a close
+  is in flight with a reveal candidate, the idle is skipped. A real lift is a
+  report and still ends the gesture with `src=report`; a genuine silence after
+  those windows ends it with `src=idle`.
+- **The cold entry is 0.000.** The first open after a host start has no settled
+  geometry (the measurement is deferred while the panel is owned), so the settle
+  starts at 0 and the takeover chases. A warm docked open uses 0.348 (the
+  auto-hidden layout used 0.186).
+- **The chase is rate-limited at 2.2 DIP/ms.** A 0.558 inherited gap takes
+  ~254 ms to close; the panel is glued only after it (`behind=0.000`). The first
+  visible frame is the entry, not the finger's mapped position; this is the
+  accepted cap, not a lost frame. A held finger settles to the mapped position:
+  docked 0.96 at 300 DIP, the panel edge 2 px from the finger.
+- **The virtual digitizer's injected reports are sparser than the real panel.**
+  A glide's first reports can be 30–46 ms apart, which the 18 ms idle reads as a
+  new contact. The shipping panel reports at ~170 Hz; the test injector is a
+  test instrument, not the hardware.
+
+## The taskbar
+
+- **Current layout: docked** (auto-hide off): work `0,0,1440,852`, tray
+  `0,852..1440,900`, panel `236,265..1229,840`, band `804..900`. The Start
+  button at physical `(36,1748)` works and the ten-cycle series used it.
+- The auto-hidden bar once stopped revealing after an injected-touch session
+  (`Shell_TrayWnd` stayed at `0,899,1440,947`, `ABM_GETSTATE=1`, Win+`T` did not
+  draw it); that state is historical for the docked runs. The Win/touch/
+  click-away paths do not depend on the bar either way.
+- The bar's 48 DIP height and the 200 % scaling are measured, not assumed.
+
+## Hardware still owed
+
+- One finger end to end on the real ELAN2513 through the final build (the
+  injector covers the logic; the hardware's report cadence is the remaining
+  difference).
+- Two fingers in both lift orders; a pen by hand; a right-side taskbar by hand.
+- The taskbar auto-hide reveal after a fresh logon (the stuck state above was
+  not reproduced after an explorer restart; the bar stayed hidden).
+
+## Not attempted
+
+- Writing the launcher's `InternalState` or `Progress` from the bridge. The
+  bridge only calls `ShowStartView`/`Dismiss`/`IsVisible`.
+- Calling the launcher from an arbitrary hook frame. Every call is posted to the
+  hidden window on the launcher thread.
+- Holding the shell's `Hide`/`Dismiss` with a retract wait. The M3 close
+  schedules the dismiss after the settle; there is no arbitration hold.

@@ -1,17 +1,51 @@
 # docs/
-
 > L2 | Parent: ../AGENTS.md
 
-The project's technical memory, moved out of the user-facing README. English only; the user guide is bilingual at ../README.md and ../README.zh-CN.md.
+The project's memory: what was measured, what was falsified, and why each
+decision was taken. The user-facing quick start is `../README.md` /
+`../README.zh-CN.md`.
 
-README.md: the index — topic map, the verified-environment block, the shipping-mod roster.
-input.md: why Raw HID — the falsified data-source table, the report decode (report IDs, TipSwitch/InRange, contact identity, liveness vs position vs evidence clocks, the coordinate-only fallback), release detection and its timers, and the eight-report history the reveal replays on both sides of an open.
-gesture.md: the Progress model and expression, the dismiss and reveal state machines, the taskbar band, the adoption of a late open, the four ordered open paths and the promotion of a still-down candidate, the live takeover's visible entry (`RevealEntryProgress`, the progress whose trail edge reaches the work area's edge) and its chase of the mapped position at the planner's 2.2 DIP/ms (`behind` is the gap left at the release, while travel and commit keep the mapped value), the late-release record that carries a pull across an open that arrives after the lift, the close-ownership rule (a close owns `Progress` until the window is observed cloaked: a gesture close whose tap is still armed is cancelled, the tap dropped and the panel brought back, `reason=cancelled`; every other pull is deferred, writes nothing, is released at the landing and served by the live takeover or the late record whose age starts there; the contested continuation is the guard for a panel the close left above the hidden rest), the shell's own limits on an open during a close, the unhealed-window invariant (a shown window with the panel off it is healed with `win open unhealed` and a settle up, and a pull there is admitted `reason=unhealed`), the band-tail mute that keeps a second touch at the edge out of the open, the commit thresholds (20%/10%, 0.45 DIP/ms), the close ownership transition.
-animation.md: the damped-spring settle — underdamped/overdamped/critical forms, T = clamp(remaining / 2.2 DIP/ms, 160, 520), slowest-root omega, end-value normalisation, TakeProgressNow/TakeVisibleProgressNow ownership, the follow's RevealEntryProgress start and its 2.2 DIP/ms chase (a settle spends time, a follow spends travel and must close the gap), the one-owner rule for a close (a deferred pull writes no `Progress`, and an open the shell performs mid-retract settles from the live position, `win open during close`), the 1.72/0.9 styles, the start-speed freshness/span checks, the offset-carrying window replay at a reveal takeover or a late release and the away-from-target clamp, the seam factors, the native flyout measurement and fit.
-geometry.md: the GestureGeometry snapshot and SRWLOCK discipline, panel-trail measurement and band, the taskbar axis probe (appbar/tray rect/work-area inset, auto-hide), the id+epoch measurement request under g_measureMutex, the six-region scroll survey and its three states, the work-area broadcast rules, the measured layouts.
-ipc.md: the v2 channel (section, events, command mutex, seqlocks, claim/ready 550 ms budget, attach watermarks), the open generation, the plan/tapped/cancelled close record, the retract request and its three answers (duration, none, cancel), the reveal claim (32-bit seqlock in the reserved words, 250 ms lease, open-tick binding), the close decision at XamlLauncherState::HideStartAndCortana (the probe, method 7 never held, the immediate fallback, the measured before/after timings), the bridge drain over both close hooks and the gesture-state publication.
-lifecycle.md: the image pin, the instance guard, counted entries (ModuleEntryLease/PostCountedUiTurn), the unload order and residuals, re-initialisation resets, the bridge's side, the Windhawk host's unload boundary.
-testing.md: the tools in ../tools and the measurements in ../artifacts.
-limits.md: known limits and risks; the hardware checks still owed (one physical finger end to end, two fingers with both lift orders, a pen by hand, a right-side taskbar by hand).
+architecture.md: M3.1, the shipping design. The launcher read (`s_pLauncher`
+outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`),
+the executor thread (the `OnHotkeyInvoke` thread, not the taskbar thread), one
+decision/one executor per trigger, the press latch for a hide in flight, the
+click-away guards of an opening window, the pull-reopen at a close's landing,
+the docked-layout timing/interruption chains, the accepted cloak cap, the v4
+channel, and the deleted M2 mechanisms.
+
+input.md: why Raw Input; the report decode (report IDs, `TipSwitch`/`InRange`,
+contact identity and its evidence clock, the coordinate-only fallback), the
+liveness and idle rules, and the release timers.
+
+gesture.md: the `Progress` model, the dismiss/reveal sessions, the band and the
+once-per-open show request, the reveal entry and the 2.2 DIP/ms chase, the one
+close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the
+reopen on a closing panel, the gates and settle ownership.
+
+animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
+start-speed seam, the mirrored close, the coast, and the measured lines.
+
+geometry.md: the `GestureGeometry` snapshot and its lock, the panel-trail
+measurement and band, the taskbar axis probe, the deferred measurement, the
+scroll survey, and the measured layouts.
+
+ipc.md: the v4 channel — names, 744-byte layout, seqlocks, open generation,
+intent/ack, executor command/ack, controller flags, init handshake.
+
+lifecycle.md: the pin, the instance guard, the counted entries, the unload
+order and residuals, the re-initialisation and the host's unload boundary.
+
+testing.md: the probes/injectors and the captured measurements in `artifacts/`.
+
+limits.md: the measured limits — the shell cap, launcher readiness, the
+launcher thread, the touch-show idle suppression, the cold entry, the taskbar
+auto-hide state, and the hardware still owed.
+
+README.md: the map and the shipping pair.
+
+## Laws
+
+Every claim names its probe or its log line. A mechanism the code no longer
+contains does not get a page; the deletion list lives in architecture.md.
 
 [PROTOCOL]: Update this header on change, then check AGENTS.md

@@ -13,21 +13,23 @@ Everything here was measured, not assumed. Verified on: Windows 11 build
 26300.9974, ExplorerPatcher 26100.9711 (`Start_ShowClassicMode=1`), Windhawk
 2.0 alpha, 2880x1800 physical at 200% scaling (1440x900 DIP), ELAN2513
 touchscreen. The taskbar was on the left for the early measurements and on top
-for the vertical-path runs; it is now the Windows 11 native taskbar with
-auto-hide on, docked at the bottom, so the work area equals the full screen
-(`work=0,0,2880,1800`, `mon=0,0,2880,1800`) — the normal state of auto-hide,
-not a transient. Where a measurement depends on the placement, the text names
-it.
+for the vertical-path runs. **Current layout: docked** (auto-hide off): work
+`0,0,1440,852`, tray `0,852..1440,900`, band `804..900`, panel
+`236,265..1229,840`, trail 265, distance 900. The auto-hidden layout (work
+`0,0,1440,900`, panel `236,167..1229,840`, trail 167) is historical; its
+numbers are not the docked ones. Where a measurement depends on the placement,
+the text names it.
 
 ## Map
 
 | File | Topic |
 |---|---|
+| [architecture.md](architecture.md) | M3: the launcher read (`s_pLauncher` outer + `0x18` interface, `[+0x160]` state), the executor thread and the taskbar-thread crash, the one-decision/one-executor contract, the measured open/close/interruption chains, the accepted 245–268 ms cap, and the list of deleted M2 mechanisms. |
 | [input.md](input.md) | Why Raw HID: the falsified data sources, the report decode (report IDs, `TipSwitch`/`InRange`, contact identity and its evidence clock, the coordinate-only fallback), release detection and its timers. |
-| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the taskbar band, the adoption of a late open and the record a lift before it leaves, the live takeover's visible entry and its 2.2 DIP/ms chase of the finger, the close-ownership rule (a close owns `Progress` until the window is observed cloaked; a gesture close whose tap is still armed is cancelled and its panel comes back, every other pull is deferred, released at the landing and served live or late, and the one-open-path order), the shell's own limits on an open during a close, the unhealed-window rule (a shown window with the panel off it is healed, and a pull there opens), the commit thresholds, what a close does to a live gesture. |
-| [animation.md](animation.md) | The damped-spring settle: both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam and the offset-carrying window replay at a reveal takeover or a late release, the one-owner rule (a deferred pull writes nothing while a close is in flight) and the from-live settle of an open the shell performs during a close, the two shipped styles, and the native Quick Settings flyout measurement behind the 1.72 fit. |
+| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the reopen on a closing panel, the gates and the settle ownership. |
+| [animation.md](animation.md) | The damped-spring settle, both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam, the mirrored close, the scheduled dismiss, and the measured lines. |
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
-| [ipc.md](ipc.md) | The v2 shared-memory channel, the open generation, the plan/tapped/cancelled close record, the retract request and its three answers (duration, none, cancel), the reveal claim, the close decision at `XamlLauncherState::HideStartAndCortana` (method 7 never held, immediate fallback), and the bridge's unload drain over both close hooks. |
+| [ipc.md](ipc.md) | The v4 shared-memory channel: names, 744-byte layout, seqlocks, the open generation, intents and acks, executor commands and acks, the controller flags, and the init handshake. |
 | [lifecycle.md](lifecycle.md) | The image pin, the per-process instance guard, the counted module entries, the unload order and its residuals, re-initialisation, and the host's unload boundary. |
 | [testing.md](testing.md) | The PowerShell/Python probes and injectors, and the captured measurements in `artifacts/`. |
 | [limits.md](limits.md) | Known limits and risks, and the hardware checks still owed (one finger end to end, two fingers in both lift orders, pen by hand, right-side taskbar by hand). |
@@ -37,16 +39,18 @@ it.
 Two mods ship together (full member list in
 [../mods/AGENTS.md](../mods/AGENTS.md)):
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.36.0) — runs in
-  `StartMenuExperienceHost.exe`; the whole gesture, follow and animation, and
-  the answer to the bridge's close question: a retract duration, no settle, or
-  `cancel` while a reveal owns the panel.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.17.0) — runs in
-  `explorer.exe`; decides at `XamlLauncherState::HideStartAndCortana` whether a
-  Windows-key, Start-button or click-away close runs now, waits for the
-  retract, or is refused. A click-away is never held (the lock screen shares its
-  method 7), so only the Windows key and the Start button animate their
-  close.
+- `mods/start-menu-legacy-swipe.wh.cpp` (0.39.0) — runs in
+  `StartMenuExperienceHost.exe`; the whole gesture, follow and animation, the
+  controller that consumes bridge intents and publishes executor commands, the
+  pull-reopen at a close's landing, and the one close path (a mirrored settle
+  from the live position, then `dismiss`).
+- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.20.0) — runs in
+  `explorer.exe`; executes `ShowStartView`/`Dismiss`/`IsVisible` on the
+  launcher's own thread from a hidden window, turns the Win key, the Start
+  button and the click-away into intents, latches a press that lands inside the
+  shell's hide and serves it at the landing, swallows the shell's duplicate
+  calls and the pointer-away close of an opening window, and never decides a
+  toggle itself.
 
 Everything else in `mods/` (`msgprobe`, `inputprobe`,
 `start-menu-touch-gesture-probe`, `start-menu-touch-gesture-consumer`) is

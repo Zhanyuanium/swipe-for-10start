@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.36.0
+// @version         0.39.0
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -62,6 +62,11 @@ What it does:
   expression
   `Vector3((1 - state.Progress) * state.DirX * state.Distance, (1 - state.Progress) * state.DirY * state.Distance, 0)`.
   `Distance`, `DirX` and `DirY` are rewritten in place when the taskbar moves.
+- The scalar and its motion live in one `PanelController`: `progress`, `target`,
+  `velocity`, `phase`, the settle record and the coast line. The touch path
+  emits `Begin`/`Move`/`End`/`Commit` intents; the keyboard and close paths
+  write the same controller through the existing helpers, so the position, the
+  seam speed and the phase have one owner.
 - `Wh_ModAfterInit` starts one input thread. The thread owns one window and
   registers `RAWINPUTDEVICE{0x0D, 0x04}` (touch) and `{0x0D, 0x02}` (pen) with
   `RIDEV_INPUTSINK`, so it still receives reports while the Start menu is in
@@ -601,6 +606,14 @@ What it does:
     consumes the record (late, `from=0.000`), so the owner sees one motion: the
     menu closes, then rises from the edge. `ActivateRevealFollow` refuses while
     `CloseInFlight`, so no follow writes under a retract.
+  - A reveal that is already driving the panel when such a close arrives is the
+    same deferral, not a mute and not a veto: `TakeCloseOwnership` keeps its
+    candidate, down point and release history, clears only `active`, and the
+    landing releases it. An external takeover (Win+Tab, the lock/display method
+    7, a forwarded Win+Shift+S) closes the window with no request of ours, so the
+    landing sees no close in flight and **drops** the pull instead:
+    `reveal dropped (window closed by shell)`, no reopen, and the rest of the
+    contact stays inert until it lifts. The takeover owns the screen.
 - The candidate path polls the cloaked attribute at most once per 20 ms; the
   cached answer is dropped on every lift, so each contact starts from a fresh
   query.
@@ -827,43 +840,41 @@ Debug channel (kept in the build):
   side resets it, so a command published while one is running is not lost.
 - The `retract` request is its own event, not a command: the bridge publishes a
   sequence number right before it holds the launcher's close decision
-  (`XamlLauncherState::HideStartAndCortana`), and this side either plans the
-  settle from the current `Progress` and answers with its duration on the same
-  channel, or — while a reveal contact owns the panel — answers `cancel` and
-  changes nothing: no close record, no tap, no suppression, no `Progress`
-  write. `retract=<settleMs>` names the animation that just started; the
-  "no settle" sentinel says that nothing started, so the bridge closes at once;
-  `cancel` says the close must not happen. The answer echoes the request's
-  sequence number, so an answer to an earlier close can never satisfy a later
-  one. The request carries the menu-open generation the bridge saw and a
-  deadline, so a request that outlived its close is answered with the sentinel
-  and starts nothing, and the bridge marks its request done when that close is
-  over. Open generation 0 is not a menu: `SwipeIpcReadOpen` reports
+  (`XamlLauncherState::HideStartAndCortana`), and this side plans the settle from
+  the current `Progress` and answers with its duration on the same channel. A
+  reveal contact that drives the panel is not a veto: the close happens, the
+  contact becomes a deferred pull, and the next open may adopt it. `retract=`
+  names the animation that just started; the "no settle" sentinel says that
+  nothing started, so the bridge closes at once. There is no cancel answer. The
+  answer echoes the request's sequence number, so an answer to an earlier close
+  can never satisfy a later one. The request carries the menu-open generation the
+  bridge saw and a deadline, so a request that outlived its close is answered with
+  the sentinel and starts nothing, and the bridge marks its request done when that
+  close is over. Open generation 0 is not a menu: `SwipeIpcReadOpen` reports
   `ERROR_NOT_READY` instead of a snapshot, and this side refuses a request that
   names 0 exactly like one whose generation is gone, so a keyboard close can
   never start a settle for a menu that never published an open.
-- The `reveal claim` is the same ownership answer without a request: the open
-  tick of the menu a reveal drives, or 0, plus the tick of its last refresh,
-  published every 50 ms while `g_reveal.active` (and once more as 0 when it
-  ends). The bridge decides a method-7 close — display change, lock, click-away
-  — from it alone, because that close may not wait: a claim inside its 250 ms
-  lease and bound to the menu on screen cancels the close, anything else lets it
-  through. A Start side that stops refreshing therefore stops cancelling.
+- The reveal claim record is gone. It existed only to let a method-7 close be
+  refused without waiting; every close now closes, the lock path never waits, and
+  the Start side reads `g_reveal.active` only for its own deferral decision. The
+  layout is 664 bytes: the record and its reserved words were removed, not left
+  as a dead second mechanism.
 - The section outlives either process, so both sides record the sequence numbers
   at attach and act only on what is newer. That is what the one-second freshness
   check on the old command file did: a request that predates this process
   belongs to a menu this process never drew (`debug retract ignored (stale)`
   names a request whose generation, deadline or done marker says its close is
   over).
-- The `close record` is three publishes of one seqlock record: the plan at the
-  release (`tapped=0`), the cancel the moment a new pull drops the close, and
-  the tapped record with a fresh sequence immediately before the Windows tap.
-  Only the tapped one tells the bridge that a Hide needs no lead. The open
-  publisher is also a close-record writer: publishing a new open generation
-  publishes the cancelled kind in the same place, so an unconsumed tapped record
-  from the previous menu cannot survive into the next one. The bridge's own
-  rule — refuse a stamp older than the open tick — is a second guard, not the
-  binding this side relies on.
+- The `close record` is still three publishes of one seqlock record: the plan at
+  the release (`tapped=0`), the cancel the moment a new pull drops a gesture
+  close, and the tapped record with a fresh sequence immediately before the
+  Windows tap. Only the tapped one tells the bridge that a Hide needs no lead;
+  the cancelled kind only ever cancels the Start side's own armed tap, never a
+  bridge close. The open publisher is also a close-record writer: publishing a
+  new open generation publishes the cancelled kind in the same place, so an
+  unconsumed tapped record from the previous menu cannot survive into the next
+  one. The bridge's own rule — refuse a stamp older than the open tick — is a
+  second guard, not the binding this side relies on.
 - Every record is a seqlock, so the bridge never reads a half-written close
   record, plan or open generation, and this side never reads half a command.
   The command record is also serialised by a named mutex, because more than one
@@ -1183,383 +1194,33 @@ Known risks:
 // ==/WindhawkModSettings==
 
 /*
- * [INPUT]: depends on StartUI::App::PrepareRootElement and
- *   StartUI::SplitViewFrame::OnGlobalAnimationRequested plus its three argument
- *   getters in StartUI_.dll; on RegisterRawInputDevices, GetRawInputData,
- *   GetRawInputDeviceInfoW,
- *   GetDpiForWindow, GetSystemMetrics, GetWindowRect, MonitorFromWindow,
- *   GetMonitorInfoW and keybd_event from
- *   user32; on GetModuleHandleExW with
- *   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN and
- *   on CreateMutexW from kernel32, which pin this image for the process lifetime
- *   and take the process-local instance guard before any thread exists; on
- *   DwmGetWindowAttribute, resolved at init from dwmapi.dll; on
- *   GetFileVersionInfoSizeW, GetFileVersionInfoW and VerQueryValueW, resolved
- *   at init from version.dll, which gate the root hook to StartUI_.dll
- *   10.0.22621.3733;
- *   on timeBeginPeriod and timeEndPeriod, resolved at init from winmm.dll so the
- *   process holds a 1 ms period while a contact is down; on the
- *   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION waitable timer that drives the 5 ms
- *   idle tick (WM_TIMER stays on the 15.6 ms tick on this build); on
- *   HidP_GetCaps, HidP_GetLinkCollectionNodes, HidP_GetValueCaps,
- *   HidP_GetButtonCaps, HidP_GetUsages and
- *   HidP_GetUsageValue from hid.dll; on the CompositionPropertySet, the
- *   expression and one damped-spring curve sampled into keyframes, which every
- *   `Progress` animation runs: the gesture opens and closes and the keyboard
- *   open, at `GestureStartSpeedPercent` of the gesture's end speed (zero for the
- *   keyboard open); on
- *   VisualTreeHelper, TransformToVisual and LayoutUpdated
- *   from Windows.UI.Xaml.Media to map the panel rectangle and to follow the
- *   layout (the second pass is where the panel is placed, which is what the
- *   measurement request waits for);
- *   on ScrollViewer, its ScrollableWidth/ScrollableHeight/VerticalOffset and its
- *   ViewChanged event from Windows.UI.Xaml.Controls, which name and follow every
- *   vertically scrollable region of the open menu (the app list and the tile
- *   grid's internal viewer), and on VisualTreeHelper::GetParent, which names the
- *   list a templated ScrollViewer belongs to; on
- *   ClientToScreen, which turns the host window's client origin into the screen
- *   offset of the XAML coordinate space; on the
- *   CoreDispatcher
- *   captured under the composition mutex in Setup, which the input thread posts
- *   the measurement request to; on the `WM_SETTINGCHANGE`
- *   (`SPI_SETWORKAREA`) and
- *   `WM_DISPLAYCHANGE` broadcasts the hidden top-level input window receives
- *   (a message-only window would not, which is why the window is not
- *   message-only); on the shared IPC channel (`swipe_ipc_shared.h`): the command
- *   event carries `p`/`t`/`e`/`anim` from `tools/ipc.ps1`, the retract event
- *   carries the bridge's request bound to an open generation and a deadline, and
- *   the section publishes this mod's close plan, its cancel, the tapped record
- *   that marks the moment of the Windows tap, the open generation and its answer
- *   to that request, every record under its own seqlock. Open generation 0 is
- *   not a menu: `SwipeIpcReadOpen` reports `ERROR_NOT_READY` and this side
- *   refuses a request that names 0 exactly like one from a closed menu.
- * [OUTPUT]: one hidden top-level window, one raw-input thread, one module-scan
- *   thread, one stop event and one process-local instance guard per process; the
- *   threads' waits include that
- *   event, so they stop even when no window was published. The stop event is a
- *   prerequisite: without it
- *   the input thread is not started and no gestures run. The module is pinned
- *   before the first thread exists
- *   (`GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
- *   GET_MODULE_HANDLE_EX_FLAG_PIN)`), because `Wh_ModUninit` cannot veto the
- *   unload: the image then leaks until the process exits by design, and only that
- *   makes a worker that resumes after the unload run mapped code. The guard is
- *   the named mutex `Local\WindhawkLegacyStartSwipe.instance.<pid>`: a second
- *   instance in this process finds it taken, logs one line and installs no hook,
- *   starts no thread and opens no channel; only a clean unload releases it.
- *   Both the pin and the guard are prerequisites: either failing returns FALSE
- *   from `Wh_ModInit` before any hook, channel or thread exists, and a pin that
- *   succeeded stays for the process lifetime while nothing else acts.
- *   One per-activation reset (`ResetActivationState`) clears the tracked contact,
- *   the contact latch, both gesture sessions, the close mute, the contested
- *   close's ticket, the deferred-layout
- *   flag, the pending tap and its pull generation, the coast and the debug
- *   overrides; it
- *   runs before the input thread exists and on that thread as it stops, so a
- *   clean re-enable of the same pinned image does not inherit a finger.
- *   Unload order: set the
- *   stop event, wait 10 s for the module poll thread and the input thread, revoke
- *   every XAML delegate on the UI thread and wait for that turn, revoke the
- *   settle batch, drain every counted entry into module code, then release the
- *   composition state and the IPC view; a thread or callback that outlives its
- *   wait, or a revoke that threw, leaves every resource and its token in place
- *   and logs which one, and the process must
- *   restart to finish the unload. A timed-out thread keeps its handle, so a later
- *   attempt can still join it. Every delegate registration keeps its own
- *   revoke token (root Loaded and SizeChanged, the layout watch, the scroller's
- *   ViewChanged, the settle batch's Completed) and its own try block; a token and
- *   its owner are cleared only after the removal succeeded, a registration that
- *   survived its revoke is never overwritten by the next root, so the handle
- *   to retry it is not lost, and each watch carries the request or element it
- *   was created for so an old callback cannot drive a newer one; the scroller's
- *   handler is authorized by the cache's element, not by its registration, so a
- *   watch that survived its revoke writes nothing. Every entry
- *   into module code from the compositor or the dispatcher is counted from before
- *   it can run: the batch's Completed registration takes a counted entry before
- *   the batch is ended, and every posted UI turn that touches module state takes
- *   one, so the drain is proof and not a poll of a depth that only rises when the
- *   handler has already started.
- *   The
- *   Composition `Progress` scalar plus the `Distance`/`DirX`/`DirY` inputs the
- *   expression reads, which the open-time and work-area refresh rewrites when
- *   the taskbar moves. One `GestureGeometry` snapshot carries the axis, the
- *   travel, the XAML origin, the work area and monitor, the panel rect with
- *   the edge derived from it, and the taskbar's reveal band (the bar's measured
- *   strip plus one thickness toward the desktop, which the input thread uses to
- *   admit a pull and to place an adoption), in absolute screen DIP, behind a
- *   short writer lock:
- *   one writer on the UI thread, one whole read per gesture sample on the input
- *   thread, the root/open generation and a layout identity token the measurement
- *   was taken in. A cached copy whose token is older than the published layout
- *   is rejected for a new gesture. It is published by one point (the panel
- *   measurement) from Setup, SizeChanged, every menu open and every work-area or
- *   display change, never by a timer; a rect that is not this layout's panel is
- *   rejected whole and the last snapshot stays; a rect is carried into a new
- *   publish only when the whole layout identity matches. The measurements
- *   themselves are one request per open (a 64-bit non-zero serial and the epoch
- *   it was recorded in, a trail-idle decision,
- *   deadline) that the second `LayoutUpdated` pass or the deadline completes,
- *   whichever runs first; the check and the clear take the whole identity, so a
- *   close cancels only the request it captured and a delayed cleanup cannot match
- *   a reused id, and the
- *   publish and scroller commit decide the request identity, epoch, layout identity
- *   and panel ownership inside the section that writes, so no close or newer
- *   request can land between the decision and the write, and the whole apply runs
- *   under a reservation gesture admission observes: either it defers whole or the
- *   admission waits for the next report. One `VK_LWIN` tap armed for
- *   the end of every
- *   committed dismiss or short reveal, the shell's own Start toggle that performs
- *   `CStartExperienceManager::Hide`; the tap is dropped when a new pull
- *   generation exists when it would run, and no request file or re-arm tap
- *   exists, and a close that never started its settle is the only one that may
- *   put the panel back; such a close armed nothing and published nothing, so
- *   `AbandonClose` only restores the panel, while a close whose batch observer
- *   was lost still
- *   runs to its tap (`close observer lost kind=dismiss`); one settle in the
- *   parameter set `AnimationStyle` selects, and one
- *   settle-and-arm helper for all four gesture outcomes. Both styles are the
- *   same spring generator, so open and close mirror exactly and both start at
- *   `GestureStartSpeedPercent` of the gesture's end speed component toward the
- *   target, divided by the travel left: 100 % names that component, not the raw
- *   release vector, because the end speed is projected onto the settle's
- *   direction before it enters the seam. One projection serves the spring and
- *   both release lines (`TowardTarget`, `SpeedTowardDip`), and the whole curve
- *   is scaled by its own
- *   value at the duration (about 0.993 on a normal settle). `Windows 11` (the
- *   default) keeps damping 1.72, fitted on this
- *   machine to the native Quick Settings flyout; `Windows 10` keeps damping 0.9,
- *   the spring this mod shipped with. The end speed is measured from an 8-30 ms
- *   window that ends at the newest stored position, in `Progress` units, signed
- *   along the gesture axis, and projected onto the settle's direction: the
- *   newest position must itself be no more than 30 ms older than the release,
- *   and the span is then measured backward from it, so the pair can lie up to
- *   60 ms before the release when the stream paused just before the lift. The
- *   window itself is replayed from the contact's last eight positioned reports
- *   when the follow takes the panel over, so a menu that opens one or two reports
- *   before the lift is still measured instead of starting from one sample; the
- *   replay holds the mapped series, never the chased one: the end speed belongs
- *   to the finger, and the chase moves at the planner's rate. The
- *   same replay measures a pull that lifts before the open: its travel, mapped
- *   position and end speed wait in one `RevealLateRelease` record for 300 ms and
- *   the closed-to-open path starts the settle at the position the panel actually
- *   shows (`reveal adopt late`) — the off-screen rest while it is hidden, because
- *   no animation runs through a cloak — so the panel rises from the bottom edge
- *   and a fast flick still leaves the seam at the finger's speed. The mapped
- *   position is kept as a diagnostic (`pos=...`), never as a start value. The
- *   record is input-thread only (the report handler writes it,
- *   the visibility poll reads it), cleared by a live takeover, an admitted newer
- *   pull, its consumption or its window — never by a bare down, because the
- *   contact that arrives first cannot be the pull that opened the menu. The open
- *   transition itself runs exactly one of a live takeover (a candidate promoted at
- *   the open, or a contact adopted from its down point), the late record, the
- *   contested continuation, or the keyboard settle, in that order; only an actual
- *   takeover suppresses the settle,
- *   so a refused or not-yet-following contact cannot leave the open unanimated.
- *   The contested continuation is the reopen of a close whose Hide already left
- *   under a pull that had taken the panel back: it settles from the panel's live
- *   position at the commit release instead of replaying from 0, and a panel the
- *   close took to the hidden rest settles from 0 as before.
- *   The live takeover starts at the visible edge and chases the finger: it begins
- *   at `RevealEntryProgress` (the smallest progress whose translated trail edge
- *   sits on the work area's edge), holds it for the first presentation
- *   (`kRevealEntryHoldMs`, 30 ms) so the first visible frame is the edge, and
- *   then moves the visible position toward the absolute mapped position at
- *   `kSettleSpeedDipPerMs` (2.2 DIP/ms, the planner's own speed) without passing
- *   it, so a finger that already travelled 400-600 DIP through the cloak starts
- *   the panel exactly at the screen edge and closes the gap in
- *   30 + 600/2.2 ≈ 303 ms instead of appearing 76-100 % open
- *   (`reveal takeover from=... offset=...`, and `behind=` on the release line).
- *   The entry, not 0: a settle spends time on the hidden travel,
- *   a follow spends the finger's travel, and starting at 0 left the panel one
- *   hidden travel behind the finger. A
- *   constant subtraction was rejected because it left the panel permanently
- *   short (0.25-0.27 at 450-560 DIP of finger travel). A
- *   contact that starts in the reveal band while the menu is open and moves away
- *   from the taskbar is that pull's tail: it takes neither `Progress` nor a settle
- *   (`dismiss skipped band tail`), and it becomes a dismiss once it reverses. A
- *   contact that did not move the panel in that window (a finger held still)
- *   reports 0, and a
- *   release still moving away from its target contributes 0 rather than starting
- *   the settle backwards. The duration is the panel travel divided
- *   by 2.2 DIP/ms, the native flyout's own speed, clamped to 160-520 ms, and the
- *   frequency is derived from it so five time constants of the slowest root land
- *   on that duration. The response is sampled by 12-128 linear keyframes, one
- *   per 4 ms or less and each clamped to 0..1 and to its predecessor; the whole
- *   curve is scaled by its own value at the duration, so the last sample is the
- *   target and the panel lands without a step. The
- *   helper also owns the suppression window, the close record and the
- *   armed tap, whose delay is the settle's own duration (160-520 ms), so
- *   neither gesture family can skip one; the close record is the plan at the
- *   release, the cancel when a new pull drops the tap, the tapped record
- *   published immediately before the tap itself, and the cancel published with
- *   every new open generation, so no stamp from the previous menu survives into
- *   the next; both settings are read once at
- *   init
- *   and refreshed on a settings change, logged as
- *   `settle style selected=... setting=...` and
- *   `settle start speed=...%`; a linear coast of
- *   `Progress` at the finger's smoothed speed while
- *   no report arrives, started by the idle tick before that tick decides the
- *   release, ended by the next report or by the release, which then
- *   settles from the value the coast reached; one owner of where `Progress` is
- *   at time t (`TakeProgressNow`), which answers from the recorded curve or the
- *   coast's line, stops that motion and pins the answer, so no interruption
- *   starts a settle from an animation's target; one helper that gives a close
- *   the same ownership whether it came from a gesture or the keyboard (the live
- *   sessions ended, the rest of a contact still down muted, the suppression
- *   window open, the timer period released); one survey per
- *   open of every vertically scrollable `ScrollViewer` under the root (measured
- *   here: `AllAppsGridListView` 309,307..569,839 with `ScrollableHeight` 4065 and
- *   the tile grid's internal `GridView` viewer `TileListView` 577,302..1229,839
- *   with 98), each with its screen rect, `VerticalOffset`, `ScrollableHeight` and
- *   a label published for the input thread and refreshed from its own
- *   `ViewChanged` event, in three states:
- *   Unknown (no measurement speaks for this open, the only one that defers),
- *   Nothing (a completed survey after the shell settled found nothing scrolls,
- *   so the press dismisses) and Scrollable (the region list, so a vertical
- *   dismiss that would only scroll the region under the press is rejected and
- *   logs `dismiss deferred to scroll ... region=...`); each watch slot and its
- *   region keep separate owners, the element whose token must still be revoked
- *   and the element the committed rect was measured from, and a handler may
- *   write a region's offsets only
- *   while it belongs to the second, so a revoke that threw leaves a silent
- *   handler instead of another list's offsets under this rect; a survey that
- *   threw or hit its depth limit is
- *   not a negative answer, so it stays Unknown and is retried with a bounded
- *   backoff (100, 200, 400 ms, then it leaves Unknown for that open), and a
- *   remeasure publishes Unknown before it starts so no earlier answer survives
- *   it; a
- *   0-to-1 settle from rest for a closed-to-open transition no reveal owns, with
- *   the same curve and the travel-planned duration a gesture open uses (an open
- *   the shell performs while a close was still in flight logs
- *   `win open during close progress=...` and settles from the panel's live
- *   position, `win open during close from=... dur=...`), plus a
- *   `win close observed` line when the shell hides the window by
- *   itself; a reopen that follows a close a pull contested continues that
- *   panel's live position (`win open continued from=... dur=...`) instead of
- *   replaying the open from 0, one release-wide ticket per close (a guard: with
- *   the deferral below no follow activates inside a close, so no ticket is
- *   stamped in the measured shapes); a 1 ms timer
- *   period (timeBeginPeriod/timeEndPeriod) held exactly
- *   while a contact is down and one 5 ms high-resolution idle tick that detects
- *   the release; a suppression window, at most 600 ms, after either close, owned
- *   by `CloseInFlight` and ending as soon as the shell reports the window
- *   cloaked, in which no path takes or writes `Progress`: a gesture close whose
- *   tap is still armed is cancelled by the contact's first report (the tap is
- *   dropped, the suppression ends, the panel comes back from its live position,
- *   `reason=cancelled`), and every other pull is deferred
- *   (`reason=deferred`, no write, no pull generation, no cancel stamp, no mute,
- *   `startedOpen` 0 so it is adoptable from its own down point), released at the
- *   landing (`reveal defer released candidate=... down=...`) and served by the
- *   open's live takeover or by its `RevealLateRelease` record, whose age starts at
- *   that landing; the
- *   unhealed check, which settles a shown window's panel back up from its live position
- *   when no motion owns it and no close is in flight (`win open unhealed
- *   progress=...`), and the band admission's `reason=open` restricted to a panel
- *   at rest, so a pull on the shown window whose panel is off it is admitted as
- *   the reveal (`reason=unhealed`) instead of being muted; the
- *   always-installed animation hook, which passes every request through unless
- *   the `anim=0` debug command suppresses the open request (type 0; never by
- *   default, because dropping it leaves the pane undrawn) while
- *   the close request (type 1) always passes through; five debug commands
- *   (`p`, `t`, `e`, `anim`, `state`) that apply a Progress value, the XAML
- *   translation, the visual offset or the animation mode, or log the window's
- *   cloak state and the live position without changing either, and the
- *   answer to the bridge's retract request (its planned duration, the
- *   no-settle sentinel, or `cancel` when a reveal contact owns the panel)
- *   published on the same channel the moment the requested settle starts — or
- *   immediately for a cancel, which changes nothing — so the bridge can hold the
- *   launcher's close for exactly that duration or refuse it; the reveal claim
- *   (`revealOpen`/`revealTick`), refreshed while `g_reveal.active` and bound to
- *   the open tick of the menu it drives, which is how the bridge decides a
- *   method-7 close (display change, lock, click-away) without waiting; no
- *   exported symbols.
- * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
- *   pointer and DirectManipulation paths with raw HID decoding, owns two
- *   gestures (the dismiss drag inside the open menu and the reveal follow that
- *   takes the menu's own open over from the taskbar band, starts at the visible
- *   edge and chases the finger's absolute position at the planner's rate so the
- *   panel meets it and stays glued, admitting a contact on the down,
- *   promoting a still-down candidate or adopting a contact when the menu opens
- *   under an already moving pull, cancelling a gesture close's armed tap and
- *   bringing the panel back when a contact lands before that tap runs, deferring
- *   every other pull that lands while a close owns the panel until the close's
- *   landing and then serving it from its own down point or its release record,
- *   keeping the guarded continuation of a close whose panel the close left
- *   above the hidden rest (`win open continued`) instead of replaying the open
- *   from 0, continuing the panel from its live position when the shell opens a
- *   menu during a close (`win open during close`), healing the shown window whose panel
- *   is off it (`win open unhealed`) and admitting a pull there as the reveal
- *   instead of refusing it at `reason=open`, consuming the release record of a
- *   pull
- *   that
- *   lifted a frame before the open (its settle starts at the panel's live
- *   position, the off-screen rest, never at the record's mapped position), and
- *   muting the band-tail contact that is not a drag of
- *   the opening menu), and re-reads the taskbar
- *   edge behind both on
- *   every open and on every work-area broadcast. Every sample takes one
- *   `GestureGeometry` snapshot, so the press hit test, the reveal follow, the
- *   release decision and the log line of that report all describe one panel;
- *   the snapshot is read under a shared writer lock and a cached copy from an
- *   older layout is rejected for a new gesture; the geometry is measured by one
- *   request per open, so no two triggers can
- *   measure the same layout twice or publish a measurement their epoch no
- *   longer owns, and a close cancels only the request identity it captured (a
- *   64-bit non-zero serial plus the epoch, checked and cleared as one pair); one
- *   layout-apply reservation makes the ownership check and the scalar writes one
- *   step against a gesture admission, and a half-applied scalar set marks the
- *   renderer invalid until a full reapply. The
- *   animation hook is
- *   installed on every load and passes requests through; only the debug switch
- *   can drop the shell's open storyboard, and it is never the default. Both hook
- *   gates prove that their fixed RVAs are executable code of the loaded image
- *   before they read a byte, so an unsupported build is refused as a build and an
- *   unreadable target is refused as unreadable. The
- *   raw HID decode follows HID's own layout: the report ID is the first byte of
- *   a report from a device that declares report IDs, contact identity is the
- *   Contact Identifier (0x0D/0x51) when the device declares one per contact and
- *   the (device, collection) node index otherwise, a contact whose own
- *   tip/in-range says it is real names the slot, and a pen
- *   in range with
- *   its tip up is a hover that drives nothing. A report that names the tracked
- *   contact without a point keeps it alive only when it asserts the contact, and
- *   moves nothing either way; the liveness clock it refreshes is not the position
- *   clock the coast reads, and the release speed is judged fresh at the release
- *   and measured backward from the newest position so a status-only hold cannot
- *   hand the settle an old velocity. The
- *   identity also carries its own evidence tick: an asserted contact or a fed
- *   point refreshes it, a report that only names the contact does not, and the
- *   idle window forgets an identity whose last evidence is that old, so a
- *   contact that vanished without a lift — even one a layout apply refused to
- *   admit — cannot lock out the next finger. A report id that
- *   carries no
- *   contact field is ignored whole, and a device with neither tip nor in-range
- *   usage is the logged count/position fallback, whose Contact Count 0 and
- *   `(0,0)` rules keep deciding the contact's ends after it is tracked. It also
- *   owns the close decision: the settle runs first, then the tap at its end; both
- *   settle styles are the same spring generator and differ only in damping, so a
- *   style switch can never change how the end speed enters the motion; the
- *   keyboard open is that settle started from rest, so no second open curve
- *   exists; a pull generation checked
- *   at the tap drops it, so a re-pull never touches the shell, and the cancel it
- *   publishes at once is what keeps that close out of the bridge's tap
- *   decision. A close that never started is the only one that restores the
- *   panel, and such a close armed no tap and published no plan, so `AbandonClose`
- *   restores it and nothing is recalled; a close whose
- *   optional batch observer was lost keeps running to its tap, because the tap is
- *   the close. A settle started from the value an earlier animation was heading
- *   to is the bug `TakeProgressNow` prevents: the panel's position is answered
- *   from the recorded curve and pinned before anything new moves it, on every
- *   interruption and in both gesture families. The explorer-side
- *   bridge still calls the original Hide; it only skips its keyboard lead on the
- *   tapped record the tap itself publishes, and otherwise waits the duration the
- *   answer names.
- *   The module pins its own image and guards its own instance, so the unload
- *   paths that leave resources behind are leaks by design and not a race against
- *   the loader: every counted entry into module code is drained, and a second
- *   instance in the same process stands down before it does anything.
- *   The composition helpers below it are shared with the root hook above it.
+ * [INPUT]: StartUI_.dll (PrepareRootElement, SplitViewFrame::
+ *   OnGlobalAnimationRequested and its three argument getters), Raw Input
+ *   (RegisterRawInputDevices/GetRawInputData/GetRawInputDeviceInfoW) for the
+ *   digitizer, the window and DWM APIs for geometry/layout, the composition
+ *   Visual/Element APIs for Progress, and swipe_ipc_shared.h v4 for the intents,
+ *   executor commands/acks, open generation and controller flags. The bridge is
+ *   the only launcher caller; this mod never loads twinui.pcshell.dll.
+ * [OUTPUT]: the panel's Progress through the one damped-spring settle, the
+ *   reveal/dismiss follows, the coast, the geometry snapshot (axis, band,
+ *   panel trail, distance), the scroll survey and gate, and the renderer.
+ *   The M3 consumer: `intent recv`/`intent open|close|external` decides open or
+ *   close; `exec show request`/`exec dismiss request`/`exec cancel request`
+ *   publish the bridge command; `exec ack` and `exec ack timeout` release or
+ *   resync. One close path: TakeCloseOwnership + BeginMirrorCloseSettle(
+ *   TakeProgressNow()) + the dismiss scheduled at settle+30 ms. A pull still
+ *   down at `win close observed` (or lifted inside the 300 ms late window)
+ *   issues one fresh show (`reveal reopen after close pull=1 late=0 entry=...`)
+ *   and the open adopts it; the 18 ms idle is held through a show and a close
+ *   so the digitizer's pause does not drop the contact. One decision line and
+ *   one executor line per trigger. The image is pinned, the instance
+ *   guard names the PID, the input thread is stop-event driven, the XAML
+ *   delegates are revoked at unload with the residual rules.
+ * [POS]: the StartMenuExperienceHost side of the pair: it owns the touch gesture
+ *   and the panel's motion, and it is the only process that can plan the settle
+ *   (the travel belongs to the panel). The bridge owns the launcher call and the
+ *   non-touch triggers. The one shared rule is the suppression window: a close
+ *   owns the retracted panel until the bridge's dismiss has landed.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -1573,6 +1234,7 @@ Known risks:
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.Numerics.h>
 #include <winrt/Windows.UI.Composition.h>
 #include <winrt/Windows.UI.Core.h>
@@ -1621,11 +1283,17 @@ void FileLog(const wchar_t* format, ...) {
     WCHAR path[MAX_PATH] = {};
     swprintf_s(path, L"%s\\renderer.log", storage);
 
-    WCHAR line[1024] = {};
+    WCHAR message[900] = {};
     va_list args;
     va_start(args, format);
-    vswprintf_s(line, ARRAYSIZE(line), format, args);
+    vswprintf_s(message, ARRAYSIZE(message), format, args);
     va_end(args);
+
+    // Every line starts with the system tick, so lines from the two processes
+    // can be ordered against each other and against an injected input.
+    WCHAR line[1024] = {};
+    swprintf_s(line, ARRAYSIZE(line), L"t=%llu %s",
+               static_cast<unsigned long long>(GetTickCount64()), message);
 
     char utf8[2048] = {};
     int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8,
@@ -1830,7 +1498,6 @@ constexpr int kGestureStartSpeedMax = 300;
 // explorer-side request and no re-arm tap exist. The settle runs first, so the
 // panel is already off screen when the window hides; the close channel tells the
 // bridge that the Hide belongs to this tap and needs no further delay.
-constexpr uint64_t kCloseTapDelayMs = 0;
 
 // A close this mod started hides the menu a moment later. Until then the shell
 // still reports the window open, so the reopen poll must not read that as a
@@ -2038,8 +1705,6 @@ using GetCoreWindowHandleAbi = HRESULT(STDMETHODCALLTYPE*)(void*, HWND*);
 // reliable open/closed signal: 0 while the menu is shown.
 constexpr DWORD kDwmwaCloaked = 14;
 using DwmGetWindowAttribute_t = HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD);
-
-// ---------------------------------------------------------------------------
 // Timer resolution
 //
 // The idle timer detects the release: the tick is every 5 ms, but the process
@@ -2341,36 +2006,69 @@ winrt::event_token g_dismissBatchToken{};
 // g_compositionMutex.
 std::shared_ptr<ModuleEntryLease> g_settleLease;
 
-// The value the renderer currently shows. Composition has no read-back, so every
-// write to `Progress` records it here: the base a direct insert writes, the value
-// a coast is stopped at, and the target a settle inserts before StartAnimation.
-// While an animation runs this is the animation's TARGET, not the position; the
-// only reader allowed to turn it into a position is `TakeProgressNow`.
-std::atomic<float> g_progressNow{kProgressRest};
+// ---------------------------------------------------------------------------
+// The panel controller
+//
+// One object owns the panel's motion: the scalar the composition expression
+// reads, the target the current motion is heading for, the last measured or
+// committed speed in Progress per millisecond, and the phase that says which
+// motion owns the value. The animation record (samples, start, duration) and the
+// coast's line are the controller's evidence: the base value is only a target
+// while a motion runs, and `TakeProgressNow` is the one reader that turns that
+// evidence into where the panel actually is.
+//
+// The four intents are the only way an input adapter changes the panel. M1 keeps
+// the touch adapter as the only caller; the non-touch paths still use their old
+// functions, which write the same controller so the two cannot disagree.
+// ---------------------------------------------------------------------------
+enum class PanelPhase : int32_t {
+    Idle = 0,    // no motion: the value is the position
+    Drag = 1,    // a contact or a direct write owns the value
+    Coast = 2,   // the 200 ms continuation between reports
+    Settle = 3,  // a sampled curve is playing
+};
 
-// The settle the compositor is playing right now: the start, the start time, the
-// duration and the exact samples handed over as keyframes. `g_progressNow` is
-// where that animation is heading, and the read-back that could tell the two
-// apart does not exist (StopCoast records the measurement: TryGetScalar answers
-// with the base value while the animation is young). So the curve is kept here,
-// and `TakeProgressNow` answers where the panel is at any instant, exactly as
-// `CoastValueAt` does for the coast. Every stop or replacement clears the frame
-// count, so nothing can plan from a curve that is no longer on screen. Written
-// under g_compositionMutex.
-float g_settleSamples[kSettleMaxFrames] = {};
-int g_settleFrames = 0;
-uint64_t g_settleStartQpc = 0;
-uint64_t g_settleDurationMs = 0;
+const wchar_t* PanelPhaseName(PanelPhase phase) {
+    switch (phase) {
+        case PanelPhase::Drag:
+            return L"drag";
+        case PanelPhase::Coast:
+            return L"coast";
+        case PanelPhase::Settle:
+            return L"settle";
+        default:
+            return L"idle";
+    }
+}
 
-// The coast owns Progress between reports. Its endpoints and start time are kept
-// here because the animation is linear: `CoastValueAt` answers where the panel is
-// at any instant, and StopCoast turns that answer into a base value so the next
-// sample or the close continues from it. All four are input thread state; the
-// flag is atomic because ResetComposition clears it from the UI thread.
-std::atomic<bool> g_coasting{false};
-uint64_t g_coastStartQpc = 0;
-float g_coastFrom = 1.0f;
-float g_coastTo = 1.0f;
+struct PanelController {
+    // The value written to the property set. While a settle plays this is the
+    // animation's target, not its position; only TakeProgressNow may read it as
+    // a position, and only when no motion is recorded.
+    std::atomic<float> progress{kProgressRest};
+    std::atomic<bool> coasting{false};
+    // Guarded by g_compositionMutex, like the animation record below.
+    float target = kProgressRest;
+    float velocity = 0.0f;  // Progress per millisecond, signed along the axis
+    PanelPhase phase = PanelPhase::Idle;
+    float samples[kSettleMaxFrames] = {};
+    int frames = 0;
+    uint64_t startQpc = 0;
+    uint64_t durationMs = 0;
+    uint64_t coastStartQpc = 0;
+    float coastFrom = 1.0f;
+    float coastTo = 1.0f;
+
+    // The four intents. Begin and Move are the contact's; End is the lift with
+    // the measured speed; Commit is a key or click that targets a direction with
+    // zero seam speed. Every one starts from the value the panel has now.
+    void Begin(const float* position);
+    bool Move(float position);
+    void End(float to, float endVelocity);
+    void Commit(float to);
+};
+
+PanelController g_panel;
 
 wux::FrameworkElement g_root{nullptr};  // UI thread only
 // Guarded by g_compositionMutex: Setup writes it on the UI thread, the input
@@ -2735,6 +2433,17 @@ GestureGeometry g_inputGeometry;  // input thread only: the last whole read
 // close of the reused root. 0 is reserved for "no expectation", so the count
 // starts at 1.
 std::atomic<uint32_t> g_openGeneration{1};
+// M3 bridge-intent and executor state. `g_intentOpenActive` holds the open
+// intent's entry until the uncloak, so the first visible frame is the edge and
+// the settle starts there. `g_pendingDismissExec` is the scheduled dismiss the
+// controller can cancel on a takeover.
+std::atomic<bool> g_intentOpenActive{false};
+std::atomic<float> g_intentOpenEntry{0.0f};
+std::atomic<LONG64> g_pendingDismissExec{0};
+std::atomic<uint64_t> g_pendingDismissExecAt{0};
+std::atomic<LONG64> g_pendingShowExec{0};
+std::atomic<uint64_t> g_pendingShowUntil{0};
+LONG64 g_lastIntentSeq = 0;  // input thread only
 
 float TrailEdge(int32_t axis, float left, float top, float right, float bottom);
 float GeometryTrailDip(const GestureGeometry& geometry);
@@ -3082,12 +2791,15 @@ bool ShowAtRest() {
         g_state.StopAnimation(L"Progress");
         // No settle is on screen any more, so no retract may plan from its curve
         // and no batch completion may still stop Progress.
-        g_settleFrames = 0;
+        g_panel.frames = 0;
         RevokeDismissBatchLocked();
         InvalidateDismissBatchLocked();
-        g_coasting.store(false, std::memory_order_relaxed);
+        g_panel.coasting.store(false, std::memory_order_relaxed);
         g_state.InsertScalar(L"Progress", kProgressRest);
-        g_progressNow.store(kProgressRest, std::memory_order_relaxed);
+        g_panel.progress.store(kProgressRest, std::memory_order_relaxed);
+        g_panel.target = kProgressRest;
+        g_panel.velocity = 0.0f;
+        g_panel.phase = PanelPhase::Idle;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Composition reset failed: %08X %s", e.code(),
                e.message().c_str());
@@ -3112,17 +2824,20 @@ bool InsertProgress(float progress) {
         // A coast is the usual case; a settle still on screen is the takeover
         // case, and its batch completion must not fire against the new value.
         const bool coasting =
-            g_coasting.exchange(false, std::memory_order_relaxed);
-        if (coasting || g_settleFrames > 0) {
-            if (g_settleFrames > 0) {
+            g_panel.coasting.exchange(false, std::memory_order_relaxed);
+        if (coasting || g_panel.frames > 0) {
+            if (g_panel.frames > 0) {
                 RevokeDismissBatchLocked();
                 InvalidateDismissBatchLocked();
-                g_settleFrames = 0;
+                g_panel.frames = 0;
             }
             g_state.StopAnimation(L"Progress");
         }
         g_state.InsertScalar(L"Progress", progress);
-        g_progressNow.store(progress, std::memory_order_relaxed);
+        g_panel.progress.store(progress, std::memory_order_relaxed);
+        g_panel.target = progress;
+        g_panel.velocity = 0.0f;
+        g_panel.phase = PanelPhase::Drag;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress update failed: %08X %s", e.code(),
                e.message().c_str());
@@ -3180,13 +2895,15 @@ bool AnimateProgressTo(float to, std::chrono::milliseconds duration,
         // this point on, and its batch completion may not touch the animation that
         // replaces it. If the new animation never starts, the base value inserted
         // below is where the panel is.
-        g_settleFrames = 0;
+        g_panel.frames = 0;
         RevokeDismissBatchLocked();
-        g_coasting.store(false, std::memory_order_relaxed);
+        g_panel.coasting.store(false, std::memory_order_relaxed);
         g_state.InsertScalar(L"Progress", std::clamp(to, 0.0f, 1.0f));
         g_state.StartAnimation(L"Progress", animation);
-        g_progressNow.store(std::clamp(to, 0.0f, 1.0f),
+        g_panel.progress.store(std::clamp(to, 0.0f, 1.0f),
                             std::memory_order_relaxed);
+        g_panel.target = std::clamp(to, 0.0f, 1.0f);
+        g_panel.phase = PanelPhase::Settle;
         // This animation replaces whatever owned Progress: an older batch's
         // completion must not stop it, and no dismiss settle is still running.
         // The serial this animation installs is minted here, under the same lock
@@ -3200,10 +2917,10 @@ bool AnimateProgressTo(float to, std::chrono::milliseconds duration,
         // animation leaves the panel. The samples are the keyframes just handed
         // over, so the interpolation is the same motion the compositor plays.
         const int frames = std::min(settleSampleCount, kSettleMaxFrames);
-        std::memcpy(g_settleSamples, settleSamples, sizeof(float) * frames);
-        g_settleFrames = frames;
-        g_settleStartQpc = startQpc;
-        g_settleDurationMs = static_cast<uint64_t>(duration.count());
+        std::memcpy(g_panel.samples, settleSamples, sizeof(float) * frames);
+        g_panel.frames = frames;
+        g_panel.startQpc = startQpc;
+        g_panel.durationMs = static_cast<uint64_t>(duration.count());
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress animation failed: %08X %s", e.code(),
                e.message().c_str());
@@ -3219,47 +2936,47 @@ bool AnimateProgressTo(float to, std::chrono::milliseconds duration,
 // Where the linear coast is at qpcNow: from + (to - from) * elapsed / duration.
 // Exact, because the animation has no easing and its start time is known here.
 float CoastValueAt(uint64_t qpcNow) {
-    if (qpcNow <= g_coastStartQpc) {
-        return g_coastFrom;
+    if (qpcNow <= g_panel.coastStartQpc) {
+        return g_panel.coastFrom;
     }
 
     const uint64_t duration = static_cast<uint64_t>(kCoastDuration.count());
-    const uint64_t elapsed = qpcNow - g_coastStartQpc;
+    const uint64_t elapsed = qpcNow - g_panel.coastStartQpc;
     if (elapsed >= duration) {
-        return g_coastTo;
+        return g_panel.coastTo;
     }
 
     const float t = static_cast<float>(elapsed) / static_cast<float>(duration);
-    return std::clamp(g_coastFrom + (g_coastTo - g_coastFrom) * t, 0.0f, 1.0f);
+    return std::clamp(g_panel.coastFrom + (g_panel.coastTo - g_panel.coastFrom) * t, 0.0f, 1.0f);
 }
 
 // Where the recorded settle puts `Progress` at qpcNow. Its keyframes are exactly
-// g_settleSamples, equally spaced and linear, so the value is one interpolation
+// g_panel.samples, equally spaced and linear, so the value is one interpolation
 // between two of them. Once the duration has passed the answer is the last
 // sample, which is the target the animation was handed and where the panel
 // actually is. Caller holds g_compositionMutex.
 float SettleValueAt(uint64_t qpcNow) {
-    if (g_settleFrames < 2 || g_settleDurationMs == 0) {
-        return std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
+    if (g_panel.frames < 2 || g_panel.durationMs == 0) {
+        return std::clamp(g_panel.progress.load(std::memory_order_relaxed), 0.0f,
                           1.0f);
     }
-    if (qpcNow <= g_settleStartQpc) {
-        return std::clamp(g_settleSamples[0], 0.0f, 1.0f);
+    if (qpcNow <= g_panel.startQpc) {
+        return std::clamp(g_panel.samples[0], 0.0f, 1.0f);
     }
 
-    const uint64_t elapsed = qpcNow - g_settleStartQpc;
-    if (elapsed >= g_settleDurationMs) {
-        return std::clamp(g_settleSamples[g_settleFrames - 1], 0.0f, 1.0f);
+    const uint64_t elapsed = qpcNow - g_panel.startQpc;
+    if (elapsed >= g_panel.durationMs) {
+        return std::clamp(g_panel.samples[g_panel.frames - 1], 0.0f, 1.0f);
     }
 
     const double position = static_cast<double>(elapsed) /
-                            static_cast<double>(g_settleDurationMs) *
-                            (g_settleFrames - 1);
-    const int index = std::min(static_cast<int>(position), g_settleFrames - 2);
+                            static_cast<double>(g_panel.durationMs) *
+                            (g_panel.frames - 1);
+    const int index = std::min(static_cast<int>(position), g_panel.frames - 2);
     const float fraction = static_cast<float>(position - index);
     const float value =
-        g_settleSamples[index] +
-        (g_settleSamples[index + 1] - g_settleSamples[index]) * fraction;
+        g_panel.samples[index] +
+        (g_panel.samples[index + 1] - g_panel.samples[index]) * fraction;
     return std::clamp(value, 0.0f, 1.0f);
 }
 
@@ -3267,7 +2984,7 @@ float SettleValueAt(uint64_t qpcNow) {
 // Where `Progress` is at time t: one owner
 // ---------------------------------------------------------------------------
 //
-// `g_progressNow` records the base value written to the property set, and a
+// `g_panel.progress` records the base value written to the property set, and a
 // settle inserts its TARGET as that base before it animates the samples over it.
 // While an animation runs, the recorded value is therefore where the panel is
 // going, not where it is. Reading it as a position made every interruption start
@@ -3292,8 +3009,8 @@ float TakeProgressNow(const wchar_t* caller) {
         return kProgressRest;
     }
 
-    const bool coasting = g_coasting.load(std::memory_order_relaxed);
-    const bool settling = g_settleFrames >= 2 && g_settleDurationMs != 0;
+    const bool coasting = g_panel.coasting.load(std::memory_order_relaxed);
+    const bool settling = g_panel.frames >= 2 && g_panel.durationMs != 0;
     if (!coasting && !settling) {
         // Nothing animates, so the panel is at rest and the value every stop
         // wrote IS its resting position: the base value is only a target while an
@@ -3301,7 +3018,7 @@ float TakeProgressNow(const wchar_t* caller) {
         // behind (ShowAtRest, StopCoast, the take itself and every direct insert
         // write the value first). With no renderer there is no recording at all,
         // and the resting value 1 is the only answer that cannot be a target.
-        return std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
+        return std::clamp(g_panel.progress.load(std::memory_order_relaxed), 0.0f,
                           1.0f);
     }
 
@@ -3313,15 +3030,15 @@ float TakeProgressNow(const wchar_t* caller) {
     // the hidden rest is pinned as the base. Rare and diagnostic.
     if (settling && value < 0.05f) {
         const uint64_t elapsed =
-            qpcNow > g_settleStartQpc ? qpcNow - g_settleStartQpc : 0;
+            qpcNow > g_panel.startQpc ? qpcNow - g_panel.startQpc : 0;
         FileLog(L"progress take settle at=%.3f elapsed=%llu dur=%llu caller=%s",
                 value, static_cast<unsigned long long>(elapsed),
-                static_cast<unsigned long long>(g_settleDurationMs), caller);
+                static_cast<unsigned long long>(g_panel.durationMs), caller);
     }
     try {
         g_state.StopAnimation(L"Progress");
         g_state.InsertScalar(L"Progress", value);
-        g_progressNow.store(value, std::memory_order_relaxed);
+        g_panel.progress.store(value, std::memory_order_relaxed);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress take failed: %08X %s",
                static_cast<unsigned>(e.code()), e.message().c_str());
@@ -3333,9 +3050,12 @@ float TakeProgressNow(const wchar_t* caller) {
 
     // The motion is gone: neither its curve nor its batch completion may act on
     // the value that was just pinned.
-    g_settleFrames = 0;
-    g_settleDurationMs = 0;
-    g_coasting.store(false, std::memory_order_relaxed);
+    g_panel.frames = 0;
+    g_panel.durationMs = 0;
+    g_panel.coasting.store(false, std::memory_order_relaxed);
+    g_panel.target = value;
+    g_panel.velocity = 0.0f;
+    g_panel.phase = PanelPhase::Idle;
     RevokeDismissBatchLocked();
     InvalidateDismissBatchLocked();
     return value;
@@ -3373,10 +3093,10 @@ float PeekProgressNow() {
     if (!g_state) {
         return kProgressRest;
     }
-    const bool coasting = g_coasting.load(std::memory_order_relaxed);
-    const bool settling = g_settleFrames >= 2 && g_settleDurationMs != 0;
+    const bool coasting = g_panel.coasting.load(std::memory_order_relaxed);
+    const bool settling = g_panel.frames >= 2 && g_panel.durationMs != 0;
     if (!coasting && !settling) {
-        return std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
+        return std::clamp(g_panel.progress.load(std::memory_order_relaxed), 0.0f,
                           1.0f);
     }
     return std::clamp(coasting ? CoastValueAt(qpcNow) : SettleValueAt(qpcNow),
@@ -3390,16 +3110,28 @@ float PeekProgressNow() {
 // running: a landed curve is not motion.
 bool ProgressMotionActive() {
     std::lock_guard lock(g_compositionMutex);
-    if (g_coasting.load(std::memory_order_relaxed)) {
+    if (g_panel.coasting.load(std::memory_order_relaxed)) {
         return true;
     }
-    if (g_settleFrames < 2 || g_settleDurationMs == 0) {
+    if (g_panel.frames < 2 || g_panel.durationMs == 0) {
+        if (g_panel.phase == PanelPhase::Settle ||
+            g_panel.phase == PanelPhase::Coast) {
+            g_panel.phase = PanelPhase::Idle;
+            g_panel.velocity = 0.0f;
+        }
         return false;
     }
     const uint64_t qpcNow = QpcMsNow();
     const uint64_t elapsed =
-        qpcNow > g_settleStartQpc ? qpcNow - g_settleStartQpc : 0;
-    return elapsed < g_settleDurationMs;
+        qpcNow > g_panel.startQpc ? qpcNow - g_panel.startQpc : 0;
+    if (elapsed >= g_panel.durationMs) {
+        if (g_panel.phase == PanelPhase::Settle) {
+            g_panel.phase = PanelPhase::Idle;
+            g_panel.velocity = 0.0f;
+        }
+        return false;
+    }
+    return true;
 }
 
 // Starts the continuation between reports. This is deliberately not
@@ -3430,7 +3162,7 @@ bool StartCoast(float from, float to) {
         g_state.StartAnimation(L"Progress", animation);
         // The coast now owns Progress; a settle curve and its batch recorded
         // earlier are gone.
-        g_settleFrames = 0;
+        g_panel.frames = 0;
         RevokeDismissBatchLocked();
         InvalidateDismissBatchLocked();
     } catch (winrt::hresult_error const& e) {
@@ -3442,10 +3174,14 @@ bool StartCoast(float from, float to) {
         return false;
     }
 
-    g_coastFrom = from;
-    g_coastTo = to;
-    g_coastStartQpc = qpcNow;
-    g_coasting.store(true, std::memory_order_relaxed);
+    g_panel.coastFrom = from;
+    g_panel.coastTo = to;
+    g_panel.coastStartQpc = qpcNow;
+    g_panel.coasting.store(true, std::memory_order_relaxed);
+    g_panel.target = to;
+    g_panel.velocity =
+        (to - from) / static_cast<float>(kCoastDuration.count());
+    g_panel.phase = PanelPhase::Coast;
     return true;
 }
 
@@ -3464,7 +3200,7 @@ bool StopCoast(float& value) {
     value = CoastValueAt(qpcNow);
 
     std::lock_guard lock(g_compositionMutex);
-    g_coasting.store(false, std::memory_order_relaxed);
+    g_panel.coasting.store(false, std::memory_order_relaxed);
     if (!g_state) {
         return false;
     }
@@ -3472,11 +3208,13 @@ bool StopCoast(float& value) {
     try {
         // The animation has to be stopped before its value can become the base.
         g_state.StopAnimation(L"Progress");
-        g_settleFrames = 0;
+        g_panel.frames = 0;
         RevokeDismissBatchLocked();
         InvalidateDismissBatchLocked();
         g_state.InsertScalar(L"Progress", value);
-        g_progressNow.store(value, std::memory_order_relaxed);
+        g_panel.progress.store(value, std::memory_order_relaxed);
+        g_panel.target = value;
+        g_panel.phase = PanelPhase::Drag;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress coast stop failed: %08X %s", e.code(),
                e.message().c_str());
@@ -3490,6 +3228,65 @@ bool StopCoast(float& value) {
         FileLog(L"coast stop value=%.3f", value);
     }
     return true;
+}
+
+// The four intents. Each records what the controller is doing before the motion
+// itself starts, so a diagnostic can name the phase without reconstructing it
+// from the animation record. A caller never waits for a previous motion: the
+// value the panel has now is the value the animation was handed.
+void PanelController::Begin(const float* position) {
+    {
+        std::lock_guard lock(g_compositionMutex);
+        if (position) {
+            target = std::clamp(*position, 0.0f, 1.0f);
+        }
+        velocity = 0.0f;
+        phase = PanelPhase::Drag;
+    }
+    if (position) {
+        InsertProgress(*position);
+    }
+    FileLog(L"panel intent=begin progress=%.3f source=touch",
+            position ? std::clamp(*position, 0.0f, 1.0f)
+                     : progress.load(std::memory_order_relaxed));
+}
+
+bool PanelController::Move(float position) {
+    const float value = std::clamp(position, 0.0f, 1.0f);
+    if (!InsertProgress(value)) {
+        return false;
+    }
+    std::lock_guard lock(g_compositionMutex);
+    target = value;
+    phase = PanelPhase::Drag;
+    return true;
+}
+
+void PanelController::End(float to, float endVelocity) {
+    {
+        std::lock_guard lock(g_compositionMutex);
+        target = std::clamp(to, 0.0f, 1.0f);
+        velocity = endVelocity;
+        phase = PanelPhase::Settle;
+    }
+    FileLog(L"panel intent=end progress=%.3f velocity=%.2f target=%.0f",
+            progress.load(std::memory_order_relaxed), endVelocity,
+            std::clamp(to, 0.0f, 1.0f));
+}
+
+// A key or click is the degenerate drag: it starts where the panel is, targets
+// the far end, and has no seam speed. The samples are planned by the caller,
+// exactly as a release's are.
+void PanelController::Commit(float to) {
+    {
+        std::lock_guard lock(g_compositionMutex);
+        target = std::clamp(to, 0.0f, 1.0f);
+        velocity = 0.0f;
+        phase = PanelPhase::Settle;
+    }
+    FileLog(L"panel intent=commit progress=%.3f target=%.0f",
+            progress.load(std::memory_order_relaxed),
+            std::clamp(to, 0.0f, 1.0f));
 }
 
 // The settle every gesture outcome runs: the dismiss commit, the dismiss
@@ -3554,32 +3351,33 @@ float SpeedTowardDip(float progressPerMs, float from, float to, float distance) 
     return TowardTarget(progressPerMs, from, to) * std::max(distance, 0.0f);
 }
 
-bool BeginGestureSettle(float from, float to, float velocity,
-                        std::chrono::milliseconds& duration,
-                        uint32_t* serialOut = nullptr) {
-    const float start = std::clamp(from, 0.0f, 1.0f);
-    const float target = std::clamp(to, 0.0f, 1.0f);
-
-    const SettleStyle style = g_settleStyle.load(std::memory_order_relaxed);
-    const double zeta =
-        style == SettleStyle::Win11 ? kWin11SpringDamping : kWin10SpringDamping;
-
-    // Plan from the travel, not from a time: the native flyout crosses its 578
-    // DIP in 262 ms and this keeps that speed, so a 900 DIP panel takes 409 ms
-    // and a resized one takes what its own travel needs. The travel is the
-    // snapshot's, so the plane the gesture followed is the plane the settle plans
-    // against.
-    const float distance =
-        std::max(ReadGestureGeometry().distance(), 0.0f);
-    const float remaining = std::fabs(target - start) * distance;
-    const int64_t durationMs = std::clamp(
-        static_cast<int64_t>(std::llround(
-            static_cast<double>(remaining) /
-            static_cast<double>(kSettleSpeedDipPerMs))),
-        static_cast<int64_t>(kSettleMinDuration.count()),
-        static_cast<int64_t>(kSettleMaxDuration.count()));
-    duration = std::chrono::milliseconds(durationMs);
-
+// One generator, two consumers. `BuildSpringSamples` fills the polyline for a
+// damped-spring move from `start` to `target`; the gesture outcomes and the
+// keyboard open use it directly, and the shell-triggered close uses it to build
+// the keyboard open's curve and plays that backwards. One formula, so the open,
+// the gesture close and the shell-triggered close cannot drift apart.
+//
+// - Open and close are exact mirrors, because the spring works in normalized
+//   travel: y(0) = 0, y(inf) = 1, and y'(0) = y0 is the scaled release speed
+//   divided by the travel left. The sign of the settle direction cancels there,
+//   because (to - from) carries it; the spring always relaxes toward its target.
+//   A release at rest gets y0 = 0, the plain step response, so a finger held
+//   still for a moment starts the settle at zero speed.
+//   A release faster than the remaining travel can absorb overshoots the
+//   target, and the 0..1 clamp turns that overshoot into a plateau at the rest
+//   position instead of a translation past it.
+// - The duration is the travel divided by kSettleSpeedDipPerMs, clamped to
+//   160-520 ms, so the panel moves at one speed whatever its size is. The
+//   frequency is derived from that duration (see the constant block), so five
+//   time constants of the spring's slowest root land on T.
+// - The frames are a polyline of 12-128 equal segments, at most 4 ms each, plus
+//   one landing frame at T. The whole curve is scaled by its own value at T, so
+//   the samples converge on the target with no step at the landing. Each sample
+//   is clamped to 0..1 and to the previous sample, so convergence is monotonic.
+// - Both sets are overdamped or near it; the sampler therefore carries the
+//   underdamped, critically damped and overdamped forms of the same response.
+int BuildSpringSamples(float start, float target, float velocity,
+                       int64_t durationMs, double zeta, float* samples) {
     const float startScale =
         static_cast<float>(g_gestureStartSpeedPercent.load(
             std::memory_order_relaxed)) /
@@ -3652,8 +3450,6 @@ bool BeginGestureSettle(float from, float to, float velocity,
     const double endValue = std::clamp(curveAt(tTotal), 0.5, 1.0);
 
     const int steps = SettleStepsFor(durationMs);
-    const int frameCount = steps + 1;
-    float samples[kSettleMaxFrames] = {};
     samples[0] = start;
     float previous = start;
     for (int i = 1; i < steps; ++i) {
@@ -3670,57 +3466,120 @@ bool BeginGestureSettle(float from, float to, float velocity,
         previous = value;
     }
     samples[steps] = target;
+    return steps;
+}
 
-    if (!AnimateProgressTo(target, duration, samples, frameCount, serialOut)) {
+// One settle line for every consumer: the style, the direction, the seam speed
+// in DIP, the duration and travel, and the first/middle/last segment step. The
+// steps are the same numbers the compositor was handed.
+void LogSettle(SettleStyle style, const wchar_t* direction, float dipVelocity,
+               int64_t durationMs, float remaining, int steps, double zeta,
+               const float* samples, float distance) {
+    FileLog(L"settle style=%s dir=%s vel=%.2f dur=%llu remaining=%.0f "
+            L"frames=%d zeta=%.2f step0=%.1f stepmid=%.1f stepend=%.1f",
+            SettleStyleName(style), direction, dipVelocity,
+            static_cast<unsigned long long>(durationMs), remaining, steps + 1,
+            zeta, (samples[1] - samples[0]) * distance,
+            (samples[steps / 2 + 1] - samples[steps / 2]) * distance,
+            (samples[steps] - samples[steps - 1]) * distance);
+}
+
+bool BeginGestureSettle(float from, float to, float velocity,
+                        std::chrono::milliseconds& duration,
+                        uint32_t* serialOut = nullptr) {
+    const float start = std::clamp(from, 0.0f, 1.0f);
+    const float target = std::clamp(to, 0.0f, 1.0f);
+    g_panel.End(target, velocity);
+
+    const SettleStyle style = g_settleStyle.load(std::memory_order_relaxed);
+    const double zeta =
+        style == SettleStyle::Win11 ? kWin11SpringDamping : kWin10SpringDamping;
+
+    // Plan from the travel, not from a time: the native flyout crosses its 578
+    // DIP in 262 ms and this keeps that speed, so a 900 DIP panel takes 409 ms
+    // and a resized one takes what its own travel needs. The travel is the
+    // snapshot's, so the plane the gesture followed is the plane the settle plans
+    // against.
+    const float distance =
+        std::max(ReadGestureGeometry().distance(), 0.0f);
+    const float remaining = std::fabs(target - start) * distance;
+    const int64_t durationMs = std::clamp(
+        static_cast<int64_t>(std::llround(
+            static_cast<double>(remaining) /
+            static_cast<double>(kSettleSpeedDipPerMs))),
+        static_cast<int64_t>(kSettleMinDuration.count()),
+        static_cast<int64_t>(kSettleMaxDuration.count()));
+    duration = std::chrono::milliseconds(durationMs);
+
+    float samples[kSettleMaxFrames] = {};
+    const int steps = BuildSpringSamples(start, target, velocity, durationMs,
+                                         zeta, samples);
+    if (!AnimateProgressTo(target, duration, samples, steps + 1, serialOut)) {
         return false;
     }
 
-    FileLog(L"settle style=%s dir=%s vel=%.2f dur=%llu remaining=%.0f "
-            L"frames=%d zeta=%.2f",
-            SettleStyleName(style), target >= start ? L"open" : L"close",
-            SpeedTowardDip(velocity, start, target, distance),
-            static_cast<unsigned long long>(duration.count()), remaining,
-            frameCount, zeta);
+    LogSettle(style, target >= start ? L"open" : L"close",
+              SpeedTowardDip(velocity, start, target, distance), durationMs,
+              remaining, steps, zeta, samples, distance);
     return true;
 }
 
-// The one dismissal every close uses. The tap is the shell's own Start toggle:
-// the key handler decides Hide exactly as it does for a keyboard close, so a
-// menu opened without keyboard focus closes too, where an injected VK_ESCAPE is
-// ignored. The 60 ms hold is the press the dismiss path always used; measured, a
-// 20 ms hold was missed intermittently and the menu stayed open. It runs on the
-// input thread and is global: it lands on whichever window has the foreground.
-void TapWindowsKey() {
-    keybd_event(VK_LWIN, 0, 0, 0);
-    // The 60 ms hold is the press the dismiss path always used. Waiting on the
-    // stop event instead of Sleep lets an unload observe the stop at once; the
-    // key is still released either way, so no Windows key is left down.
-    if (g_hidStopEvent) {
-        WaitForSingleObject(g_hidStopEvent, 60);
-    } else {
-        Sleep(60);
+// The three shell-triggered closes — the Windows key, the Start button and a
+// click-away — use the keyboard open's curve played from the live position to 0:
+// the same spring generated for 0 -> 1 and sampled backwards
+// (value(i) = start * openY(steps - i)), no seam speed, and the open's own
+// full-travel duration. The close therefore starts almost still and accelerates
+// into the edge. The gesture close is not this: it keeps following the finger
+// and settles with its release spring (`BeginGestureSettle`).
+bool BeginMirrorCloseSettle(float from, std::chrono::milliseconds& duration,
+                            uint32_t* serialOut = nullptr) {
+    const float start = std::clamp(from, 0.0f, 1.0f);
+    g_panel.Commit(0.0f);
+
+    const SettleStyle style = g_settleStyle.load(std::memory_order_relaxed);
+    const double zeta =
+        style == SettleStyle::Win11 ? kWin11SpringDamping : kWin10SpringDamping;
+
+    const float distance =
+        std::max(ReadGestureGeometry().distance(), 0.0f);
+    const float remaining = distance;
+    const int64_t durationMs = std::clamp(
+        static_cast<int64_t>(std::llround(
+            static_cast<double>(remaining) /
+            static_cast<double>(kSettleSpeedDipPerMs))),
+        static_cast<int64_t>(kSettleMinDuration.count()),
+        static_cast<int64_t>(kSettleMaxDuration.count()));
+    duration = std::chrono::milliseconds(durationMs);
+
+    float openSamples[kSettleMaxFrames] = {};
+    const int steps = BuildSpringSamples(0.0f, 1.0f, 0.0f, durationMs, zeta,
+                                         openSamples);
+    float samples[kSettleMaxFrames] = {};
+    for (int i = 0; i <= steps; ++i) {
+        samples[i] = std::clamp(start * openSamples[steps - i], 0.0f, 1.0f);
     }
-    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    samples[steps] = 0.0f;
+
+    if (!AnimateProgressTo(0.0f, duration, samples, steps + 1, serialOut)) {
+        return false;
+    }
+
+    LogSettle(style, L"close", 0.0f, durationMs, remaining, steps, zeta,
+              samples, distance);
+    return true;
 }
+
 
 const wchar_t* CloseKindName(CloseKind kind) {
     return kind == CloseKind::Dismiss ? L"dismiss" : L"reveal";
 }
 
-// The tail every close shares: ownership, the close plan the bridge reads, and
-// the tap armed for the end of the settle. The dismiss and the reveal cancel both
-// come through here, so the two families cannot diverge. The plan is not the tap:
-// it is published tapped = 0, so a Hide that arrives while the settle runs (the
-// user pressing the key) is a keyboard close for the bridge and gets its own
-// lead.
+// The tail every close shares: ownership and the dismiss armed for the end of
+// the settle. The dismiss and the reveal cancel both come through here.
 void ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
     // A finger that has just lifted is already leaving the panel, so this close
     // does not have to mute a contact that will keep reporting.
     TakeCloseOwnership(GetTickCount64(), false);
-    if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindGesture, kCloseTapDelayMs,
-                              0, g_pullSerial)) {
-        FileLog(L"close mode stamp failed kind=%s", CloseKindName(kind));
-    }
     ScheduleCloseTap(kind, static_cast<uint64_t>(duration.count()));
 }
 
@@ -3943,7 +3802,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
                     if (g_state) {
                         g_state.StopAnimation(L"Progress");
                     }
-                    g_settleFrames = 0;
+                    g_panel.frames = 0;
                     g_dismissSettling.store(false, std::memory_order_relaxed);
                 } catch (...) {
                     g_dismissSettling.store(false, std::memory_order_relaxed);
@@ -4036,33 +3895,17 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 // on what is newer, which is what the one-second freshness check on the old
 // command file did: a command or request that predates this process belongs to
 // a menu this process never drew. A request is additionally bound to the menu
-// open it was written for, and to the close it serves: see ApplyRetractRequest.
+// open it was written for: a request that predates this process belongs to a
+// menu this process never drew.
 // ---------------------------------------------------------------------------
 
 // The highest sequence this process has acted on. Set from the section at
 // attach, advanced by the input thread only.
 LONG64 g_ipcCommandSeq = 0;
-LONG64 g_ipcRetractSeq = 0;
 
-// The low 32 bits of the open tick this process last published, and the reveal
-// claim's last write: input thread only. `g_revealClaimOpen` is the open tick the
-// claim names (0 = no claim), `g_revealClaimTick` the tick of its last refresh.
+// The low 32 bits of the open tick this process last published: input thread
+// only. It names the menu a later open record belongs to; it is not a claim.
 uint32_t g_ipcOpenTickLow = 0;
-uint32_t g_revealClaimOpen = 0;
-uint32_t g_revealClaimTick = 0;
-
-// The reveal's standing claim on the panel, mirrored to the explorer bridge. A
-// method-7 close (display change, lock, click-away) may not wait for an answer,
-// so the bridge decides that one from this record alone: the tick of the menu
-// open the reveal belongs to, or 0 when no reveal drives the panel. The input
-// thread refreshes it from every report and every idle tick (both pass through
-// PublishPanelOwnership), and the bridge treats a record older than
-// kSwipeRevealClaimLeaseMs as no claim, so a stopped Start side cannot wedge a
-// close. The write is skipped while the value is unchanged and the record is
-// still fresh, which keeps the section quiet. The body sits with the follow
-// state it reads; only these declarations are needed here.
-bool RevealOwnsPanel();
-void PublishRevealClaim();
 
 void OpenIpcChannel() {
     bool created = false;
@@ -4076,18 +3919,9 @@ void OpenIpcChannel() {
     // raw counters are enough for a seed: the first record this process accepts
     // must be newer than anything the previous one could have written.
     g_ipcCommandSeq = SwipeIpcLoad64(&g_ipc.state->cmdSeq);
-    g_ipcRetractSeq = SwipeIpcLoad64(&g_ipc.state->retractRequestSeq);
-    // Withdraw any reveal claim the previous activation left: no reveal drives
-    // this process's panel yet, and nothing is running that could race the
-    // write. The open binding would keep it from covering a later menu, but a
-    // claim that names no reveal is not worth leaving readable.
     g_ipcOpenTickLow = 0;
-    g_revealClaimOpen = 0;
-    g_revealClaimTick = 0;
-    PublishRevealClaim();
-    FileLog(L"ipc open created=%d cmd=%lld retract=%lld", created ? 1 : 0,
-            static_cast<long long>(g_ipcCommandSeq),
-            static_cast<long long>(g_ipcRetractSeq));
+    FileLog(L"ipc open created=%d cmd=%lld", created ? 1 : 0,
+            static_cast<long long>(g_ipcCommandSeq));
 }
 
 // Deletes the files this channel used before it moved to shared memory. They
@@ -4112,18 +3946,6 @@ void RemoveLegacyChannelFiles() {
     if (removed > 0) {
         FileLog(L"ipc legacy files removed=%d", removed);
     }
-}
-
-// Tells the explorer-side bridge how long the settle it asked for lasts, or that
-// no settle started. Called on the input thread right after the animation
-// started: the bridge is holding the shell's Hide until this answer arrives, so
-// the answer comes before the diagnostic line. The answer echoes the request's
-// sequence number, so an answer to an earlier close cannot satisfy a later one.
-// A failed answer only costs the bridge's own fallback lead, never the
-// animation.
-bool AnswerRetract(LONG64 requestSequence, uint64_t settleMs) {
-    return SwipeIpcAnswerRetract(&g_ipc, requestSequence,
-                                 static_cast<int32_t>(settleMs));
 }
 
 // Parses "v[,v...]" up to maxCount values. A missing, partial or trailing
@@ -4241,10 +4063,17 @@ void ApplyDebugLine(const char* line) {
             ++rest;
         }
         if (*rest == '\0') {
-            FileLog(L"state open=%d progress=%.3f motion=%d restore=%d",
+            const bool motion = ProgressMotionActive();
+            PanelPhase phase = PanelPhase::Idle;
+            {
+                std::lock_guard lock(g_compositionMutex);
+                phase = g_panel.phase;
+            }
+            FileLog(L"state open=%d progress=%.3f motion=%d restore=%d phase=%s",
                     StartWindowIsOpen() ? 1 : 0, PeekProgressNow(),
-                    ProgressMotionActive() ? 1 : 0,
-                    g_commitNeedsProgressReset ? 1 : 0);
+                    motion ? 1 : 0,
+                    g_commitNeedsProgressReset ? 1 : 0,
+                    PanelPhaseName(phase));
             return;
         }
     }
@@ -4327,6 +4156,55 @@ void ApplyDebugCommands(char* text) {
 // pass takes it. Nothing runs before the renderer exists, because before the
 // first Setup neither mechanism has an object to act on; a command that arrives
 // then stays in the section and is replaced by the next one.
+// M3 executor requests. The bridge owns ShowStartView/Dismiss; these publish the
+// command and its sequence. The bridge acks through execAck; a command that is
+// not acked expires on the bridge and the Start side resyncs from the cloak.
+constexpr uint64_t kBridgeDismissLeadMs = 30;
+constexpr uint64_t kBridgeAckTimeoutMs = 400;
+
+void RequestBridgeShow(uint32_t method, uint32_t flags) {
+    if (!g_ipc.state) {
+        return;
+    }
+    const LONG64 sequence = SwipeIpcPublishExec(
+        &g_ipc, kSwipeExecShow, static_cast<int32_t>(method),
+        static_cast<int32_t>(flags), 0, 0);
+    g_pendingShowExec.store(sequence, std::memory_order_relaxed);
+    g_pendingShowUntil.store(GetTickCount64() + kBridgeAckTimeoutMs,
+                             std::memory_order_relaxed);
+    FileLog(L"exec show request seq=%lld method=%u flags=%u",
+            static_cast<long long>(sequence), method, flags);
+}
+
+void RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
+    if (!g_ipc.state) {
+        return;
+    }
+    const LONG64 sequence = SwipeIpcPublishExec(
+        &g_ipc, kSwipeExecDismiss, static_cast<int32_t>(method), 0, executeAt,
+        open);
+    g_pendingDismissExec.store(sequence, std::memory_order_relaxed);
+    g_pendingDismissExecAt.store(executeAt, std::memory_order_relaxed);
+    FileLog(L"exec dismiss request seq=%lld method=%u executeAt=%llu open=%llu",
+            static_cast<long long>(sequence), method,
+            static_cast<unsigned long long>(executeAt),
+            static_cast<unsigned long long>(open));
+}
+
+void CancelPendingDismiss(const wchar_t* reason) {
+    const LONG64 target =
+        g_pendingDismissExec.exchange(0, std::memory_order_relaxed);
+    g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+    if (target == 0) {
+        return;
+    }
+    if (g_ipc.state) {
+        SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, target);
+    }
+    FileLog(L"exec cancel request target=%lld reason=%s",
+            static_cast<long long>(target), reason);
+}
+
 void ApplyPendingCommand() {
     ResetEvent(g_ipc.commandEvent);
     if (g_unloading.load(std::memory_order_relaxed) ||
@@ -4339,123 +4217,6 @@ void ApplyPendingCommand() {
         return;
     }
     ApplyDebugCommands(text);
-}
-
-// The bridge asks how long the retract it just triggered lasts, and holds the
-// launcher's close decision until the answer arrives. The close is already
-// decided, so the panel slides out on the same settle a committed dismiss uses.
-// Only this process can plan it: the travel belongs to the panel, not the shell.
-//
-// A reveal contact that drives the panel answers `cancel` instead: the menu must
-// stay open where the finger has it, so no close record is published, no tap is
-// armed, no suppression opens and no Progress is written. The bridge then returns
-// without calling the shell's decision, which leaves the launcher's state at 5 —
-// the next press is an ordinary close. The cancel answer is here as well as in
-// the standing claim the bridge reads for a method-7 close, because the request
-// path must decide on its own if the two race.
-//
-// The request is refused, with the no-settle answer, when it belongs to a menu
-// that is gone: a generation that is not the current open generation, a deadline
-// that has passed, a request the bridge already marked done, or one this process
-// handled before. A late request must never start a settle under the menu the
-// user opened since; the bridge then closes at once.
-void ApplyRetractRequest() {
-    SwipeIpcRetractRequest request{};
-    if (!SwipeIpcReadRetractRequest(&g_ipc, &request)) {
-        return;  // no stable record: the bridge closes at once
-    }
-    if (request.seq == 0 || request.seq == g_ipcRetractSeq) {
-        return;
-    }
-    g_ipcRetractSeq = request.seq;
-
-    const uint64_t now = GetTickCount64();
-    uint64_t openGeneration = 0;
-    uint64_t openTick = 0;
-    const bool openKnown =
-        SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick);
-    const bool cancelled = request.seq <= SwipeIpcReadRetractCancel(&g_ipc);
-    // Generation 0 is not a menu. SwipeIpcReadOpen already reports
-    // ERROR_NOT_READY instead of a snapshot for an unpublished counter, and a
-    // request that names 0 is refused exactly like one from a closed menu: a
-    // keyboard close must never start a settle for a menu that never published
-    // an open.
-    if (!openKnown || request.open == 0 ||
-        request.open != openGeneration || cancelled ||
-        (now > request.deadline)) {
-        // A request that sat unread, or one whose close is over, belongs to a
-        // menu this process no longer has on screen. Answer, so a bridge still
-        // waiting stops waiting, but start nothing.
-        FileLog(L"debug retract ignored (stale)");
-        AnswerRetract(request.seq, kSwipeRetractPlanNone);
-        return;
-    }
-    if (g_unloading.load(std::memory_order_relaxed) ||
-        !RendererReady()) {
-        AnswerRetract(request.seq, kSwipeRetractPlanNone);
-        return;
-    }
-
-    // A reveal owns the panel: the close must not happen. Nothing is changed —
-    // no close record, no tap, no suppression, no Progress write — and the
-    // answer goes out before the diagnostic line because the bridge is waiting.
-    if (RevealOwnsPanel()) {
-        if (!AnswerRetract(request.seq, kSwipeRetractPlanCancel)) {
-            FileLog(L"retract answer failed dur=cancel");
-        }
-        FileLog(L"debug retract cancelled (reveal owns)");
-        return;
-    }
-
-    // This Hide is the user's Windows press, not this mod's tap: an armed tap
-    // would toggle the menu back open while the shell is hiding it, so the
-    // close being superseded drops its tap here.
-    if (g_pendingTapTick != 0) {
-        const CloseKind dropped = g_pendingTapKind;
-        g_pendingTapTick = 0;
-        g_pendingTapKind = CloseKind::None;
-        g_pendingTapPull = 0;
-        FileLog(L"close tap dropped kind=%s", CloseKindName(dropped));
-        if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
-                                  g_pullSerial)) {
-            FileLog(L"close mode cancel stamp failed");
-        }
-    }
-
-    // The close owns Progress from here exactly as a gesture close does: the
-    // contact that was driving it is dropped, the suppression window opens, and
-    // a later report or release of that contact cannot settle the menu open
-    // under the close. The finger is still down, so its reports are muted until
-    // it lifts.
-    TakeCloseOwnership(now, true);
-
-    // Where the panel is now, not where the last animation was heading: a
-    // keyboard close during the open settle would otherwise start this retract
-    // from 1.0 and the panel would jump to fully open before it slid out. The
-    // take stops the old animation and pins the value it answers.
-    const float from = TakeProgressNow(L"retract");
-    // The keyboard close has no release speed of its own, so it settles from
-    // rest: the plain step response of the selected spring.
-    std::chrono::milliseconds duration{0};
-    if (BeginGestureSettle(from, 0.0f, 0.0f, duration)) {
-        // The window is about to be hidden: the next open restores Progress by
-        // itself, so no restore is owed after this retract.
-        g_commitNeedsProgressReset = false;
-        // The bridge is waiting for this answer, so it goes out before the
-        // diagnostic line.
-        if (!AnswerRetract(request.seq,
-                           static_cast<uint64_t>(duration.count()))) {
-            FileLog(L"retract answer failed dur=%llu",
-                    static_cast<unsigned long long>(duration.count()));
-        }
-        FileLog(L"debug retract from=%.3f dur=%llu", from,
-                static_cast<unsigned long long>(duration.count()));
-    } else {
-        // No animation, so there is no duration to wait for: the bridge uses
-        // its own lead.
-        FileLog(L"debug retract failed");
-        AnswerRetract(request.seq, kSwipeRetractPlanNone);
-    }
 }
 
 
@@ -5483,6 +5244,7 @@ bool CloseCancellableByPull() {
 void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     g_suppressRestoreUntil.store(tickMs + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
+    SwipeIpcSetControllerTouch(&g_ipc, false);
 
     // A new close decides the menu, so a release record left by an earlier pull
     // is moot: its open either already came or never will. The record of a pull
@@ -5501,21 +5263,30 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     // close can arrive while the *reveal* owns the contact, and clearing only
     // the reveal flags left the finger live, so its next report could start a
     // dismiss session on the reopened menu and its release could settle an open.
+    //
+    // A reveal that is still driving the panel is the exception: it is the pull
+    // that may open the menu this close makes room for, so it becomes a deferred
+    // candidate (measured, never written) instead of a muted contact. The next
+    // open releases it, exactly as it releases a pull that landed during the
+    // close; the takeover owns the screen until then.
     const bool contactLive =
         g_contactDown || g_hidSession.active || g_reveal.edgeCandidate;
-    if (contactStillDown && contactLive) {
+    const bool liveReveal =
+        contactStillDown && (g_reveal.active || g_reveal.deferred);
+    if (contactStillDown && contactLive && !liveReveal) {
         g_hidSession.suppress = true;
     }
 
     g_hidSession.active = false;
-    // A live reveal is ended whole: a keyboard close must not leave it owning
-    // the panel, and its release must not settle an open. Only the two flags are
-    // cleared; the measurements the release line prints stay readable. A pull
-    // deferred by an earlier close is superseded too: this close decides the
-    // menu, and the pull that opens the next one is the one that begins after
-    // this line.
-    g_reveal.deferred = false;
-    g_reveal.edgeCandidate = false;
+    // A live reveal keeps its candidate and its deferral; a keyboard close must
+    // not leave it owning the panel, and its release must not settle an open.
+    // Only the active flag is cleared; the measurements the release line prints
+    // stay readable. A pull deferred by an earlier close is superseded only when
+    // there is no live reveal to carry over.
+    if (!liveReveal) {
+        g_reveal.deferred = false;
+        g_reveal.edgeCandidate = false;
+    }
     g_reveal.active = false;
     EndContactTiming();
     // Nothing owns the panel edge any more, so a settled measurement may move it
@@ -5778,10 +5549,10 @@ void ResetActivationState() {
     g_pendingTapPull = 0;
     g_pullSerial = 0;
 
-    g_coasting.store(false, std::memory_order_relaxed);
-    g_coastStartQpc = 0;
-    g_coastFrom = 1.0f;
-    g_coastTo = 1.0f;
+    g_panel.coasting.store(false, std::memory_order_relaxed);
+    g_panel.coastStartQpc = 0;
+    g_panel.coastFrom = 1.0f;
+    g_panel.coastTo = 1.0f;
     ResetCoastVelocity();
     ResetEndVelocity();
 
@@ -5802,13 +5573,9 @@ void ResetActivationState() {
     g_suppressOpenAnim.store(false, std::memory_order_relaxed);
     g_animLogCount.store(0, std::memory_order_relaxed);
 
-    // No reveal of this activation drives anything any more. Withdrawing the
-    // claim here also covers the input thread's own exit, where the channel is
-    // still open; the lease covers a thread that never reaches this line.
+    // No reveal of this activation names a menu any more. The open tick is the
+    // only published identity left; there is no claim record to withdraw.
     g_ipcOpenTickLow = 0;
-    g_revealClaimOpen = 0;
-    g_revealClaimTick = 0;
-    PublishRevealClaim();
 
     EndContactTiming();
     FileLog(L"activation state reset");
@@ -6214,6 +5981,26 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
         return;
     }
 
+    // M3 own-show: the contact that begins in the band asks the bridge for the
+    // window now, instead of waiting for the shell's edge gesture (60-250 ms
+    // later). The controller holds the entry until the uncloak; the reveal
+    // takeover at the open then follows the finger. One request per open: a
+    // following report that still sees a closed window is the same pull, not a
+    // second show.
+    if (!StartWindowIsOpen() &&
+        !g_intentOpenActive.load(std::memory_order_relaxed)) {
+        const GestureGeometry geometry = ReadGestureGeometry();
+        const float entry =
+            std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
+        InsertProgress(entry);
+        g_intentOpenActive.store(true, std::memory_order_relaxed);
+        g_intentOpenEntry.store(entry, std::memory_order_relaxed);
+        SwipeIpcSetControllerOwning(&g_ipc, true, 0, 1);
+        SwipeIpcSetControllerTouch(&g_ipc, true);
+        RequestBridgeShow(1, 0);
+        FileLog(L"reveal show request entry=%.3f", entry);
+    }
+
     // The new pull owns the panel from this report on. It starts a new pull
     // generation; a close tap checks it once and is skipped while this pull
     // exists, so the shell never hides the menu the finger is pulling out.
@@ -6223,14 +6010,14 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     // pull-generation check in the consumer is the same rule, kept as a guard for
     // any path that changes one without the other.
     g_lateRelease = RevealLateRelease{};
-    // A close that armed its tap is cancelled the moment this pull begins, not
-    // at the tap's deadline: until the cancel is published the record still says
-    // "a gesture close is in flight", and a Hide in between would be read as
-    // that close's own tap.
-    if (g_pendingTapTick != 0 &&
-        !SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
-                              g_pullSerial)) {
-        FileLog(L"close mode cancel stamp failed");
+    // A close that armed its dismiss is cancelled the moment this pull begins:
+    // the finger on the glass is taking the menu back, and the bridge must not
+    // hide the window it is pulling out.
+    if (g_pendingTapTick != 0) {
+        CancelPendingDismiss(L"pull");
+        g_pendingTapTick = 0;
+        g_pendingTapKind = CloseKind::None;
+        g_pendingTapPull = 0;
     }
 }
 
@@ -6387,7 +6174,9 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // already that value and this insert writes the same one; when the base was
     // the open rest of a process that has not shown the panel yet, it is what
     // keeps that frame from presenting the panel at rest.
-    InsertProgress(visible);
+    // The contact takes the panel over: record the intent before the first
+    // frame that can be composited.
+    g_panel.Begin(&visible);
     reveal.lastInserted = visible;
     reveal.progress = visible;
 
@@ -6403,6 +6192,13 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // was, not a value that is subtracted from every insert.
     FileLog(L"reveal takeover from=%.3f offset=%.3f", visible,
             reveal.activationGap);
+    // The opening contact now owns the panel through the follow. The entry the
+    // touch show reserved belongs to the reveal takeover, not to a later keyboard
+    // settle. `controllerTouch` stays set for the whole contact: the shell's
+    // click-away from this same contact can arrive after this takeover too, and
+    // it is still the finger that pulled the menu out. It clears when the contact
+    // lifts or a close takes ownership.
+    g_intentOpenActive.store(false, std::memory_order_relaxed);
     return true;
 }
 
@@ -6418,18 +6214,15 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
 // again. The cancelled record goes out so the bridge stops treating the close as
 // a tap; the slot's own pull generation is the record's, not the newer pull's.
 bool DropPendingCloseTap() {
+    CancelPendingDismiss(L"pull");
     if (g_pendingTapTick == 0) {
         return false;
     }
     const CloseKind dropped = g_pendingTapKind;
-    const uint32_t pull = g_pendingTapPull;
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
-    if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0, pull)) {
-        FileLog(L"close mode cancel stamp failed");
-    }
-    FileLog(L"close tap dropped kind=%s", CloseKindName(dropped));
+    FileLog(L"close dismiss cancelled kind=%s", CloseKindName(dropped));
     return true;
 }
 
@@ -6545,7 +6338,7 @@ void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
     // snapping back to the value before it.
     float coastValue = reveal.visible;
     const bool resumed =
-        g_coasting.load(std::memory_order_relaxed) && StopCoast(coastValue);
+        g_panel.coasting.load(std::memory_order_relaxed) && StopCoast(coastValue);
     if (resumed) {
         reveal.visible = std::clamp(coastValue, 0.0f, 1.0f);
     }
@@ -6581,7 +6374,7 @@ void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
     if ((resumed ||
          std::fabs(progress - reveal.lastInserted) * reveal.distance >=
              kProgressEpsilonDip) &&
-        InsertProgress(progress)) {
+        g_panel.Move(progress)) {
         reveal.lastInserted = progress;
     }
     // The release speed belongs to the finger, not to the chase: the window reads
@@ -6832,6 +6625,9 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     }
 
     reveal.edgeCandidate = false;
+    // The opening contact is gone: the shell's click-away from it can no longer
+    // arrive, and a real click-away is a trigger again.
+    SwipeIpcSetControllerTouch(&g_ipc, false);
     if (!reveal.active) {
         // The contact is gone and the menu never appeared under it. A tap is not
         // worth a line (it never moved); a pull that travelled says the shell
@@ -7088,8 +6884,10 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
         tickMs >= g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
         g_commitNeedsProgressReset = false;
         session.startProgress = kProgressRest;
-        InsertProgress(kProgressRest);
     }
+    // The contact begins at the position the panel has now. Begin records the
+    // drag phase and pins that value; the first sample then moves it.
+    g_panel.Begin(&session.startProgress);
     session.lastProgress = session.startProgress;
 
     FileLog(L"hid down x=%.1f y=%.1f axis=%d dist=%.0f", x, y, axis,
@@ -7203,7 +7001,7 @@ void UpdateHidSession(const GestureGeometry& geometry, float x, float y,
     // the finger at once. The correction is only the few DIP it drifted.
     float coastValue = session.lastProgress;
     const bool resumed =
-        g_coasting.load(std::memory_order_relaxed) && StopCoast(coastValue);
+        g_panel.coasting.load(std::memory_order_relaxed) && StopCoast(coastValue);
 
     const int32_t axis = geometry.axis();
     const float delta = AxisDelta(axis, session, x, y);
@@ -7240,7 +7038,7 @@ void UpdateHidSession(const GestureGeometry& geometry, float x, float y,
     if (resumed ||
         std::fabs(progress - session.lastProgress) * distance >=
             kProgressEpsilonDip) {
-        InsertProgress(progress);
+        g_panel.Move(progress);
         session.lastProgress = progress;
     }
     // The release speed reads the value the panel actually shows.
@@ -7417,31 +7215,6 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     BeginHidSession(geometry, xDip, yDip, tickMs);
 }
 
-// The reveal's standing claim on the panel; see the declaration beside
-// g_ipcOpenTickLow. `g_reveal.active` is the takeover, exactly the condition the
-// request path answers cancel on, so the bridge's method-7 decision and the
-// requested close can never disagree about what "a reveal owns the panel" means.
-bool RevealOwnsPanel() {
-    return g_reveal.active;
-}
-
-void PublishRevealClaim() {
-    if (!g_ipc.state) {
-        return;
-    }
-    const uint32_t now = static_cast<uint32_t>(GetTickCount64());
-    const uint32_t open = RevealOwnsPanel() ? g_ipcOpenTickLow : 0;
-    if (open == g_revealClaimOpen && g_revealClaimTick != 0 &&
-        static_cast<uint32_t>(now - g_revealClaimTick) <
-            kSwipeRevealClaimRefreshMs) {
-        return;
-    }
-    if (SwipeIpcPublishRevealClaim(&g_ipc, open, now)) {
-        g_revealClaimOpen = open;
-        g_revealClaimTick = now;
-    }
-}
-
 // Publishes whether a live contact owns the panel edge. The UI side re-reads it
 // when a measurement runs, so a request recorded on an idle panel cannot move the
 // edge under a finger that started in between.
@@ -7455,11 +7228,6 @@ void PublishPanelOwnership() {
     // flag, and their handshake is what keeps a layout change out from under a
     // gesture that has just started.
     g_panelOwned.store(owned, std::memory_order_seq_cst);
-    // The same state, in the form the explorer side reads without waiting: a
-    // close on the synchronous method must decide from this record, and the
-    // refresh that keeps it inside its lease rides every report and every idle
-    // tick.
-    PublishRevealClaim();
     if (!owned && g_measureDeferred.exchange(false, std::memory_order_relaxed) &&
         !g_unloading.load(std::memory_order_relaxed)) {
         // The change that was held back is applied once now: renderer scalars,
@@ -7492,17 +7260,17 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
 // coast and plans the close from its value.
 void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
                 uint64_t qpcNow) {
-    if (g_coasting.load(std::memory_order_relaxed)) {
+    if (g_panel.coasting.load(std::memory_order_relaxed)) {
         // Nothing interrupted this coast: pin the value it was heading to. The
         // animation is over at this point, and its base value is the report
         // before it, which would snap the panel back.
-        if (qpcNow >= g_coastStartQpc &&
-            qpcNow - g_coastStartQpc >=
+        if (qpcNow >= g_panel.coastStartQpc &&
+            qpcNow - g_panel.coastStartQpc >=
                 static_cast<uint64_t>(kCoastDuration.count())) {
             if (g_debugCoast) {
-                FileLog(L"coast end value=%.3f", g_coastTo);
+                FileLog(L"coast end value=%.3f", g_panel.coastTo);
             }
-            InsertProgress(g_coastTo);  // ends the coast, see InsertProgress
+            g_panel.Move(g_panel.coastTo);  // ends the coast, see InsertProgress
         }
         return;
     }
@@ -7625,17 +7393,32 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         }
     }
 
+    // A touch show is in flight: the shell is uncloaking the window and the
+    // digitizer may go quiet for that whole window (the own-show starts at the
+    // band, before the shell's own gesture would have). The contact is still down
+    // as far as this mod knows — no lift report arrived — so the idle must not
+    // release the candidate the open is about to adopt. The flag is cleared at
+    // the live takeover or when the show fails.
+    const bool touchShowInFlight =
+        SwipeIpcControllerTouch(&g_ipc) ||
+        g_intentOpenActive.load(std::memory_order_relaxed);
+    // A close in flight is a gap in the digitizer stream too (the key press and
+    // the shell's hide both pause it). A contact that was already owning the
+    // panel is held through that gap; its real lift is a report and releases it
+    // explicitly. This is the pull the close's landing reopens.
+    const bool holdThroughClose =
+        CloseInFlight(tickMs) && (g_reveal.edgeCandidate || g_reveal.active);
     const bool sessionIdle =
         session.active && qpcNow >= session.lastAliveQpc &&
         qpcNow - session.lastAliveQpc >= kIdleReleaseMs;
-    if (sessionIdle) {
+    if (sessionIdle && !touchShowInFlight && !holdThroughClose) {
         ReleaseHidSession(geometry, true, L"idle");
     }
 
     const bool revealIdle =
         g_reveal.edgeCandidate && qpcNow >= g_reveal.lastAliveQpc &&
         qpcNow - g_reveal.lastAliveQpc >= kIdleReleaseMs;
-    if (revealIdle) {
+    if (revealIdle && !touchShowInFlight && !holdThroughClose) {
         ReleaseRevealSession(geometry);
     }
 
@@ -7704,24 +7487,20 @@ void RunPendingCloseTap(uint64_t tickMs) {
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
 
-    // A Win press during the retract has already hidden the menu. The tap would
-    // only toggle it back open.
+    // A Win press during the retract has already hidden the menu. The dismiss
+    // would only ask the shell to close a window that is already closed.
     if (!StartWindowIsOpen()) {
-        FileLog(L"close tap skipped kind=%s (already closed)",
+        FileLog(L"close dismiss skipped kind=%s (already closed)",
                 CloseKindName(kind));
         return;
     }
 
-    // The record the bridge waits for is the tap itself: a fresh sequence with
-    // tapped = 1 goes out immediately before the key, so the Hide that follows
-    // is provably this tap's and nothing else's.
-    if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindGesture, kCloseTapDelayMs,
-                              1, pull)) {
-        FileLog(L"close mode stamp failed kind=%s", CloseKindName(kind));
-    }
-    TapWindowsKey();
-    FileLog(L"close tap kind=%s delay=%llu", CloseKindName(kind),
-            static_cast<unsigned long long>(kCloseTapDelayMs));
+    // The close's settle has reached 0; the bridge is the only executor of the
+    // shell's Dismiss. The controller owns the panel until the Hide lands, so
+    // the bridge swallows the shell's own calls meanwhile.
+    SwipeIpcSetControllerOwning(&g_ipc, true, 0, 2);
+    RequestBridgeDismiss(1, GetTickCount64(), 0);
+    FileLog(L"close dismiss kind=%s", CloseKindName(kind));
 }
 
 // ---------------------------------------------------------------------------
@@ -8018,6 +7797,143 @@ void PostUiOpenWatchRelease(uint32_t closedGeneration,
 // without a system event: the XAML root is reused between opens, so
 // PrepareRootElement does not fire again and the axis, Distance and DirX/DirY
 // captured by Setup can belong to a taskbar that has moved since.
+// M3: one intent handler for the bridge's four triggers. The controller never
+// branches on the trigger: open sets the entry and asks the bridge for Show,
+// close runs the one mirrored close and asks for Dismiss, external drops the
+// pull and resyncs. The bridge's executor acks through execAck.
+void ApplyBridgeIntent() {
+    SwipeIpcIntent intent{};
+    if (!SwipeIpcReadIntent(&g_ipc, &intent) || intent.seq == 0 ||
+        intent.seq == g_lastIntentSeq) {
+        return;
+    }
+    g_lastIntentSeq = intent.seq;
+    const wchar_t* kind = intent.kind == kSwipeIntentOpen
+                              ? L"open"
+                              : (intent.kind == kSwipeIntentClose ? L"close"
+                                                                  : L"external");
+    const wchar_t* trigger =
+        intent.trigger == kSwipeTriggerWin
+            ? L"win"
+            : (intent.trigger == kSwipeTriggerStartButton
+                   ? L"startbutton"
+                   : (intent.trigger == kSwipeTriggerClickAway ? L"clickaway"
+                                                               : L"override"));
+    FileLog(L"intent recv seq=%lld kind=%s trigger=%s method=%u flags=%u "
+            L"open=%llu",
+            static_cast<long long>(intent.seq), kind, trigger, intent.method,
+            intent.flags, static_cast<unsigned long long>(intent.open));
+
+    int32_t ackState = kSwipeAckExecuted;
+    int32_t ackDuration = 0;
+    int32_t ackEntry = 0;
+    HRESULT ackHr = S_OK;
+
+    if (intent.kind == kSwipeIntentExternal) {
+        CancelPendingDismiss(L"external");
+        if (g_hidSession.active) {
+            g_hidSession.active = false;
+            EndContactTiming();
+        }
+        g_reveal = HidRevealSession{};
+        g_contactOrigin = HidContactOrigin{};
+        g_lateRelease = RevealLateRelease{};
+        SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
+        SwipeIpcSetControllerTouch(&g_ipc, false);
+        g_commitNeedsProgressReset = false;
+        FileLog(L"intent external drop trigger=%s", trigger);
+    } else if (intent.kind == kSwipeIntentOpen) {
+        CancelPendingDismiss(L"open-intent");
+        const GestureGeometry geometry = ReadGestureGeometry();
+        const float entry =
+            std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
+        g_intentOpenEntry.store(entry, std::memory_order_relaxed);
+        g_intentOpenActive.store(true, std::memory_order_relaxed);
+        g_panel.Begin(&entry);
+        SwipeIpcSetControllerOwning(&g_ipc, true, intent.open, 1);
+        RequestBridgeShow(intent.method ? intent.method : 1, intent.flags);
+        ackEntry = static_cast<int32_t>(std::llround(entry * 1000.0f));
+        FileLog(L"intent open entry=%.3f", entry);
+    } else if (intent.kind == kSwipeIntentClose) {
+        CancelPendingDismiss(L"close-intent");
+        // The close owns the panel now: one close mechanism, the same ownership
+        // the gesture and keyboard closes take. It sets the restore suppression
+        // so the visibility poll cannot "heal" the retracted panel while the
+        // bridge's dismiss is still on its way, and it mutes a contact still on
+        // the glass.
+        TakeCloseOwnership(GetTickCount64(), g_contactDown);
+        const float from = TakeProgressNow(L"intent-close");
+        std::chrono::milliseconds duration{0};
+        if (!BeginMirrorCloseSettle(from, duration)) {
+            ShowAtRest();
+            ackState = kSwipeAckRefused;
+            ackHr = E_FAIL;
+        } else {
+            g_commitNeedsProgressReset = true;
+            SwipeIpcSetControllerOwning(&g_ipc, true, intent.open, 2);
+            const uint64_t executeAt =
+                GetTickCount64() + static_cast<uint64_t>(duration.count()) +
+                kBridgeDismissLeadMs;
+            RequestBridgeDismiss(intent.method ? intent.method : 1, executeAt,
+                                 intent.open);
+            ackDuration = static_cast<int32_t>(duration.count());
+            FileLog(L"intent close from=%.3f dur=%lld", from,
+                    static_cast<long long>(duration.count()));
+        }
+    }
+    SwipeIpcAnswerIntent(&g_ipc, intent.seq, ackState, ackDuration, ackEntry,
+                         static_cast<int32_t>(ackHr));
+}
+
+void ApplyExecAck() {
+    SwipeIpcExecAck ack{};
+    if (!SwipeIpcReadExecAck(&g_ipc, &ack)) {
+        return;
+    }
+    FileLog(L"exec ack seq=%lld command=%lld state=%u hr=%08X visible=%d",
+            static_cast<long long>(ack.seq),
+            static_cast<long long>(ack.command), ack.state,
+            static_cast<unsigned>(ack.hr), ack.visible);
+    if (ack.command == g_pendingDismissExec.load(std::memory_order_relaxed)) {
+        g_pendingDismissExec.store(0, std::memory_order_relaxed);
+        g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+    }
+    if (ack.command != g_pendingShowExec.load(std::memory_order_relaxed)) {
+        return;
+    }
+    g_pendingShowExec.store(0, std::memory_order_relaxed);
+    g_pendingShowUntil.store(0, std::memory_order_relaxed);
+    if (ack.state == kSwipeAckRefused || ack.state == kSwipeAckExpired) {
+        // The bridge did not run the show (no launcher, no window). Release the
+        // panel so the shell's own gesture, which follows the band contact, is
+        // passed through instead of swallowed.
+        SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
+        g_intentOpenActive.store(false, std::memory_order_relaxed);
+        FileLog(L"exec show failed command=%lld state=%u hr=%08X",
+                static_cast<long long>(ack.command), ack.state,
+                static_cast<unsigned>(ack.hr));
+    }
+}
+
+// A command the bridge never answered: the Start side stops owning the panel
+// and reads the truth from the window's cloak on the next poll, exactly as it
+// does for any open it did not perform.
+void CheckExecAckTimeout(uint64_t now) {
+    const LONG64 sequence = g_pendingShowExec.load(std::memory_order_relaxed);
+    if (sequence == 0) {
+        return;
+    }
+    if (now < g_pendingShowUntil.load(std::memory_order_relaxed)) {
+        return;
+    }
+    g_pendingShowExec.store(0, std::memory_order_relaxed);
+    g_pendingShowUntil.store(0, std::memory_order_relaxed);
+    SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
+    g_intentOpenActive.store(false, std::memory_order_relaxed);
+    FileLog(L"exec ack timeout seq=%lld open=%d (resync from cloak)",
+            static_cast<long long>(sequence), StartWindowIsOpen() ? 1 : 0);
+}
+
 void PollRootVisibility(uint64_t tickMs) {
     static uint64_t lastPollTick = 0;
     if (tickMs - lastPollTick < kOpenCheckIntervalMs) {
@@ -8055,16 +7971,6 @@ void PollRootVisibility(uint64_t tickMs) {
         // previous menu can never cancel a close of this one. The claim's own
         // refresh happens on this tick's report/idle path, after any adoption.
         g_ipcOpenTickLow = static_cast<uint32_t>(tickMs);
-        // The open publish also cancels the close stamp the previous menu left.
-        // The bridge refuses a stamp older than the open tick, but an
-        // unconsumed tapped record from the previous menu can still be the
-        // newest record when the next Hide arrives inside 800 ms; publishing the
-        // cancelled kind here is what proves no tap of this menu is in flight.
-        // This is the one place that has to do it: the open publisher.
-        if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
-                                  g_pullSerial)) {
-            FileLog(L"close mode cancel stamp failed");
-        }
         // A new open is also a new geometry epoch: every measurement recorded for
         // the previous one is stale from this point on, and a request that was
         // still live is cancelled by the epoch check in its turn.
@@ -8165,15 +8071,25 @@ void PollRootVisibility(uint64_t tickMs) {
             // settle planned from it would run the 160 ms floor. Restore the
             // resting value instead and let the shell's own storyboard run.
             if (geometry.distance() > 0.0f) {
-                const float from = openDuringClose
-                                       ? TakeVisibleProgressNow(L"win-during-close")
-                                       : 0.0f;
+                const bool intentEntry =
+                    g_intentOpenActive.exchange(false, std::memory_order_relaxed);
+                const float intentFrom =
+                    g_intentOpenEntry.load(std::memory_order_relaxed);
+                const float from = intentEntry
+                                       ? intentFrom
+                                       : (openDuringClose
+                                              ? TakeVisibleProgressNow(
+                                                    L"win-during-close")
+                                              : 0.0f);
                 std::chrono::milliseconds duration{0};
                 if (BeginGestureSettle(from, 1.0f, 0.0f, duration)) {
                     // The animation now owns Progress, so no later path needs to
                     // restore the resting value for this open.
                     g_commitNeedsProgressReset = false;
-                    if (openDuringClose) {
+                    if (intentEntry) {
+                        FileLog(L"win open intent from=%.3f dur=%llu", from,
+                                static_cast<unsigned long long>(duration.count()));
+                    } else if (openDuringClose) {
                         FileLog(L"win open during close from=%.3f dur=%llu", from,
                                 static_cast<unsigned long long>(duration.count()));
                     } else {
@@ -8195,27 +8111,60 @@ void PollRootVisibility(uint64_t tickMs) {
             !g_hidSession.active && !g_reveal.edgeCandidate);
         PostGeometryMeasurement(request, false);
     } else if (!open && g_rootWasOpen) {
+        // Whether this landing belongs to a close this mod started. It is read
+        // before the suppression is cleared: an external takeover (Win+Tab,
+        // Win+Shift+S, the lock screen, a display change) closes the window with
+        // no request of ours, so it never opened a suppression window.
+        const bool closeInFlight =
+            tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
         // The close has landed, so its suppression no longer applies. Without
         // this a Win press right after the hide opened the window with Progress
         // still at 0, and the panel was invisible until the next open.
         g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
-        // A pull that arrived during the close is the pull that opens the menu
-        // this hide made room for. The landing is the one moment its deferral can
-        // end: the retract is over, nothing else writes Progress, and the open's
-        // own poll either promotes the contact from its down point (still down) or
-        // consumes the release record it left (already lifted).
-        if (g_reveal.deferred) {
-            g_reveal.deferred = false;
-            FileLog(L"reveal defer released candidate=%d down=%d",
-                    g_reveal.edgeCandidate ? 1 : 0,
-                    g_contactOrigin.valid ? 1 : 0);
-        }
-        // The release record of a pull that lifted during this close becomes
-        // consumable now: its end speed was measured at the lift, and the window
-        // it must arrive in starts at the landing, not at the lift.
-        if (g_lateRelease.valid && g_lateRelease.deferred) {
-            g_lateRelease.deferred = false;
-            g_lateRelease.readyQpc = QpcMsNow();
+        if (closeInFlight) {
+            // A pull that arrived during the close is the pull that opens the
+            // menu this hide made room for. The landing is the one moment its
+            // deferral can end: the retract is over, nothing else writes
+            // Progress, and the open's own poll either promotes the contact from
+            // its down point (still down) or consumes the release record it left
+            // (already lifted).
+            if (g_reveal.deferred) {
+                g_reveal.deferred = false;
+                FileLog(L"reveal defer released candidate=%d down=%d",
+                        g_reveal.edgeCandidate ? 1 : 0,
+                        g_contactOrigin.valid ? 1 : 0);
+            }
+            // The release record of a pull that lifted during this close becomes
+            // consumable now: its end speed was measured at the lift, and the
+            // window it must arrive in starts at the landing, not at the lift.
+            if (g_lateRelease.valid && g_lateRelease.deferred) {
+                g_lateRelease.deferred = false;
+                g_lateRelease.readyQpc = QpcMsNow();
+            }
+        } else {
+            // A close this mod did not start: an external takeover owns the
+            // screen. The pull is dropped, not deferred — the takeover's window
+            // is not a menu to reopen — and the rest of the contact stays inert
+            // until it lifts. No close record, no tap, no Progress write: the
+            // shell did all of it.
+            const bool contactLive =
+                g_contactDown || g_hidSession.active || g_reveal.active ||
+                g_reveal.edgeCandidate;
+            if (g_reveal.active || g_reveal.edgeCandidate ||
+                g_reveal.deferred) {
+                g_reveal = HidRevealSession{};
+                FileLog(L"reveal dropped (window closed by shell)");
+            }
+            if (g_hidSession.active) {
+                g_hidSession.active = false;
+                EndContactTiming();
+                FileLog(L"hid dropped (window closed by shell)");
+            }
+            if (contactLive) {
+                g_hidSession.suppress = true;
+                g_contactOrigin = HidContactOrigin{};
+            }
+            g_lateRelease = RevealLateRelease{};
         }
         // The closed menu shows no panel, and the layout of the next open is a
         // new epoch: a measurement still in flight belongs to the menu that just
@@ -8226,9 +8175,44 @@ void PollRootVisibility(uint64_t tickMs) {
         const SettledMeasureRequest closing = SnapshotMeasureRequest();
         AdvanceOpenGeneration();
         FileLog(L"win close observed");
+        SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
+        SwipeIpcSetControllerTouch(&g_ipc, false);
+        g_intentOpenActive.store(false, std::memory_order_relaxed);
+        g_pendingDismissExec.store(0, std::memory_order_relaxed);
+        g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
         // The measurement request and the cached scroller belong to the open that
         // just ended; the UI thread releases them.
         PostUiOpenWatchRelease(closedGeneration, closing);
+
+        // A pull that was down when this close landed is the pull that takes the
+        // menu back. The close cannot be cancelled at its landing, so the
+        // controller issues one fresh show exactly like the band admission; the
+        // open's poll then adopts the live contact (PromoteRevealContact) or
+        // consumes the release record a pull that lifted just before the landing
+        // left (ConsumeLateRevealRelease). One pull, one reopen.
+        const uint64_t closeQpc = QpcMsNow();
+        const bool pullDown =
+            g_contactDown && (g_reveal.edgeCandidate || g_reveal.active);
+        const bool lateFresh =
+            g_lateRelease.valid && !g_lateRelease.deferred &&
+            g_lateRelease.releaseQpc != 0 &&
+            closeQpc >= g_lateRelease.releaseQpc &&
+            closeQpc - g_lateRelease.releaseQpc <= kLateRevealWindowMs;
+        if ((pullDown || lateFresh) && RendererReady() &&
+            !StartWindowIsOpen() &&
+            !g_intentOpenActive.load(std::memory_order_relaxed)) {
+            const GestureGeometry geometry = ReadGestureGeometry();
+            const float entry =
+                std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
+            InsertProgress(entry);
+            g_intentOpenActive.store(true, std::memory_order_relaxed);
+            g_intentOpenEntry.store(entry, std::memory_order_relaxed);
+            SwipeIpcSetControllerOwning(&g_ipc, true, 0, 1);
+            SwipeIpcSetControllerTouch(&g_ipc, true);
+            RequestBridgeShow(1, 0);
+            FileLog(L"reveal reopen after close pull=%d late=%d entry=%.3f",
+                    pullDown ? 1 : 0, lateFresh ? 1 : 0, entry);
+        }
     } else if (open) {
         // The window has stayed uncloaked across polls. That is the healthy state
         // for an open menu, but a close that hid the menu and a reopen whose
@@ -8500,6 +8484,17 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
             // its declared in-range bit cleared. No other slot in this report
             // restarts it. `Unknown` never ends it: a report that carries no
             // contact field for the slot cannot speak for the contact.
+            FileLog(L"hid tracked notcontact field=%d tip=%d tipdown=%d range=%d "
+                    L"rangedown=%d id=%d count=%d coord=%d report=%u pos=%d",
+                    static_cast<int>(slot.buttons.field),
+                    slot.buttons.tipDeclared ? 1 : 0,
+                    slot.buttons.tipDown ? 1 : 0,
+                    slot.buttons.inRangeDeclared ? 1 : 0,
+                    slot.buttons.inRangeDown ? 1 : 0,
+                    slot.hasIdentifier ? 1 : 0,
+                    countField == HidField::Ok ? topLevelCount : -1,
+                    device.coordinatePath ? 1 : 0, reportId,
+                    slot.hasPosition ? 1 : 0);
             ForgetTrackedContact();
             OnHidSample(0, 0.0f, 0.0f, tickMs);
             return;
@@ -8835,7 +8830,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // unload sets it even if this thread has not published the HWND yet, and it
     // is checked again after every message batch, because a queued message can
     // win the wait over a just-signalled event.
-    HANDLE waits[4] = {};
+    HANDLE waits[6] = {};
     DWORD waitCount = 0;
     if (g_hidStopEvent) {
         waits[waitCount++] = g_hidStopEvent;
@@ -8846,8 +8841,11 @@ DWORD WINAPI HidInputThread(LPVOID) {
     if (g_ipc.commandEvent) {
         waits[waitCount++] = g_ipc.commandEvent;
     }
-    if (g_ipc.retractRequestEvent) {
-        waits[waitCount++] = g_ipc.retractRequestEvent;
+    if (g_ipc.intentEvent) {
+        waits[waitCount++] = g_ipc.intentEvent;
+    }
+    if (g_ipc.execAckEvent) {
+        waits[waitCount++] = g_ipc.execAckEvent;
     }
 
     MSG msg;
@@ -8863,6 +8861,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 WaitForSingleObject(g_hidStopEvent, 0) == WAIT_OBJECT_0) {
                 running = false;
             }
+            CheckExecAckTimeout(GetTickCount64());
             continue;
         }
         if (wait == WAIT_OBJECT_0 + waitCount) {
@@ -8890,6 +8889,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 const uint64_t now = GetTickCount64();
                 RunPendingCloseTap(now);
                 CheckHidIdleRelease(now);
+                CheckExecAckTimeout(now);
                 PollRootVisibility(now);
                 continue;
             }
@@ -8897,8 +8897,12 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 ApplyPendingCommand();
                 continue;
             }
-            if (signalled == g_ipc.retractRequestEvent) {
-                ApplyRetractRequest();
+            if (signalled == g_ipc.intentEvent) {
+                ApplyBridgeIntent();
+                continue;
+            }
+            if (signalled == g_ipc.execAckEvent) {
+                ApplyExecAck();
                 continue;
             }
             continue;
@@ -11174,6 +11178,7 @@ bool RefreshGestureGeometry() {
     return true;
 }
 
+// ---------------------------------------------------------------------------
 // Runs on the UI thread, after the root element is loaded.
 bool Setup(wux::FrameworkElement const& root) {
     if (!root) {
@@ -11241,6 +11246,7 @@ bool Setup(wux::FrameworkElement const& root) {
         // thread posts through CopyDispatcher.
         g_dispatcher = dispatcher;
     }
+
 
     // The property set now carries this travel, so the renderer geometry may be
     // committed to it. A throw above leaves the old value and no renderer.
@@ -12132,16 +12138,19 @@ void ResetComposition() {
     // so an old batch cannot touch a close in a newly opened menu. The recorded
     // settle curve belongs to the root that is going away.
     InvalidateDismissBatchLocked();
-    g_settleFrames = 0;
-    g_settleDurationMs = 0;
+    g_panel.frames = 0;
+    g_panel.durationMs = 0;
 
     try {
         if (g_state) {
             g_state.StopAnimation(L"Progress");
-            g_coasting.store(false, std::memory_order_relaxed);
+            g_panel.coasting.store(false, std::memory_order_relaxed);
             g_state.InsertScalar(L"Progress", kProgressRest);
-            g_progressNow.store(kProgressRest, std::memory_order_relaxed);
+            g_panel.progress.store(kProgressRest, std::memory_order_relaxed);
         }
+        g_panel.target = kProgressRest;
+        g_panel.velocity = 0.0f;
+        g_panel.phase = PanelPhase::Idle;
         if (g_visual) {
             g_visual.StopAnimation(L"Translation");
             g_visual.Properties().InsertVector3(
@@ -12316,7 +12325,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.36.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.39.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance

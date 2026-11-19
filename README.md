@@ -23,14 +23,19 @@ Two mods ship together, and both are needed for the full experience:
 
 - **Start menu legacy swipe** (`start-menu-legacy-swipe`) — the gesture
   itself: edge-pull to open, follow the finger, drag to dismiss, and the
-  animation.
+  animation. The same controller also consumes the bridge's intents and
+  schedules the close's dismiss.
 - **Start menu touch gesture bridge** (`start-menu-touch-gesture-bridge`) —
-  runs in Explorer and decides what a close from outside the gesture does: the
-  Windows key and the Start button play the slide-out, a click away closes at
-  once (the same close decision carries the lock screen, which must never
-  wait), and a close that arrives while your finger is still pulling the menu
-  out is refused, so the menu stays with your finger. Without the bridge the
-  menu still closes, but instantly.
+  runs in Explorer and executes the shell's own `ShowStartView`/`Dismiss` on
+  the launcher's thread. The Windows key, the Start button and a click away
+  publish one intent; the controller decides open or close, runs the one
+  mirrored settle, and then asks the bridge to dismiss. A close slides out with
+  the same animation the gesture close uses; a press during a close is either
+  cancelled (the settle is still running) or latched and served when the hide
+  lands, so the key never goes dead; a touch pull still down when a close lands
+  reopens through the controller. Win+Tab, the lock screen and a display change
+  pass through untouched, so a lock never waits. Without the bridge the menu
+  still opens and closes, but the close is instant.
 
 ## Install
 

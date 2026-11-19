@@ -34,8 +34,7 @@ clean unload releases the mutex.
 The one stop event is created before any thread starts; without it the mod
 starts no raw-input thread and logs `hid thread not started (stop event
 unavailable)`. The input thread waits on that event beside its messages in
-10 ms slices, the module-scan thread waits on the same event, and the 60 ms
-Windows tap waits on it too and always releases the key.
+10 ms slices, and the module-scan thread waits on the same event.
 
 Every entry into module code from the compositor or the dispatcher is counted
 from before it can run: the batch completion takes a `ModuleEntryLease` before
@@ -80,7 +79,7 @@ A re-initialisation of the same pinned image after a clean unload resets the
 lifecycle state (`ResetReinitState`) and then runs one per-activation reset
 (`ResetActivationState`, logged `activation state reset`), which the input
 thread's exit runs too: the tracked contact, the contact latch, both sessions,
-the close mute, the deferred flag, the pending tap and the pull generation it
+the close mute, the deferred flag, the pending dismiss and the pull generation it
 was armed under, the pull serial, the coast, both velocity windows, the
 diagnostic latches and the `anim` override all start over.
 
@@ -102,7 +101,7 @@ A re-enable re-initialises the same image without the loader resetting
 anything, and refuses while a close from the previous activation is still inside
 (`mod init refused: a close from the previous activation is still inside;
 ...`); otherwise `ResetReinitState()` clears `g_disabled`, `g_afterInit`,
-`g_explorerHooked`, `g_arbiterEnabled` and `g_startPointTick`, retries a
+`g_explorerHooked`, `g_closeHookEnabled` and `g_startPointTick`, retries a
 failed gesture mapping, leaves `g_closeCalls` alone, and logs `activation state
 reset`; a drained unload closes the channel before it returns, so a re-enable
 opens a fresh one. `Wh_ModInit` still reuses a channel `g_ipc` already holds
