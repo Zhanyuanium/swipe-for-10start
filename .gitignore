@@ -12,6 +12,7 @@ compile_flags.txt
 # Local test logs and captures
 *.log
 *.etl
+*.raw
 *.csv.tmp
 
 # Python bytecode from tools/*.py
