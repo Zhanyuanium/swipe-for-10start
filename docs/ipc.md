@@ -78,9 +78,24 @@ a close published no plan and armed no tap, so there is nothing to cancel.
 A new edge pull during the retract cancels the close on the Start side: the
 armed tap is dropped before it is sent (the record becomes the cancelled kind),
 no `Hide` runs, the shell's toggle is never touched, and the pull's own follow
-keeps driving the panel. A gesture close that the user cancels by pulling the
-menu open again reappears at the mapped position under the finger (0.269 at the
-screen edge on this layout) instead of already being open.
+keeps driving the panel. The drop happens on the new contact's first report, not
+at the tap's deadline, so a pull whose first point lands above the band cancels
+too; the panel the close had retracted is brought back from its live position. A
+gesture close that the user cancels by pulling the
+menu open again keeps the live position the retract had reached and then chases
+the finger's absolute mapped position at the planner's rate, instead of snapping
+to it immediately; once the retract has finished (the panel cloaked or below the
+visible entry) the follow starts at the entry, so the panel appears from the
+screen edge and closes the gap to the finger.
+
+A close whose tap already fired is not cancellable, because the `Hide` is already
+in the shell or held by the bridge. If a pull took the panel back during that
+close, the reopen that follows is that pull's own open: the Start side marks the
+close contested at the follow's activation, stamps the ticket at its commit
+release, and at the next open settles from the panel's live position
+(`win open continued from=... dur=...`) rather than replaying the keyboard settle
+from 0. A close that took the panel to the hidden rest has nothing to continue
+and settles from 0 as before.
 
 ## The keyboard close
 

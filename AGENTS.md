@@ -13,7 +13,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 
-Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.33.0) runs in
+Two mods ship together: `mods/start-menu-legacy-swipe.wh.cpp` (0.34.0) runs in
 `StartMenuExperienceHost.exe` and reads the digitizer through Raw Input because
 every XAML/DirectManipulation source on this UI is empty (see docs/input.md). The
 tracked contact is named by the HID Contact Identifier (`0x0D/0x51`) when the
@@ -47,14 +47,43 @@ retries on the next open or broadcast. That band is also the strip a reveal
 candidate may start in — `804..900` on this bottom auto-hidden layout, the same
 in both hide states because the hidden bar still measures its 48 DIP — and the
 fixed `kEdgeBandDip` of 12 DIP is only the fallback before a snapshot carries
-one. The open runs exactly one of three paths, in this order: a live takeover (a
+one. The open runs exactly one of four paths, in this order: a live takeover (a
 contact still down that has travelled `kAdoptTravelDip`, 24 DIP — a candidate
 promoted at the open instead of waiting for a report it may never get, or a
 contact with none adopted, both from their own down point), the late release
-record below, or the keyboard settle. A tap or a finger resting at the edge has
+record below, the contested continuation of a close whose Hide already left
+(the settle starts where the pull had the panel, not at 0), or the keyboard
+settle. A tap or a finger resting at the edge has
 not travelled 24 DIP and is not promoted. `gestureOwnsProgress` is
 `g_reveal.active`, that takeover itself and never a candidate, so a candidate the
-open never reaches cannot take the animation away. A contact that lifts before
+open never reaches cannot take the animation away. A live takeover starts at the
+visible edge and then chases the finger. The shell uncloaks the window 60-250 ms
+after the pull starts, so a still-down finger has already travelled 400-600 DIP
+and the absolute trail mapping reads 0.76-1.00; the takeover starts at
+`RevealEntryProgress` — the smallest `Progress` whose translated trail edge sits
+on the work area's edge, the first progress at which any of the panel is on
+screen — holds it for the first presentation (`kRevealEntryHoldMs`, 30 ms) so the
+first visible frame is the edge, and from there every report moves the visible
+position toward the absolute mapped position at `kSettleSpeedDipPerMs`
+(2.2 DIP/ms) without passing it:
+`visible += clamp(mapped - visible, -rate*dt, +rate*dt)`. That is the planner's
+own speed, the one every keyboard open and settle uses, so the catch-up is the
+panel opening at the system's speed and its cost is time: a 600 DIP gap closes in
+~303 ms and a 100 DIP gap in ~75 ms, after which the chase keeps up with any
+finger and the panel is glued. The entry, not 0, because a settle spends time
+crossing the hidden travel while a follow spends the finger's travel (starting at
+0 left the panel one hidden travel behind for the whole gesture). A constant
+subtraction was rejected: it left the panel
+permanently short (0.25-0.27 visible at 450-560 DIP of finger travel) and unable
+to pass `1 - offset`. Travel, the commit test, `max=` and the end-speed window
+keep reading the mapped value, so the measured motion is the finger's own; only
+the written position is rate-limited. The takeover line says the start and the
+gap it inherited (`reveal takeover from=... offset=...`) and the release line
+prints the visible progress, the gap still open and that inherited gap
+(`open follow ... progress=... behind=... offset=...`). The late-release and
+keyboard settles keep starting at 0 (`TakeVisibleProgressNow`): they spend time,
+not travel. A
+contact that lifts before
 the shell opens the menu keeps its travel, mapped position and end speed —
 measured at the release over the same 8-30 ms window — in one `RevealLateRelease`
 record for `kLateRevealWindowMs` (300 ms; the shell's open arrived 107-251 ms
@@ -124,7 +153,33 @@ attempts. A gesture close then taps `VK_LWIN` at the end of that settle: the
 shell's own key handler performs the hide, so the Start toggle stays in step and
 no re-arm tap exists. A keyboard close instead has the bridge hold
 `CStartExperienceManager::Hide` for the settle the Start side answers with. A
-new pull during the settle drops the tap before the shell is touched. A close
+new pull during the settle drops the tap before the shell is touched: the drop
+runs on the contact's first report whatever its point (a pull whose first point
+misses the band never reaches the candidate path), and the close's retracted
+panel is brought back from its live position because a menu left open at
+`Progress` 0 has no pane. The same contact also records `startedOpen = 0` while
+`g_suppressRestoreUntil` is ahead, so a pull that starts above the band is
+adopted from its own down point instead of staying inert. A close whose tap has
+already fired is not cancellable: the Hide is in the shell's or the bridge's
+hand, and the reopen that follows is that pull coming back, not a new open. The
+follow marks the close contested when it activates inside the suppression window
+and the commit release stamps a one-release, 300 ms ticket; the open consumes it
+and settles from the panel's live position (`win open continued from=...
+dur=...`) instead of the keyboard settle from 0, so one pull produces one motion
+up. A panel the close took to the hidden rest has nothing to continue and
+settles from 0 as before. A shown window whose panel sits off it is the one
+state no path may leave standing: a close whose `Hide` landed, or a reopen whose
+settle never ran, leaves the window uncloaked with `Progress` 0, so nothing of
+the menu is on screen while every pull is refused `reason=open` and muted as a
+band tail. The visibility poll heals it once the close's suppression has ended
+and no settle, coast, follow or dismiss drag moves the panel
+(`win open unhealed progress=...` plus a settle up from the live position), and
+the band admission refuses only a panel at rest: a pull on the shown window whose
+panel is low is admitted as the reveal (`reason=unhealed`). The poll reads the
+live position with `PeekProgressNow`, never `TakeProgressNow`, because taking the
+late-release settle at its first millisecond was that dead state's cause
+(`progress take settle at=0.000 elapsed=0 caller=contested` right after
+`reveal adopt late`). A close
 exists only once its settle starts:
 `BeginDismissSettle` answers not started, started, or started with a lost batch
 observer (`close observer lost kind=...`), and only a close that provably never

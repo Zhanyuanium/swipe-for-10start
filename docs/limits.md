@@ -97,6 +97,30 @@
   request arrives. A press just after that hide lands in the shell's own settle
   and is ignored; the toggle is not advanced, and the next press opens the menu.
   A press 50 ms after the menu reports closed opens it and animates the panel in.
+  A contact that lands during the retract drops the tap on its first report and
+  brings the panel back from its live position, so that close never hides the
+  menu. A close whose tap already fired cannot be recalled: the shell or the
+  bridge holds the Hide, and no API in this design can withdraw it (returning
+  `S_OK` from the bridge without calling the original broke the Start toggle).
+  The reopen that follows such a close continues the panel from its live
+  position, but the shell's own show request still presents the window: the
+  measurement `anim=0` proves the request is the step that draws the pane, so the
+  mod does not drop it. The user therefore sees the menu hide once and come back
+  at the position the pull had reached, never a second settle from 0.
+- A shown window with the panel at the hidden rest is not a menu, and it was
+  reachable: the visibility poll read the live position with the taking reader
+  (`TakeProgressNow`) after it had just started the late-release settle, so the
+  take evaluated the new curve at 0 ms, stopped it and pinned 0. Measured:
+  `reveal adopt late ... from=0.000`, then
+  `progress take settle at=0.000 elapsed=0 dur=409 caller=contested`, then
+  `win open unhealed progress=0.000` every second, every pull refused
+  `reason=open` and muted as a band tail, until a press on the panel ran a dismiss
+  cancel. The poll now peeks (`PeekProgressNow`), the band admission refuses
+  `reason=open` only when the panel is at rest, and the unhealed check settles the
+  panel up from its live position when nothing owns it and the close's
+  suppression has ended. The cost is one extra position read per poll and one
+  settle up when the pair is found; the alternative — a menu that is shown but
+  has no pane — is not a state the mod may leave behind.
 - The bridge holds every `CStartExperienceManager::Hide` that is not a gesture
   close for the settle the Start mod answered with, plus 30 ms, and that wait
   runs on explorer's UI thread: a click-away close slides out too, and the
@@ -129,8 +153,32 @@
 - A gesture close that the user cancels by pulling the menu open again drops its
   armed tap before the shell is touched, so no `Hide` runs and the toggle is
   never advanced. The panel is already retracted and is driven purely by the
-  follow from then on: it reappears at the mapped position under the finger
-  (0.269 at the screen edge on this layout) instead of already being open.
+  follow from then on: it keeps the live position the retract had reached (the
+  takeover's `from`) when that position is above the visible entry, and the
+  finger's motion advances it from there, instead of snapping to the absolute
+  mapped position. When the retract has finished (the panel is cloaked or below
+  the entry), the follow starts at the entry and the panel appears from the
+  screen edge.
+- The live takeover starts at the visible entry and then chases the finger, so
+  for a moment the panel is behind by the gap it inherited, and the cost is the
+  catch-up time: `30 + gap / 2.2` ms at the planner's rate (the 30 ms entry hold
+  plus the gap). The entry is derived, not fixed: `RevealEntryProgress` puts the
+  panel's top on the work area's bottom, so it is 0.289 with the root at 900 DIP
+  and 0.249 with the root at 852 DIP (the bar shown at the open shrinks the root),
+  and the measured runs take their value from the same snapshot the follow reads.
+  A 90 DIP slow pull whose open arrives under the finger
+  takes `offset=0.118` (root 900); the gap is the 90 DIP of pre-open travel plus
+  the 16 DIP between the band's admit point and the screen bottom, and it closes
+  in ~78 ms; a 560 DIP fast pull closes its 634 DIP gap in ~318 ms. While
+  the chase
+  runs the panel trails the finger by the remaining gap, and once it is closed
+  the panel is glued (a finger moves at 0.5-5 DIP/ms). A constant subtraction is
+  the rejected alternative: it never closes, so the panel stayed at 0.25-0.27
+  visible with the finger at 450-560 DIP and could not pass `1 - offset`. The
+  other alternative — starting at the mapped position — is the teleport this
+  release removes. A very fast flick released before the chase finishes hands the
+  settle a shorter remaining travel, which is correct: the settle plans what is
+  still off its target, not the gap the finger skipped.
 - The root hook is gated, not opportunistic: the file version of `StartUI_.dll`
   must be exactly `10.0.22621.3733` **and** the target prologue plus its `E8`
   call target must match. Anything else logs one line

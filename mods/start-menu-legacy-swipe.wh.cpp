@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.33.0
+// @version         0.34.0
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -394,19 +394,49 @@ What it does:
   the menu with no candidate, and the menu opened as if the Windows key had been
   pressed. A contact that started while the menu was closed, has already pulled
   24 DIP along the opening axis and finds the menu open under it is therefore
-  adopted: the same pull continues from the panel's live position at the finger
-  (`reveal adopt ...`), never from 0, and a tap is not adopted because it has no
-  travel. EP opens the menu by
+  adopted (`reveal adopt ...`); a tap is not adopted because it has no travel.
+  EP opens the menu by
   itself once the contact passes its own edge threshold. The open transition then
-  runs exactly one of three paths, in this order: a live takeover (a still-down,
+  runs exactly one of four paths, in this order: a live takeover (a still-down,
   moving finger — a candidate is promoted at the open instead of waiting for a
   report it might not get, and a contact without one is adopted), the late
-  release record (the pull already lifted), or the keyboard settle (nothing
-  preceded the open). The suppression test is that actual takeover, never the
+  release record (the pull already lifted), the contested continuation of a close
+  whose Hide already left (the settle starts where the pull had the panel), or
+  the keyboard settle (nothing preceded the open). The suppression test is that
+  actual takeover, never the
   existence of an edge candidate: a contact that was refused (`reason=open`) or
   has not started following must not take the animation away, and the follow
   takes the keyboard settle over from its live position if it does activate. A
   tap on the taskbar keeps the keyboard-style settle, because it has not moved.
+  A live takeover starts at the visible edge and then chases the finger. The
+  shell uncloaks the window 60-250 ms after the pull starts (or after the lift),
+  so a finger that is still down has already travelled 400-600 DIP and the
+  absolute trail mapping reads 0.76-1.00; writing that on the first visible frame
+  made the panel appear already 76-100 % open, the owner's "pause, then snap
+  open". Nothing the finger did through the cloak was displayed, so the takeover
+  starts at `RevealEntryProgress` — the smallest progress whose translated trail
+  edge sits on the work area's edge, i.e. the first progress at which any of the
+  panel is on screen. The entry is written and held for the first presentation
+  (`kRevealEntryHoldMs`, 30 ms, two frames at 60 fps), so the first visible frame
+  is the edge itself; then every report moves the visible position toward the
+  absolute mapped position at `kSettleSpeedDipPerMs` (2.2 DIP/ms) and never
+  past it: `visible += clamp(mapped - visible, -rate*dt, +rate*dt)`. That is the
+  speed every keyboard open and settle already uses, so a catch-up is the panel
+  opening at the system's own speed, and the cost is time: a 600 DIP gap closes in
+  ~303 ms (30 ms hold + 273 ms), a 100 DIP gap in ~75 ms, after which the chase
+  keeps up with any finger and the panel is glued. An earlier fixed subtraction
+  (`mapped - offset`) was rejected: it left the panel permanently behind and
+  unable to pass `1 - offset`,
+  so a finger at 450-560 DIP of travel held it at 0.25-0.27. The chase does not
+  touch the measurements: `travel`, the commit test, `max=` and the end-speed
+  window keep the finger's real motion, and only the written position is
+  rate-limited. A panel that was already on screen above the entry (a pull that
+  cancels a close takes the live retract over) starts at its live value, so the
+  chase begins from where it is. The takeover line prints the visible start and
+  the gap it inherited (`reveal takeover from=... offset=...`), and the release
+  line prints the visible progress, the gap still open (`behind=` in progress
+  units) and that inherited gap
+  (`open follow ... progress=... behind=... offset=...`).
   A fast pull can also lift before the shell opens the menu (measured: 107-251 ms
   later on this machine); then there is no contact left to adopt. The release keeps
   its facts for 300 ms — the travel,
@@ -415,7 +445,10 @@ What it does:
   closed-to-open path consumes them before the keyboard settle: the ordinary
   settle starts at the position the panel actually shows and at the recorded
   speed (`reveal adopt late ...`), and the record is cleared, so one release is
-  consumed once. The start is `TakeProgressNow()`, which is the off-screen rest
+  consumed once. That settle is not the follow: it keeps starting at 0 because it
+  spends time crossing the hidden travel without a finger to spend, while the
+  follow spends the finger's travel and must therefore start at the entry. The
+  start is `TakeProgressNow()`, which is the off-screen rest
   while the menu is hidden: no animation and no follow runs through a cloak, so
   the mapped position was never on screen, and starting there made the panel
   appear already open (measured: `pos=0.60`, a start at 0.60 while the
@@ -494,11 +527,14 @@ What it does:
   far screen edge minus the travel, so `Progress` still reads 0 at the taskbar
   edge and 1 at the far one on either side, and the log says
   `reveal panelTrail=... (fallback)`.
-  The panel edge therefore meets the finger at every sample, and the
-  panel is exactly off screen at the screen edge (Progress 0.269 for a 1052 DIP
-  trail on a 1440 DIP root). That mapping drives the visual only. The release
-  decision mirrors the dismiss path: it judges the travel away from the edge at
-  release, `(finger - edgeStart) * openingSign` clamped at 0, where
+  The mapped position therefore places the panel's edge under the finger at every
+  sample, and the panel is exactly off screen at the screen edge (Progress 0.269
+  for a 1052 DIP trail on a 1440 DIP root). That mapping is the target, not the
+  written value: the live takeover starts at the visible entry and then chases
+  `mapped` at the planner's rate (see above), so the panel meets the finger and
+  stays glued instead of trailing it by a constant. The
+  release decision mirrors the dismiss path: it judges the travel away from the
+  edge at release, `(finger - edgeStart) * openingSign` clamped at 0, where
   `openingSign` is +1 for a left or top taskbar and -1 for right or bottom. A
   release past 20% of `Distance`, or one whose session-average velocity
   `travel / max(elapsed, 1)` exceeds 0.45 DIP/ms, settles `Progress` to 1 with
@@ -513,8 +549,12 @@ What it does:
   stays 0; a later
   open restores it, unless an edge contact is already driving that open. Pulling
   out and pushing back therefore cancels, as it does inside the open menu. The
-  line `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`
-  is written once per reveal; the cancel adds `close tap kind=reveal delay=0`,
+  line `open follow travel=... max=... progress=... behind=... offset=... vel=...
+  commit=... panel=... n=...` is written once per reveal: `progress` is the last
+  chased value, `behind` the gap to the finger's mapped position still open at the
+  release (progress units), `offset` the gap the takeover inherited, and
+  `travel`/`max` the finger's real motion. The cancel adds
+  `close tap kind=reveal delay=0`,
   or `close tap dropped kind=reveal` when a new pull is already there at the tap.
 - A close owns `Progress` the same way from either family. A gesture close
   arrives from its release; a keyboard close arrives through the bridge while the
@@ -538,7 +578,15 @@ What it does:
   while the close was in flight. For the same window a contact on the edge counts
   as a new reveal attempt even while the window still reports open: otherwise the
   down was read as a drag of the settling panel, which stopped the settle and
-  restored `Progress = 1` on the first sample.
+  restored `Progress = 1` on the first sample. That window is not an open panel
+  for adoption either: a contact that lands during the retract records
+  `startedOpen = 0` (`g_suppressRestoreUntil` still ahead), so a pull whose first
+  point misses the band is adopted from its own down point once it has travelled
+  `kAdoptTravelDip`, instead of staying inert while the tap hides the menu. The
+  armed tap is dropped on that first report, not at its deadline, and the panel is
+  brought back from the close's live position (an open settle from where it is),
+  because a menu that stays open at `Progress` 0 has no pane; a pull overwrites
+  that value on its first sample and the follow continues from there.
 - The candidate path polls the cloaked attribute at most once per 20 ms; the
   cached answer is dropped on every lift, so each contact starts from a fresh
   query.
@@ -570,9 +618,40 @@ What it does:
   than its 800 ms window, means a keyboard close and takes the keyboard lead.
 - A new edge pull during the settle cancels the close before the shell is
   touched: the tap is dropped and the pull keeps driving the panel, so no Hide
-  runs and the toggle is never advanced. The pull generation is sampled at the
-  release and checked once when the tap would run; the drop overrides the stamp
-  with the cancelled kind, so a later keyboard close uses its own lead.
+  runs and the toggle is never advanced. The drop happens on the contact's first
+  report, whatever its point, because the band test only admits a candidate and a
+  pull whose first point lands above the band would otherwise let the tap fire;
+  the pull generation sampled at the release and checked once when the tap would
+  run stays as the second line of defence. The drop overrides the stamp with the
+  cancelled kind, so a later keyboard close uses its own lead.
+- A close whose tap already fired is not cancellable: the Hide is in the shell or
+  in the bridge's hand, and the menu may go away under a pull that took the panel
+  back. The reopen that follows is then that pull coming back, not a new open.
+  `ActivateRevealFollow` marks the close contested when it activates inside the
+  suppression window, and the reveal's commit release stamps the ticket
+  (`g_contestedReleaseQpc`). `PollRootVisibility` consumes the one-release,
+  300 ms ticket at the next open and settles from the panel's live position
+  (`win open continued from=... dur=...`) instead of starting the keyboard settle
+  from 0, so one pull produces one motion up and the panel is never rewound. A
+  panel the close already took to the hidden rest has nothing to continue, and
+  that open settles from 0 exactly as before. The next close clears the ticket.
+- The uncloaked window and the hidden panel are one state, and no path may leave
+  it standing. A close whose Hide landed, or a reopen whose settle never ran,
+  leaves the window shown with `Progress` 0: nothing of the menu is on screen
+  while `StartWindowIsOpen()` says it is open, so every pull is refused
+  `reason=open` and the band-tail mute silences the rest — the dead menu. The
+  visibility poll owns the pair: once the close's suppression has ended and no
+  settle, coast, follow or dismiss drag moves the panel, an off-screen panel is
+  logged (`win open unhealed progress=...`) and settled back up from its live
+  position. The band admission applies the same reading: `reason=open` refuses
+  only a panel at rest, and a pull that lands while the window is shown with the
+  panel anywhere else is admitted as the reveal (`reason=unhealed`), so repeated
+  pulls cannot all be muted. This poll reads the live position with
+  `PeekProgressNow`, never `TakeProgressNow`: it is also where the late-release
+  settle starts, and taking that settle at its first millisecond pinned the hidden
+  rest and was the dead state's cause (measured:
+  `progress take settle at=0.000 elapsed=0 caller=contested` right after
+  `reveal adopt late`).
 - The batch observer is optional; the close is not. A close arms its tap and
   publishes its plan before the batch registration resolves, so a registration
   that loses its serial (a reset or a take-over replaced the animation) or throws
@@ -789,16 +868,31 @@ Diagnostics:
   from the one projection the spring scales;
   `frames` counts keyframes, so the segment count is one
   less),
-  `win open dur=...`, `win open restore (no geometry)`, `win close observed`,
+  `win open dur=...`, `win open restore (no geometry)`,
+  `win open continued from=... dur=...` (the reopen of a close a pull contested:
+  the settle continues from the panel's live position, the close's own settle
+  value, and is not the keyboard settle from 0),
+  `win open unhealed progress=...` (the visibility poll found the window shown
+  with the panel off it and no motion; it is logged once per second while the
+  pair stands, immediately before the settle that brings the panel back),
+  `progress take settle at=... elapsed=... dur=... caller=...` (a settle taken
+  below 5 %, naming the caller; the dead open's fingerprint),
+  `win close observed`,
   `close tap kind=dismiss|reveal delay=...`,
-  `close tap dropped kind=dismiss|reveal`,
+  `close tap dropped kind=dismiss|reveal` (now written on the new contact's first
+  report during a close as well as at the tap's deadline),
   `close tap skipped kind=... (already closed)`,
   `close observer lost kind=dismiss` (the settle runs and its tap is armed; only
   the batch observer is gone),
   `close abandoned kind=dismiss|reveal` (no settle started, so the panel was put
   back and nothing was armed),
   `close mode stamp failed kind=...`, `close mode cancel stamp failed`,
-  `open follow travel=... max=... progress=... vel=... commit=... panel=... n=...`,
+  `open follow travel=... max=... progress=... behind=... offset=... vel=...
+  commit=... panel=... n=...` (`progress` is the last chased visible value,
+  `behind` the gap to the finger's mapped position still open at the release in
+  progress units, `offset` the gap the takeover inherited (both in progress
+  units), `travel`/`max` the finger's real motion, and `vel` the end speed toward
+  the settle's target),
   `reveal panelTrail=... axis=... rect=...,...,...,... work=...,...,...,...
   band=...,... gen=...`
   (once per open from the open-time turn, and again whenever the value moved by
@@ -859,13 +953,24 @@ Diagnostics:
   that started in the reveal band and is moving away from the taskbar is the tail
   of the pull that opened the menu: it is not a drag of the open panel, and its
   release settles nothing,
-  `reveal admit x=... y=... axis=... band=...,... ok=... reason=...` once per
-  contact that lands in the reveal band: `ok=1 reason=admitted`, or the test that
-  refused it (`renderer`, `layout`, `distance`, `open`); a contact outside the
+  `reveal admit x=... y=... axis=... band=...,... ok=... reason=... progress=...
+  restore=...` once per contact that lands in the reveal band: `ok=1
+  reason=admitted`, or the test that refused it (`renderer`, `layout`,
+  `distance`, `open`); `progress` is the live position read without taking it and
+  `restore` is the restore the state owes, so a refusal at rest reads
+  `progress=1.000` and a refusal with the panel off the window would be visible
+  as `reason=open progress=0...`; `reason=unhealed` is the admitted pull that
+  lands on the shown window whose panel is not at rest; a contact outside the
   band stays silent, as it was,
   `reveal adopt x=... y=... travel=... axis=... band=...,... gen=...` when the
   menu opened under a live pull that had no candidate and that contact took the
   follow over,
+  `reveal takeover from=... offset=...` when a live follow takes `Progress` over:
+  `from` is the position the panel shows at that instant (the entry, the smallest
+  progress at which any of it is on screen, while the shell's window was cloaked;
+  the live position when it was already above the entry) and `offset` is the gap
+  it inherited, `mapped_at_activation - from`, which the chase closes at the
+  planner's rate; it is not subtracted from later samples,
   `reveal adopt late travel=... vel=... age=... gen=... from=... pos=...` when
   the pull lifted before the menu opened and the closed-to-open path consumed the
   release record: the settle starts at `from` — the position the panel actually
@@ -1117,7 +1222,8 @@ Known risks:
  *   from `Wh_ModInit` before any hook, channel or thread exists, and a pin that
  *   succeeded stays for the process lifetime while nothing else acts.
  *   One per-activation reset (`ResetActivationState`) clears the tracked contact,
- *   the contact latch, both gesture sessions, the close mute, the deferred-layout
+ *   the contact latch, both gesture sessions, the close mute, the contested
+ *   close's ticket, the deferred-layout
  *   flag, the pending tap and its pull generation, the coast and the debug
  *   overrides; it
  *   runs before the input thread exists and on that thread as it stops, so a
@@ -1201,7 +1307,9 @@ Known risks:
  *   60 ms before the release when the stream paused just before the lift. The
  *   window itself is replayed from the contact's last eight positioned reports
  *   when the follow takes the panel over, so a menu that opens one or two reports
- *   before the lift is still measured instead of starting from one sample. The
+ *   before the lift is still measured instead of starting from one sample; the
+ *   replay holds the mapped series, never the chased one: the end speed belongs
+ *   to the finger, and the chase moves at the planner's rate. The
  *   same replay measures a pull that lifts before the open: its travel, mapped
  *   position and end speed wait in one `RevealLateRelease` record for 300 ms and
  *   the closed-to-open path starts the settle at the position the panel actually
@@ -1214,9 +1322,29 @@ Known risks:
  *   pull, its consumption or its window — never by a bare down, because the
  *   contact that arrives first cannot be the pull that opened the menu. The open
  *   transition itself runs exactly one of a live takeover (a candidate promoted at
- *   the open, or a contact adopted from its down point), the late record, or the
- *   keyboard settle, in that order; only an actual takeover suppresses the settle,
- *   so a refused or not-yet-following contact cannot leave the open unanimated. A
+ *   the open, or a contact adopted from its down point), the late record, the
+ *   contested continuation, or the keyboard settle, in that order; only an actual
+ *   takeover suppresses the settle,
+ *   so a refused or not-yet-following contact cannot leave the open unanimated.
+ *   The contested continuation is the reopen of a close whose Hide already left
+ *   under a pull that had taken the panel back: it settles from the panel's live
+ *   position at the commit release instead of replaying from 0, and a panel the
+ *   close took to the hidden rest settles from 0 as before.
+ *   The live takeover starts at the visible edge and chases the finger: it begins
+ *   at `RevealEntryProgress` (the smallest progress whose translated trail edge
+ *   sits on the work area's edge), holds it for the first presentation
+ *   (`kRevealEntryHoldMs`, 30 ms) so the first visible frame is the edge, and
+ *   then moves the visible position toward the absolute mapped position at
+ *   `kSettleSpeedDipPerMs` (2.2 DIP/ms, the planner's own speed) without passing
+ *   it, so a finger that already travelled 400-600 DIP through the cloak starts
+ *   the panel exactly at the screen edge and closes the gap in
+ *   30 + 600/2.2 ≈ 303 ms instead of appearing 76-100 % open
+ *   (`reveal takeover from=... offset=...`, and `behind=` on the release line).
+ *   The entry, not 0: a settle spends time on the hidden travel,
+ *   a follow spends the finger's travel, and starting at 0 left the panel one
+ *   hidden travel behind the finger. A
+ *   constant subtraction was rejected because it left the panel permanently
+ *   short (0.25-0.27 at 450-560 DIP of finger travel). A
  *   contact that starts in the reveal band while the menu is open and moves away
  *   from the taskbar is that pull's tail: it takes neither `Progress` nor a settle
  *   (`dismiss skipped band tail`), and it becomes a dismiss once it reverses. A
@@ -1275,18 +1403,30 @@ Known risks:
  *   0-to-1 settle from rest for a closed-to-open transition no reveal owns, with
  *   the same curve and the travel-planned duration a gesture open uses, plus a
  *   `win close observed` line when the shell hides the window by
- *   itself; a 1 ms timer period (timeBeginPeriod/timeEndPeriod) held exactly
+ *   itself; a reopen that follows a close a pull contested continues that
+ *   panel's live position (`win open continued from=... dur=...`) instead of
+ *   replaying the open from 0, one release-wide ticket per close; a 1 ms timer
+ *   period (timeBeginPeriod/timeEndPeriod) held exactly
  *   while a contact is down and one 5 ms high-resolution idle tick that detects
  *   the release; a suppression window, at most 600 ms, after either close in
- *   which a closed-to-open report does not restore `Progress` and an edge
- *   contact starts a new reveal rather than a drag of the settling panel; the
- *   window ends as soon as the shell reports the window cloaked; the
+ *   which a closed-to-open report does not restore `Progress`, an edge
+ *   contact starts a new reveal rather than a drag of the settling panel, a
+ *   contact that lands anywhere drops the close's armed tap and brings the panel
+ *   back from its live position, and the contact is adoptable from its own down
+ *   point (`startedOpen` is 0 while the close is in flight); the
+ *   window ends as soon as the shell reports the window cloaked; the unhealed
+ *   check, which settles a shown window's panel back up from its live position
+ *   when no motion owns it and no close is in flight (`win open unhealed
+ *   progress=...`), and the band admission's `reason=open` restricted to a panel
+ *   at rest, so a pull on the shown window whose panel is off it is admitted as
+ *   the reveal (`reason=unhealed`) instead of being muted; the
  *   always-installed animation hook, which passes every request through unless
  *   the `anim=0` debug command suppresses the open request (type 0; never by
  *   default, because dropping it leaves the pane undrawn) while
- *   the close request (type 1) always passes through; four debug commands
- *   (`p`, `t`, `e`, `anim`) that apply a Progress value, the XAML translation,
- *   the visual offset or the animation mode, and the
+ *   the close request (type 1) always passes through; five debug commands
+ *   (`p`, `t`, `e`, `anim`, `state`) that apply a Progress value, the XAML
+ *   translation, the visual offset or the animation mode, or log the window's
+ *   cloak state and the live position without changing either, and the
  *   answer to the bridge's retract request (its planned duration, or the
  *   no-settle sentinel) published on the same channel the moment the requested
  *   settle starts, so the bridge can hold the shell's Hide for exactly that
@@ -1294,13 +1434,21 @@ Known risks:
  * [POS]: input and gesture layer of the legacy Start mod. It replaces the XAML
  *   pointer and DirectManipulation paths with raw HID decoding, owns two
  *   gestures (the dismiss drag inside the open menu and the reveal follow that
- *   takes the menu's own open over from the taskbar band and pins the panel's
- *   trailing edge to the finger, admitting a contact on the down, promoting a
- *   still-down candidate or adopting a contact when the menu opens under an
- *   already moving pull, consuming the release record of a pull that lifted a
- *   frame before the open (its settle starts at the panel's live position, the
- *   off-screen rest, never at the record's mapped position), and muting the
- *   band-tail contact that is not a drag of
+ *   takes the menu's own open over from the taskbar band, starts at the visible
+ *   edge and chases the finger's absolute position at the planner's rate so the
+ *   panel meets it and stays glued, admitting a contact on the down,
+ *   promoting a still-down candidate or adopting a contact when the menu opens
+ *   under an already moving pull, cancelling a close's armed tap and bringing
+ *   the panel back when a contact lands during the retract, continuing the panel
+ *   at the reopen of a close a pull already animated (`win open continued`)
+ *   instead of replaying the open from 0, healing the shown window whose panel
+ *   is off it (`win open unhealed`) and admitting a pull there as the reveal
+ *   instead of refusing it at `reason=open`, consuming the release record of a
+ *   pull
+ *   that
+ *   lifted a frame before the open (its settle starts at the panel's live
+ *   position, the off-screen rest, never at the record's mapped position), and
+ *   muting the band-tail contact that is not a drag of
  *   the opening menu), and re-reads the taskbar
  *   edge behind both on
  *   every open and on every work-area broadcast. Every sample takes one
@@ -1789,6 +1937,17 @@ constexpr float kCoastMaxVelocityDip = 6.0f;
 // The reveal maps Progress from the panel edge the snapshot carries; for the
 // first 50 ms of a follow that mapping is still settling.
 constexpr uint64_t kRevealCoastSettleMs = 50;
+// The live follow chases the finger's absolute position at `kSettleSpeedDipPerMs`
+// (2.2 DIP/ms, the planner's own speed). A step is bounded by that speed times the
+// time since the last report; this cap only keeps a stalled thread from turning
+// the bound into a jump, and it is longer than the 18 ms idle that ends a contact.
+constexpr uint64_t kRevealChaseMaxStepMs = 50;
+// The entry is the first visible position, so it is written and then held for the
+// first presentation (two frames at 60 fps) before the chase clock starts. Without
+// that beat the chase's own first steps are already 40-90 px up when the first
+// frame after the uncloak is composited, and the panel appears a few percent open
+// instead of exactly at the edge. It costs the catch-up that much extra time.
+constexpr uint64_t kRevealEntryHoldMs = 30;
 // The coast start/stop lines measured the coast; off in the shipping build.
 constexpr bool g_debugCoast = false;
 // The `vel window` and `follow`/`take` lines print the release-speed window one
@@ -2414,6 +2573,9 @@ bool RendererReady() {
 // Diagnostics for a dismiss that did not start: one line per second, not per
 // report, because a deferred scroll produces a sample every ~6 ms.
 uint64_t g_skipLogTick = 0;
+// The unhealed-open diagnostic: the window is uncloaked with the panel off it,
+// and no animation owns Progress. Once per second while it stands.
+uint64_t g_unhealedLogTick = 0;
 std::atomic<int64_t> g_winRectDip[4]{};  // left, top, right, bottom
 
 // ---------------------------------------------------------------------------
@@ -2769,6 +2931,10 @@ SwipeIpcChannel g_ipc;
 // kind for its log line.
 const wchar_t* CloseKindName(CloseKind kind);
 
+// Defined with the cloaked-window cache below; the debug `state` command reads
+// the window's cloak state on demand.
+bool StartWindowIsOpen();
+
 // ---------------------------------------------------------------------------
 // Composition helpers
 // ---------------------------------------------------------------------------
@@ -3065,7 +3231,7 @@ float SettleValueAt(uint64_t qpcNow) {
 // panel that is standing still where its last frame left it. With nothing
 // recorded nothing animates, so the base value is a real position and the answer
 // is the resting value.
-float TakeProgressNow() {
+float TakeProgressNow(const wchar_t* caller) {
     const uint64_t qpcNow = QpcMsNow();
 
     std::lock_guard lock(g_compositionMutex);
@@ -3091,6 +3257,16 @@ float TakeProgressNow() {
     const float value =
         std::clamp(coasting ? CoastValueAt(qpcNow) : SettleValueAt(qpcNow),
                    0.0f, 1.0f);
+    // A settle taken over at its very start is the shape of a dead open: the
+    // animation that should lift the panel is stopped a few milliseconds in and
+    // the hidden rest is pinned as the base. Rare and diagnostic.
+    if (settling && value < 0.05f) {
+        const uint64_t elapsed =
+            qpcNow > g_settleStartQpc ? qpcNow - g_settleStartQpc : 0;
+        FileLog(L"progress take settle at=%.3f elapsed=%llu dur=%llu caller=%s",
+                value, static_cast<unsigned long long>(elapsed),
+                static_cast<unsigned long long>(g_settleDurationMs), caller);
+    }
     try {
         g_state.StopAnimation(L"Progress");
         g_state.InsertScalar(L"Progress", value);
@@ -3112,6 +3288,67 @@ float TakeProgressNow() {
     RevokeDismissBatchLocked();
     InvalidateDismissBatchLocked();
     return value;
+}
+
+// Where the panel really shows at this instant, for a settle that starts from the
+// recorded base. The only value `TakeProgressNow` answers while nothing animates
+// is that base. At the first interaction of a process the base is the open rest
+// (1), which a hidden panel never showed: the shell's window is cloaked and no
+// follow and no settle ran through the cloak, so the compositor held the
+// off-screen rest. That case therefore answers 0, and a hidden panel's only
+// visible value is the off-screen rest. A panel that was already on screen is
+// answered by its live position as it is: the caller refuses the paths where a
+// close still owns the animation, and at the first millisecond of a retract the
+// live value is already below the rest.
+//
+// This is the settle rule, not the follow rule. A settle may start below the
+// screen edge because it spends time crossing that hidden travel without the
+// finger; a follow spends the finger's travel, so it starts at
+// `RevealEntryProgress` and then closes the gap at the planner's rate, so it
+// pays in catch-up time instead of leaving the panel behind forever.
+float TakeVisibleProgressNow(const wchar_t* caller = L"visible") {
+    const float live = TakeProgressNow(caller);
+    return live >= 1.0f ? 0.0f : live;
+}
+
+// The same answer as `TakeProgressNow`, without taking it. A diagnostic and the
+// refusal test read the live position while a settle or a coast may still own it,
+// so this must not stop the motion or pin a new base: it only evaluates the same
+// curve the compositor was handed. With nothing recorded, the base value is the
+// position. Callers hold no lock; the composition lock is taken here.
+float PeekProgressNow() {
+    const uint64_t qpcNow = QpcMsNow();
+    std::lock_guard lock(g_compositionMutex);
+    if (!g_state) {
+        return kProgressRest;
+    }
+    const bool coasting = g_coasting.load(std::memory_order_relaxed);
+    const bool settling = g_settleFrames >= 2 && g_settleDurationMs != 0;
+    if (!coasting && !settling) {
+        return std::clamp(g_progressNow.load(std::memory_order_relaxed), 0.0f,
+                          1.0f);
+    }
+    return std::clamp(coasting ? CoastValueAt(qpcNow) : SettleValueAt(qpcNow),
+                      0.0f, 1.0f);
+}
+
+// Whether a settle or a coast is still moving `Progress`. The unhealed check needs
+// to tell a panel that is on its way up from one that no animation owns any more.
+// A completed settle keeps its recorded samples until the next take, so the
+// elapsed time, not the record's presence, is what says whether it is still
+// running: a landed curve is not motion.
+bool ProgressMotionActive() {
+    std::lock_guard lock(g_compositionMutex);
+    if (g_coasting.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    if (g_settleFrames < 2 || g_settleDurationMs == 0) {
+        return false;
+    }
+    const uint64_t qpcNow = QpcMsNow();
+    const uint64_t elapsed =
+        qpcNow > g_settleStartQpc ? qpcNow - g_settleStartQpc : 0;
+    return elapsed < g_settleDurationMs;
 }
 
 // Starts the continuation between reports. This is deliberately not
@@ -3915,6 +4152,24 @@ void ApplyDebugLine(const char* line) {
         return;
     }
 
+    // A one-shot state line for a measurement harness: the window's cloak state,
+    // the live Progress, whether a settle or coast is moving it, and the restore
+    // the state owes. It only reads (PeekProgressNow never stops an animation),
+    // so a probe cannot change what it measures.
+    if (std::strncmp(line, "state", 5) == 0) {
+        const char* rest = line + 5;
+        while (*rest == ' ' || *rest == '\t' || *rest == '\r') {
+            ++rest;
+        }
+        if (*rest == '\0') {
+            FileLog(L"state open=%d progress=%.3f motion=%d restore=%d",
+                    StartWindowIsOpen() ? 1 : 0, PeekProgressNow(),
+                    ProgressMotionActive() ? 1 : 0,
+                    g_commitNeedsProgressReset ? 1 : 0);
+            return;
+        }
+    }
+
     // anim=0 drops the shell's own open storyboard, anim=1 restores it. The
     // switch is its own command word, so it is matched before the one-letter
     // commands and their `letter=value` shape.
@@ -4080,7 +4335,7 @@ void ApplyRetractRequest() {
     // keyboard close during the open settle would otherwise start this retract
     // from 1.0 and the panel would jump to fully open before it slid out. The
     // take stops the old animation and pins the value it answers.
-    const float from = TakeProgressNow();
+    const float from = TakeProgressNow(L"retract");
     // The keyboard close has no release speed of its own, so it settles from
     // rest: the plain step response of the selected spring.
     std::chrono::milliseconds duration{0};
@@ -4868,14 +5123,19 @@ HidGestureSession g_hidSession;  // input thread only
 // rest, Progress 0 slides it out by Distance. `panelTrail` is the panel edge in
 // absolute screen DIP that the finger meets: the reveal is
 // Progress = 1 - (finger - panelTrail) / (dir * distance), so the panel's
-// trailing edge sits under the finger at every sample and Progress no longer
-// depends on when the menu was seen opening. That mapping is visual only.
+// trailing edge would sit under the finger at every sample and the value no
+// longer depends on when the menu was seen opening. That mapping is the target
+// the follow chases, not the value it writes: `visible` moves toward it at
+// `kSettleSpeedDipPerMs` and never past it, so a finger that was already at
+// 0.9 when the menu opened is met within a fraction of a second instead of
+// leaving the panel permanently short. `target` keeps the last mapped value for
+// the `behind=` diagnostic.
 // `travel` is the decision quantity: the distance the finger moved away from
 // the taskbar edge since the touch began, clamped at 0, so pulling out and back
 // reads 0 at release. `maxTravel` is the furthest it got; the log shows it.
-// `progress` is the last computed value, `lastInserted` the last one that
-// reached the property set, so the 0.5 DIP change filter compares against what
-// the renderer actually shows.
+// `progress` is the last visible value the chase produced, `lastInserted` the
+// last one that reached the property set, so the 0.5 DIP change filter compares
+// against what the renderer actually shows.
 struct HidRevealSession {
     bool edgeCandidate = false;
     bool active = false;
@@ -4886,6 +5146,18 @@ struct HidRevealSession {
     float travel = 0.0f;
     float maxTravel = 0.0f;
     float progress = 0.0f;
+    // The chased position written to Progress, and the finger's absolute mapped
+    // position it moves toward. The difference is the catch-up left, logged as
+    // `behind=` at the release.
+    float visible = 0.0f;
+    float target = 0.0f;
+    // The gap the follow inherited at its takeover (mapped_at_activation - the
+    // visible entry): the distance the chase has to close. Logged as `offset=`.
+    float activationGap = 0.0f;
+    // When the last chase step ran. The step is bounded by
+    // kSettleSpeedDipPerMs * (now - chaseQpc), so the bound is a speed, not a
+    // per-report distance.
+    uint64_t chaseQpc = 0;
     float lastInserted = 1.0f;
     int samples = 0;
     uint64_t startTick = 0;
@@ -5040,6 +5312,15 @@ float g_screenDipHeight = 0.0f;  // input thread only
 // value of 0, so BeginHidSession restores the resting value first.
 bool g_commitNeedsProgressReset = false;  // input thread only
 bool g_rootWasOpen = false;              // input thread only
+// A reveal follow that took the panel back while a close was in flight. The
+// close's Hide is not cancellable (its tap already fired or the bridge already
+// holds it), so the menu can still go away under that follow. The reopen that
+// follows is then the same pull coming back: it must continue the panel the
+// pull reached instead of replaying the open from 0. `g_contestedReleaseQpc`
+// is the commit release that ended the follow (0 while the contact is down),
+// so the ticket covers one release and expires with kLateRevealWindowMs.
+bool g_closeContested = false;      // input thread only
+uint64_t g_contestedReleaseQpc = 0;  // input thread only, QPC
 uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
 // The edge line was a measurement instrument: it is off in the shipping build.
 constexpr bool g_debugEdge = false;
@@ -5071,6 +5352,12 @@ constexpr bool g_debugEdge = false;
 void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     g_suppressRestoreUntil.store(tickMs + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
+
+    // This close supersedes any earlier one, including a contested open that
+    // never arrived: its ticket names one reopen, and a new close decides the
+    // menu again.
+    g_closeContested = false;
+    g_contestedReleaseQpc = 0;
 
     // The mute belongs to the contact, not to the session that happened to own
     // it. Read the latch and both owners before either is cleared: a keyboard
@@ -5359,10 +5646,13 @@ void ResetActivationState() {
 
     g_commitNeedsProgressReset = false;
     g_rootWasOpen = false;
+    g_closeContested = false;
+    g_contestedReleaseQpc = 0;
     g_openCheckValid = false;
     g_openCheckOpen = false;
     g_lastOpenCheckTick = 0;
     g_skipLogTick = 0;
+    g_unhealedLogTick = 0;
     g_edgeLogTick = 0;
     g_scrollerRejectLogTick = 0;
     g_bandTailLogTick = 0;
@@ -5559,6 +5849,39 @@ float FallbackTrailDip(int32_t axis, float distance) {
     return distance;
 }
 
+// The smallest `Progress` at which any of the panel is on screen: the value whose
+// translated trail edge sits on the work area's edge on the side the panel leaves
+// through. The composition moves that edge by `(1 - Progress) * Direction *
+// Distance`, so the answer is `1 - Direction * (edge - trail) / Distance`, and a
+// measured panel's trail comes from the snapshot; without one the fallback trail
+// is defined so the answer is 0, exactly the old behaviour.
+//
+// The live follow starts here, not at the off-screen rest. A settle may start at
+// 0 because it spends time crossing the hidden travel (the 409 ms open crosses
+// it in about 50 ms), but a follow spends the finger's own travel: starting at 0
+// made the panel one hidden travel behind the finger for the whole gesture
+// one hidden travel behind the finger. Starting at the entry puts the first
+// visible frame exactly on the screen edge, and the lag is then only the travel
+// the cloak hid. The work area, not the monitor, is the boundary: a docked bar's
+// strip is where the panel stops being visible, and a hidden bar reserves
+// nothing, so the two agree on this machine.
+float RevealEntryProgress(const GestureGeometry& geometry) {
+    const float distance = geometry.distance();
+    if (!(distance > 0.0f)) {
+        return 0.0f;
+    }
+    const int32_t axis = geometry.axis();
+    const float direction = AxisDirection(axis);
+    const float trail = geometry.panel ? GeometryTrailDip(geometry)
+                                       : FallbackTrailDip(axis, distance);
+    const bool horizontal = IsHorizontalAxis(axis);
+    const float edge =
+        direction > 0.0f
+            ? (horizontal ? geometry.layout.workRight : geometry.layout.workBottom)
+            : (horizontal ? geometry.layout.workLeft : geometry.layout.workTop);
+    return std::clamp(1.0f - direction * (edge - trail) / distance, 0.0f, 1.0f);
+}
+
 // Whether a press belongs to the panel. The measured rectangle decides it, with
 // the 2 DIP the rect's own border needs. A panel that was never measured cannot
 // place a press, so it does not reject one: the window test and the gesture's own
@@ -5749,11 +6072,15 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     }
 }
 
-// The panel position the finger asks for: the panel's trailing edge meets the
-// finger, in absolute screen DIP on both sides so the value does not depend on
-// where the finger was when the menu was first seen open. One mapping for the
-// follow's samples and for the window replayed out of the contact's own reports,
-// so the two series cannot disagree about where the panel is.
+// The absolute panel position the finger asks for: the panel's trailing edge
+// would meet the finger there, in absolute screen DIP on both sides, so the value
+// does not depend on where the finger was when the menu was first seen open. One
+// mapping for the follow's samples and for the window replayed out of the
+// contact's own reports, so the two series cannot disagree about where the
+// finger is. A live takeover starts at the visible entry and then chases this
+// value at the planner's rate, so the part of it that happened while the menu
+// was cloaked is closed over time instead of being skipped or subtracted;
+// travel, commit and the speed window keep reading the mapped value as it is.
 float RevealProgressDip(const GestureGeometry& geometry, float distance, float x,
                         float y, float& panelTrailOut) {
     const int32_t axis = geometry.axis();
@@ -5774,10 +6101,9 @@ float RevealProgressDip(const GestureGeometry& geometry, float distance, float x
 // Rebuilds the release-speed window from the contact's own positioned reports.
 // Used at a takeover and at a release that ended before the menu opened, so both
 // measure the finger from the same history through the same trail mapping. The
-// replayed value is the mapped position the panel shows as soon as the follow
-// drives it, so the series is continuous with the first inserted sample; a finger
-// that rested before the open repeats one value and the window stays flat, which
-// is what a hold must report.
+// window holds the *mapped* series, never the chased visible one: the end speed
+// belongs to the finger, and the chase deliberately moves at the planner's rate
+// instead of the finger's.
 void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
     ResetEndVelocity();
     float ignoredTrail = 0.0f;
@@ -5794,7 +6120,36 @@ void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
 // is taken, never the animation's target; the trail mapping is read from this
 // snapshot and every later report drives Progress from the finger. One place, so
 // the admission's first sample and the adoption's first sample cannot differ.
-bool ActivateRevealFollow(const GestureGeometry& geometry, uint64_t sampleQpc) {
+//
+// The follow starts where the panel becomes visible and then chases the finger.
+// The shell uncloaks the menu 60-250 ms after the pull starts (or after the
+// lift), so a finger that is still down has travelled 400-600 DIP by then and the
+// absolute mapping reads 0.76-1.00. Writing that on the first visible frame made
+// the panel appear already 76-100 % open — the owner's "pause, then snap open" —
+// and subtracting the difference as a constant made it trail the finger forever
+// and stop short of full (measured: 0.25-0.27 while the finger was 450-560 DIP
+// out). So the start is `RevealEntryProgress`, the smallest progress at which the
+// panel's trail edge sits on the work area's edge, and from there `DriveRevealFollow`
+// moves the visible position toward the mapped one at the planner's rate:
+//
+//     step    = clamp(mapped - visible, -rate * dt, +rate * dt)
+//     visible = clamp(visible + step, 0, 1)
+//
+// A settle may start at 0 because it spends time crossing the hidden travel; a
+// follow spends the finger's travel, so it starts at the entry and then closes
+// the gap at 2.2 DIP/ms — the speed every keyboard open and settle already uses,
+// so the catch-up is the panel opening at the system's own speed, not a new
+// mechanism. A 600 DIP gap closes in ~303 ms (30 ms hold + 273 ms) and a 100 DIP
+// gap in ~75 ms, and from then on the panel is glued to the finger (a finger
+// moves at 0.5-5 DIP/ms).
+//
+// The trail mapping still measures the finger for `travel`, the commit test,
+// `max=` and the end-speed window; only the value written to Progress chases. A
+// panel that was already on screen (a pull that cancels a close makes the follow
+// take a live retract over) starts at its live value, so the chase begins from
+// where it is.
+bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
+                          uint64_t sampleQpc, uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
     const float distance = geometry.distance();
     if (!(distance > 0.0f)) {
@@ -5810,7 +6165,6 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, uint64_t sampleQpc) {
     reveal.distance = distance;
     reveal.progress = 0.0f;
     reveal.samples = 0;
-
     // The mapped progress below (0.269 at the screen edge on this layout)
     // replaces whatever the panel was doing, so the first step of the follow
     // must not become the coast speed, and the window starts at the value the
@@ -5821,12 +6175,22 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, uint64_t sampleQpc) {
     // path: this finger owns the panel now.
     g_lateRelease = RevealLateRelease{};
 
-    // The release window starts at the contact's own reports, not at the
-    // takeover: the shell opens the menu late when the taskbar is auto-hidden
-    // (the pull first reveals the bar), so a takeover one or two reports before
-    // the lift had no window to measure and the settle started from rest while
-    // the finger was moving.
-    SeedRevealEndVelocity(geometry, distance);
+    // A follow that starts while a close is in flight is the pull that took the
+    // panel back from that close. The close's Hide is not cancellable (its tap
+    // may already have fired, or the bridge already holds it), so the menu can
+    // still go away under this follow; the reopen that follows is the same pull
+    // coming back and must continue this panel instead of replaying the open
+    // from 0. One flag per contest, one release of the contest.
+    if (tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+        g_closeContested = true;
+        g_contestedReleaseQpc = 0;
+    }
+
+    float panelTrail = 0.0f;
+    const float mapped =
+        RevealProgressDip(geometry, distance, x, y, panelTrail);
+    reveal.panelTrail = panelTrail;
+    reveal.target = mapped;
 
     // A cancel or dismiss animation from a previous gesture may still own
     // Progress; the follow must drive the scalar from this sample on, and the
@@ -5834,12 +6198,41 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, uint64_t sampleQpc) {
     // writes shows the old animation's target. A close tap that is still ahead
     // is not touched here: it re-checks the pull generation once, so a pull that
     // began first drops the close.
-    reveal.lastInserted = TakeProgressNow();
+    const float entry = RevealEntryProgress(geometry);
+    const float live = TakeProgressNow(L"activate");
+    // A hidden panel's visible value is the entry, never the recorded open rest
+    // (1) of a process that has not shown it yet; a panel already above the entry
+    // keeps its live position, and one below it is off screen, so the entry is
+    // the honest start there too.
+    const float visible = live >= 1.0f ? entry : std::max(live, entry);
+    reveal.visible = visible;
+    reveal.activationGap = mapped - visible;
+    // The chase clock starts after the entry has been held for the first
+    // presentation, so the first visible frame is the edge and not the chase's
+    // first steps. Until then `chaseQpc` lies ahead of the sample time and the
+    // step bound is zero.
+    reveal.chaseQpc = sampleQpc + kRevealEntryHoldMs;
+    // The first frame after this call is the first one that can be composited,
+    // so the visible start is written now. When nothing animated, the base was
+    // already that value and this insert writes the same one; when the base was
+    // the open rest of a process that has not shown the panel yet, it is what
+    // keeps that frame from presenting the panel at rest.
+    InsertProgress(visible);
+    reveal.lastInserted = visible;
+    reveal.progress = visible;
 
-    // Diagnostic: the position the takeover replaces, so a reopen backlash can be
-    // traced to a value left behind or to an animation still running. This is the
-    // pinned value, not the recorded target.
-    FileLog(L"reveal takeover from=%.3f", reveal.lastInserted);
+    // The release window starts at the contact's own reports, not at the
+    // takeover: the shell opens the menu late when the taskbar is auto-hidden
+    // (the pull first reveals the bar), so a takeover one or two reports before
+    // the lift had no window to measure and the settle started from rest while
+    // the finger was moving.
+    SeedRevealEndVelocity(geometry, distance);
+
+    // Diagnostic: where the follow starts and the gap it inherited. The chase
+    // closes that gap at the planner's rate; the line says how much of it there
+    // was, not a value that is subtracted from every insert.
+    FileLog(L"reveal takeover from=%.3f offset=%.3f", visible,
+            reveal.activationGap);
     return true;
 }
 
@@ -5849,6 +6242,27 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, uint64_t sampleQpc) {
 // a dismiss start, not a candidate, unless a close of this mod is still in
 // flight.
 //
+// An armed close tap that must not fire. The slot is cleared here, not left to
+// the deadline: a tap that already passed its due tick but has not run yet still
+// toggles the menu, and the caller has just proved that the user is on the glass
+// again. The cancelled record goes out so the bridge stops treating the close as
+// a tap; the slot's own pull generation is the record's, not the newer pull's.
+bool DropPendingCloseTap() {
+    if (g_pendingTapTick == 0) {
+        return false;
+    }
+    const CloseKind dropped = g_pendingTapKind;
+    const uint32_t pull = g_pendingTapPull;
+    g_pendingTapTick = 0;
+    g_pendingTapKind = CloseKind::None;
+    g_pendingTapPull = 0;
+    if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0, pull)) {
+        FileLog(L"close mode cancel stamp failed");
+    }
+    FileLog(L"close tap dropped kind=%s", CloseKindName(dropped));
+    return true;
+}
+
 // A dismiss that is still settling does not block a candidate: the edge contact
 // during its retract is the pull that can still cancel the close if it began
 // before the tap, and refusing it would let the tap take the menu away under the
@@ -5861,6 +6275,12 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
     const int32_t axis = geometry.axis();
     const float position = AxisScreenPosition(axis, x, y);
     const bool inBand = haveBand && position >= low && position <= high;
+    // The live position and the restore the state owes, for the `reason=open`
+    // refusal: the window reporting itself open is not proof that the menu is
+    // usable, and the two numbers are what tell a healthy refusal from the
+    // unhealed pair (window uncloaked, panel at the hidden rest).
+    const float progress = inBand ? PeekProgressNow() : -1.0f;
+    const bool restoreOwed = g_commitNeedsProgressReset;
 
     // The line speaks once per contact, and only for a contact that landed in
     // the band: a tap anywhere else is not this gesture and stays as quiet as it
@@ -5892,8 +6312,22 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
         const bool closeInFlight =
             tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
         if (!closeInFlight && StartWindowIsOpenThrottled(tickMs)) {
-            reason = L"open";
-            break;
+            // An uncloaked window is not proof that the menu is usable: a close
+            // whose Hide landed, or a settle that died at the hidden rest, leaves
+            // the window shown with the panel translated off it. Only a panel at
+            // rest is a menu this contact must not touch; a panel anywhere else is
+            // the pull's to bring back, so it is admitted as the reveal instead of
+            // being refused and then muted as the band tail.
+            const float distance = geometry.distance();
+            const float live = PeekProgressNow();
+            const bool atRest =
+                distance > 0.0f &&
+                (1.0f - live) * distance < kProgressEpsilonDip;
+            if (atRest) {
+                reason = L"open";
+                break;
+            }
+            reason = L"unhealed";
         }
         StartRevealFollow(x, y, tickMs, tickMs);
         admitted = true;
@@ -5901,9 +6335,9 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
 
     if (inBand) {
         FileLog(L"reveal admit x=%.0f y=%.0f axis=%d band=%.0f,%.0f ok=%d "
-                L"reason=%s",
+                L"reason=%s progress=%.3f restore=%d",
                 x, y, axis, haveBand ? low : -1.0f, haveBand ? high : -1.0f,
-                admitted ? 1 : 0, reason);
+                admitted ? 1 : 0, reason, progress, restoreOwed ? 1 : 0);
     }
     return admitted;
 }
@@ -5924,17 +6358,46 @@ void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
     reveal.maxTravel = std::max(reveal.maxTravel, reveal.travel);
 
     float panelTrail = 0.0f;
-    const float progress =
+    const float mapped =
         RevealProgressDip(geometry, reveal.distance, x, y, panelTrail);
     reveal.panelTrail = panelTrail;
+    reveal.target = mapped;
 
-    // A report ends the coast: pin where it got to, then insert the real value
-    // below even when it is inside the 0.5 DIP filter, so the panel returns to
-    // the finger at once. The correction is only the few DIP it drifted.
-    float coastValue = reveal.lastInserted;
+    // A report ends the coast: pin where it got to, then chase from there, so the
+    // panel continues from the position the coast actually reached instead of
+    // snapping back to the value before it.
+    float coastValue = reveal.visible;
     const bool resumed =
         g_coasting.load(std::memory_order_relaxed) && StopCoast(coastValue);
+    if (resumed) {
+        reveal.visible = std::clamp(coastValue, 0.0f, 1.0f);
+    }
 
+    // The visible position chases the finger's absolute position and never passes
+    // it. The bound is a speed, not a per-report distance: the same
+    // kSettleSpeedDipPerMs (2.2 DIP/ms) every keyboard open and every settle
+    // uses, so closing a gap looks like the panel opening at the system's own
+    // speed. A 600 DIP gap takes ~273 ms of chasing (30 ms more with the entry
+    // hold) and a 100 DIP gap ~45 ms; after that the chase keeps up with any
+    // finger (0.5-5 DIP/ms) and the panel is glued. The clock is still in the entry
+    // hold for the first presentation, and a sample inside that beat must not move
+    // the entry or start the clock early.
+    if (sampleQpc > reveal.chaseQpc) {
+        const uint64_t elapsed = sampleQpc - reveal.chaseQpc;
+        // A stalled thread must not turn the speed bound into a jump: 50 ms is
+        // more than the 18 ms idle that ends a contact, so this only ever trims a
+        // gap the gesture cannot really have bridged.
+        const uint64_t stepMs =
+            std::min<uint64_t>(elapsed, kRevealChaseMaxStepMs);
+        const float stepLimit =
+            kSettleSpeedDipPerMs * static_cast<float>(stepMs) / reveal.distance;
+        const float step =
+            std::clamp(mapped - reveal.visible, -stepLimit, stepLimit);
+        reveal.visible = std::clamp(reveal.visible + step, 0.0f, 1.0f);
+        reveal.chaseQpc = sampleQpc;
+    }
+
+    const float progress = reveal.visible;
     reveal.progress = progress;
     reveal.samples++;
     SampleCoastVelocity(progress, sampleQpc);
@@ -5944,9 +6407,10 @@ void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
         InsertProgress(progress)) {
         reveal.lastInserted = progress;
     }
-    // The release speed reads what the panel actually showed, so a report the
-    // 0.5 DIP filter ignored cannot count as movement.
-    SampleEndVelocity(reveal.lastInserted, sampleQpc);
+    // The release speed belongs to the finger, not to the chase: the window reads
+    // the mapped value, so a catch-up that is still in flight cannot be mistaken
+    // for the finger's end speed.
+    SampleEndVelocity(mapped, sampleQpc);
 }
 
 // One reveal step. While the menu is still closed the contact is only
@@ -5964,7 +6428,7 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
         if (!StartWindowIsOpenThrottled(tickMs)) {
             return;
         }
-        if (!ActivateRevealFollow(geometry, sampleQpc)) {
+        if (!ActivateRevealFollow(geometry, x, y, sampleQpc, tickMs)) {
             return;
         }
     }
@@ -5978,7 +6442,9 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
 // inside the taskbar's thickness therefore used to reach the menu as a
 // keyboard-style open from 0 while the finger was pulling. Adoption is the
 // takeover that was missing: the same contact, measured from its own down point,
-// continues from the panel's live position at the finger.
+// takes the reveal over and the panel counts that finger's motion from the screen
+// edge (the visible entry through the cloak), not the absolute mapped position it
+// never displayed.
 //
 // Three tests keep a tap a tap: the contact must have started while the menu was
 // closed (a contact on the open panel is a dismiss), it must have moved
@@ -6008,7 +6474,8 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     StartRevealFollow(g_contactOrigin.downX, g_contactOrigin.downY,
                       g_contactOrigin.downTick, tickMs);
     const uint64_t sampleQpc = QpcMsNow();
-    if (!ActivateRevealFollow(geometry, sampleQpc)) {
+    if (!ActivateRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
+                              sampleQpc, tickMs)) {
         return false;
     }
     DriveRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
@@ -6044,7 +6511,8 @@ void PromoteRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
             return;
         }
         const uint64_t sampleQpc = QpcMsNow();
-        if (ActivateRevealFollow(geometry, sampleQpc)) {
+        if (ActivateRevealFollow(geometry, g_contactOrigin.x,
+                                 g_contactOrigin.y, sampleQpc, tickMs)) {
             DriveRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
                               sampleQpc);
         }
@@ -6103,15 +6571,12 @@ bool ConsumeLateRevealRelease(const GestureGeometry& geometry) {
     // the live position, not 0. `TakeProgressNow()` is the one reader that turns
     // an animation's recorded base into a position, and the caller already
     // refuses the record while a close is still running, so this cannot take an
-    // animation over.
-    const float live = TakeProgressNow();
-    // The only value `TakeProgressNow()` answers while nothing animates is the
-    // recorded base. At the first interaction of a process that base is the open
-    // rest (1), which is not a position this panel ever showed while hidden: an
-    // open from it would cut to the resting panel instead of rising. A hidden
-    // panel's only visible value is the off-screen rest, so that is where the
-    // settle starts in that case too.
-    const float from = live >= 1.0f ? 0.0f : live;
+    // animation over. The rest sentinel of a process that has not shown this
+    // panel yet is the off-screen rest, and `TakeVisibleProgressNow` is where that
+    // rule lives. This path keeps starting at 0 while the live follow starts at
+    // the entry: a settle spends time crossing the hidden travel, a follow spends
+    // the finger's travel, and this record has no finger left.
+    const float from = TakeVisibleProgressNow(L"late");
     std::chrono::milliseconds duration{0};
     if (!BeginGestureSettle(from, 1.0f, record.velocity, duration)) {
         return false;
@@ -6235,9 +6700,12 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     EndContactTiming();
 
     // The coast carried the panel past the last report, so both outcomes start
-    // from where it got to. `progress` above stays the mapped release position,
-    // which is the measurement, not the point the animation starts from.
-    const float from = TakeProgressNow();
+    // from where it got to. `progress` above is the last chased value and
+    // `behind` the gap to the finger's mapped position that the chase had not
+    // closed yet; the settle starts from the position the coast actually reached.
+    const float from = TakeProgressNow(L"reveal-release");
+    const float behind =
+        std::clamp(reveal.target - progress, 0.0f, 1.0f);
     // Progress per millisecond at the end of the gesture, signed along the
     // reveal axis. The settle projects it onto its own direction. The release
     // time makes the freshness test: a held tip with no point answers 0.
@@ -6248,11 +6716,19 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
         // finishes the slide instead of snapping.
+        // A commit is the ticket the reopen reads: if this pull took the panel
+        // back from a close, the settle this starts is the one motion up, and
+        // the open that follows the close must continue it instead of replaying
+        // from 0 (PollRootVisibility). The ticket is one release wide.
+        if (g_closeContested) {
+            g_contestedReleaseQpc = releaseQpc;
+        }
         const bool started = BeginGestureOpen(from, endVelocity);
-        FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f vel=%.2f "
-                L"commit=%d panel=%.0f n=%d",
-                travel, reveal.maxTravel, progress, releaseSpeed,
-                commit ? 1 : 0, reveal.panelTrail, reveal.samples);
+        FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
+                L"offset=%.3f vel=%.2f commit=%d panel=%.0f n=%d",
+                travel, reveal.maxTravel, progress, behind,
+                reveal.activationGap, releaseSpeed, commit ? 1 : 0,
+                reveal.panelTrail, reveal.samples);
         if (!started) {
             ShowAtRest();
         }
@@ -6264,16 +6740,21 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     // committed dismiss, from the same release speed. Both close paths read
     // identically from any finger position.
     //
+    // This pull chose the close, so its earlier contest of another close does
+    // not name a reopen: the ticket dies with the decision.
+    g_closeContested = false;
+    g_contestedReleaseQpc = 0;
+    //
     // Progress stays at 0 afterwards and is not restored here: the hide takes a
     // moment, and restoring now would flash the fully open menu while the close
     // is in flight. The flag makes the next down restore the resting value once
     // the shell has finished hiding the reused root.
     const GestureClose close =
         BeginGestureClose(from, endVelocity, CloseKind::RevealCancel);
-    FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f vel=%.2f "
-            L"commit=%d panel=%.0f n=%d",
-            travel, reveal.maxTravel, progress, releaseSpeed, commit ? 1 : 0,
-            reveal.panelTrail, reveal.samples);
+    FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
+            L"offset=%.3f vel=%.2f commit=%d panel=%.0f n=%d",
+            travel, reveal.maxTravel, progress, behind, reveal.activationGap,
+            releaseSpeed, commit ? 1 : 0, reveal.panelTrail, reveal.samples);
     if (close.started) {
         g_commitNeedsProgressReset = true;
         return;
@@ -6401,7 +6882,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
     // restore is skipped while a close this mod started is still in flight:
     // inserting 1 there flashed the fully open panel until the shell hid the
     // window. The flag stays set so the next open restores the scalar.
-    session.startProgress = TakeProgressNow();
+    session.startProgress = TakeProgressNow(L"hid-begin");
     if (g_commitNeedsProgressReset &&
         tickMs >= g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
         g_commitNeedsProgressReset = false;
@@ -6441,7 +6922,7 @@ void ReleaseHidSession(const GestureGeometry& geometry, bool allowCommit,
     // The coast continued the drag after the last report; the close has to start
     // from where it got to, not from the last report, or the panel jumps back
     // before it settles. Both gesture families read it through the same call.
-    const float from = TakeProgressNow();
+    const float from = TakeProgressNow(L"hid-release");
     // Progress per millisecond at the end of the gesture, signed along the
     // dismiss axis: a finger still moving toward the taskbar is negative. The
     // release time makes the freshness test: a held tip with no point answers 0.
@@ -6597,7 +7078,24 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     // contact, so a retried admission cannot move the down point.
     if (!g_contactOrigin.valid) {
         g_contactOrigin.valid = true;
-        g_contactOrigin.startedOpen = StartWindowIsOpenThrottled(tickMs);
+        // A close in flight is not an open panel. A finger that lands during the
+        // retract is the user taking the menu back, so adoption must read it as
+        // a pull from its own down point once it has travelled
+        // kAdoptTravelDip, exactly as it does with the menu closed. Reading the
+        // shown-but-leaving window as open refused that pull: it stayed inert,
+        // the armed tap hid the menu under it, and the reopen replayed the open.
+        const bool closeInFlight =
+            tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+        const bool windowOpen =
+            !closeInFlight && StartWindowIsOpenThrottled(tickMs);
+        // The same reading covers the other uncloaked-but-empty window: a close
+        // whose Hide landed and left the panel at the hidden rest. That is not an
+        // open menu either, so a pull that lands there is adoptable and brings the
+        // panel back instead of being refused as a press on an open panel.
+        const bool unhealed =
+            windowOpen && geometry.distance() > 0.0f &&
+            PeekProgressNow() < RevealEntryProgress(geometry);
+        g_contactOrigin.startedOpen = windowOpen && !unhealed;
         g_contactOrigin.downX = xDip;
         g_contactOrigin.downY = yDip;
         g_contactOrigin.downTick = tickMs;
@@ -6611,6 +7109,41 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     g_contactOrigin.x = xDip;
     g_contactOrigin.y = yDip;
     SampleOriginPoint(xDip, yDip, QpcMsNow());
+
+    // The edge test belongs to the first report of the contact: a finger that
+    // slides into the band after starting elsewhere is not a reveal candidate,
+    // and a candidate that already exists owns the contact until it lifts.
+    const bool newContact =
+        !g_contactDown ||
+        (tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs);
+
+    // A contact that lands while a close is in flight is the user taking the
+    // menu back, so the close's tap must not toggle the menu under that finger.
+    // It is dropped here, before its deadline and whatever this contact's first
+    // point is: the band test below only admits a reveal candidate, and a pull
+    // whose first report lands above the band would otherwise let the tap fire.
+    if (newContact &&
+        tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+        if (DropPendingCloseTap()) {
+            // The close's tap is gone, so this close will not hide the menu.
+            // Its settle is still taking the panel down, and a menu that stays
+            // open with Progress 0 has no pane: bring the panel back from where
+            // it is. A pull that takes the panel over rewrites this value on its
+            // first sample, and the follow then continues from there. At rest
+            // there is nothing to bring back, so the close is simply stopped.
+            const float live = TakeProgressNow(L"new-contact");
+            const float distance = ReadGestureGeometry().distance();
+            if (distance > 0.0f &&
+                (1.0f - live) * distance < kProgressEpsilonDip) {
+                ShowAtRest();
+            } else {
+                std::chrono::milliseconds duration{0};
+                if (BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
+                    g_commitNeedsProgressReset = false;
+                }
+            }
+        }
+    }
 
     if (session.suppress) {
         // A close muted this contact: its reports are not a gesture, but the
@@ -6626,12 +7159,6 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
         return;
     }
 
-    // The edge test belongs to the first report of the contact: a finger that
-    // slides into the band after starting elsewhere is not a reveal candidate,
-    // and a candidate that already exists owns the contact until it lifts.
-    const bool newContact =
-        !g_contactDown ||
-        (tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs);
     if (newContact && !ClaimPanelForAdmission()) {
         // A layout apply owns the renderer: admit nothing, and leave the latch
         // untouched so the next report of this contact is still new and retries
@@ -6935,18 +7462,15 @@ void RunPendingCloseTap(uint64_t tickMs) {
 
     const CloseKind kind = g_pendingTapKind;
     const uint32_t pull = g_pendingTapPull;
+
+    if (g_pullSerial != pull || g_reveal.active || g_reveal.edgeCandidate) {
+        DropPendingCloseTap();
+        return;
+    }
+
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
-
-    if (g_pullSerial != pull || g_reveal.active || g_reveal.edgeCandidate) {
-        if (!SwipeIpcPublishClose(&g_ipc, kSwipeCloseKindCancelled, 0, 0,
-                                  pull)) {
-            FileLog(L"close mode cancel stamp failed");
-        }
-        FileLog(L"close tap dropped kind=%s", CloseKindName(kind));
-        return;
-    }
 
     // A Win press during the retract has already hidden the menu. The tap would
     // only toggle it back open.
@@ -7312,7 +7836,7 @@ void PollRootVisibility(uint64_t tickMs) {
             PromoteRevealContact(geometry, tickMs);
         }
 
-        // Exactly one of the three open paths runs, in this order:
+        // Exactly one of the four open paths runs, in this order:
         //
         // 1. the live takeover above — a still-down, moving finger that started
         //    while the menu was closed, promoted from its candidate or adopted
@@ -7322,7 +7846,11 @@ void PollRootVisibility(uint64_t tickMs) {
         //    even when a new contact is already down, because that contact cannot
         //    be the one that opened the menu and may be refused on its next
         //    report;
-        // 3. the keyboard settle — nothing preceded the open.
+        // 3. the contested continuation — this open follows a close whose Hide
+        //    already left under a pull that took the panel back. Its commit
+        //    release is the ticket, and the settle starts where that panel is,
+        //    not at 0, so the one motion up is not replayed;
+        // 4. the keyboard settle — nothing preceded the open.
         //
         // The suppression test is that actual takeover, never the existence of an
         // edge candidate: a candidate that is down but not following (the open
@@ -7342,10 +7870,50 @@ void PollRootVisibility(uint64_t tickMs) {
             !closeInFlight && !gestureOwnsProgress &&
             ConsumeLateRevealRelease(geometry);
 
+        // The reopen of a close that a pull contested is that pull coming back.
+        // The close's Hide is not cancellable, so the menu went away under the
+        // follow; the release already started the one settle up, and Progress is
+        // the position the panel had. Starting the keyboard settle here would
+        // rewind it to 0 and replay the open — the flash the user sees. So the
+        // reopen continues the panel instead: a settle from the live position
+        // (the close's own settle value), planned from the travel still left, so
+        // one pull produces one motion up and lands on 1. The ticket is one
+        // release old (kLateRevealWindowMs) and only counts while the panel is
+        // above the hidden rest: a close that took it all the way to 0 left
+        // nothing to continue, and the settle from 0 is its first animation.
+        // The live position is read, never taken here: this poll also starts the
+        // late-release settle, and taking that settle at its first millisecond
+        // pins the hidden rest and leaves the window shown with the panel off it
+        // (the dead state this check exists for). A peek answers the same value
+        // and lets the animation that owns Progress keep running; the branches
+        // below replace it only when they actually start a settle.
+        const uint64_t nowQpc = QpcMsNow();
+        const float liveNow = PeekProgressNow();
+        const bool contestedOpen =
+            !gestureOwnsProgress && !lateAdopted && g_closeContested &&
+            g_contestedReleaseQpc != 0 &&
+            nowQpc >= g_contestedReleaseQpc &&
+            nowQpc - g_contestedReleaseQpc <= kLateRevealWindowMs &&
+            liveNow > 0.0f;
+        g_closeContested = false;
+        g_contestedReleaseQpc = 0;
+        if (contestedOpen) {
+            std::chrono::milliseconds duration{0};
+            if (BeginGestureSettle(liveNow, 1.0f, 0.0f, duration)) {
+                g_commitNeedsProgressReset = false;
+                FileLog(L"win open continued from=%.3f dur=%llu", liveNow,
+                        static_cast<unsigned long long>(duration.count()));
+            } else {
+                ShowAtRest();
+                FileLog(L"win open continued from=%.3f (no settle)", liveNow);
+            }
+        }
+
         // The keyboard open is the gesture open from rest: one curve for every
         // open, so a Windows press and an edge pull cannot look different, and
         // the travel plans the duration exactly as it does there.
-        if (!closeInFlight && !gestureOwnsProgress && !lateAdopted) {
+        if (!closeInFlight && !gestureOwnsProgress && !lateAdopted &&
+            !contestedOpen) {
             // The settle needs the measured travel, from the snapshot the follow
             // reads. The measurement request below runs after this poll, so an
             // open that lands before the first publish still has Distance 0: a
@@ -7390,6 +7958,38 @@ void PollRootVisibility(uint64_t tickMs) {
         // The measurement request and the cached scroller belong to the open that
         // just ended; the UI thread releases them.
         PostUiOpenWatchRelease(closedGeneration, closing);
+    } else if (open) {
+        // The window has stayed uncloaked across polls. That is the healthy state
+        // for an open menu, but a close that hid the menu and a reopen whose
+        // settle never ran leave the same window shown with the panel at the
+        // hidden rest: nothing of the menu is on screen, every pull is refused
+        // with `reason=open` because the window is shown, and the band-tail mute
+        // silences the rest. The pair is never left standing: log it once and
+        // bring the panel back from where it is. A settle on the way up, a live
+        // follow or a dismiss drag is left alone.
+        const GestureGeometry geometry = ReadGestureGeometry();
+        const float distance = geometry.distance();
+        const float live = PeekProgressNow();
+        const bool offScreen =
+            distance > 0.0f && live < RevealEntryProgress(geometry);
+        // A close still in flight owns this window: its Hide is ahead, and
+        // restoring the panel there is the flash the suppression window exists to
+        // prevent. Only a window whose close is over can be unhealed.
+        const bool closeInFlight =
+            tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+        if (offScreen && !closeInFlight && !ProgressMotionActive() &&
+            !g_reveal.active && !g_hidSession.active) {
+            if (tickMs > g_unhealedLogTick &&
+                tickMs - g_unhealedLogTick >= 1000) {
+                g_unhealedLogTick = tickMs;
+                FileLog(L"win open unhealed progress=%.3f", live);
+            }
+            std::chrono::milliseconds duration{0};
+            if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
+                ShowAtRest();
+            }
+            g_commitNeedsProgressReset = false;
+        }
     }
 
     g_rootWasOpen = open;
@@ -8050,7 +8650,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // One per-activation reset, the same function Wh_ModInit calls, so a clean
     // re-enable of this pinned image starts from the state the first activation
     // did. Nothing a gesture left behind survives: the tracked identity, the
-    // latch, the sessions, the close mute, the deferred layout, the tap, the
+    // latch, the sessions, the close mute, the contested close's ticket, the
+    // deferred layout, the tap, the
     // coast and the debug switches.
     ResetActivationState();
     // No measurement of this thread's opens is left to run.
@@ -11444,7 +12045,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.33.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.34.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance
