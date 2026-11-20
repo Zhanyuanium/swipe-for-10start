@@ -27,7 +27,7 @@ Three details it encodes, each learned the hard way:
   pull and the drag are therefore retried before a step is called failed.
 
 .PARAMETER Log
-The Start mod's `renderer.log`. Default: the standard Windhawk data root under
+The Start half's `renderer.log`. Default: the standard Windhawk data root under
 `%ProgramData%`; pass this when Windhawk keeps its data elsewhere.
 
 .PARAMETER SkipClickAway
@@ -39,7 +39,7 @@ pwsh -File tools/smoke.ps1
 #>
 [CmdletBinding()]
 param(
-    [string]$Log = (Join-Path $env:ProgramData 'Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\renderer.log'),
+    [string]$Log = (Join-Path $env:ProgramData 'Windhawk\Engine\ModsWritable\mod-storage\local@swipe-for-10start\renderer.log'),
     [switch]$SkipClickAway
 )
 

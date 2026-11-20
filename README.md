@@ -17,31 +17,32 @@ By Zhanyuanium, distributed as Windhawk mods.
 - A touchscreen or pen. (The mouse is deliberately not used for these
   gestures.)
 
-## The two mods
+## The mod
 
-Two mods ship together, and both are needed for the full experience:
+One Windhawk mod ships, and it runs in both processes it needs: the controller
+in StartMenuExperienceHost and the executor in Explorer.
 
-- **Start menu legacy swipe** (`start-menu-legacy-swipe`) — the gesture
-  itself: edge-pull to open, follow the finger, drag to dismiss, and the
-  animation. The same controller also consumes the bridge's intents and
-  schedules the close's dismiss.
-- **Start menu touch gesture bridge** (`start-menu-touch-gesture-bridge`) —
-  runs in Explorer and executes the shell's own `ShowStartView`/`Dismiss` on
-  the launcher's thread. The Windows key, the Start button and a click away
-  publish one intent; the controller decides open or close from its own
-  published state, runs the one mirrored settle, and then asks the bridge to
-  dismiss. A close slides out with the same animation the gesture close uses.
+- **The controller** owns the gesture itself: edge-pull to open, follow the
+  finger, drag to dismiss, and the animation. It also consumes the executor's
+  intents and schedules the close's dismiss.
+- **The executor** runs in Explorer and executes the shell's own
+  `ShowStartView`/`Dismiss` on the launcher's thread. The Windows key, the Start
+  button and a click away publish one intent; the controller decides open or
+  close from its own published state, runs the one mirrored settle, and then
+  asks the executor to dismiss. A close slides out with the same animation the
+  gesture close uses.
   A press during a close is read as a reopen: while the window is still on
   screen the close is cancelled and the panel settles back from where the
   retract left it; a press inside the shell's hide is latched and served when
   the hide lands. The key never goes dead. A touch pull still down when a close
   lands reopens through the controller. Win+Tab, the lock screen and a display
-  change pass through untouched, so a lock never waits. Without the bridge the
-  menu still opens and closes, but the close is instant.
+  change pass through untouched, so a lock never waits. If the executor half is
+  refused by the Explorer build, the menu still opens and closes, but the close
+  is instant.
 
 ## Install
 
-Install both mods from the Windhawk UI, or from an elevated PowerShell in this
+Install the mod from the Windhawk UI, or from an elevated PowerShell in this
 repository:
 
 ```powershell
@@ -49,9 +50,9 @@ pwsh -File .\tools\install_mods.ps1
 ```
 
 The script runs `tools/make_store_mods.ps1 -Profile local` first: that writes the
-single-file builds to `dist\local\`, with the shared headers inlined and no `-I`
+single-file build to `dist\local\`, with the shared headers inlined and no `-I`
 in `@compilerOptions`, because an installed mod is compiled from stdin with no
-repository beside it. It then installs and enables both mods. Windhawk's install
+repository beside it. It then installs and enables the mod. Windhawk's install
 folder must be on `PATH`; `-Compiler` names `windhawk-cli` explicitly, `-All`
 also installs the diagnostic probes, and `-SkipRestart` leaves the menu host
 alone.
@@ -60,8 +61,8 @@ The script restarts `StartMenuExperienceHost.exe` when it finishes; do it by han
 (Task Manager → details → `StartMenuExperienceHost.exe` → end task; it restarts
 itself) or sign out and back in — the mod can only attach when the menu process
 creates its window. `mod install` leaves a previously disabled mod disabled, so
-the script enables both; the bridge hooks Explorer when it is enabled, without an
-Explorer restart on this build.
+the script enables it; the Explorer half hooks Explorer when the mod is enabled,
+without an Explorer restart on this build.
 
 ## Settings
 
@@ -111,9 +112,9 @@ Explorer restart on this build.
 
 ## If something looks wrong
 
-- Each mod logs into its own Windhawk storage folder, which Windhawk shows on the
-  mod's page: `renderer.log` for `local@start-menu-legacy-swipe` and
-  `bridge.log` for `local@start-menu-touch-gesture-bridge`.
+- The mod logs into two files in its Windhawk storage folder, which Windhawk
+  shows on the mod's page: `renderer.log` from the Start half and `bridge.log`
+  from the Explorer half, both under `local@swipe-for-10start`.
 - After disabling and re-enabling the mod, restart
   `StartMenuExperienceHost.exe` — gestures cannot attach to the already-open
   menu window.
@@ -125,5 +126,5 @@ Explorer restart on this build.
 - The full technical documentation — what was measured, what was falsified,
   and every design decision — lives in [docs/](docs/README.md), including the
   complete [known-limits list](docs/limits.md).
-- [CHANGELOG.md](CHANGELOG.md) lists each release tag with the Start and bridge
-  versions it shipped.
+- [CHANGELOG.md](CHANGELOG.md) lists each release tag with the version it
+  shipped.

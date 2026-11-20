@@ -30,9 +30,9 @@ is closed after the down, so the only in-process source is the digitizer itself.
 
 ## Capturing reports
 
-A worker thread in `mods/start-menu-legacy-swipe.wh.cpp` registers Raw Input for
-the digitizer (`usUsagePage 0x0D / usUsage 0x04` for touch, `0x0D / 0x02` for
-pen, `RIDEV_INPUTSINK`) on a hidden top-level window. A message-only window
+A worker thread in the `start` namespace of `mods/swipe-for-10start.wh.cpp`
+registers Raw Input for the digitizer (`usUsagePage 0x0D / usUsage 0x04` for
+touch, `0x0D / 0x02` for pen, `RIDEV_INPUTSINK`) on a hidden top-level window. A message-only window
 would not receive the `WM_SETTINGCHANGE` (`SPI_SETWORKAREA`) and
 `WM_DISPLAYCHANGE` broadcasts that move the taskbar, and those broadcasts are
 the whole event-driven axis refresh (see [geometry.md](geometry.md)).

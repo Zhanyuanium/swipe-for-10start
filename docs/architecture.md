@@ -1,28 +1,29 @@
 # M3.2 architecture — one controller, one executor
 
-> L3-level design record. Start **0.44.0**, bridge **0.25.0**, channel **v7 /
-> 744 B**. The measured evidence is quoted with the build and the layout it came
-> from; everything below was run on this machine. **Layouts:** *auto-hidden* =
-> work `0,0,1440,900`, the bar off screen, band `804..900`, panel
+> L3-level design record. Mod **0.7.0** (one source, two process halves),
+> channel **v7 / 744 B**. The measured evidence is quoted with the build and the
+> layout it came from; everything below was run on this machine. **Layouts:**
+> *auto-hidden* = work `0,0,1440,900`, the bar off screen, band `804..900`, panel
 > `236,265..1229,840`, trail 265, Distance 852 (current). *Docked* = work
 > `0,0,1440,852`, tray `0,852..1440,900`, same panel, trail 265 (historical).
 
 ## What ships
 
-Two Windhawk mods:
+One Windhawk mod, two process halves:
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.44.0) runs in
-  `StartMenuExperienceHost.exe`. It owns the touch gesture, the claim on
-  `Progress`, the settle planner, the gates and the decision state. It consumes
-  bridge intents, publishes executor commands, and publishes its own liveness.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.25.0) runs in
-  `explorer.exe`. It turns the Win key, the Start button and the click-away into
-  intents, and executes the Start side's `show`/`dismiss`/`cancel` commands on
-  the launcher's own thread. It also swallows the shell's own duplicate
-  show/close while the controller owns the panel.
+- `mods/swipe-for-10start.wh.cpp` (0.7.0) is installed once and loaded into both
+  hosts. Its `start` namespace runs in `StartMenuExperienceHost.exe` and owns the
+  touch gesture, the claim on `Progress`, the settle planner, the gates and the
+  decision state. It consumes executor intents, publishes executor commands, and
+  publishes its own liveness. Its `bridge` namespace runs in `explorer.exe` and
+  turns the Win key, the Start button and the click-away into intents, and
+  executes the Start side's `show`/`dismiss`/`cancel` commands on the launcher's
+  own thread. It also swallows the shell's own duplicate show/close while the
+  controller owns the panel. `Wh_ModInit` selects the half from the host
+  executable name; the other half's hooks and threads never exist there.
 
-The shell still performs every visual transition. Neither mod writes the
-launcher's state.
+The shell still performs every visual transition. The mod writes no launcher
+state.
 
 ## The launcher read (corrected)
 

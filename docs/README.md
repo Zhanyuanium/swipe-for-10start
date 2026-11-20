@@ -34,33 +34,34 @@ it.
 | [lifecycle.md](lifecycle.md) | The image pin, the per-process instance guard, the counted module entries, the unload order and its residuals, re-initialisation, and the host's unload boundary. |
 | [testing.md](testing.md) | The PowerShell/Python probes and injectors, and the captured measurements in `artifacts/`. |
 | [limits.md](limits.md) | Known limits and risks, what the real-machine pass covered, and what is still owed (a pen by hand, and the HID dismiss log excerpt). |
-| [store.md](store.md) | How the pair is submitted to `ramensoftware/windhawk-mods`: the generated single-file form, the two-PR rule, and the checks to run before opening one. |
+| [store.md](store.md) | How the mod is submitted to `ramensoftware/windhawk-mods`: the generated single-file form, the one-file rule, and the checks to run before opening the PR. |
 
-## The mods
+## The mod
 
-Two mods ship together (full member list in
+One mod ships, in one source with two process halves (full member list in
 [../mods/AGENTS.md](../mods/AGENTS.md)):
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.44.0) — runs in
-  `StartMenuExperienceHost.exe`; the whole gesture, follow and animation, the
-  controller that consumes bridge intents and publishes executor commands, the
-  closing direction it publishes before the settle's first frame, the open that
-  cancels a close still on screen, the pull-reopen at a close's landing, the one
-  close path (a mirrored settle from the live position, then `dismiss`), the
-  recovery ticket that exists only for a published command, and the peer
-  liveness (intent-consumer readiness) the bridge gates on.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.25.0) — runs in
-  `explorer.exe`; executes `ShowStartView`/`Dismiss`/`IsVisible` on the
-  launcher's own thread from a hidden window, turns the Win key, the Start
-  button and the click-away into intents, reads the toggle direction from the
-  controller's flags and never from the shell's lagging state, latches a press
-  that lands inside the shell's hide and serves it at the landing, swallows the
-  shell's duplicate calls and the pointer-away close of an opening window,
-  passes every trigger when the Start side is not alive, and never decides a
-  toggle itself. It reads the shell's state only when the controller publishes
-  no direction: the shell's cloak and `InternalState` are the resync for a
-  panel the controller does not own, so a bridge with no controller still
-  decides from the window.
+- `mods/swipe-for-10start.wh.cpp` (0.7.0) — installed once; `Wh_ModInit` selects
+  `start::Role` in `StartMenuExperienceHost.exe` or `bridge::Role` in
+  `explorer.exe` from the host executable name. The `start` namespace holds the
+  whole gesture, follow and animation, the controller that consumes executor
+  intents and publishes executor commands, the closing direction it publishes
+  before the settle's first frame, the open that cancels a close still on
+  screen, the pull-reopen at a close's landing, the one close path (a mirrored
+  settle from the live position, then `dismiss`), the recovery ticket that
+  exists only for a published command, and the peer liveness
+  (intent-consumer readiness) the executor gates on.
+- The `bridge` namespace runs in `explorer.exe`; it executes
+  `ShowStartView`/`Dismiss`/`IsVisible` on the launcher's own thread from a
+  hidden window, turns the Win key, the Start button and the click-away into
+  intents, reads the toggle direction from the controller's flags and never from
+  the shell's lagging state, latches a press that lands inside the shell's hide
+  and serves it at the landing, swallows the shell's duplicate calls and the
+  pointer-away close of an opening window, passes every trigger when the Start
+  side is not alive, and never decides a toggle itself. It reads the shell's
+  state only when the controller publishes no direction: the shell's cloak and
+  `InternalState` are the resync for a panel the controller does not own, so an
+  executor with no controller still decides from the window.
 
 Everything else in `mods/` (`msgprobe`, `inputprobe`,
 `start-menu-touch-gesture-probe`, `start-menu-touch-gesture-consumer`) is

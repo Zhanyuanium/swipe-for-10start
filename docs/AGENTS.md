@@ -60,14 +60,14 @@ limits.md: the measured limits — the shell cap, launcher readiness, the
 launcher thread, the touch-show idle suppression, the cold entry, the taskbar
 auto-hide state, and the hardware still owed.
 
-README.md: the map and the shipping pair.
+README.md: the map and the one shipping mod.
 
-store.md: how the pair reaches `ramensoftware/windhawk-mods` — the one-file-per-PR
+store.md: how the mod reaches `ramensoftware/windhawk-mods` — the one-file-per-PR
 rule that forces `tools/make_store_mods.ps1` to inline the shared headers, what
 the `store` and `local` profiles each change (no `-I` in either; the store also
-drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage` plus the
-companion-mod note), the local install flow that consumes `local`, why it is two
-PRs, and the four checks to run before opening one.
+drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage`), the local
+install flow that consumes `local`, why it is one PR, and the four checks to run
+before opening it.
 
 ## Laws
 

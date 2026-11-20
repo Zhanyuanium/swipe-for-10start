@@ -5,12 +5,12 @@ Build self-contained Windhawk mod sources from the repo's mod sources, for the
 store submission or for a local install.
 
 .DESCRIPTION
-The mods here share `mods/swipe_ipc_shared.h` (and the bridge and the consumer
-also include `mods/start_gesture_shared.h`), which neither the store nor a
+The mod ships as one source and still shares `mods/swipe_ipc_shared.h` (and, in
+this commit, `mods/start_gesture_shared.h`), which neither the store nor a
 Windhawk install can resolve: a pull request adds exactly one self-contained
 `mods/<id>.wh.cpp`, and Windhawk compiles the installed file from stdin with no
-repository beside it. This script produces that one file per mod and changes
-nothing else. Two profiles:
+repository beside it. This script produces that one file and changes nothing
+else. Two profiles:
 
 - `store` (the default) is the `ramensoftware/windhawk-mods` submission. Each
   `#include "..."` of a local header is replaced by the header body, inside a
@@ -19,16 +19,11 @@ nothing else. Two profiles:
   otherwise warn (the store's 2.0 compatibility check fails on any warning).
   `-I`, `-Wall` and `-Wextra` are dropped from `@compilerOptions` (a quoted
   option breaks the collection's compile job, and the warning flags are not
-  among the options it accepts), `@github`, `@license` and `@homepage` are added,
-  a companion-mod note is put under the README heading (the two shipping mods
-  only work as a pair), and each output is checked with
-  `windhawk-cli source meta --strict`.
+  among the options it accepts), `@github`, `@license` and `@homepage` are
+  added, and the output is checked with `windhawk-cli source meta --strict`.
 - `local` is the file `tools/install_mods.ps1` installs. It inlines the same
   headers, removes the `-I` option, and changes nothing else: `-Wall -Wextra`
-  stay so a local build is warning-clean, and no store metadata or companion
-  note is added. It also builds `start-menu-touch-gesture-consumer.wh.cpp`, the
-  diagnostic that includes a local header; the other probes install from `mods/`
-  directly.
+  stay so a local build is warning-clean, and no store metadata is added.
 
 The output is generated, never hand-edited: `dist/` is ignored, and a diff
 against the repo source is only the inlined headers and the metadata the store
@@ -91,23 +86,7 @@ function Resolve-WindhawkCli {
 }
 
 $modsToBuild = New-Object System.Collections.Generic.List[hashtable]
-$modsToBuild.Add(@{
-        File = 'start-menu-legacy-swipe.wh.cpp'
-        CompanionId = 'start-menu-touch-gesture-bridge'
-        CompanionName = 'Start Menu Touch Gesture Bridge'
-        CompanionWhere = 'explorer.exe'
-    })
-$modsToBuild.Add(@{
-        File = 'start-menu-touch-gesture-bridge.wh.cpp'
-        CompanionId = 'start-menu-legacy-swipe'
-        CompanionName = 'Legacy Start Edge Swipe'
-        CompanionWhere = 'StartMenuExperienceHost.exe'
-    })
-if (-not $isStore) {
-    # The only diagnostic that includes a local header; the others install from
-    # mods/ as they are.
-    $modsToBuild.Add(@{ File = 'start-menu-touch-gesture-consumer.wh.cpp' })
-}
+$modsToBuild.Add(@{ File = 'swipe-for-10start.wh.cpp' })
 
 $cli = $null
 if ($isStore) { $cli = Resolve-WindhawkCli }
@@ -164,19 +143,6 @@ $($body.TrimEnd())
         $text = [regex]::Replace($text, '(?m)^(//\s+@author\s+.*)$', {
                 param($m) $m.Groups[1].Value.TrimEnd() + "`r`n" + ($extra -join "`r`n")
             }.GetNewClosure())
-
-        # -- the pair note, under the README heading
-        $note = @"
-> **This is one half of a pair.** The gesture is decided in
-> [$($mod.CompanionName)](https://windhawk.net/mods/$($mod.CompanionId)) (``$($mod.CompanionWhere)``);
-> install both mods, or the menu opens without the swipe following the finger and
-> closes without the settle.
->
-> Requires ExplorerPatcher's legacy Windows 10 Start menu (``Start_ShowClassicMode=1``).
-"@
-        $text = [regex]::Replace($text,
-            '(?m)^(// ==WindhawkModReadme==\r?\n/\*\r?\n)(#[^\r\n]*\r?\n)',
-            { param($m) $m.Groups[1].Value + $m.Groups[2].Value + $note + "`n" })
     }
 
     $out = Join-Path $OutDir $mod.File

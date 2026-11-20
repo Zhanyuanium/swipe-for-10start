@@ -193,8 +193,8 @@ could act, or before its confirmation could land).
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges
-each step by `start_menu.ps1`'s state plus the lines the pair wrote in that step:
-a VK_LWIN tap opens (`kind=open`, `exec show`) and closes (`kind=close`,
+each step by `start_menu.ps1`'s state plus the lines the two halves wrote in that
+step: a VK_LWIN tap opens (`kind=open`, `exec show`) and closes (`kind=close`,
 `exec dismiss`), an injected edge pull opens (`reveal admit|takeover`), an
 injected panel drag closes, and a desktop click closes (`trigger=clickaway`,
 `method=7`). The last step fails on any error-shaped line in the run — a non-zero

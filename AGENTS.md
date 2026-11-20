@@ -2,7 +2,7 @@
 
 C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
-mods/ - Windhawk mod sources (8 sources + AGENTS.md: start-menu-legacy-swipe, touch-gesture-bridge, touch-gesture-consumer, touch-gesture-probe, msgprobe, inputprobe, start_gesture_shared.h, swipe_ipc_shared.h)
+mods/ - Windhawk mod sources (5 sources + 2 headers: swipe-for-10start, touch-gesture-consumer, touch-gesture-probe, msgprobe, inputprobe; start_gesture_shared.h, swipe_ipc_shared.h)
 tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke, the store packager and the local installer (18 scripts + AGENTS.md)
 artifacts/ - captured measurements (6 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
@@ -17,15 +17,17 @@ CHANGELOG.zh-CN.md - the Chinese page of the release history
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.3, Start 0.44.0 / bridge 0.25.0)
+## What ships (M3.3, 0.7.0, one mod)
 
-Two mods, one path. `mods/start-menu-legacy-swipe.wh.cpp` runs in
-`StartMenuExperienceHost.exe` and owns the touch gesture, the panel claims, the
-settle planner, the gates and the controller state.
-`mods/start-menu-touch-gesture-bridge.wh.cpp` runs in `explorer.exe` and owns the
-launcher call and the non-touch triggers.
+One mod, two processes. `mods/swipe-for-10start.wh.cpp` is installed once and
+loaded into `StartMenuExperienceHost.exe` (namespace `start`) and into
+`explorer.exe` (namespace `bridge`): the controller owns the touch gesture, the
+panel claims, the settle planner, the gates and the controller state; the
+executor owns the launcher call and the non-touch triggers. Wh_ModInit picks one
+role table from the host executable name before either half runs, and the other
+half's hooks, threads and handles are never created there.
 
-The controller decides; the bridge executes. The Win key
+The controller decides; the executor performs. The Win key
 (`XamlLauncher::OnHotkeyInvoke`), the Start button (`ShowStartView` method 11,
 `Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) publish
 one `intent(seq, kind, trigger, method, flags, open)`; the Start side answers
@@ -178,8 +180,8 @@ touch flag, and the liveness triple `peerTick` (732) / `peerState` (736) /
 `tools/ipc.ps1` is the only command publisher and takes the mutex; `-State` reads
 v7/744 and prints the peer epoch.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
-`initState` are refused, never waited on. Both mods open the channel at
-`Wh_ModInit`, never in a hook.
+`initState` are refused, never waited on. Each role opens the channel at its
+`RoleInit`, never in a hook.
 
 ## Machine
 

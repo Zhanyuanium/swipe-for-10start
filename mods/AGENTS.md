@@ -1,12 +1,28 @@
 # mods/
 > L2 | Parent: ../AGENTS.md
 
-## Shipping pair
+## Shipping mod
 
-### start-menu-legacy-swipe.wh.cpp (0.44.0, StartMenuExperienceHost.exe)
+### swipe-for-10start.wh.cpp (0.7.0, StartMenuExperienceHost.exe + explorer.exe)
+One image, installed once and loaded into two hosts that never share a process.
+The file holds both halves in named namespaces — `start` (the controller and the
+touch gesture) and `bridge` (the launcher executor and the non-touch triggers) —
+with the Windows, WinRT, Windhawk and shared headers included once at file
+scope. The first operation of `Wh_ModInit` reads the host executable name
+(`GetModuleFileNameW`, basename, case-insensitive) and picks `start::Role` or
+`bridge::Role`; the four Windhawk entry points forward to that table and no
+callback rediscovers the process, and an unknown host installs nothing. The two
+runtime lifetimes stay two: explorer can outlive a Start restart, and a
+touch-first open can reach the launcher before any Win or Start-button hook ran.
+The version follows the project tag; the former Start 0.44.0 and bridge 0.25.0
+versions are gone.
+
+The text below describes the Start half; the explorer half follows it.
+
+### The controller (namespace start, StartMenuExperienceHost.exe)
 The controller and the touch gesture. It reads the digitizer through Raw Input
 (the XAML/DirectManipulation sources are empty on this UI), owns the panel's
-`Progress`, plans every settle, and decides the toggle from bridge intents.
+`Progress`, plans every settle, and decides the toggle from executor intents.
 
 **What it owns.** The raw HID decode (report IDs, `TipSwitch`/`InRange`,
 contact identity and its evidence clock, the coordinate-only fallback); the
@@ -104,7 +120,7 @@ and the per-activation reset. A disable/enable without a host
 restart reuses the XAML root and has no renderer until the host restarts (a
 measured limit, not a bug to paper over).
 
-### start-menu-touch-gesture-bridge.wh.cpp (0.25.0, explorer.exe)
+### The executor (namespace bridge, explorer.exe)
 The launcher executor and the non-touch triggers.
 
 **Launcher read.** `s_pLauncher` at `twinui.pcshell.dll + 0x948E80` is the
@@ -272,7 +288,8 @@ value, never a pair) and dropped `controllerOpen`, which no reader used. v6 adde
 the liveness pair and took the section from 736 to 744 bytes. v7 adds `peerEpoch`
 at 740, which the 8-byte alignment had already paid for, so the size stays 744 and
 the **version word** is what refuses a v6 section handed over by an older build.
-0.44.0/0.25.0 add no field: the ack's outcome word gained values (`confirmed`,
+0.44.0/0.25.0, the last pair versions before the 0.7.0 merge, add no field: the
+ack's outcome word gained values (`confirmed`,
 `unconfirmed`, `unknown`, `superseded`) and the visible word gained
 `unknown = -1`, both inside the existing `LONG` slots, so the version stays 7 and
 `tools/ipc.ps1`/`docs/ipc.md` only document the new names.

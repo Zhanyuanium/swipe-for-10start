@@ -87,7 +87,7 @@
 - **Still owed:** a pen by hand. The one-finger pass also ran the HID dismiss
   producer (`TakeCloseOwnership` → `RequestBridgeDismiss`), because a real
   finger's panel drag is its only producer, but no `close dismiss kind=…` excerpt
-  was captured. Take one the next time the pair is touched: that line is the only
+  was captured. Take one the next time the mod is touched: that line is the only
   evidence separating the HID producer from the click-away one.
 
 ## Not attempted

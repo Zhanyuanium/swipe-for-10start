@@ -1,7 +1,8 @@
 # IPC — the v7 channel
 
-> Start 0.44.0 / bridge 0.25.0. One session-local section, seven named objects,
-> every record a seqlock. There is no file and no polling on either side.
+> Mod 0.7.0 (one source, two process halves). One session-local section, seven
+> named objects, every record a seqlock. There is no file and no polling on either
+> side.
 
 ## Names and layout
 
