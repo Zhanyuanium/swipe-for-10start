@@ -61,6 +61,11 @@ if (-not ('Smoke.Native' -as [type])) {
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, System.UIntPtr e);
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(System.IntPtr context);
+public static void SetDpiAware() {
+    // PMv2: the injector takes physical pixels, so the metrics must not be virtualised.
+    try { SetProcessDpiAwarenessContext(new System.IntPtr(-4)); } catch { }
+}
 public static void WinTap() {
     keybd_event(0x5B, 0, 0, System.UIntPtr.Zero);
     System.Threading.Thread.Sleep(60);
@@ -74,6 +79,8 @@ public static void Click(int x, int y) {
 }
 '@
 }
+
+[Smoke.Native]::SetDpiAware()
 
 function Mark { (Get-Content -LiteralPath $Log | Measure-Object -Line).Lines }
 function New-Lines { param($from) Get-Content -LiteralPath $Log | Select-Object -Skip $from }
@@ -114,7 +121,14 @@ function Get-Layout {
             $layout.Low = [int]$Matches[1]; $layout.High = [int]$Matches[2]
         }
     }
-    $layout.Scale = [math]::Round([Smoke.Native]::GetSystemMetrics(0) / 1440.0)
+    # The scale comes from the mod's own numbers: the log's `work` rectangle is in
+    # DIP and GetSystemMetrics is physical once this process is DPI-aware, so the
+    # ratio is the monitor scale without assuming a screen size.
+    $layout.Scale = 0
+    if ($line -and $line.Line -match 'work=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
+        $workWidth = [int]$Matches[3] - [int]$Matches[1]
+        if ($workWidth -gt 0) { $layout.Scale = [int][math]::Round([Smoke.Native]::GetSystemMetrics(0) / [double]$workWidth) }
+    }
     if ($layout.Scale -lt 1) { $layout.Scale = 1 }
     return $layout
 }
@@ -168,7 +182,10 @@ $l = (New-Lines $m) -join "`n"
 Add-Row 'win close' ($closed -and ($l -match 'kind=close') -and ($l -match 'exec dismiss')) ''
 
 # 3. an injected edge pull opens it (admission, takeover, show); retried because
-# an injected contact is occasionally decoded as a hover
+# an injected contact is occasionally decoded as a hover. The wait is deliberate:
+# a pull that starts inside the previous close's settle is tracked as the reopen
+# that close owes, not as a fresh admission, and its log lines differ.
+Start-Sleep -Milliseconds 1200
 $pull = Get-PullPoints $layout
 $opened = $false; $detail = ''
 for ($i = 1; $i -le 3 -and -not $opened; $i++) {
@@ -177,7 +194,8 @@ for ($i = 1; $i -le 3 -and -not $opened; $i++) {
     $opened = Wait-For $true 4000
     Start-Sleep -Milliseconds 400
     $l = (New-Lines $m) -join "`n"
-    $opened = $opened -and ($l -match 'reveal (admit|takeover)') -and ($l -match 'exec show')
+    $opened = $opened -and ($l -match 'reveal (admit|takeover|reopen)') -and
+        ($l -match 'exec show|intent open recovered')
     if (-not $opened) { $detail = "attempt $i"; Start-Sleep -Milliseconds 400 }
 }
 Add-Row 'touch open' $opened $detail
