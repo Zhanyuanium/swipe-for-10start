@@ -34,6 +34,7 @@ it.
 | [lifecycle.md](lifecycle.md) | The image pin, the per-process instance guard, the counted module entries, the unload order and its residuals, re-initialisation, and the host's unload boundary. |
 | [testing.md](testing.md) | The PowerShell/Python probes and injectors, and the captured measurements in `artifacts/`. |
 | [limits.md](limits.md) | Known limits and risks, what the real-machine pass covered, and what is still owed (a pen by hand, and the HID dismiss log excerpt). |
+| [store.md](store.md) | How the pair is submitted to `ramensoftware/windhawk-mods`: the generated single-file form, the two-PR rule, and the checks to run before opening one. |
 
 ## The mods
 

@@ -25,3 +25,6 @@ __pycache__/
 .idea/
 desktop.ini
 Thumbs.db
+
+# Generated store submission files
+dist/
