@@ -16,8 +16,11 @@
 2. **Thread and shape** — neither `ShowStartView` nor `Dismiss` contains a
    thread test; the affinity is implicit (they drive the shell's own state
    object, which captures its apartment and is fed by the shell's dispatcher).
-   Call them on explorer's shell UI thread, from a **posted message to a hidden
-   window created on that thread**, never inside a hook frame.
+   Call them on explorer's launcher thread — the thread that runs
+   `XamlLauncher::OnHotkeyInvoke`, measured `tid=7108`; **not** the
+   `Shell_TrayWnd` thread, whose `ShowStartView` fail-fast-crashed explorer — from
+   a **posted message to a hidden window created on that thread**, never inside a
+   hook frame.
 3. **Cloak** — the shell writes DWM attribute 13 with `DwmSetWindowAttribute`
    bracketed by `EnableIAMAccess(key, TRUE/FALSE)`; the ticket is why a bare call
    fails. It is not "shell only": code already inside explorer can take the same
@@ -203,11 +206,11 @@ moving the call "a few frames later" still hangs.
 
 ### 2.4 The safe shape
 
-**Deliver the call as a posted message to a hidden window created on the shell UI
-thread, and let the message loop run it with an empty stack.**
+**Deliver the call as a posted message to a hidden window created on the
+launcher thread, and let the message loop run it with an empty stack.**
 
 ```
-first time the bridge runs on the shell UI thread (the hook frame is fine for this part):
+first time the bridge runs on the launcher thread (the hook frame is fine for this part):
     RegisterClassExW(hidden class, WndProc)
     hwnd = CreateWindowExW(..., class, ..., HWND_MESSAGE or a hidden top-level)
     remember hwnd + the owning thread id
@@ -216,8 +219,8 @@ when the mod decides to open/close:
     PostMessageW(hwnd, WM_APP + kExec, (WPARAM)verb, 0)     // returns immediately
     return from the hook
 
-WndProc, on the shell UI thread, outside any shell frame:
-    launcher = *(void**)(twinui + 0x948E80)
+WndProc, on the launcher thread, outside any shell frame:
+    launcher = *(void**)(twinui + 0x948E80) + 0x18
     if (!launcher || *(uint64_t*)(launcher + 0x160) <= 0x10000) -> drop, log
     hr = verb == open ? ShowStartView(method, flags) : Dismiss(method)
     confirm: IsVisible(&visible) / the state's own visibility, log hr and visible
@@ -225,7 +228,7 @@ WndProc, on the shell UI thread, outside any shell frame:
 
 Why a window and not another mechanism:
 
-- The thread is already pumping (it is explorer's UI thread); a message posted to
+- The thread is already pumping (it is explorer's launcher thread); a message posted to
   a window it owns is the one delivery route that is guaranteed to run **after**
   the current callback returns, i.e. outside the frame that deadlocks.
 - It is the same shape the shipping Start mod already uses in the host process
@@ -239,7 +242,8 @@ launcher is a WRL object with no proxy/stub registration, and the object is not
 agile (`RuntimeClassFlags<1>` with no `FtmBase` in its implements chain, unlike
 the free-threaded broker args class which lists `FtmBase` explicitly). A
 cross-apartment call would be marshalled to the owning apartment anyway — which
-is exactly the shell UI thread, only with more failure modes.
+is exactly the launcher thread (measured: the thread that runs
+`OnHotkeyInvoke`), only with more failure modes.
 
 **Confirmation of execution.** `IsVisible` (`0x1F9B40`) is the cheapest honest
 answer: it reads the same `[+0x160]` and asks the state (`vtable+0x68`) whether
@@ -405,6 +409,15 @@ debugger breakpoints in a live session, which is why they are listed here.
   Expected: one hit, on the shell UI thread (`GetCurrentThreadId` equals the
   thread that owns `Shell_TrayWnd`), before the first `ShowStartView`; `[twinui+0x948E80]`
   equals the `rcx` of that call from then on.
+  **Superseded hypothesis.** "The thread that owns `Shell_TrayWnd`" was this
+  document's guess and it is wrong for this build: the launcher thread is the one
+  that runs `XamlLauncher::OnHotkeyInvoke`, measured `tid=7108` (and `11096` after
+  an explorer restart), and it is **not** the thread that owns `Shell_TrayWnd`
+  (`tid=5924/6732/8980`). A `ShowStartView` on the taskbar thread opened the
+  shell's show and then fail-fast-crashed explorer
+  (`twinui.pcshell.dll+0x1BB010`, `0xC0000409`). The executor's thread rule and
+  the measurement are in [../architecture.md](../architecture.md#the-executor-thread);
+  E1's *construction* claim is unaffected, only the thread it names.
 - **E2 — readiness.** At the moment the bridge wants its first own open, read
   `[twinui+0x948E80]` and `[launcher+0x160]`. Expected: a heap pointer, not
   `0x100`. A run that reads `0x100` proves the "capture at ctor is too early"

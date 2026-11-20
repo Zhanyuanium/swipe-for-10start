@@ -1,31 +1,41 @@
-# IPC — the v6 channel
+# IPC — the v7 channel
 
-> Start 0.42.0 / bridge 0.23.0. One session-local section, seven named objects,
+> Start 0.43.0 / bridge 0.24.0. One session-local section, seven named objects,
 > every record a seqlock. There is no file and no polling on either side.
 
 ## Names and layout
 
 ```
-Local\SwipeFor10Start_v6_State        SwipeIpcState (744 bytes, v6)
-Local\SwipeFor10Start_v6_Cmd          manual-reset, tools -> Start
-Local\SwipeFor10Start_v6_CmdWrite     mutex, one command writer
-Local\SwipeFor10Start_v6_Intent       auto-reset, bridge -> Start
-Local\SwipeFor10Start_v6_IntentAck    auto-reset, Start -> bridge
-Local\SwipeFor10Start_v6_Exec         auto-reset, Start -> bridge
-Local\SwipeFor10Start_v6_ExecAck      auto-reset, bridge -> Start
+Local\SwipeFor10Start_v7_State        SwipeIpcState (744 bytes, v7)
+Local\SwipeFor10Start_v7_Cmd          manual-reset, tools -> Start
+Local\SwipeFor10Start_v7_CmdWrite     mutex, one command writer
+Local\SwipeFor10Start_v7_Intent       auto-reset, bridge -> Start
+Local\SwipeFor10Start_v7_IntentAck    auto-reset, Start -> bridge
+Local\SwipeFor10Start_v7_Exec         auto-reset, Start -> bridge
+Local\SwipeFor10Start_v7_ExecAck      auto-reset, bridge -> Start
 ```
 
-`kSwipeIpcMagic = 0x53313053` (`S01S`), `kSwipeIpcVersion = 6`. The names carry
+`kSwipeIpcMagic = 0x53313053` (`S01S`), `kSwipeIpcVersion = 7`. The names carry
 the version, so a layout change is a new channel, never a silent mismatch. Every
 field's offset is pinned by a `static_assert` in `mods/swipe_ipc_shared.h`;
 `layoutBytes` publishes `sizeof(SwipeIpcState)` and a reader that sees a different
 value refuses with `ERROR_INVALID_DATA` instead of reading a foreign layout.
 
-**v6 adds the Start side's liveness pair.** `peerTick` and `peerState` extend the
-tail (736 -> 744). The bridge creates the section, so a mapped channel is not
+**v7 adds the Start side's activation identity.** `peerEpoch` fills the four
+bytes after `peerState` (740), because the struct's 8-byte alignment had left
+them, so the section stays 744 bytes. The size alone therefore no longer names the
+layout: the version word, in the object names and in the section, separates v6
+from v7. The field answers one question: *which Start activation is answering
+now*. The Start side increments it once per attach, before any tick or `alive`;
+the bridge reads it beside the press it latched, and a serve against a different
+epoch is a serve into a controller that never saw that press, so the latch is
+invalidated instead of published.
+
+**v6 added the Start side's liveness pair.** `peerTick` and `peerState` extended
+the tail (736 -> 744). The bridge creates the section, so a mapped channel is not
 evidence that the Start side runs; this pair is the precondition every
-interception reads. It is not a seqlock: two independent words, written by the
-Start side only, read as one liveness answer (see "Peer liveness" below).
+interception reads. It is not a seqlock: independent words, written by the Start
+side only, read as one liveness answer (see "Peer liveness" below).
 
 **v5 replaced v4's controller words.** v4 published `controllerOwning` and
 `controllerPhase` as separate atomics, so a bridge reader could see new ownership
@@ -53,7 +63,7 @@ v4 removed them). The layout is:
 716  execAckHr       720  execAckVisible
 724  controllerDirection
 728  controllerTouch
-732  peerTick         736  peerState
+732  peerTick        736  peerState        740  peerEpoch
 size 744
 ```
 
@@ -74,7 +84,8 @@ instead of spinning it.
 `openSeq` (seqlock), `openTick` (uint64). Published when the Start side first
 sees the window shown. The even `openSeq` is the generation; generation 0 is not
 a menu and `SwipeIpcReadOpen` returns `ERROR_NOT_READY`. Every intent carries the
-generation the bridge read.
+generation the bridge read, and the Start side's recovery ticket is bound to the
+same identity, so a landing can only serve an open for the menu it belongs to.
 
 ### Intent — bridge -> Start
 
@@ -90,6 +101,11 @@ with `SwipeIpcAnswerIntent(seq, state, durationMs, entryPercent, hr)` on
 executor command first and then the ack: the ack reports the decision, it is not
 a barrier the bridge waits for before the command.
 
+A landing reconciles an already-published `external` intent before it may issue a
+recovery: the idle timer and the intent event are two wait objects of the same
+thread, and the timer has the lower index, so the landing can otherwise run
+before the takeover that arrived with it.
+
 ### Executor command — Start -> bridge
 
 ```
@@ -100,9 +116,26 @@ executeAt (GetTickCount64 deadline), open, target (the dismiss a cancel names)
 Published by `SwipeIpcPublishExec`; `execEvent` wakes the bridge worker. `show`
 and `cancel` run at once; `dismiss` is armed for `executeAt` and a later command
 supersedes it (the launcher-thread sequence watermark ignores the same record
-delivered twice). The bridge answers on `execAckSeq` with
-`(command, state, hr, visible)`, where `visible` is the `IsVisible` result: 0
-right after Show, 1 at the 300 ms probe, 0 after Dismiss.
+delivered twice). `execTick` is the publication tick and is the deadline of a
+show and a cancel.
+
+**Expiry.** The controller's budget is 400 ms: a show is answered within 400 ms
+of its publication, a dismiss within 400 ms of the deadline it was given. A
+dispatch that starts after that is stale — the publisher has already cleared its
+sequence, published a cancel where it could, and released ownership — so the
+bridge answers `kSwipeAckExpired` and does not call the primitive. The publisher
+does the same from its side: an unanswered dismiss is cancelled by sequence at its
+timeout, and an unanswered show, which has no armed command to revoke, is
+invalidated by the executor's age check.
+
+The bridge answers on `execAckSeq` with `(command, state, hr, visible)`, where
+`visible` is the `IsVisible` result: 0 right after Show, 1 at the 300 ms probe, 0
+after Dismiss. For a dismiss it is **advisory**: `hr=0` says the primitive
+returned, and the window can still be visible until the shell's own hide runs. The
+bridge keeps that confirmation as an obligation and logs
+`exec dismiss confirmed seq=... visible=0` or
+`exec dismiss unconfirmed seq=... visible=1 at_call=… after=300 ms` 300 ms later;
+it never reports success as a hide.
 
 ### Controller direction — Start -> bridge
 
@@ -123,35 +156,47 @@ executor dismiss still latches the press instead of publishing into a no-op show
 is not published as a close; the peer gate sits before every close intent, so a
 call with no live controller passes to the shell instead.
 
-### Peer liveness — Start -> bridge
+Both words belong to the activation that publishes them. The attach withdraws
+availability, resets both to `0`, and only then claims the epoch; a kill while
+`closing` (or with `controllerTouch` set) therefore cannot leave the previous
+activation's decision readable as the next one's.
+
+### Peer liveness and identity — Start -> bridge
 
 | Field | Meaning |
 |---|---|
+| `peerEpoch` | incremented once per attach: the activation that answers now |
 | `peerTick` | low 32 bits of the Start side's `GetTickCount64`, refreshed from its input thread |
-| `peerState` | `1` alive after a successful init, `0` gone when the Start mod unloads |
+| `peerState` | `1` while that consumer runs, `0` before it is ready and after it stops |
 
 The bridge creates the section, so the channel stays mapped and valid while the
 bridge runs even with the Start mod disabled. `peerState` is the controller's
-answer to "am I here"; `peerTick` is the freshness that survives a host kill.
-The bridge intercepts a trigger only while `peerState == 1` and
-`(uint32_t)now - peerTick < kSwipePeerStaleMs` (600 ms); otherwise it logs one
-`own pass trigger=... reason=no-peer` line and calls the shell's own path. The
-close intent at `HideStartAndCortana` logs `exec pass hide method=... reason=no-peer`
-and passes the same way.
+answer to "am I here"; `peerTick` is the freshness that survives a host kill. The
+bridge intercepts a trigger only while `peerState == 1` and
+`(uint32_t)GetTickCount64() - peerTick < kSwipePeerStaleMs` (600 ms); otherwise it
+logs one `own pass trigger=... reason=no-peer` line and calls the shell's own
+path. The close intent at `HideStartAndCortana` logs
+`exec pass hide method=... reason=no-peer` and passes the same way.
 
-The Start side's `OpenIpcChannel` writes a fresh tick and then `alive`, so a
-reader that sees `alive` never pairs it with the previous activation's tick. The
-input thread refreshes the tick from its 5 ms idle tick and from every positioned
-report, at most once per `kSwipePeerTickIntervalMs` (100 ms). `Wh_ModUninit`
-writes `gone` before it releases the view, and it does so before any residual
-early return: a clean disable is immediate, and a residual unload also stops
-every interception. A killed host leaves `alive` behind; the tick stops, and the
-gate closes 600 ms later.
+The reader takes the comparison clock **after** it reads `peerTick`, never from
+its own earlier read: a heartbeat published in between would otherwise subtract
+to a huge age and close the gate on a peer that had just proved it runs.
+
+Publication order is `peerEpoch`, then `peerTick`, then `peerState=alive`. The
+Start side refreshes the tick from its input thread at most once per
+`kSwipePeerTickIntervalMs` (100 ms). A killed host leaves `alive` behind; the tick
+stops, and the gate closes 600 ms later. A few presses during a start or a stop
+are therefore served natively by the shell, by design.
 
 The window is six refresh intervals: five consecutive refreshes may be missed
 without closing the gate, so a stalled input thread (a settle, a busy message
 loop) does not flap it, and a kill still restores the shell's own toggle within
-0.6 s.
+0.6 s. **600 ms is a detection budget, not a delivery guarantee.** A decision
+taken inside the window can still be published after the peer died, and a press
+latched inside the window can still be served after it. The residual windows are:
+the gate check to the `SetEvent` of a published intent (sub-millisecond, but not
+atomic against a kill), and, for the latch, the whole wait it is held for, which
+is why the serve re-reads the peer and the epoch instead of trusting the press.
 
 ## Initialisation
 
@@ -165,17 +210,15 @@ mods call it at `Wh_ModInit`, never in a hook.
 
 A reinstall maps a new image at a new base while the old one stays pinned. The
 new image opens the same section; the old image's handles are closed by its
-unload. The names carry the version, so a v6 build opens its own section and
-leaves a v5 (736 bytes) one to the old pair. If a section of another layout is
-handed over anyway, `SwipeIpcOpen` refuses it with `ipc open failed err=13`
-(`ERROR_INVALID_DATA`): `version` must be 6 and `layoutBytes` 744. A v4 section
-was also 744 bytes, so the version word, not the size, separates the two.
-Measured on the v5 upgrade: install Start first, then the bridge; a bridge that
-still held the old section was one Start reload behind.
+unload. The names carry the version, so a v7 build opens its own section and
+leaves a v6 one of the same 744 bytes to the old pair; the version word is what
+refuses it if it is handed over anyway (`ipc open failed err=13`,
+`ERROR_INVALID_DATA`). Measured on the v5 upgrade: install Start first, then the
+bridge; a bridge that still held the old section was one Start reload behind.
 
 ## The debug command
 
-`Local\SwipeFor10Start_v6_Cmd` is the only command path: `tools/ipc.ps1` takes
+`Local\SwipeFor10Start_v7_Cmd` is the only command path: `tools/ipc.ps1` takes
 the mutex, writes one line, sets the event. The Start side's input thread takes
 it (`SwipeIpcTakeCommand`) and applies the documented debug lines. Nothing
 polls.

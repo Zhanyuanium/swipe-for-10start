@@ -4,14 +4,17 @@
 #          events and mutex `mods/swipe_ipc_shared.h` defines.
 # [OUTPUT]: `pwsh -File tools/ipc.ps1 p=0.5` publishes one command; -State
 #           prints one snapshot of the channel (each record with the sequence it
-#           was copied under, plus the controller and peer liveness words) and
-#           refuses a section whose initState is not ready or whose magic,
-#           version or layoutBytes is not this header's.
+#           was copied under, plus the controller words, the peer liveness pair and
+#           the peer activation epoch) and refuses a section whose initState is not
+#           ready or whose magic, version or layoutBytes is not this header's.
 # [POS]: replaces writing into the mod's debug.txt from a shell. The offsets
 #        below are the contract in swipe_ipc_shared.h; the mod asserts the same
 #        numbers at compile time, and this tool compares the section's initState,
 #        magic, version and layoutBytes before it reads or writes, so a foreign
-#        or uninitialised section is refused instead of misread. Every record is
+#        or uninitialised section is refused instead of misread. v7 keeps the
+#        744-byte size of v6 and only adds `peerEpoch` at 740, so the version word
+#        is what separates the two layouts; a v6 section of the same size is
+#        refused rather than read at v7's offsets. Every record is
 #        a seqlock: the counter is bumped to odd before a write and to even
 #        after, and a reader retries while it is odd or changed, returning the
 #        accepted counter with the copy so no display can mix two publishes. The
@@ -36,9 +39,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_v6_State'
-$CommandEventName = 'Local\SwipeFor10Start_v6_Cmd'
-$CommandMutexName = 'Local\SwipeFor10Start_v6_CmdWrite'
+$StateName = 'Local\SwipeFor10Start_v7_State'
+$CommandEventName = 'Local\SwipeFor10Start_v7_Cmd'
+$CommandMutexName = 'Local\SwipeFor10Start_v7_CmdWrite'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -81,7 +84,8 @@ $OffsetControllerDirection = 724
 $OffsetControllerTouch = 728
 $OffsetPeerTick = 732
 $OffsetPeerState = 736
-$StateVersion = 6
+$OffsetPeerEpoch = 740
+$StateVersion = 7
 $StateBytes = 744
 
 function Open-State {
@@ -217,6 +221,7 @@ if ($State) {
             controllerTouch     = $view.ReadInt32($OffsetControllerTouch)
             peerTick            = $view.ReadUInt32($OffsetPeerTick)
             peerState           = $view.ReadInt32($OffsetPeerState)
+            peerEpoch           = $view.ReadUInt32($OffsetPeerEpoch)
         } | Format-List
         $view.Dispose()
     } finally {
