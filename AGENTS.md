@@ -15,7 +15,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.1, Start 0.39.0 / bridge 0.20.0)
+## What ships (M3.2, Start 0.40.0 / bridge 0.21.0)
 
 Two mods, one path. `mods/start-menu-legacy-swipe.wh.cpp` runs in
 `StartMenuExperienceHost.exe` and owns the touch gesture, the panel claims, the
@@ -31,14 +31,24 @@ one `intent(seq, kind, trigger, method, flags, open)`; the Start side answers
 and then `exec dismiss`. External takeovers (Win+Tab, lock, display change, a
 forwarded modified Win press) publish `intent=external` and are never held.
 
-A press is never lost. The bridge's one dispatch reads the state. A close still
-settling (phase 2, no dismiss armed) is genuinely cancellable: the press
-publishes an open intent and the Start side takes the panel from its live
-position. A shell hide in flight (`InternalState` 9/11), or a dismiss already
-armed and due, cannot be cancelled: the press is latched (one slot, with its
-tick) and served as the same open intent when the hide lands (`OnStartHidden`,
-or the closed cloak if that event was missed). A second press replaces the slot
-and logs the replacement; the serve logs its wait (measured 31–110 ms).
+A press is never lost. The bridge's one dispatch reads the controller's published
+state: while `controllerOwning` is set, `controllerPhase` 2 (a close in flight)
+makes the press an open and an owned phase 1 makes it a close. The launcher's
+state is only the resync for a panel the controller does not own. That direction
+cannot come from the shell: a gesture close retracts the panel with
+`InternalState` 5 and the cloak still open for the whole settle, until the
+executor's `Dismiss`; the controller publishes phase 2 in `TakeCloseOwnership`,
+before the settle's first frame. A close still settling (no executor dismiss
+armed) publishes open at once: the controller drops the tap and the pending
+dismiss and settles the panel back from its live position (`intent open cancel
+from=...`). A dismiss already inside the shell's `Dismiss` call cannot be
+recalled; the window hides, and the landing reissues that open once (`intent open
+recovered entry=...`). A shell hide in flight (`InternalState` 9/11), or an
+executor dismiss already armed, latches the press (one slot, with its tick). The
+hidden event arms a 50 ms timer and the timer serves the same open intent after
+the event's stack has unwound; a show at the event's own tick was swallowed
+(state stuck at 3, no Shown). A second press replaces the slot and logs the
+replacement; the serve logs its wait.
 
 The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user
@@ -62,10 +72,11 @@ the uncloak and during the key/hide. A pull that is still down when a close land
 (or that lifted within the 300 ms late window) is the pull that takes the menu
 back: after `win close observed` the controller issues the same show the band
 admission would, and the open adopts the live contact or the release record
-(`reveal reopen after close pull=1 late=0`). The close is `TakeProgressNow()` +
-the mirrored settle + `exec dismiss` at +30 ms; the bridge's timer runs `Dismiss`
-on the launcher thread. The close suppression keeps the visibility poll from
-healing the retracted panel before the dismiss lands.
+(`reveal reopen after close pull=1 late=0`). An intent close is
+`TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
+close asks for the same dismiss at its own settle's end. The bridge's timer runs
+`Dismiss` on the launcher thread. The close suppression keeps the visibility
+poll from healing the retracted panel before the dismiss lands.
 
 The close is judged by behaviour: the shell's hidden event (`own state
 event=hidden open=0`), the executor's `visible=0`, and the next open working.
@@ -93,17 +104,18 @@ is the only command publisher and takes the mutex; `-State` reads v4/744.
 
 Windows 11 10.0.26100.9949, ExplorerPatcher legacy Start
 (`Start_ShowClassicMode=1`), 2880x1800 physical at 200 % (1440x900 DIP).
-**Current layout: docked** (auto-hide off): work `0,0,1440,852`, tray
-`0,852..1440,900`, band `804..900`, panel `236,265..1229,840`, trail 265,
-distance 900. The earlier auto-hidden layout (work `0,0,1440,900`, panel
-`236,167..1229,840`, trail 167) is historical; its numbers are not the docked
-ones. The Start button is at physical `(36,1748)`; the docked bar is always
-visible, so the button trigger is re-testable.
+**Current layout: auto-hidden** (auto-hide on): work `0,0,1440,900`, the bar off
+screen, band `804..900`, panel `236,265..1229,840`, trail 265, Distance 852. The
+docked layout (work `0,0,1440,852`, tray `0,852..1440,900`) and the earlier
+auto-hidden variant (panel `236,167..1229,840`, trail 167) are historical; their
+numbers are not the current ones. The Start button is off screen until the bar
+is revealed; the button test hovers the bottom edge first, then clicks physical
+`(36,1748)`.
 
 ## Rules
 
-- One data source per claim: the cloak decides the shell state, the launcher
-  state decides the toggle, the geometry snapshot decides the mapping.
+- One data source per claim: the cloak decides the shell state, the controller's
+  published flags decide the toggle, the geometry snapshot decides the mapping.
 - One mechanism, one log shape. A decision line and an executor line per
   trigger; no per-trigger branch in either mod.
 - A wrong-thread launcher call is not a clean error. Never call from a hook

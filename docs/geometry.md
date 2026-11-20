@@ -31,10 +31,12 @@ it was tested against and the generation.
 A measurement is accepted only when the rect lies on the monitor and its
 taskbar-side edge lies inside the band the taskbar itself defines: the bar's
 reserved strip at the screen edge, extended by one bar thickness toward the
-desktop. On this bottom-taskbar layout the bar reserves `852..900`, so the
-band is `804..900`; the settled panel sits 12 DIP inside the bar's inner edge
-(`840` against `852`), inside the band, and the open storyboard's rect is
-rejected whole. The same band is the reveal's candidate strip on the input
+desktop. On the current bottom-taskbar layout the auto-hidden bar's own 48 DIP
+thickness gives the band `804..900` even though the work area is the whole
+screen; the settled panel sits 12 DIP inside the bar's inner edge (`840` against
+`852`), inside the band, and the open storyboard's rect is rejected whole. The
+docked layout had the same band from the reserved strip `852..900`. The same
+band is the reveal's candidate strip on the input
 thread, so the panel the snapshot accepts and the strip a pull may start in
 cannot disagree about where the taskbar ends. A rejection publishes nothing
 and logs `reveal panelTrail rejected ... axis=... rect=... work=... mon=...
@@ -184,14 +186,14 @@ deferred there rather than dismissed.
 
 ## Measured layouts
 
-The current layout is **docked** (auto-hide off): `dismiss axis=3`, `Distance`
-900, work `0,0,1440,852`, tray `0,852..1440,900`, panel
+The current layout is **auto-hidden** (auto-hide on): `dismiss axis=3`,
+`Distance` 852, work `0,0,1440,900`, the bar off screen, panel
 `236,265..1229,840`, so the trail is the panel's top edge at **265 DIP** and the
 band it is tested against is `804..900` (`reveal panelTrail=265 axis=3 ...
-work=0,0,1440,852 band=804,900`). The bar is always visible; the tray window is
-48 DIP thick at the bottom edge. The earlier auto-hidden layout (work
-`0,0,1440,900`, panel `236,167..1229,840`, trail 167, hidden window at
-`0,1798,2880,1894`) is historical and its numbers are not these.
+work=0,0,1440,900 band=804,900`). The docked layout (work `0,0,1440,852`, tray
+`0,852..1440,900`, the same panel and band, the bar 48 DIP thick) is historical.
+The earlier auto-hidden variant (panel `236,167..1229,840`, trail 167, hidden
+window at `0,1798,2880,1894`) is also historical and its numbers are not these.
 
 The survey on this layout measured two regions: the app list
 (`AllAppsGridListView`, `sh=4065`) and the tile grid's internal viewer

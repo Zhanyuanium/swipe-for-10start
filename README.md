@@ -28,14 +28,16 @@ Two mods ship together, and both are needed for the full experience:
 - **Start menu touch gesture bridge** (`start-menu-touch-gesture-bridge`) —
   runs in Explorer and executes the shell's own `ShowStartView`/`Dismiss` on
   the launcher's thread. The Windows key, the Start button and a click away
-  publish one intent; the controller decides open or close, runs the one
-  mirrored settle, and then asks the bridge to dismiss. A close slides out with
-  the same animation the gesture close uses; a press during a close is either
-  cancelled (the settle is still running) or latched and served when the hide
-  lands, so the key never goes dead; a touch pull still down when a close lands
-  reopens through the controller. Win+Tab, the lock screen and a display change
-  pass through untouched, so a lock never waits. Without the bridge the menu
-  still opens and closes, but the close is instant.
+  publish one intent; the controller decides open or close from its own
+  published state, runs the one mirrored settle, and then asks the bridge to
+  dismiss. A close slides out with the same animation the gesture close uses.
+  A press during a close is read as a reopen: while the window is still on
+  screen the close is cancelled and the panel settles back from where the
+  retract left it; a press inside the shell's hide is latched and served when
+  the hide lands. The key never goes dead. A touch pull still down when a close
+  lands reopens through the controller. Win+Tab, the lock screen and a display
+  change pass through untouched, so a lock never waits. Without the bridge the
+  menu still opens and closes, but the close is instant.
 
 ## Install
 

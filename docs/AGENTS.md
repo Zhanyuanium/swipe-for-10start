@@ -5,13 +5,15 @@ The project's memory: what was measured, what was falsified, and why each
 decision was taken. The user-facing quick start is `../README.md` /
 `../README.zh-CN.md`.
 
-architecture.md: M3.1, the shipping design. The launcher read (`s_pLauncher`
+architecture.md: M3.2, the shipping design. The launcher read (`s_pLauncher`
 outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`),
 the executor thread (the `OnHotkeyInvoke` thread, not the taskbar thread), one
-decision/one executor per trigger, the press latch for a hide in flight, the
-click-away guards of an opening window, the pull-reopen at a close's landing,
-the docked-layout timing/interruption chains, the accepted cloak cap, the v4
-channel, and the deleted M2 mechanisms.
+decision/one executor per trigger, the controller-state toggle rule (phase 2
+published at the close's start), the close cancel/recovery for a press during a
+retract, the press latch for a hide in flight, the click-away guards of an
+opening window, the pull-reopen at a close's landing, the auto-hidden
+timing/interruption chains (docked numbers named as historical), the accepted
+cloak cap, the v4 channel, and the deleted M2 mechanisms.
 
 re/: reverse-engineering records, read-only analysis of this build's shell, kept
 because every RVA and prologue check in the mods comes from here. close-decisions.md

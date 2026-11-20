@@ -27,9 +27,11 @@ contact lifts.
    timing, and requests `exec show` **once per open** (`g_intentOpenActive`).
    It sets `controllerOwning` (phase 1) and `controllerTouch`.
 2. **Shell open** — the bridge's executor calls `ShowStartView`; the shell
-   uncloaks (245–268 ms worst case; the docked keyboard open showed its first
-   pixel at +190 ms from the key). The Start side starts the content settle at
-   the entry (`RevealEntryProgress`; docked warm 0.348, cold 0.000), not at 0.
+   uncloaks (245–268 ms worst case; the current auto-hidden Win open showed its
+   first panel pixel at +82–187 ms from the key, median +115 over three runs; the
+   docked run was +190 ms). The Start side starts the content settle at
+   the entry (`RevealEntryProgress`; auto-hidden warm 0.255, docked 0.348, cold
+   0.000), not at 0.
 3. **Live takeover** — at the open, `PromoteRevealContact` adopts the contact
    that began in the band if it is still down and has travelled
    `kAdoptTravelDip` (24 DIP). The takeover starts at the entry, holds it for the
@@ -37,8 +39,9 @@ contact lifts.
    visible position toward the absolute mapped position at
    `kSettleSpeedDipPerMs` (2.2 DIP/ms), never past it. The finger's own motion is
    the mapping; only the written position is rate-limited.
-4. **Follow** — once caught up, `behind=0.000`: the panel is glued (docked
-   `progress=0.96` at a held 300 DIP finger, the panel edge 2 px from it). A
+4. **Follow** — once caught up, `behind=0.000`: the panel is glued (auto-hidden
+   `progress=0.96` at a held 300 DIP finger, the panel edge 1.8 px from it;
+   `progress=0.90` at 350 DIP, 0.4 px; the docked 300 DIP hold measured 2 px). A
    release
    commits on travel (half the travel) or on the session average, and the release
    speed is measured over the last 8–30 ms window (freshness 30 ms).
@@ -59,9 +62,10 @@ The 18 ms idle still ends a contact that is truly silent, with `src=idle`.
 
 `RevealEntryProgress` is the smallest `Progress` whose translated trail edge sits
 on the work area's edge — the first progress at which any of the panel is on
-screen. The trail is the measured panel edge (docked `reveal panelTrail=265` at
-`axis=3`; auto-hidden `167`). The fallback is the far screen edge. A warm
-docked measurement gives 0.348 on the 900 DIP panel (auto-hidden 0.186); a cold
+screen. The trail is the measured panel edge (current auto-hidden
+`reveal panelTrail=265` at `axis=3`; the earlier auto-hidden variant measured
+167, docked 265). The fallback is the far screen edge. A warm auto-hidden
+measurement gives 0.255 on the 852 DIP panel (docked 0.348); a cold
 first open (no measurement yet, the request deferred because the panel is owned)
 gives 0.000, and the settle starts there honestly. The first visible frame is
 always the entry.
@@ -75,30 +79,43 @@ intent close -> TakeCloseOwnership -> BeginMirrorCloseSettle(TakeProgressNow())
              -> exec dismiss at settle + 30 ms -> bridge Dismiss -> hidden
 ```
 
-`TakeCloseOwnership` sets `g_suppressRestoreUntil` (the visibility poll must not
-heal the retracted panel), mutes a contact still on the glass, clears the reveal
-and clears `controllerTouch`. The mirrored settle is the open curve played
-backwards, full travel (409 ms at 900 DIP docked; 387 at 852 in the historical
-auto-hidden geometry), no seam speed, from the live position. The dismiss is scheduled, not immediate, so the panel is never
-hidden mid-slide.
+A gesture close runs the same pipeline with its own release settle and `exec
+dismiss` at that settle's end; it has no 30 ms lead.
 
-A press while the close runs is never lost. If the close is still settling
-(phase 2, no dismiss armed), `IntentShouldClose` answers open and the Start side
-takes the panel from its live position; if the dismiss is already armed and due,
-or the shell is in the 9/11 hide, the bridge latches the press (one slot, tick)
-and serves it as the same open intent when the hide lands (`own press served
-wait=...`, 31–110 ms measured). A press while the open runs is a close: phase 1
-makes it a close, and the settle starts from the live position (`from=0.542`
-measured 172 ms into an open).
+`TakeCloseOwnership` sets `g_suppressRestoreUntil` (the visibility poll must not
+heal the retracted panel), publishes `controllerOwning` phase 2 **before the
+settle's first frame**, mutes a contact still on the glass, and clears the reveal
+and `controllerTouch`. The phase is the whole toggle answer while it is set; the
+shell's cloak and state cannot answer it, because they still say open for the
+whole retract. The mirrored settle is the open curve played backwards, full
+travel (387 ms at the current 852 DIP; 409 at the docked 900), no seam speed,
+from the live position. The dismiss
+is scheduled, not immediate, so the panel is never hidden mid-slide.
+
+A press while the close runs is never lost. `IntentShouldClose` reads the
+controller's phase, so a press during the retract is an open:
+- a gesture close still settling publishes open at once; the Start side drops
+  the tap, cancels the pending dismiss, clears the suppression and settles the
+  panel back from its live position (`intent open cancel from=...`). If the
+  dismiss already entered the shell's `Dismiss` call, the hide lands and the
+  landing reissues the open (`intent open recovered entry=...`);
+- an intent close has its dismiss armed for a future deadline, so the bridge
+  latches the press (one slot, tick); the hidden event arms a 50 ms timer and
+  the timer serves the open after the event's stack has unwound (`own press
+  served wait=...`). A show at the hidden event's own tick was swallowed (state
+  stuck at 3), which is why the serve is deferred. A shell hide in flight (state
+  9/11) is latched the same way.
+A press while the open runs is a close: phase 1 makes it a close, and the settle
+starts from the live position (`from=0.542` measured 172 ms into an open).
 
 A pull that is still down when the close lands (or that lifted inside the 300 ms
 late window) takes the menu back: after `win close observed` the controller
 issues one fresh show (`reveal reopen after close pull=1 late=0 entry=...`), and
 the open adopts the live contact or consumes the release record. The idle is
 held through the close so the digitizer's pause during the key/hide does not
-drop the pull. Measured: held pull at 350 DIP, Win close, landing reopened with
-`reveal takeover from=0.348 offset=0.558`, 221 reports, `progress=0.91
-behind=0.000 commit=1`, menu open.
+drop the pull. Measured on the docked layout: held pull at 350 DIP, Win close,
+landing reopened with `reveal takeover from=0.348 offset=0.558`, 221 reports,
+`progress=0.91 behind=0.000 commit=1`, menu open. The auto-hidden entry is 0.255.
 
 The gesture close (a touch drag with enough travel/velocity) uses its own release
 spring through `BeginGestureSettle` and schedules the same dismiss at the end of

@@ -1,22 +1,21 @@
-# M3.1 architecture — one controller, one executor
+# M3.2 architecture — one controller, one executor
 
-> L3-level design record for `feat/own-start-state`. Start **0.39.0**,
-> bridge **0.20.0**, channel **v4 / 744 B**. The measured evidence is quoted with
-> the build and the layout it came from; everything below was run on this
-> machine. **Layouts:** *docked* = work `0,0,1440,852`, tray `0,852..1440,900`,
-> panel `236,265..1229,840`, trail 265, distance 900 (current). *Auto-hidden* =
-> work `0,0,1440,900`, panel `236,167..1229,840`, trail 167 (historical; its
-> numbers are never the docked ones).
+> L3-level design record. Start **0.40.0**, bridge **0.21.0**, channel **v4 /
+> 744 B**. The measured evidence is quoted with the build and the layout it came
+> from; everything below was run on this machine. **Layouts:** *auto-hidden* =
+> work `0,0,1440,900`, the bar off screen, band `804..900`, panel
+> `236,265..1229,840`, trail 265, Distance 852 (current). *Docked* = work
+> `0,0,1440,852`, tray `0,852..1440,900`, same panel, trail 265 (historical).
 
 ## What ships
 
 Two Windhawk mods:
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.38.0) runs in
+- `mods/start-menu-legacy-swipe.wh.cpp` (0.40.0) runs in
   `StartMenuExperienceHost.exe`. It owns the touch gesture, the claim on
   `Progress`, the settle planner, the gates and the decision state. It consumes
   bridge intents and publishes executor commands.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.19.0) runs in
+- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.21.0) runs in
   `explorer.exe`. It turns the Win key, the Start button and the click-away into
   intents, and executes the Start side's `show`/`dismiss`/`cancel` commands on
   the launcher's own thread. It also swallows the shell's own duplicate
@@ -97,24 +96,39 @@ Triggers and their decision lines:
 | click-away | `HideStartAndCortana` method 7 | `intent close trigger=clickaway` |
 | touch | the Start side's band admission | `reveal show request` |
 
-`IntentShouldClose` is the only toggle rule: the controller's phase (1 opening,
-2 closing) decides first, then the shell's cloak and internal state (1/3/5 are
-open or opening, 7/9/11 are closing). A press during a close is therefore an
-open, and a press during an open is a close. No trigger has its own branch.
+`IntentShouldClose` is the only toggle rule: the controller's published flags
+decide while it owns the panel (phase 2 is a close in flight, so the press is an
+open; an owned phase 1 is the open it owns, so the press is a close), and the
+shell's cloak and internal state are the resync only for a panel the controller
+does not own. The shell cannot be the direction: a gesture close publishes phase
+2 in `TakeCloseOwnership`, before its first frame, because the window still
+reports state 5 and the cloak still reports open for the whole retract, until
+the executor's `Dismiss` runs. Reading the shell there made a press during the
+retract a second close, and the owner's press did nothing. No trigger has its
+own branch.
 
-**A press is never lost — the latch.** The same dispatch decides from the state:
-a close still settling (phase 2, no dismiss armed) is genuinely cancellable and
-publishes open now; a shell hide in flight (`InternalState` 9/11), or a dismiss
-already armed and due, is latched in one slot (tick, trigger, method, flags) and
-served as the same open intent when the hide lands (`own state event=hidden`, or
-a closed cloak if the event was missed). A second press replaces the slot
-(`own press latch replaced ...`); the serve logs `own press served wait=...`
-(measured 31–110 ms; median 78 ms over 30 randomised trials). The timer is only
-the fallback for a missed landing. The click-away that the shell issues while the
-window is appearing (state 1/3), and the Hide(7) it issues inside our own
-`ShowStartView` in state 1/3, are the pointer-away check, not a user click, and
-are swallowed (`reason=opening`/`reason=own-show`). Without that, the served open
-came back and was hidden in the same millisecond.
+**A press is never lost — cancel or latch.** A close still settling has no
+executor dismiss armed (a gesture close) or has one armed for a future deadline
+(an intent close). The gesture shape publishes open at once: the Start side
+drops the tap, cancels the pending dismiss, clears the suppression, takes the
+panel where the retract left it and settles it back to 1 (`intent open
+cancel from=...`). If the dismiss had already entered the shell's `Dismiss` call
+when the press landed, the window hides anyway; the landing reissues the open
+once (`intent open recovered entry=...`). A shell hide in flight
+(`InternalState` 9/11), or an executor dismiss already armed, is latched in one
+slot (tick, trigger, method, flags). The hidden event arms a 50 ms timer and the
+timer serves the same open intent after the event's stack has unwound: a show at
+the hidden event's own tick was swallowed (same tick, `exec visible=0`, state
+stuck at 3, no Shown), while a show 16 ms after it opened normally. A second
+press replaces the slot (`own press latch replaced ...`); the serve logs `own
+press served wait=...` (current auto-hidden medians: 219 ms Win close, 210 ms
+Start-button, 234 ms click-away; the gesture latch is rare and measured 94 ms).
+The 400 ms timer is only the fallback for a landing the event missed. The
+click-away that the shell issues while the window is appearing (state 1/3), and
+the Hide(7) it issues inside our own `ShowStartView` in state 1/3, are the
+pointer-away check, not a user click, and are swallowed
+(`reason=opening`/`reason=own-show`). Without that, the served open came back
+and was hidden in the same millisecond.
 
 The Start side answers each intent (`intent ack`), then publishes the executor
 command:
@@ -138,7 +152,7 @@ Fallbacks, each logged once:
 - no executor ack within 400 ms: `exec ack timeout seq=… (resync from cloak)`,
   same release.
 
-## The open and the close (docked layout)
+## The open and the close (auto-hidden; docked numbers named)
 
 Open (touch, docked, warm):
 
@@ -151,26 +165,28 @@ reveal takeover              172817437   (+109 ms)
 exec visible ... visible=1   172817640   (+312 ms)
 ```
 
-The Win open captured at `x=1200` in a 16×1300 strip: `key=172830139`,
-`exec show` `172830218` (+79 ms), `shown` `172830281` (+142 ms), first panel
-pixel `172830329` (**+190 ms**), probe `visible=1` `172830531` (+392 ms). The
-shell's cloak is the dominant term; the executor removes the shell's 60–250 ms
-gesture wait. The auto-hidden layout measured +257 ms for the same pixel; the
-docked bar changes the available work area, not the cloak rule.
+The Win open, current auto-hidden layout (three captures at `x=1200` in a
+16×1600 strip, `top` counts the first panel row): key → `exec show` **+31–32 ms**
+→ `own state event=shown` **+46–141 ms** → first panel pixel **+82–187 ms**
+(median +115) → `exec visible ... visible=1` **+343–344 ms**. The docked capture
+was `key=172830139`, `exec show` +79 ms, `shown` +142 ms, first panel pixel
+**+190 ms**, `visible=1` +392 ms. The shell's cloak is the dominant term; the
+executor removes the shell's 60–250 ms gesture wait. The earlier auto-hidden
+variant measured +257 ms for the same pixel.
 
 The touch show is requested once per open (`g_intentOpenActive` guards a second
 report while the window is still closed). The entry is
-`RevealEntryProgress`; docked it reads **0.348** (warm; the panel trail is 265,
-the distance 900). A cold first open still reads 0.000. The first visible frame
-is the entry, not 0.
+`RevealEntryProgress`; auto-hidden it reads **0.255** (warm; the panel trail is
+265, the Distance 852); the docked layout read 0.348. A cold first open still
+reads 0.000. The first visible frame is the entry, not 0.
 
 The reveal takeover starts at the entry and chases the mapped finger at
-`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. Docked, held contact
-(`follow_hold`, 114 reports): `reveal takeover from=0.547 offset=-0.127`,
-`open follow travel=475 progress=0.91 behind=0.000 commit=1`. A hold at
-physical 600 (`y=300 DIP`) gives `progress=0.96 behind=0.000`; the panel's top
-edge is then 301 DIP, **2 px** from the finger (the M2 hold was 4 px on the
-other layout). The `offset` is the inherited gap at the takeover; the chase
+`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. Current auto-hidden, a held
+contact (`follow_hold`, 85 reports): `reveal takeover from=0.255 offset=0.338`,
+`open follow travel=488 max=488 progress=0.90 behind=0.000 commit=1`; the panel
+edge is 350.2 DIP at the held 350 DIP finger, **0.4 px** away. The 300 DIP hold
+gives `progress=0.96` and a 299.1 DIP edge, **1.8 px** away; the docked 300 DIP
+hold measured 2 px. The `offset` is the inherited gap at the takeover; the chase
 closes it at 2.2 DIP/ms, and `behind=0.000` is the glued state.
 
 A digitizer that goes quiet while the shell uncloaks, or while a close is in
@@ -179,23 +195,38 @@ the 18 ms idle release is held, so the candidate the open/landing is about to
 adopt survives. A real lift is a report and still ends the contact.
 
 Close: a Win, Start-button or click-away intent calls `TakeCloseOwnership`
-(sets `g_suppressRestoreUntil`, mutes the contact, clears the reveal) and runs
+(sets `g_suppressRestoreUntil`, publishes `controllerOwning` phase 2 before the
+settle's first frame, mutes the contact, clears the reveal) and runs
 `BeginMirrorCloseSettle` from `TakeProgressNow()`: the open curve played
-backwards, full travel (409 ms at 900 DIP). The dismiss is scheduled at the end
+backwards, full travel (387 ms at the current 852 DIP; 409 ms at the docked 900).
+The dismiss is scheduled at the end
 plus 30 ms. The bridge's timer runs `Dismiss`; the shell's hidden event follows
 and the Start side logs `win close observed`, clears
 `controllerOwning`/`controllerTouch`, and the next open is ready. The close is
 judged by that hidden event and `visible=0`, not by an internal `0xA` value;
-that value is not a criterion.
+that value is not a criterion. A gesture close is the same path with its own
+release settle (160–520 ms) and no 30 ms lead: its dismiss is requested at the
+settle's end.
+
+A Win press during a close is an open because the controller's phase says so,
+not because the shell's state does. The open intent takes the live panel,
+cancels the tap and the pending dismiss and settles back to 1
+(`intent open cancel from=...`); the window never hides. The dismiss can already
+be inside the shell's `Dismiss` call when that press lands (a 1–15 ms window);
+the close then lands and the next poll reissues the open
+(`intent open recovered entry=...`), so no press is lost. A press during a
+shell hide (state 9/11) or with an armed executor dismiss is latched and served
+at the landing instead.
 
 A pull that is still down when the close lands (or that lifted inside the
 300 ms late window) is the pull that takes the menu back: after
 `win close observed` the controller issues one fresh show
-(`reveal reopen after close pull=1 late=0 entry=0.348`), and the open adopts the
-live contact or consumes the release record. Measured: the Win close during a
-held pull at `y=350 DIP`; the landing reopened, `reveal takeover from=0.348
-offset=0.558`, the follow continued with 221 reports and ended
-`progress=0.91 behind=0.000 commit=1`, menu open.
+(`reveal reopen after close pull=1 late=0 entry=...`), and the open adopts the
+live contact or consumes the release record. Measured on the docked layout: the
+Win close during a held pull at `y=350 DIP`; the landing reopened, `reveal
+takeover from=0.348 offset=0.558`, the follow continued with 221 reports and
+ended `progress=0.91 behind=0.000 commit=1`, menu open. The auto-hidden entry is
+0.255.
 
 The suppression is what keeps the visibility poll from "healing" the panel that
 the close has retracted: without it the poll saw a shown window with the panel
@@ -203,22 +234,31 @@ at 0 and started an open settle between the settle end and the dismiss
 (`win open unhealed`), a flash. `TakeCloseOwnership` now sets it for the intent
 close too.
 
-Measured interruption:
+Measured interruption (current auto-hidden unless named):
 
 - open settle interrupted: the Win close 172 ms into the open started at
   `from=0.542` (the live position), not 1.0;
-- close interrupted: a second Win 79 ms after the close published `exec cancel`,
-  the bridge killed the timer, and the menu stayed open (`visible=1` after
-  300 ms);
 - drag interrupted: a Win press while a touch was held at `y=399.5` ran the
   close from `progress=1.000`, hid at +437 ms, and the touch's later lift was
-  ignored;
-- press at the hide: 30 randomised trials (10 Win, 10 Start-button, 10
-  click-away closes, press offset random 300–445 ms) gave **0 lost**, 17
-  latched-and-served (waits 47–110 ms, median 78), 1 cancelled (settle still
-  cancellable), and 12 direct opens (the press landed after the hide). The
-  latch is the one path for the last two shapes; the pre-hide shape is the
-  cancel.
+  ignored (docked);
+- press during a close, 40 randomised trials per kind, press offset random
+  50–500 ms: **0 lost**. Win close: 29 latched (waits 94–359 ms, median 219), 11
+  direct, 0 cancelled. Start-button close: 30 latched (median 210), 10 direct.
+  Click-away close: 21 latched (median 234), 19 direct. Gesture close: 7
+  cancelled (`intent open cancel`, the press landed in the retract), 33 direct,
+  0 latched, 0 lost; two of the seven were first marked invalid because the
+  script's t0 lagged the decoded release by 266 ms (the injected contact ended on
+  idle), and the log shows one cancelled and one direct. A separate 20-trial
+  gesture run aimed at the settle's end gave 1 latched (94 ms), 1 cancelled, 17
+  direct, 1 t0-lag trial, 0 lost.
+- the settle-end → dismiss window: 18 of the randomised presses landed after the
+  close settle and before the dismiss had completed (Win 8, Start-button 3,
+  click-away 6, gesture 1); 0 lost. The 3–4 ms cases were latched and served
+  94–141 ms after the press; the later ones opened directly once the hide had
+  landed.
+- `intent open recovered` (a dismiss that already entered the shell when the
+  press arrived) is the safety net for the 1–15 ms race; it did not fire in the
+  runs above.
 
 ## Mixed cycles (docked)
 
@@ -256,8 +296,10 @@ executor command and its ack, and the controller flags. No dead field remains.
 ## The accepted cap, restated
 
 The shell's first visible frame is 245–268 ms after a band show in the worst
-case; the docked keyboard open captured its first panel pixel at **+190 ms**
-from the key (79 ms to `exec show`, 111 ms to the first pixel). The shell owns
+case. The current auto-hidden Win open showed its first panel pixel at
+**+82–187 ms** from the key (median +115 over three runs; `exec show` +31–32 ms,
+`shown` +46–141 ms), and the docked capture at **+190 ms** (79 ms to
+`exec show`, 111 ms to the first pixel). The shell owns
 that window; the early-uncloak experiment found DWM attribute 13 returns
 `E_ACCESSDENIED` without the shell's IAM ticket, and the owning process cannot
 set it before the shell's own uncloak. No early visibility is attempted. The M3
