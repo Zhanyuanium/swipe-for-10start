@@ -272,7 +272,9 @@ struct SwipeIpcState {
     volatile LONG intentAckHr;
 
     // M3: Start -> bridge executor command (seqlock). Show and cancel run now;
-    // dismiss is due at execExecuteAt (a GetTickCount64 deadline).
+    // dismiss is due at execExecuteAt (a GetTickCount64 deadline). `execOpen` is
+    // the open generation from SwipeIpcReadOpen, not the open tick: 0 means the
+    // record names no menu and the menu guard allows it.
     volatile LONG64 execSeq;
     volatile LONG64 execTick;
     volatile LONG execKind;           // kSwipeExec*
@@ -286,7 +288,10 @@ struct SwipeIpcState {
     // the launcher's HRESULT and visible is the visibility probe afterwards
     // (kSwipeVisibility*). A dismiss is answered twice: once when the primitive
     // returns (`Executed`) and once when the confirmation probe reads the window
-    // (`Confirmed`/`Unconfirmed`/`Unknown`).
+    // (`Confirmed`/`Unconfirmed`/`Unknown`). The record is one answer, not a
+    // queue: a later answer replaces it before the Start side reads it, so the
+    // reader matches `execAckFor` and never attributes one state to another
+    // sequence.
     volatile LONG64 execAckSeq;
     volatile LONG64 execAckFor;
     volatile LONG execAckState;

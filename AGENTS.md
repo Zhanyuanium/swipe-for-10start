@@ -73,12 +73,13 @@ from=...`). The recovery ticket exists **only for a published command**: still
 queued or armed when the cancel ran (`cancelled != 0`), or executed with its hide
 not yet confirmed. A local-only cancel arms none, because no dismiss is inside
 the shell and a later hide of the same menu is not that press's close. It is bound
-to that menu's open generation, to the executor sequence it revoked, and to a
-deadline (that command's deadline plus the ack budget and the confirmation
-probe); a refused/expired/superseded answer for **that sequence** retires it, and
-the landing serves it only before the deadline. It is not cleared merely because
-one poll still sees the window open. A dismiss already inside the shell's `Dismiss`
-call cannot be recalled; the window hides, and the landing reissues that open once
+to that menu's open tick (the tick the open record published), to the executor
+sequence it revoked, and to a deadline (that command's deadline plus the ack
+budget and the confirmation probe); a refused/expired/superseded answer for
+**that sequence** retires it, and the landing serves it only before the deadline.
+A still-open poll does not clear it: an entered `Dismiss` may land at any point
+while the window is up. A dismiss already inside the shell's `Dismiss` call
+cannot be recalled; the window hides, and the landing reissues that open once
 (`intent open recovered entry=...`) — after reconciling an `external` intent that
 arrived with the landing (applying the record it examined, not a second read),
 because the idle timer outranks the intent event. A

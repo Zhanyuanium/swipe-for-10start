@@ -33,7 +33,7 @@ the consumer withdraws before it unregisters its devices.
   cancels the close: the local dismiss slot is cleared (`ClearLocalCloseTap`), the
   suppression cleared, and one settle from `TakeProgressNow()` back to 1
   (`intent open cancel from=...`); the cancel writes the recovery ticket
-  (`CloseCancelTicket`: open generation + the cancelled executor sequence + a
+  (`CloseCancelTicket`: open tick + the cancelled executor sequence + a
   deadline) for the dismiss-won race, and arms it only for a published command
   (still pending, or executed with its hide unconfirmed). If the window is closed it holds the entry
   (`RevealEntryProgress`), sets `g_intentOpenActive` and asks for `exec show`; a
@@ -51,9 +51,10 @@ the consumer withdraws before it unregisters its devices.
 - `ApplyExecAck` / `CheckExecAckTimeout` — one ack per command. A refused show or
   a refused/expired dismiss runs `ReleaseExecutorOwnership`, which releases
   the controller direction, `controllerTouch` and the pending open entry in one
-  step so the direction resyncs from the cloak; a failed dismiss also drops the
-  recovery ticket **by the ticket's own sequence**, which the already-cleared
-  pending slot can no longer name. An `executed` dismiss clears the pending slot
+  step so the direction resyncs from the cloak; a refused/expired/superseded
+  answer for the recovery ticket's own sequence retires it **before the
+  pending-slot gate**, because the open that cancelled the close already cleared
+  the slot that gate reads. An `executed` dismiss clears the pending slot
   but keeps the command in `g_pendingDismissConfirm`; `confirmed` closes it,
   `unconfirmed`/`unknown` is the same terminal repair, and `superseded` needs no
   repair. A 400 ms silence does the same from `g_pendingShowUntil` for a
@@ -81,7 +82,7 @@ the consumer withdraws before it unregisters its devices.
   `reveal reopen after close pull=1 late=0 entry=...`. The pull that was under
   the close is the pull that takes the menu back. If the ticket says an open
   cancelled a close that still landed, the landing reissues that open
-  (`intent open recovered entry=...`); the ticket is bound to the open generation,
+  (`intent open recovered entry=...`); the ticket is bound to the open tick,
   so a landing for another menu cannot serve it. The landing first reconciles an
   already-published `external` intent
   (`intent reconcile ... (before landing recovery)`) because the idle timer
