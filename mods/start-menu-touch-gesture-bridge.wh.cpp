@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Decides the shell's Start close from explorer and publishes the live Win10 Start edge-gesture handle and state
-// @version         0.23.0
+// @version         0.24.0
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
@@ -101,15 +101,18 @@ Win press and the Start button's open (ShowStartView method 11) and close
 swallowed only while the controller owns the panel.
 The mod creates one hidden message-only window and one worker thread for the
 executor, and no COM objects. It refuses to initialize unless its own image can
-be pinned, and on unload it stops the executor first (the ready flag goes clear,
-the worker is joined, and the launcher thread destroys the window and its timers
-with an acknowledged `WM_CLOSE`), then waits with no deadline until every
-close-hook frame and every executor dispatch that is inside has left, and closes
-the channel only then. A frame that does not return therefore holds the whole
-Windhawk reload until it does; that is the price of never handing the host a
-trampoline a live frame can still call. A join or window-close timeout keeps the
-handles rather than closing one under a live thread, and the next activation
-refuses instead of inheriting a half-stopped executor.
+be pinned, and on unload it stops the executor first: admission to window
+creation closes, a creator that is inside is drained, the worker is joined, and
+the identified window and its timers are destroyed — directly on the owner thread,
+otherwise through an acknowledged `WM_CLOSE`. It then waits with no deadline until
+every close-hook frame and every executor dispatch that is inside has left, and
+closes the channel only when the executor's teardown also completed. A frame that
+does not return therefore holds the whole Windhawk reload until it does; that is
+the price of never handing the host a trampoline a live frame can still call. A
+join, a creator drain or a window-close timeout keeps every handle and the channel,
+defers the close with `ipc close deferred`, and makes the next activation refuse
+until that exact join or destruction has completed (`exec reinit refused: ...`); a
+worker that exits later is reaped and the enable then proceeds.
 
 Notes:
 - Windhawk compiles the mod from stdin, so the repository `mods` folder is
@@ -160,8 +163,10 @@ Notes:
   one `intent kind=... trigger=... seq=... open=...` line per decision.
 - The two channels have two lifetimes. The v6 channel (the section mapping and
   view, the mutex and the five events) is closed when the mod is disabled, and
-  only then: the disable flag keeps new closes out of it, and the unload waits
-  for every close that already entered to leave before it closes anything. That
+  only then: the disable flag keeps new closes out of it, the executor's own
+  teardown has completed (otherwise the close is deferred with
+  `ipc close deferred: ...` and every handle stays), and the unload has waited
+  for every close that already entered to leave. That
   wait has no deadline, so its outcome is one of two. `drained`: the count
   reached zero, the channel is closed, the unload returns. `stalled`: the count
   is still nonzero and nothing else happens — no close, no return, no handle
@@ -169,7 +174,8 @@ Notes:
   because the shell call under it never came back or a debugger suspended its
   thread, holds the Windhawk reload until it resumes. A re-enable of the pinned
   image reuses a channel an earlier activation left open instead of opening a
-  second one over it.
+  second one over it, and refuses (`exec reinit refused: ...`) while the deferred
+  teardown still owns it.
   The gesture mapping and its event stay for the rest of the explorer process
   lifetime instead: a consumer maps them independently, and an in-flight gesture
   callback may still hold the view, so unmapping them is unsafe. The image is
@@ -243,13 +249,17 @@ Notes:
   the old state stays exactly as the unload left it. A drained unload returns at
   zero, so this refusal is reachable only through the entry window the count
   cannot see; it is kept because that window is real. The same refusal covers an
-  executor worker whose join timed out (its handles are kept, never closed under
-  the live thread), so a second worker is never started over the first one's stop
-  event. When the count is zero and the worker is gone, `ResetReinitState` clears
-  the lifecycle flags, the executor's pending command, latch and thread ids,
-  retries a failed gesture mapping, and the init logs `activation state reset`; a
-  ready mapping and a channel an earlier activation left open are reused rather
-  than rebuilt.
+  executor teardown that did not complete (a join timeout, a window-close post
+  failure, an unacknowledged `WM_CLOSE`, or a creator that did not leave
+  `CreateWindowExW` in 500 ms): the handles and the channel stay with the live
+  participant, and `exec reinit refused: ...` names which one. A worker that has
+  exited since is joined and its handles closed when the next enable asks, and a
+  window destroyed since clears the identified stop target then, so the refusal
+  is not permanent. When nothing from the previous activation is left,
+  `ResetReinitState` clears the lifecycle flags, the executor's pending command,
+  latch and thread ids, reopens admission, retries a failed gesture mapping, and
+  the init logs `activation state reset`; a ready mapping and a channel an
+  earlier activation left open are reused rather than rebuilt.
 
 The decision and the executor:
 
@@ -526,12 +536,33 @@ SwipeIpcChannel g_ipc;
 // launcher with an empty stack. `t_execCall` marks our own call so the primitive
 // hooks pass it through instead of reading it as a shell trigger.
 std::atomic<HWND> g_execWindow{nullptr};
-DWORD g_execThreadId = 0;  // the launcher thread that owns the window
+// The thread that created the window. Written before the window is published and
+// read after it, so a non-null g_execWindow carries its owner.
+DWORD g_execThreadId = 0;
 std::atomic<DWORD> g_launcherThread{0};
 thread_local int t_execCall = 0;
 HANDLE g_execStopEvent = nullptr;
 HANDLE g_execWorker = nullptr;
 DWORD g_execWorkerId = 0;
+// Window creation and window shutdown are one protocol, not two independent
+// checks. A creator reserves `g_execCreating`, then asks admission, then
+// publishes the HWND and releases the reservation; the stop path closes
+// admission, drains the reservation, and then snapshots the HWND. A creator
+// therefore either published before that snapshot or is refused after it, which
+// is what closes the race in which a creator passed the disabled check before
+// the stop saw a null HWND and published afterwards.
+std::atomic<bool> g_execAdmissionOpen{true};
+std::atomic<bool> g_execCreating{false};
+// The window a shutdown owes. Set when the stop snapshots a live window and
+// cleared by that window's own WM_NCDESTROY, so a later enable can tell "the
+// destruction completed while nothing was waiting" from "the old window still
+// runs". Only this exact HWND satisfies the wait: WM_NCDESTROY of any other
+// window signals nothing.
+std::atomic<HWND> g_execStopTarget{nullptr};
+// How long the stop waits for a creator to leave CreateWindowExW. A creator
+// that does not leave in this budget makes the teardown outstanding: the channel
+// and the handles stay, and the next enable refuses.
+constexpr DWORD kExecCreatorDrainMs = 500;
 constexpr UINT kExecMessage = WM_APP + 0x5A;
 constexpr UINT_PTR kExecDismissTimer = 0x5358;
 constexpr UINT_PTR kExecProbeTimer = 0x5359;
@@ -543,12 +574,15 @@ constexpr uint64_t kPressLatchRetryMs = 100;
 // dismiss that never comes. A failed worker startup leaves it false and the
 // shell's own path serves every trigger.
 std::atomic<bool> g_execReady{false};
-// Set by WM_NCDESTROY on the launcher thread. StopExecutorWorker waits on it, so
-// the window and its three one-shot timers are gone before the channel closes.
+// Set by WM_NCDESTROY on the launcher thread when the destroyed window is the
+// one this activation recorded. StopExecutorWorker waits on it, so the window and
+// its timers are gone before the channel closes. It is never closed: a stop that
+// timed out leaves it for the teardown a later enable reaps.
 HANDLE g_execWindowGone = nullptr;
 // How long the unload waits for the worker to join and for the window to be
-// destroyed. Both are diagnostics only: a timeout keeps the handles (never closes
-// one under a live thread) and makes the next activation refuse.
+// destroyed. A timeout keeps every resource the outstanding participant still
+// uses (the worker's handles, the channel), makes the unload defer, and makes
+// the next activation refuse until the matching join or destruction completed.
 constexpr DWORD kExecJoinWaitMs = 2000;
 // The hidden event does not publish the latched open from its own stack. A show
 // that ran at the hidden event's own tick was swallowed by the completing hide
@@ -2918,6 +2952,14 @@ void ResetReinitState() {
     t_ownDecisionCall = 0;
     t_ownForeignClose = false;
     t_ownCloseExecutor = 0;
+    // The executor's lifetime protocol, which the refusal checks above have
+    // proved complete: no worker, no identified window, no creator. Only now is
+    // admission reopened; a stop that did not complete left it closed and the
+    // refusal above kept this function out.
+    g_execAdmissionOpen.store(true, std::memory_order_release);
+    g_execCreating.store(false, std::memory_order_release);
+    g_execStopTarget.store(nullptr, std::memory_order_release);
+    g_execWorkerId = 0;
     AcquireSRWLockExclusive(&g_ownLock);
     g_ownOpen = false;
     g_ownCloseTrigger = OwnTrigger::None;
@@ -3200,13 +3242,23 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
     if (message == WM_NCDESTROY) {
-        if (g_execWindow.load() == window) {
-            g_execWindow.store(nullptr);
+        // The acknowledgement names the window it is for. A stop waits on one
+        // identified HWND; any other window's destruction (an old activation's,
+        // a class the shell recreated) must not answer for it.
+        bool identified = false;
+        if (g_execWindow.load(std::memory_order_acquire) == window) {
+            g_execWindow.store(nullptr, std::memory_order_release);
+            identified = true;
         }
-        if (g_execWindowGone) {
+        if (g_execStopTarget.load(std::memory_order_acquire) == window) {
+            g_execStopTarget.store(nullptr, std::memory_order_release);
+            identified = true;
+        }
+        if (identified && g_execWindowGone) {
             SetEvent(g_execWindowGone);
         }
-        FileLog(L"exec window gone tid=%u", GetCurrentThreadId());
+        FileLog(L"exec window gone hwnd=%p identified=%d tid=%u", window,
+                identified ? 1 : 0, GetCurrentThreadId());
         return 0;
     }
     if (!g_execReady.load(std::memory_order_acquire) ||
@@ -3291,11 +3343,26 @@ void EnsureExecutorOnLauncherThread(const wchar_t* source) {
 }
 
 void EnsureExecutorWindow() {
-    if (g_execWindow.load(std::memory_order_relaxed)) {
-        return;
+    // One creator at a time. The reservation is what a shutdown drains: a creator
+    // that is inside CreateWindowExW must publish before the stop reads the HWND,
+    // and a creator that arrives after admission closed must not publish at all.
+    // The admission test sits after the reservation, not before it, so those two
+    // cases are the only two a stop can see.
+    bool expected = false;
+    if (!g_execCreating.compare_exchange_strong(expected, true,
+                                                std::memory_order_acq_rel)) {
+        return;  // another creator holds it; its outcome is this call's outcome
     }
-    if (g_disabled.load(std::memory_order_relaxed) ||
-        g_initRefused.load(std::memory_order_relaxed)) {
+    struct CreatorDone {
+        ~CreatorDone() {
+            g_execCreating.store(false, std::memory_order_release);
+        }
+    } creatorDone;
+
+    if (!g_execAdmissionOpen.load(std::memory_order_acquire) ||
+        g_disabled.load(std::memory_order_relaxed) ||
+        g_initRefused.load(std::memory_order_relaxed) ||
+        g_execWindow.load(std::memory_order_relaxed)) {
         return;
     }
     // The class is unique per activation. A Windhawk reinstall maps a new image
@@ -3330,8 +3397,10 @@ void EnsureExecutorWindow() {
         FileLog(L"exec window create failed err=%u", GetLastError());
         return;
     }
-    g_execWindow.store(window, std::memory_order_relaxed);
+    // The owner is written before the window is published, so the pair a reader
+    // sees is never a window without its thread.
     g_execThreadId = GetCurrentThreadId();
+    g_execWindow.store(window, std::memory_order_release);
     // The assertion the owner-thread report is for: a created window must be on
     // the launcher thread, never on the thread that happened to call a hook.
     const DWORD launcherThread = g_launcherThread.load(std::memory_order_relaxed);
@@ -3357,6 +3426,10 @@ LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
 bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
     if (g_execWindow.load(std::memory_order_relaxed)) {
         return true;
+    }
+    if (!g_execAdmissionOpen.load(std::memory_order_acquire) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return false;  // a shutdown owns the lifetime now
     }
     const DWORD target = g_launcherThread.load(std::memory_order_relaxed);
     if (target == 0) {
@@ -3392,6 +3465,16 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
 }
 
 DWORD WINAPI ExecutorWorkerProc(LPVOID) {
+    // Every exit clears readiness, including the unexpected ones: a worker that
+    // returned on WAIT_FAILED or a refused wait must not leave the gate open for
+    // a command nobody will post. The unload clears it too; this covers the exit
+    // that has no unload.
+    struct ReadyOnExit {
+        ~ReadyOnExit() {
+            g_execReady.store(false, std::memory_order_release);
+        }
+    } readyOnExit;
+
     // The executor must live on explorer's launcher thread -- the thread that
     // runs OnHotkeyInvoke and the shell's own ShowStartView/Dismiss, not the
     // thread that owns Shell_TrayWnd. Creating the window from a hook frame puts
@@ -3406,7 +3489,12 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
         if (wait == WAIT_OBJECT_0) {
             return 0;
         }
+        if (wait == WAIT_FAILED) {
+            FileLog(L"exec worker wait failed err=%u", GetLastError());
+            return 0;
+        }
         if (wait != WAIT_OBJECT_0 + 1) {
+            FileLog(L"exec worker wait ended unexpectedly result=%u", wait);
             return 0;
         }
         HWND window = g_execWindow.load(std::memory_order_relaxed);
@@ -3426,6 +3514,24 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
             FileLog(L"exec command post failed err=%u", GetLastError());
         }
     }
+}
+
+// Closes the worker's two handles and clears its identity. Only called when the
+// thread has been joined, because a handle a live thread still waits on must
+// never be closed: the next enable would otherwise hand that thread a recycled
+// value for its wait.
+void ReapExecutorWorker() {
+    if (!g_execWorker) {
+        return;
+    }
+    CloseHandle(g_execWorker);
+    g_execWorker = nullptr;
+    if (g_execStopEvent) {
+        CloseHandle(g_execStopEvent);
+        g_execStopEvent = nullptr;
+    }
+    FileLog(L"exec worker joined tid=%u", g_execWorkerId);
+    g_execWorkerId = 0;
 }
 
 void StartExecutorWorker() {
@@ -3456,59 +3562,203 @@ void StartExecutorWorker() {
     FileLog(L"exec worker started tid=%u", g_execWorkerId);
 }
 
-void StopExecutorWorker() {
+// The one window shutdown. Returns true only when no worker and no window of this
+// activation can run a command any more. False means an outstanding participant
+// still uses the channel, the stop event or the window's message loop: the caller
+// keeps all of them and the next activation refuses until the matching join or
+// destruction has completed.
+//
+// The order is the fix for a same-image re-enable. Admission closes first, so no
+// creator can publish a window behind the snapshot; the creator reservation is
+// drained, so a creation that already passed admission finishes and is seen. Then
+// the worker is joined, and only then is the identified window destroyed — directly
+// when this call already runs on its owner thread, otherwise with a WM_CLOSE the
+// owner acknowledges from WM_NCDESTROY.
+bool StopExecutorWorker() {
     // From here on no dispatch may reach the launcher: the WndProc gates on this
     // and the window's destruction below ends its timers. Every trigger falls
     // through to the shell while this is false.
     g_execReady.store(false, std::memory_order_release);
+
+    g_execAdmissionOpen.store(false, std::memory_order_release);
+    const ULONGLONG drainDeadline = GetTickCount64() + kExecCreatorDrainMs;
+    while (g_execCreating.load(std::memory_order_acquire) &&
+           GetTickCount64() < drainDeadline) {
+        Sleep(1);  // a creator is inside CreateWindowExW; its publish is next
+    }
+    const bool creatorDrained =
+        !g_execCreating.load(std::memory_order_acquire);
+    if (!creatorDrained) {
+        FileLog(L"exec window creator did not leave in %u ms",
+                static_cast<unsigned>(kExecCreatorDrainMs));
+    }
+
+    HWND window = g_execWindow.load(std::memory_order_acquire);
+    g_execStopTarget.store(window, std::memory_order_release);
+    if (window && g_execWindow.load(std::memory_order_acquire) != window) {
+        // The window was destroyed between the snapshot and the target store, so
+        // its WM_NCDESTROY could not see the target and cleared nothing. A stale
+        // target here would refuse every later enable forever.
+        g_execStopTarget.store(nullptr, std::memory_order_release);
+        FileLog(L"exec window already gone hwnd=%p", window);
+        window = nullptr;
+    }
+
+    bool workerStopped = true;
     if (g_execWorker) {
         SetEvent(g_execStopEvent);
         const DWORD joined = WaitForSingleObject(g_execWorker, kExecJoinWaitMs);
         if (joined == WAIT_OBJECT_0) {
-            CloseHandle(g_execWorker);
-            g_execWorker = nullptr;
-            if (g_execStopEvent) {
-                CloseHandle(g_execStopEvent);
-                g_execStopEvent = nullptr;
-            }
-            FileLog(L"exec worker joined tid=%u", g_execWorkerId);
-            g_execWorkerId = 0;
+            ReapExecutorWorker();
         } else {
-            // The worker still holds both handles. Closing either would hand it a
-            // recycled handle for its wait; they stay with the pinned image for
-            // process exit, and the next activation refuses rather than starting
-            // a second worker over the same stop event.
-            FileLog(L"exec worker join timeout tid=%u", g_execWorkerId);
+            // The worker still waits on both handles and on the channel's Exec
+            // event. Closing either would hand it a recycled handle, and closing
+            // the channel would unmap the event it is waiting on; all three stay
+            // with the pinned image, and the next enable refuses until this join
+            // has actually completed.
+            workerStopped = false;
+            FileLog(L"exec worker join timeout tid=%u (handles and channel kept)",
+                    g_execWorkerId);
         }
     }
-    HWND window = g_execWindow.load(std::memory_order_relaxed);
-    if (!window) {
-        if (g_execWindowGone) {
-            SetEvent(g_execWindowGone);
+
+    bool windowStopped = true;
+    if (window) {
+        if (g_execThreadId == GetCurrentThreadId()) {
+            // Already on the owner thread: destroy directly, no post and no ack.
+            DestroyWindow(window);
+            windowStopped = g_execWindow.load(std::memory_order_acquire) == nullptr;
+            if (windowStopped) {
+                FileLog(L"exec window destroyed directly tid=%u",
+                        static_cast<unsigned>(g_execThreadId));
+            } else {
+                FileLog(L"exec window destroy refused tid=%u",
+                        static_cast<unsigned>(g_execThreadId));
+            }
+        } else {
+            if (!g_execWindowGone) {
+                g_execWindowGone = CreateEventW(nullptr, TRUE, TRUE, nullptr);
+                if (!g_execWindowGone) {
+                    FileLog(L"exec window gone event failed err=%u",
+                            GetLastError());
+                }
+            }
+            if (!g_execWindowGone) {
+                // Nothing can acknowledge the destruction, and leaving the
+                // window is not a stop. Keep it and make the teardown
+                // outstanding rather than pretending it completed.
+                windowStopped = false;
+                FileLog(L"exec window close unacknowledged tid=%u (no event)",
+                        static_cast<unsigned>(g_execThreadId));
+            } else if (g_execStopTarget.load(std::memory_order_acquire) !=
+                       window) {
+                // The owner destroyed it while the worker was being joined; its
+                // acknowledgement was already consumed (or could not name this
+                // target yet). Nothing is left to wait for.
+                FileLog(L"exec window gone before the close hwnd=%p", window);
+            } else {
+                ResetEvent(g_execWindowGone);
+                if (!PostMessageW(window, WM_CLOSE, 0, 0)) {
+                    FileLog(L"exec window close post failed err=%u",
+                            GetLastError());
+                    windowStopped = false;
+                } else if (WaitForSingleObject(g_execWindowGone,
+                                               kExecJoinWaitMs) ==
+                           WAIT_OBJECT_0) {
+                    FileLog(L"exec window destroyed tid=%u",
+                            static_cast<unsigned>(g_execThreadId));
+                } else {
+                    // WM_CLOSE kills the timers and destroys the window; the ack
+                    // is WM_NCDESTROY's, and it has not come. The dispatch gate
+                    // keeps the surviving window harmless, but the activation is
+                    // not gone and nothing is closed under it.
+                    FileLog(L"exec window close timeout tid=%u",
+                            static_cast<unsigned>(g_execThreadId));
+                    windowStopped = false;
+                }
+            }
         }
-        return;
     }
-    if (!g_execWindowGone) {
-        // No ack event: the window is still gated by g_execReady, so a surviving
-        // message cannot run a command; the post is all this path can do.
-        PostMessageW(window, WM_CLOSE, 0, 0);
-        return;
+    if (windowStopped) {
+        g_execStopTarget.store(nullptr, std::memory_order_release);
     }
-    ResetEvent(g_execWindowGone);
-    if (!PostMessageW(window, WM_CLOSE, 0, 0)) {
-        FileLog(L"exec window close post failed err=%u", GetLastError());
-        return;
+    return creatorDrained && workerStopped && windowStopped;
+}
+
+// Answers whether a teardown that a previous activation left outstanding has
+// completed since. It is also the second half of the creation race: a creator
+// that was inside CreateWindowExW when the stop ran its drain can publish a
+// window after that stop returned, so the window found here is destroyed exactly
+// as the unload would have destroyed it. A worker that has exited is joined and
+// its handles closed. True means nothing of that activation is left, which is the
+// one state a re-enable may inherit.
+bool ReapExecutorTeardown() {
+    if (g_execWorker) {
+        if (WaitForSingleObject(g_execWorker, 0) == WAIT_OBJECT_0) {
+            ReapExecutorWorker();
+        } else {
+            FileLog(L"exec reinit refused: the previous worker is still running "
+                    L"tid=%u",
+                    g_execWorkerId);
+            return false;
+        }
     }
-    // Owner-thread shutdown, acknowledged: WM_CLOSE kills the three timers and
-    // destroys the window; WM_NCDESTROY sets this event. The wait is bounded, and
-    // a timeout is reported rather than covered: the dispatch gate keeps the
-    // surviving window harmless, and nothing is closed under it.
-    const DWORD destroyed = WaitForSingleObject(g_execWindowGone, kExecJoinWaitMs);
-    if (destroyed == WAIT_OBJECT_0) {
-        FileLog(L"exec window destroyed tid=%u", g_execThreadId);
-    } else {
-        FileLog(L"exec window close timeout tid=%u", g_execThreadId);
+    HWND target = g_execStopTarget.load(std::memory_order_acquire);
+    if (!target) {
+        target = g_execWindow.load(std::memory_order_acquire);
+        if (target) {
+            // A window nobody was waiting for: the stop timed out on its creator
+            // or its close path gave up. From here it is the identified target.
+            g_execStopTarget.store(target, std::memory_order_release);
+            FileLog(L"exec teardown found a surviving window hwnd=%p", target);
+        }
     }
+    if (target) {
+        if (!IsWindow(target)) {
+            g_execWindow.store(nullptr, std::memory_order_release);
+            g_execStopTarget.store(nullptr, std::memory_order_release);
+            FileLog(L"exec teardown cleared a dead window hwnd=%p", target);
+        } else {
+            // Finish the stop here rather than refusing forever: the window is
+            // this image's, so its own WM_CLOSE path is what destroys it and
+            // acknowledges. The event is reset for this target, never read as an
+            // acknowledgement left by an earlier stop.
+            if (!g_execWindowGone) {
+                g_execWindowGone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (!g_execWindowGone) {
+                    FileLog(L"exec reinit refused: no acknowledgement event for "
+                            L"the surviving window hwnd=%p",
+                            target);
+                    return false;
+                }
+            }
+            ResetEvent(g_execWindowGone);
+            bool destroyed = false;
+            if (g_execThreadId == GetCurrentThreadId()) {
+                DestroyWindow(target);
+                destroyed = !IsWindow(target);
+            } else if (PostMessageW(target, WM_CLOSE, 0, 0) &&
+                       WaitForSingleObject(g_execWindowGone, kExecJoinWaitMs) ==
+                           WAIT_OBJECT_0) {
+                destroyed = true;
+            }
+            if (!destroyed) {
+                FileLog(L"exec reinit refused: the previous window still exists "
+                        L"hwnd=%p",
+                        target);
+                return false;
+            }
+            g_execWindow.store(nullptr, std::memory_order_release);
+            g_execStopTarget.store(nullptr, std::memory_order_release);
+            FileLog(L"exec teardown completed late hwnd=%p", target);
+        }
+    }
+    if (g_execCreating.load(std::memory_order_acquire)) {
+        FileLog(L"exec reinit refused: a window creation from the previous "
+                L"activation is still inside");
+        return false;
+    }
+    return true;
 }
 
 void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
@@ -3537,7 +3787,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.23.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.24.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
@@ -3555,13 +3805,16 @@ BOOL Wh_ModInit() {
                 L"still inside; no hook, no channel and no thread installed");
         return FALSE;
     }
-    if (reinit && g_execWorker) {
-        // Wh_ModUninit's join timed out and kept the handles: starting a second
-        // worker over the same stop event would leave the first one waiting on a
-        // handle it still owns. Refuse, like the close-frame case above.
+    if (reinit && !ReapExecutorTeardown()) {
+        // A stop that timed out leaves the worker's handles, the window and the
+        // channel in place. Clearing the HWND, the owner TID and the watermark
+        // here would hand a surviving window this activation's channel, so the
+        // enable refuses instead. A later enable reaps the completion, because
+        // the acknowledgement names the window it waited for.
         g_initRefused.store(true, std::memory_order_relaxed);
-        FileLog(L"mod init refused: the previous activation's executor worker is "
-                L"still running; no hook, no channel and no thread installed");
+        FileLog(L"mod init refused: the previous activation's executor has not "
+                L"finished stopping; no hook, no channel and no thread "
+                L"installed");
         return FALSE;
     }
 
@@ -3668,12 +3921,13 @@ void Wh_ModUninit() {
     }
 
     // The executor first: it posts to the hidden window and its dispatches call
-    // the launcher. StopExecutorWorker clears the ready flag, joins the worker
-    // before it closes either of the worker's handles, and has the launcher
-    // thread destroy the window and its three timers before returning. A
-    // timeout leaves the handles alive and the next activation refuses instead
-    // of inheriting a half-stopped executor.
-    StopExecutorWorker();
+    // the launcher. StopExecutorWorker closes admission to window creation,
+    // drains a creator, joins the worker before it closes either of the worker's
+    // handles, and has the window destroyed and acknowledged. Its result is the
+    // answer this unload needs: false means an outstanding participant still uses
+    // the channel, the stop event or the window, so the channel stays and the
+    // next enable refuses until that join or destruction has completed.
+    const bool executorStopped = StopExecutorWorker();
 
     // Two channels, two lifetimes, for two reasons.
     //
@@ -3692,10 +3946,10 @@ void Wh_ModUninit() {
     // The v6 channel is closed, because its objects are named and its records
     // belong to the other process: g_ipc is unmapped and its mapping, mutex and
     // five events are closed once no close hook and no executor dispatch can
-    // still be inside them. g_disabled was set in Wh_ModBeforeUninit and the
-    // executor's ready flag was cleared by StopExecutorWorker, so neither a new
-    // close decision nor a queued command reaches the channel; g_closeCalls names
-    // the frames that are already inside.
+    // still be inside them AND the executor's own teardown completed. g_disabled
+    // was set in Wh_ModBeforeUninit and the executor's ready flag was cleared by
+    // StopExecutorWorker, so neither a new close decision nor a queued command
+    // reaches the channel; g_closeCalls names the frames that are already inside.
     //
     // The wait below has no deadline, and that is the whole point. The lease
     // spans the whole frame, the original calls included, so a count of zero also
@@ -3752,10 +4006,19 @@ void Wh_ModUninit() {
         Sleep(kHidePollMs);
     }
 
-    // Drained: the count reached zero, so this is the one path that closes the
-    // channel and the one point where the host may take the trampolines back.
+    // Drained: the count reached zero, so no counted frame can still need the
+    // trampolines. The channel is a second question: it is closed only when the
+    // executor's half of the unload also completed. A deferred teardown keeps it,
+    // because the surviving worker waits on its Exec event and the surviving
+    // window belongs to the same activation; closing it would hand a live thread
+    // a closed handle and a reused one later.
     FileLog(L"ipc unload drained waited=%llu ms",
             static_cast<unsigned long long>(GetTickCount64() - drainStart));
+    if (!executorStopped) {
+        FileLog(L"ipc close deferred: the previous activation's executor has not "
+                L"finished stopping; the channel and its handles stay");
+        return;
+    }
     if (g_ipc.state) {
         SwipeIpcClose(&g_ipc);
         FileLog(L"ipc close");
