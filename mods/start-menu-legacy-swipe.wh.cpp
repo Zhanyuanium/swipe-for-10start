@@ -832,7 +832,7 @@ Debug channel (kept in the build):
 - The section outlives either process, so both sides record the sequence numbers
   at attach and act only on what is newer: an intent, a command or an open
   generation from a previous process is ignored by its sequence, never served.
-- The v6 section is 744 bytes: the command, the open generation, the intent and
+- The v7 section is 744 bytes: the command, the open generation, the intent and
   its ack, the executor command and its ack, the controller direction and touch
   flag, and the peer liveness pair. Every record is a seqlock, so the bridge
   never reads a half-written intent, command or open generation, and this side
@@ -1162,7 +1162,7 @@ Known risks:
  *   OnGlobalAnimationRequested and its three argument getters), Raw Input
  *   (RegisterRawInputDevices/GetRawInputData/GetRawInputDeviceInfoW) for the
  *   digitizer, the window and DWM APIs for geometry/layout, the composition
- *   Visual/Element APIs for Progress, and swipe_ipc_shared.h v6 for the intents,
+ *   Visual/Element APIs for Progress, and swipe_ipc_shared.h v7 for the intents,
  *   executor commands/acks, open generation, controller direction and peer
  *   liveness. The bridge is the only launcher caller; this mod never loads
  *   twinui.pcshell.dll.
@@ -3885,11 +3885,12 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_v6_Cmd     p=, t=, e=, anim=   (tools -> here)
-//   Local\SwipeFor10Start_v6_Intent  kind, trigger, method, flags, open (bridge)
-//   Local\SwipeFor10Start_v6_Exec    show, dismiss, cancel               (here)
+//   Local\SwipeFor10Start_v7_Cmd     p=, t=, e=, anim=   (tools -> here)
+//   Local\SwipeFor10Start_v7_Intent  kind, trigger, method, flags, open (bridge)
+//   Local\SwipeFor10Start_v7_Exec    show, dismiss, cancel               (here)
 //   ..._State.openSeq                "this is a new menu"               (here)
 //   ..._State.peerTick/peerState     "a controller is here"             (here)
+//   ..._State.peerEpoch              "which activation answers"         (here)
 //
 // Every record is a seqlock: this side bumps the counter to odd, writes, and
 // bumps it to even, so the bridge can never accept a half-written intent, exec
@@ -3904,10 +3905,11 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 // a menu this process never drew. An intent carries the open generation the
 // bridge saw, so a close is tied to the menu it was read for.
 //
-// The liveness pair is not a record: it is two words the bridge polls at a
+// The liveness triple is not a record: it is three words the bridge polls at a
 // decision, never a seqlock. The bridge creates the section, so peerState is how
 // this side says "the controller is here"; peerTick is the freshness that
-// survives a process kill. See "Peer liveness" in swipe_ipc_shared.h.
+// survives a process kill; peerEpoch is the identity of the activation that
+// answers. See "Peer liveness" in swipe_ipc_shared.h.
 // ---------------------------------------------------------------------------
 
 // The highest sequence this process has acted on. Set from the section at
@@ -3923,6 +3925,11 @@ uint32_t g_ipcOpenTickLow = 0;
 // on, so the two writers never overlap. It is the throttle: an idle tick or a
 // report inside the same 100 ms window does not write again.
 uint32_t g_peerTickLast = 0;
+
+// The activation identity this attach claimed. Written once by OpenIpcChannel,
+// before the input thread exists, and read only for the log line and the bridge's
+// comparison; 0 means this attachment never opened a channel.
+uint32_t g_peerEpoch = 0;
 
 // Refreshes the bridge's liveness clock. Called from the input thread's idle
 // tick and from every positioned report, so silence on the digitizer cannot
@@ -3965,6 +3972,11 @@ void OpenIpcChannel() {
     // must be newer than anything the previous one could have written.
     g_ipcCommandSeq = SwipeIpcLoad64(&g_ipc.state->cmdSeq);
     g_ipcOpenTickLow = 0;
+    // The activation identity goes before anything this activation publishes. A
+    // bridge decision that was latched against the previous activation can then
+    // see that a different one answers, even though both run the same pinned
+    // image.
+    g_peerEpoch = SwipeIpcBeginPeerActivation(&g_ipc);
 
     // Tick first, then alive: the bridge pairs an alive state with the tick it
     // reads after it, so it never accepts the previous activation's tick as
@@ -3975,8 +3987,8 @@ void OpenIpcChannel() {
     SwipeIpcPublishPeerTick(&g_ipc, now);
     SwipeIpcSetPeerState(&g_ipc, kSwipePeerAlive);
 
-    FileLog(L"ipc open created=%d cmd=%lld", created ? 1 : 0,
-            static_cast<long long>(g_ipcCommandSeq));
+    FileLog(L"ipc open created=%d cmd=%lld epoch=%u", created ? 1 : 0,
+            static_cast<long long>(g_ipcCommandSeq), g_peerEpoch);
     FileLog(L"ipc peer alive");
 }
 
