@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Decides the shell's Start close from explorer and publishes the live Win10 Start edge-gesture handle and state
-// @version         0.24.0
+// @version         0.25.0
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
@@ -52,11 +52,15 @@ runs `XamlLauncher::Dismiss` on the launcher thread. A reveal contact that was
 driving the panel becomes a deferred pull in the Start mod: the menu closes, and
 the pull may open the next one. A close the Start side's own gesture causes runs
 the same command, scheduled at the settle's end. A command the publisher has
-already given up on is not run late: a dispatch that starts more than 400 ms past
+already given up on is not run late: a dispatch that starts at or past 400 ms after
 its scheduled time is answered expired (`exec show|dismiss ... expired`) and the
 primitive is not called. A successful dismiss is not reported as a hide on the
 strength of `hr=0` alone; a 300 ms probe records whether the window really went
-away (`exec dismiss confirmed|unconfirmed seq=... visible=...`).
+away (`exec dismiss confirmed|unconfirmed|unknown seq=... visible=hidden|visible|unknown`),
+and `unconfirmed`/`unknown` is a terminal repair on the Start side. A record whose
+publisher activation changed is answered `superseded` immediately before the
+call; the Start side also cancels a record the previous activation left queued
+when it attaches.
 
 A press during a close is a reopen, and the direction comes from the Start side's
 published controller direction, never from the shell's. That controller publishes
@@ -72,12 +76,17 @@ open intent when the hide lands (`own press served wait=...`). The serve is arme
 published 50 ms later, off that event's stack: a show at the hidden event's own
 tick was swallowed and the window stayed in state 3, while a show 16 ms after it
 opened normally. For the gesture path's own dismiss the landing instead reissues
-the cancelled open (`intent open recovered`). The immediate `ShowStartView`
+the cancelled open (`intent open recovered`) — but only when the cancel had a
+command pending; a local-only cancel arms no recovery ticket, so an unrelated
+hide of the same menu is not served. The immediate `ShowStartView`
 inside the shell's own Hide was measured to wedge the UI thread, so the latch is
 the action for that shape. The latch is not trusted: every newer press supersedes
-it, a serve re-reads the peer and its activation epoch, and a latch whose hide
+it, it stores the epoch the admission was decided under, a serve re-reads the peer
+and that epoch, and a latch whose hide
 never lands (a refused or expired dismiss) is dropped with
-`own press latch dropped reason=...` instead of retrying.
+`own press latch dropped reason=...` instead of retrying. A latch whose first
+timer cannot be armed is dropped too: the hidden event alone is not a guaranteed
+serve point.
 
 External takeovers (`Win+Tab`, the lock/display method-7 path, and a modified
 Windows press the Win hook can recognise) publish `intent=external` and pass
@@ -112,7 +121,12 @@ executor, and no COM objects. It refuses to initialize unless its own image can
 be pinned, and on unload it stops the executor first: admission to window
 creation closes, a creator that is inside is drained, the worker is joined, and
 the identified window and its timers are destroyed — directly on the owner thread,
-otherwise through an acknowledged `WM_CLOSE`. It then waits with no deadline until
+otherwise through a private teardown message the owner answers, and only for the
+window this activation recorded. A re-enable proves the creator is out before it
+takes the window snapshot and refuses rather than clearing a reservation; the
+window's procedure also refuses every ordinary dispatch for an HWND other than the
+published current one, so a survivor cannot act on the new activation's channel.
+It then waits with no deadline until
 every close-hook frame and every executor dispatch that is inside has left, and
 closes the channel only when the executor's teardown also completed. A frame that
 does not return therefore holds the whole Windhawk reload until it does; that is
@@ -152,9 +166,14 @@ Notes:
   forwarded to the shell unchanged and logged as `own pass trigger=...
   reason=no-peer` (or `no-executor`/`wrong-thread`/`no-window` for a missing
   executor, and `no-primitive` for the close intent at `HideStartAndCortana`);
-  nothing is swallowed for a command nobody would execute. A clean disable
+  nothing is swallowed for a command nobody would execute. "Alive" is the intent
+  consumer's readiness (window, message loop, intent event), not the digitizer's:
+  a refused raw-input registration is logged and does not withdraw it. A clean
+  disable
   publishes `peerState=gone` at once; a killed host is caught when its tick goes
-  stale. That 600 ms is a detection budget, not a delivery guarantee.
+  stale. That 600 ms is a detection budget, not a delivery guarantee. A press the
+  bridge already swallowed is not forwarded later if its peer dies before the
+  serve: it is dropped.
 - Hooks are installed only after `twinui.pcshell.dll` is loaded, via a
   `LoadLibraryExW` hook plus the module check in `Wh_ModAfterInit`.
 - The sequence field is a seqlock: a reader must retry when it is odd or when
@@ -583,6 +602,15 @@ std::atomic<HWND> g_execStopTarget{nullptr};
 // and the handles stay, and the next enable refuses.
 constexpr DWORD kExecCreatorDrainMs = 500;
 constexpr UINT kExecMessage = WM_APP + 0x5A;
+// The private shutdown and latch messages. A generic WM_CLOSE says only "some
+// window should close"; the teardown is a request this activation made about one
+// identified window, and the WndProc answers it only when that window is the
+// recorded target. The latch message moves the hidden event's arm onto the
+// executor's owner thread, where the timer and the slot live.
+constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
+constexpr UINT kExecLatchMessage = WM_APP + 0x5C;
+constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
+constexpr WPARAM kExecLatchMagic = 0x53574C41;     // "SWLA"
 constexpr UINT_PTR kExecDismissTimer = 0x5358;
 constexpr UINT_PTR kExecProbeTimer = 0x5359;
 constexpr UINT_PTR kPressLatchTimer = 0x535A;
@@ -637,6 +665,18 @@ LONG64 g_pendingShowSeq = 0;       // UI thread only
 // confirmation. Zero means none; the probe timer reads it 300 ms after the call.
 LONG64 g_pendingDismissConfirmSeq = 0;  // launcher thread only
 int32_t g_pendingDismissConfirmVisible = 0;  // launcher thread only
+// When the confirmation probe was armed, so the log prints the elapsed time it
+// actually took instead of the requested delay.
+uint64_t g_pendingDismissConfirmTick = 0;  // launcher thread only
+// The activation that published the dismiss this window is armed for. A Start
+// restart inside the execution budget would otherwise let the old record hide a
+// menu the new activation just opened.
+uint32_t g_pendingDismissEpoch = 0;  // launcher thread only
+// The activation that published the record now being dispatched. Compared
+// immediately before the launcher call: the record cannot carry it without a
+// channel field, and reading it at acceptance is enough because the only way the
+// publisher changes is a new attach, which increments the epoch first.
+uint32_t g_dispatchEpoch = 0;  // launcher thread only
 // The launcher thread's watermark: the last executor record it accepted, for
 // every kind. The worker posts a tokenless message per Exec signal, and an
 // auto-reset event can deliver the same record twice; without the watermark a
@@ -1513,10 +1553,24 @@ void* OwnStateOf(void* launcher) {
         static_cast<const uint8_t*>(launcher) + kLauncherStatePointerOffset);
 }
 
+// The one readiness test for an IXamlLauncherState. The constructor leaves the
+// 0x100 sentinel and a detached interface reads 0; both are dereferenced by
+// OwnIsVisible and OwnInternalState, so every read of the state goes through
+// this first. LauncherNow (the singleton read), the hook paths (the +0x160
+// read) and the post-call resync share it, so no reader can disagree about what
+// is safe.
+bool LauncherStateReady(uint64_t state) {
+    return state > kLauncherStateReadyFloor;
+}
+
 // The launcher state's IsStartWindowVisible (IXamlLauncherState vtable +0x70):
 // the shell's own answer to "is the panel on screen", which follows the cloak.
+// Refuses an unready pointer itself: the readiness floor is checked by every
+// caller, but this is the one place the interface is dereferenced, and a
+// post-call read can observe a state the pre-call check never saw.
 bool OwnIsVisible(void* state) {
-    if (!state) {
+    if (!LauncherStateReady(
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state)))) {
         return false;
     }
     void** vtable = *reinterpret_cast<void***>(state);
@@ -1529,19 +1583,12 @@ bool OwnIsVisible(void* state) {
 }
 
 uint32_t OwnInternalState(void* state) {
-    return state ? *reinterpret_cast<const volatile uint32_t*>(
-                       static_cast<const uint8_t*>(state) +
-                       kLauncherInternalStateOffset)
-                 : 0;
-}
-
-// The one readiness test for an IXamlLauncherState. The constructor leaves the
-// 0x100 sentinel and a detached interface reads 0; both are dereferenced by
-// OwnIsVisible and OwnInternalState, so every read of the state goes through
-// this first. LauncherNow (the singleton read) and the hook paths (the +0x160
-// read) share it, so the two readers cannot disagree about what is safe.
-bool LauncherStateReady(uint64_t state) {
-    return state > kLauncherStateReadyFloor;
+    if (!LauncherStateReady(
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state)))) {
+        return 0;
+    }
+    return *reinterpret_cast<const volatile uint32_t*>(
+        static_cast<const uint8_t*>(state) + kLauncherInternalStateOffset);
 }
 
 OwnCaller OwnResolveCaller(void* returnAddress) {
@@ -1608,7 +1655,21 @@ OwnSnapshot OwnSync(void* launcher) {
 
 // The same adoption after a close the executor passed or served. It reads the
 // state the hook received, which is the IXamlLauncherState interface.
+//
+// The readiness floor is checked HERE, not only before the call. A forwarded
+// Show/Dismiss reloads `[launcher+0x160]` after the shell returned, and that
+// value is the new one: a state that detached, or the constructor's 0x100
+// sentinel during an activation, was never seen by the pre-call check. An
+// unready value leaves the cached observation untouched — deciding from it would
+// turn "the state is gone" into "the panel is hidden".
 void OwnResyncFromState(void* state) {
+    const uint64_t raw =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state));
+    if (!LauncherStateReady(raw)) {
+        FileLog(L"own state resync skipped reason=state-not-ready raw=0x%llX",
+                static_cast<unsigned long long>(raw));
+        return;
+    }
     const bool shellOpen = OwnIsVisible(state);
     bool resync = false;
     {
@@ -1687,6 +1748,7 @@ uint32_t PeerEpochNow() {
 // thread to run it.
 bool BridgeCanServe() {
     return g_ipc.state != nullptr &&
+           g_execAdmissionOpen.load(std::memory_order_acquire) &&
            g_execReady.load(std::memory_order_acquire) &&
            !g_disabled.load(std::memory_order_relaxed) &&
            !g_initRefused.load(std::memory_order_relaxed);
@@ -1718,13 +1780,23 @@ bool OnRecordedLauncherThread() {
 // is created here, on a known launcher entry, and never from the library-load
 // hook or the worker's wait loop. Creating it takes no wait, so this is safe
 // inside the hook.
-bool BridgeCanServeOnLauncherThread(const wchar_t* trigger) {
+//
+// `epochOut` is the activation the admission was decided under. The latch stores
+// this value, not a fresh read: a restart between this decision and the latch
+// creation would otherwise label an old press with the new activation's epoch,
+// and the serve would accept it.
+bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
+                                    uint32_t* epochOut) {
+    if (epochOut) {
+        *epochOut = 0;
+    }
     if (!PeerAliveNow()) {
         // No controller: the caller forwards to the shell. One line per press
         // names the trigger and says why nothing was decided.
         FileLog(L"own pass trigger=%s reason=no-peer", trigger);
         return false;
     }
+    const uint32_t epoch = PeerEpochNow();
     if (!BridgeCanServe()) {
         FileLog(L"own pass trigger=%s reason=no-executor", trigger);
         return false;
@@ -1740,6 +1812,9 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger) {
     if (!ExecutorWindowOnThisThread()) {
         FileLog(L"own pass trigger=%s reason=no-window", trigger);
         return false;
+    }
+    if (epochOut) {
+        *epochOut = epoch;
     }
     return true;
 }
@@ -1921,8 +1996,7 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
 // press during the retract as a second close, and the owner's press did nothing.
 // The controller publishes closing before the close's first frame precisely so
 // this rule has the direction while the shell still looks open.
-bool IntentShouldClose(const OwnSnapshot& own) {
-    const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
+bool IntentShouldClose(const OwnSnapshot& own, int32_t direction) {
     if (direction != kSwipeDirectionUnowned) {
         return direction != kSwipeDirectionClosing;
     }
@@ -2000,39 +2074,45 @@ bool ShellHideInFlight(const OwnSnapshot& own) {
 }
 
 void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
-                uint32_t flags) {
+                uint32_t flags, uint32_t admittingEpoch) {
     const uint64_t now = GetTickCount64();
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (!window) {
+        // Neither the fallback timer nor the hidden event's arm has a window to
+        // run on. A slot with no guaranteed callback is not armed at all.
+        FileLog(L"own press latch dropped reason=no-window state=%u",
+                own.state);
+        return;
+    }
     if (g_pressLatch.pending) {
         FileLog(L"own press latch replaced old_tick=%llu old_wait=%llu state=%u",
                 static_cast<unsigned long long>(g_pressLatch.tick),
                 static_cast<unsigned long long>(now - g_pressLatch.tick),
                 own.state);
     }
-    g_pressLatch = PressLatch{true,           now, kSwipeIntentOpen,
-                              trigger,        method, flags,
-                              PeerEpochNow()};
+    g_pressLatch = PressLatch{true,            now,  kSwipeIntentOpen,
+                              trigger,         method, flags,
+                              admittingEpoch};
     FileLog(L"own press latched state=%u trigger=%s tick=%llu epoch=%u "
             L"(hide in flight)",
             own.state, PressTriggerName(trigger),
             static_cast<unsigned long long>(now), g_pressLatch.epoch);
-    HWND window = g_execWindow.load(std::memory_order_relaxed);
-    if (!window) {
-        // No fallback timer can be armed. The hidden event still serves the
-        // latch off its own stack; if that also cannot arm, the latch is dropped
-        // rather than shown from the event's stack.
-        FileLog(L"own press latch timer skipped reason=no-window");
-        return;
-    }
     g_pressServeReason = L"timeout";
     if (SetTimer(window, kPressLatchTimer, kPressLatchTimeoutMs, nullptr) == 0) {
-        // Without the timer the hidden event is the only serve point. That is
-        // still a legitimate path, so it is logged and the latch stays.
+        // The hidden event is a second serve point, but it is not a guaranteed
+        // one: the landing may already have passed. Today the initial timer is
+        // the only promise, so a latch that cannot arm it is dropped.
         FileLog(L"own press latch timer failed err=%u", GetLastError());
+        DropPressLatch(L"timer-failed", L"latch");
     }
 }
 
 // The latch waits for the hide's own event; the event then arms this deferral
 // instead of publishing from its stack. See kPressServeDelayMs.
+//
+// The slot and its timer are launcher-thread state. The hidden event is expected
+// there, but the check is not an assumption: a callback on another thread posts
+// one private notification to the executor window and the owner arms it.
 void ArmLatchedServe() {
     if (!g_pressLatch.pending) {
         return;
@@ -2040,6 +2120,15 @@ void ArmLatchedServe() {
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (!window) {
         DropPressLatch(L"no-window", L"hidden");
+        return;
+    }
+    if (!ExecutorWindowOnThisThread()) {
+        if (!PostMessageW(window, kExecLatchMessage, kExecLatchMagic, 0)) {
+            FileLog(L"own press latch arm post failed err=%u", GetLastError());
+        } else {
+            FileLog(L"own press latch arm posted tid=%u owner=%u",
+                    GetCurrentThreadId(), g_execThreadId);
+        }
         return;
     }
     g_pressServeReason = L"hidden";
@@ -2131,15 +2220,18 @@ bool ServeLatchedPress(const wchar_t* reason) {
 // A physical Start-button close on a shown panel used to leave the old slot for
 // the hidden event to serve.
 void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
-                    uint32_t dismissMethod, uint32_t flags) {
+                    uint32_t dismissMethod, uint32_t flags,
+                    uint32_t admittingEpoch) {
     if (g_pressLatch.pending && !ShellHideInFlight(own)) {
         // The landing event was missed and this newer press is the one the user
         // means.
         DropPressLatch(L"superseded", L"newer-press");
     }
+    // One sample of the controller's direction drives both the decision and its
+    // line. Reading it twice could log a direction the decision never used.
     const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
-    const int32_t kind =
-        IntentShouldClose(own) ? kSwipeIntentClose : kSwipeIntentOpen;
+    const int32_t kind = IntentShouldClose(own, direction) ? kSwipeIntentClose
+                                                           : kSwipeIntentOpen;
     // One decision line for every trigger. The method below is the one the action
     // will use, not the one the shell called with: a reopen from Dismiss(6) asks
     // for Show(11), and a close from Show(11) asks for Dismiss(6).
@@ -2150,7 +2242,7 @@ void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
         (ShellHideInFlight(own) || g_pendingDismissSeq != 0)) {
         // The hide or the armed dismiss has already taken the window; the open
         // is served at the landing instead of being published into a no-op show.
-        LatchPress(own, trigger, showMethod, flags);
+        LatchPress(own, trigger, showMethod, flags, admittingEpoch);
         return;
     }
     PublishBridgeIntent(kind, trigger,
@@ -2170,9 +2262,10 @@ OnHotkeyInvoke_t OnHotkeyInvoke_Original = nullptr;
 // recognised falls back to the ordinary close, which may animate it.
 HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
     const CloseCallLease closeCall;
+    uint32_t admittingEpoch = 0;
     if (!g_ownWinEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) ||
-        !BridgeCanServeOnLauncherThread(L"win")) {
+        !BridgeCanServeOnLauncherThread(L"win", &admittingEpoch)) {
         // No controller, no worker, or no window on this thread: the shell's own
         // toggle serves the press instead of an intent nobody can execute.
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
@@ -2226,7 +2319,7 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
                                        : S_OK;
     }
     DispatchToggle(own, kSwipeTriggerWin, kDismissMethodWin, kDismissMethodWin,
-                   flags);
+                   flags, admittingEpoch);
     return S_OK;
 }
 using OnStartButtonPressed_t = HRESULT (*)(void*, uint32_t, uint32_t);
@@ -2238,9 +2331,10 @@ OnStartButtonPressed_t OnStartButtonPressed_Original = nullptr;
 HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                                   uint32_t dismissMethod) {
     const CloseCallLease closeCall;
+    uint32_t admittingEpoch = 0;
     if (!g_ownButtonEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) ||
-        !BridgeCanServeOnLauncherThread(L"startbutton")) {
+        !BridgeCanServeOnLauncherThread(L"startbutton", &admittingEpoch)) {
         return OnStartButtonPressed_Original
                    ? OnStartButtonPressed_Original(self, showMethod,
                                                    dismissMethod)
@@ -2257,7 +2351,8 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                                                    dismissMethod)
                    : S_OK;
     }
-    DispatchToggle(own, kSwipeTriggerStartButton, showMethod, dismissMethod, 0);
+    DispatchToggle(own, kSwipeTriggerStartButton, showMethod, dismissMethod, 0,
+                   admittingEpoch);
     return S_OK;
 }
 
@@ -2320,11 +2415,12 @@ DismissHook_t Dismiss_Original = nullptr;
 
 HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
     const CloseCallLease closeCall;
+    uint32_t admittingEpoch = 0;
     if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) || t_execCall > 0) {
         return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
     }
-    if (!BridgeCanServeOnLauncherThread(L"dismiss")) {
+    if (!BridgeCanServeOnLauncherThread(L"dismiss", &admittingEpoch)) {
         return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
     }
     const OwnSnapshot own = OwnSync(launcher);
@@ -2336,7 +2432,8 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
     // this primitive with method 6 and must reach the controller even while the
     // controller owns the panel. Its reopen form asks for Show(11) instead.
     if (method == kDismissMethodStartButton) {
-        DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0);
+        DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0,
+                       admittingEpoch);
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
@@ -2355,13 +2452,14 @@ ShowStartViewHook_t ShowStartView_Original = nullptr;
 
 HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
     const CloseCallLease closeCall;
+    uint32_t admittingEpoch = 0;
     if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) || t_execCall > 0) {
         return ShowStartView_Original
                    ? ShowStartView_Original(launcher, method, flags)
                    : E_FAIL;
     }
-    if (!BridgeCanServeOnLauncherThread(L"showstartview")) {
+    if (!BridgeCanServeOnLauncherThread(L"showstartview", &admittingEpoch)) {
         return ShowStartView_Original
                    ? ShowStartView_Original(launcher, method, flags)
                    : E_FAIL;
@@ -2378,7 +2476,8 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
     // controller while the controller owns a close, so it is decided here before
     // the duplicate suppression. Its close form asks for Dismiss(6).
     if (method == 11) {
-        DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags);
+        DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags,
+                       admittingEpoch);
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
@@ -3052,15 +3151,18 @@ void ResetReinitState() {
     g_dismissReadRetries = 0;
     g_pendingDismissConfirmSeq = 0;
     g_pendingDismissConfirmVisible = 0;
+    g_pendingDismissConfirmTick = 0;
+    g_pendingDismissEpoch = 0;
+    g_dispatchEpoch = 0;
     g_pressLatch = PressLatch{};
     g_pressServeReason = L"timeout";
     t_ownExternalMethod = 0;
     // The executor's lifetime protocol, which the refusal checks above have
     // proved complete: no worker, no identified window, no creator. Only now is
     // admission reopened; a stop that did not complete left it closed and the
-    // refusal above kept this function out.
+    // refusal above kept this function out. The creator reservation is NOT set
+    // here: a flag cleared by the reaper would be a proof it did not obtain.
     g_execAdmissionOpen.store(true, std::memory_order_release);
-    g_execCreating.store(false, std::memory_order_release);
     g_execStopTarget.store(nullptr, std::memory_order_release);
     g_execWorkerId = 0;
     AcquireSRWLockExclusive(&g_ownLock);
@@ -3125,15 +3227,46 @@ void AnswerExec(LONG64 sequence, int32_t state, HRESULT hr, int visible) {
     }
 }
 
-bool LauncherVisibleNow(void* launcher) {
+// The visibility probe is three-valued. "No launcher" and "IsVisible failed" are
+// not "hidden": reporting those as a confirmed hide is how a dismiss that never
+// ran looked successful.
+enum class ProbeVisibility { Hidden, Visible, Unknown };
+
+int32_t ProbeVisibilityValue(ProbeVisibility value) {
+    switch (value) {
+        case ProbeVisibility::Hidden:
+            return kSwipeVisibilityHidden;
+        case ProbeVisibility::Visible:
+            return kSwipeVisibilityVisible;
+        default:
+            return kSwipeVisibilityUnknown;
+    }
+}
+
+const wchar_t* ProbeVisibilityName(ProbeVisibility value) {
+    switch (value) {
+        case ProbeVisibility::Hidden:
+            return L"hidden";
+        case ProbeVisibility::Visible:
+            return L"visible";
+        default:
+            return L"unknown";
+    }
+}
+
+ProbeVisibility LauncherVisibleNow(void* launcher) {
     if (!launcher || !g_twinuiBase) {
-        return false;
+        return ProbeVisibility::Unknown;
     }
     const LauncherIsVisibleFn isVisible = reinterpret_cast<LauncherIsVisibleFn>(
         g_twinuiBase + kLauncherIsVisibleRva);
     BOOL visible = FALSE;
-    isVisible(launcher, &visible);
-    return visible != FALSE;
+    const HRESULT hr = isVisible(launcher, &visible);
+    if (FAILED(hr)) {
+        return ProbeVisibility::Unknown;
+    }
+    return visible != FALSE ? ProbeVisibility::Visible
+                            : ProbeVisibility::Hidden;
 }
 
 void ArmVisibleProbe(LONG64 sequence) {
@@ -3148,35 +3281,84 @@ void ArmVisibleProbe(LONG64 sequence) {
 // dismiss deadline, or the publication tick for a show and a cancel. A zero means
 // the publisher never wrote one (a record from an older layout), and such a
 // record is not judged here.
+//
+// The comparison is `>=` on both sides — here and in the Start side's
+// CheckExecAckTimeout — because the record and the publisher are two clocks: a
+// dispatch at exactly due+400 has already outlived the budget, and the side that
+// sees equality must not be the only one that treats it as live. This is not a
+// lease on the shell call: a primitive that entered before the deadline can
+// return after the publisher timed out, and nothing here can recall it. The
+// publisher's timeout is a repair, not a cancel.
 bool ExecCommandExpired(const SwipeIpcExecCommand& command, uint64_t now) {
     const uint64_t due = command.kind == kSwipeExecDismiss ? command.executeAt
                                                            : command.tick;
-    return due != 0 && now > due && now - due > kExecExpiryMs;
+    return due != 0 && now >= due && now - due >= kExecExpiryMs;
 }
 
 // Arms the visibility confirmation a successful dismiss owes. Any previous one
-// belongs to a command this one supersedes.
-void ArmDismissConfirm(LONG64 sequence, bool visible) {
+// belongs to a command this one supersedes, and that record is answered
+// `Superseded` so its publisher can tell it from a timer failure. A timer that
+// cannot be armed answers `Unknown`: without the probe the hide is not confirmed,
+// and silence would let the Start side read the executed ack as one.
+void ArmDismissConfirm(LONG64 sequence, ProbeVisibility visible) {
+    if (g_pendingDismissConfirmSeq != 0 &&
+        g_pendingDismissConfirmSeq != sequence) {
+        FileLog(L"exec dismiss superseded seq=%lld by=%lld",
+                static_cast<long long>(g_pendingDismissConfirmSeq),
+                static_cast<long long>(sequence));
+        AnswerExec(g_pendingDismissConfirmSeq, kSwipeAckSuperseded, S_OK,
+                   g_pendingDismissConfirmVisible);
+    }
     g_pendingDismissConfirmSeq = sequence;
-    g_pendingDismissConfirmVisible = visible ? 1 : 0;
+    g_pendingDismissConfirmVisible = ProbeVisibilityValue(visible);
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (!window) {
+        FileLog(L"exec dismiss confirm timer failed seq=%lld reason=no-window",
+                static_cast<long long>(sequence));
+        g_pendingDismissConfirmSeq = 0;
+        AnswerExec(sequence, kSwipeAckUnknown, S_OK, kSwipeVisibilityUnknown);
         return;
     }
     if (SetTimer(window, kExecDismissProbeTimer,
                  static_cast<UINT>(kExecDismissConfirmMs), nullptr) == 0) {
-        FileLog(L"exec dismiss confirm timer failed err=%u", GetLastError());
+        FileLog(L"exec dismiss confirm timer failed seq=%lld err=%u",
+                static_cast<long long>(sequence), GetLastError());
         g_pendingDismissConfirmSeq = 0;
+        AnswerExec(sequence, kSwipeAckUnknown, S_OK, kSwipeVisibilityUnknown);
+        return;
     }
+    g_pendingDismissConfirmTick = GetTickCount64();
 }
 
 void KillDismissConfirm() {
     g_pendingDismissConfirmSeq = 0;
     g_pendingDismissConfirmVisible = 0;
+    g_pendingDismissConfirmTick = 0;
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (window) {
         KillTimer(window, kExecDismissProbeTimer);
     }
+}
+
+// A record names the menu it was published for. When the section has already
+// moved to a newer menu, a record for the old one must not act on the new one —
+// the case a Start restart leaves behind when the old record is accepted after
+// the new activation attached. A zero in either word means the record predates
+// the binding (or no menu has opened yet), and the epoch check is then the one
+// that guards it.
+bool ExecCommandForCurrentMenu(const SwipeIpcExecCommand& command,
+                               const wchar_t* kind) {
+    uint64_t open = 0;
+    uint64_t openTick = 0;
+    SwipeIpcReadOpen(&g_ipc, &open, &openTick);
+    if (command.open == 0 || openTick == 0 || command.open == openTick) {
+        return true;
+    }
+    FileLog(L"exec %s seq=%lld superseded menu=%llu now=%llu", kind,
+            static_cast<long long>(command.seq),
+            static_cast<unsigned long long>(command.open),
+            static_cast<unsigned long long>(openTick));
+    return false;
 }
 
 void ExecuteShow(const SwipeIpcExecCommand& command) {
@@ -3190,11 +3372,23 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
                 static_cast<long long>(command.seq),
                 static_cast<unsigned long long>(now - command.tick));
         AnswerExec(command.seq, kSwipeAckExpired,
-                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), 0);
+                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
+        return;
+    }
+    if (!ExecCommandForCurrentMenu(command, L"show")) {
+        AnswerExec(command.seq, kSwipeAckSuperseded,
+                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
         return;
     }
     // A show supersedes whatever confirmation an earlier dismiss still owed: the
-    // window is opening again, and the old probe would read this open.
+    // window is opening again, and the old probe would read this open. The
+    // publisher is told the old confirmation will not come.
+    if (g_pendingDismissConfirmSeq != 0) {
+        FileLog(L"exec dismiss confirm superseded seq=%lld reason=show",
+                static_cast<long long>(g_pendingDismissConfirmSeq));
+        AnswerExec(g_pendingDismissConfirmSeq, kSwipeAckSuperseded, S_OK,
+                   g_pendingDismissConfirmVisible);
+    }
     KillDismissConfirm();
     uint64_t state = 0;
     void* outer = nullptr;
@@ -3205,7 +3399,17 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
                 static_cast<long long>(command.seq), outer, launcher,
                 static_cast<unsigned long long>(state));
         AnswerExec(command.seq, kSwipeAckRefused,
-                   HRESULT_FROM_WIN32(ERROR_NOT_FOUND), 0);
+                   HRESULT_FROM_WIN32(ERROR_NOT_FOUND), kSwipeVisibilityUnknown);
+        return;
+    }
+    const uint32_t epoch = PeerEpochNow();
+    if (epoch != g_dispatchEpoch) {
+        // The activation that published this record is gone. Calling Show now
+        // would present a menu for a controller that has already released it.
+        FileLog(L"exec show seq=%lld superseded epoch=%u now=%u",
+                static_cast<long long>(command.seq), g_dispatchEpoch, epoch);
+        AnswerExec(command.seq, kSwipeAckSuperseded,
+                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
         return;
     }
     ++t_execCall;
@@ -3216,15 +3420,15 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
     // IsVisible right after the call is honest but early: the shell's show is
     // still running and the window is cloaked, so the answer is 0 here. The
     // confirmation is read again by the probe timer on this same thread.
-    const bool visible = LauncherVisibleNow(launcher);
+    const ProbeVisibility visible = LauncherVisibleNow(launcher);
     --t_execCall;
     FileLog(L"exec show seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
-            L"visible=%d",
+            L"visible=%s",
             static_cast<long long>(command.seq), outer, launcher,
             static_cast<unsigned long long>(state),
-            static_cast<unsigned>(hr), visible ? 1 : 0);
+            static_cast<unsigned>(hr), ProbeVisibilityName(visible));
     AnswerExec(command.seq, SUCCEEDED(hr) ? kSwipeAckExecuted : kSwipeAckRefused,
-               hr, visible ? 1 : 0);
+               hr, ProbeVisibilityValue(visible));
     if (SUCCEEDED(hr)) {
         ArmVisibleProbe(command.seq);
     }
@@ -3243,8 +3447,14 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
                                                     : 0),
                 static_cast<long long>(g_pendingDismissSeq));
         AnswerExec(command.seq, kSwipeAckExpired,
-                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), 0);
+                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
         DropPressLatch(L"dismiss-expired", L"executor");
+        return;
+    }
+    if (!ExecCommandForCurrentMenu(command, L"dismiss")) {
+        AnswerExec(command.seq, kSwipeAckSuperseded,
+                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
+        DropPressLatch(L"dismiss-superseded", L"menu");
         return;
     }
     // A pending show probe belongs to a window this dismiss is about to hide; its
@@ -3262,25 +3472,41 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
                 static_cast<long long>(command.seq), outer, launcher,
                 static_cast<unsigned long long>(state));
         AnswerExec(command.seq, kSwipeAckRefused,
-                   HRESULT_FROM_WIN32(ERROR_NOT_FOUND), 0);
+                   HRESULT_FROM_WIN32(ERROR_NOT_FOUND), kSwipeVisibilityUnknown);
         DropPressLatch(L"dismiss-refused", L"executor");
+        return;
+    }
+    // The command was accepted against one activation and runs against whatever
+    // answers now. A fast Start restart inside the execution budget is otherwise
+    // invisible: the epoch is read immediately before the call, and a mismatch
+    // means this Dismiss would hide a menu the new activation may have opened.
+    // No scheme can recall a call that has already entered the shell; this is the
+    // last point at which the decision is still free.
+    const uint32_t epoch = PeerEpochNow();
+    if (epoch != g_pendingDismissEpoch) {
+        FileLog(L"exec dismiss seq=%lld superseded epoch=%u now=%u",
+                static_cast<long long>(command.seq), g_pendingDismissEpoch,
+                epoch);
+        AnswerExec(command.seq, kSwipeAckSuperseded,
+                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
+        DropPressLatch(L"dismiss-superseded", L"epoch");
         return;
     }
     ++t_execCall;
     const HRESULT hr =
         g_dismiss ? g_dismiss(launcher, command.method ? command.method : 1)
                   : E_FAIL;
-    // `hr` is the primitive's answer, and `visible` right after it is checked
-    // again by the confirmation probe: success is not yet a hide.
-    const bool visible = LauncherVisibleNow(launcher);
+    // `hr` is the primitive's answer, and the visibility right after it is
+    // checked again by the confirmation probe: success is not yet a hide.
+    const ProbeVisibility visible = LauncherVisibleNow(launcher);
     --t_execCall;
     FileLog(L"exec dismiss seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
-            L"visible=%d",
+            L"visible=%s",
             static_cast<long long>(command.seq), outer, launcher,
             static_cast<unsigned long long>(state),
-            static_cast<unsigned>(hr), visible ? 1 : 0);
+            static_cast<unsigned>(hr), ProbeVisibilityName(visible));
     AnswerExec(command.seq, SUCCEEDED(hr) ? kSwipeAckExecuted : kSwipeAckRefused,
-               hr, visible ? 1 : 0);
+               hr, ProbeVisibilityValue(visible));
     if (SUCCEEDED(hr)) {
         ArmDismissConfirm(command.seq, visible);
     } else {
@@ -3339,7 +3565,12 @@ void ExecuteDueDismiss() {
         FileLog(L"exec dismiss seq=%lld superseded by %lld",
                 static_cast<long long>(g_pendingDismissSeq),
                 static_cast<long long>(command.seq));
+        if (g_pendingDismissSeq != 0) {
+            AnswerExec(g_pendingDismissSeq, kSwipeAckSuperseded, S_OK,
+                       kSwipeVisibilityUnknown);
+        }
         g_pendingDismissSeq = 0;
+        g_pendingDismissEpoch = 0;
         return;
     }
     g_pendingDismissSeq = 0;
@@ -3359,6 +3590,11 @@ void ExecutePendingCommand() {
         return;
     }
     g_execAcceptedSeq = command.seq;
+    // The activation that published this record, read once at acceptance. A
+    // dismiss may be armed for hundreds of milliseconds; the epoch is compared
+    // again immediately before the shell call, because a Start restart inside
+    // that budget must not let the old record act on a new menu.
+    g_dispatchEpoch = PeerEpochNow();
     if (command.kind == kSwipeExecCancel) {
         if (g_pendingDismissSeq != 0 &&
             (command.target == 0 || command.target == g_pendingDismissSeq)) {
@@ -3366,8 +3602,11 @@ void ExecutePendingCommand() {
             FileLog(L"exec cancel seq=%lld target=%lld",
                     static_cast<long long>(command.seq),
                     static_cast<long long>(g_pendingDismissSeq));
+            AnswerExec(g_pendingDismissSeq, kSwipeAckSuperseded, S_OK,
+                       kSwipeVisibilityUnknown);
             AnswerExec(command.seq, kSwipeAckExecuted, S_OK, 0);
             g_pendingDismissSeq = 0;
+            g_pendingDismissEpoch = 0;
         } else {
             AnswerExec(command.seq, kSwipeAckExecuted, S_OK, 0);
         }
@@ -3375,7 +3614,10 @@ void ExecutePendingCommand() {
     }
     if (g_pendingDismissSeq != 0 && command.seq != g_pendingDismissSeq) {
         KillTimer(g_execWindow.load(), kExecDismissTimer);
+        AnswerExec(g_pendingDismissSeq, kSwipeAckSuperseded, S_OK,
+                   kSwipeVisibilityUnknown);
         g_pendingDismissSeq = 0;
+        g_pendingDismissEpoch = 0;
     }
     if (command.kind == kSwipeExecShow) {
         ExecuteShow(command);
@@ -3387,9 +3629,11 @@ void ExecutePendingCommand() {
             const uint32_t delay = static_cast<UINT>(command.executeAt - now);
             if (ArmDismissTimer(delay)) {
                 g_pendingDismissSeq = command.seq;
+                g_pendingDismissEpoch = g_dispatchEpoch;
                 g_dismissReadRetries = 0;
-                FileLog(L"exec dismiss seq=%lld armed in=%u ms",
-                        static_cast<long long>(command.seq), delay);
+                FileLog(L"exec dismiss seq=%lld armed in=%u ms epoch=%u",
+                        static_cast<long long>(command.seq), delay,
+                        g_pendingDismissEpoch);
                 return;
             }
             // No timer means the command would be armed forever. Run it now: a
@@ -3399,6 +3643,7 @@ void ExecutePendingCommand() {
             FileLog(L"exec dismiss seq=%lld armed=0 reason=no-timer",
                     static_cast<long long>(command.seq));
         }
+        g_pendingDismissEpoch = g_dispatchEpoch;
         ExecuteDismiss(command);
     }
 }
@@ -3409,10 +3654,21 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
     // Wh_ModUninit waits for the count to reach zero before it closes the
     // channel, so no command can run against a closed section.
     const CloseCallLease dispatch;
-    if (message == WM_CLOSE) {
-        // The owner-thread shutdown: the one-shot timers would otherwise outlive
-        // the window, and a timer that fires after Wh_ModUninit would read a
-        // session the channel no longer maps.
+    if (message == kExecTeardownMessage) {
+        // The owner-thread shutdown. This is a private request, not a generic
+        // WM_CLOSE: the one-shot timers would otherwise outlive the window, and a
+        // timer that fires after Wh_ModUninit would read a session the channel no
+        // longer maps. Only the identified target answers: a recycled HWND that
+        // now belongs to another window never reaches this procedure, and a
+        // window of this image that this activation did not name refuses, which
+        // is what makes the handle a statement about this window.
+        const bool identified =
+            g_execStopTarget.load(std::memory_order_acquire) == window;
+        if (wParam != kExecTeardownMagic || !identified) {
+            FileLog(L"exec teardown ignored hwnd=%p identified=%d",
+                    window, identified ? 1 : 0);
+            return 0;
+        }
         KillTimer(window, kExecDismissTimer);
         KillTimer(window, kExecProbeTimer);
         KillTimer(window, kPressLatchTimer);
@@ -3440,13 +3696,29 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                 identified ? 1 : 0, GetCurrentThreadId());
         return 0;
     }
+    // A window this activation did not publish is not a dispatcher. A survivor
+    // from a previous activation has this image's procedure and would otherwise
+    // see this activation's globals and channel; its timers are the sharper
+    // edge, because a dismiss armed for an old menu would fire into a new one.
+    // The teardown above is the only message such a window answers.
+    if (window != g_execWindow.load(std::memory_order_acquire)) {
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
     if (!g_execReady.load(std::memory_order_acquire) ||
+        !g_execAdmissionOpen.load(std::memory_order_acquire) ||
         g_disabled.load(std::memory_order_relaxed) ||
         g_initRefused.load(std::memory_order_relaxed)) {
         // An unload is in flight: no command and no timer may touch the launcher
-        // or the channel after this point. WM_CLOSE above is the only message
-        // that still acts.
+        // or the channel after this point.
         return DefWindowProcW(window, message, wParam, lParam);
+    }
+    if (message == kExecLatchMessage) {
+        if (wParam == kExecLatchMagic) {
+            // The hidden event ran on another thread; the slot and its timer
+            // belong to this one.
+            ArmLatchedServe();
+        }
+        return 0;
     }
     if (message == kExecMessage) {
         ExecutePendingCommand();
@@ -3462,34 +3734,56 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         uint64_t state = 0;
         void* outer = nullptr;
         void* launcher = LauncherNow(&state, &outer);
-        const bool visible = LauncherVisibleNow(launcher);
-        FileLog(L"exec visible seq=%lld launcher=%p state=0x%llX visible=%d",
+        const ProbeVisibility visible = LauncherVisibleNow(launcher);
+        FileLog(L"exec visible seq=%lld launcher=%p state=0x%llX visible=%s",
                 static_cast<long long>(g_pendingShowSeq), launcher,
-                static_cast<unsigned long long>(state), visible ? 1 : 0);
+                static_cast<unsigned long long>(state),
+                ProbeVisibilityName(visible));
         return 0;
     }
     if (message == WM_TIMER && wParam == kExecDismissProbeTimer) {
         KillTimer(window, kExecDismissProbeTimer);
         const LONG64 sequence = g_pendingDismissConfirmSeq;
         const int32_t atCall = g_pendingDismissConfirmVisible;
+        const uint64_t armedAt = g_pendingDismissConfirmTick;
         g_pendingDismissConfirmSeq = 0;
         g_pendingDismissConfirmVisible = 0;
+        g_pendingDismissConfirmTick = 0;
         if (sequence != 0) {
             uint64_t state = 0;
             void* outer = nullptr;
             void* launcher = LauncherNow(&state, &outer);
-            const bool visible = LauncherVisibleNow(launcher);
+            const ProbeVisibility visible = LauncherVisibleNow(launcher);
+            const uint64_t elapsed =
+                armedAt != 0 && GetTickCount64() > armedAt
+                    ? GetTickCount64() - armedAt
+                    : 0;
             // The bounded confirmation: `hr=0` said the primitive returned, and
-            // this says whether the window actually went away. A still-visible
-            // window is recorded, not reported as a hide, and the press latch
-            // that was waiting for this hide is dropped: its reopen has no
-            // landing to be served at.
-            FileLog(L"exec dismiss %s seq=%lld visible=%d at_call=%d after=%u ms",
-                    visible ? L"unconfirmed" : L"confirmed",
-                    static_cast<long long>(sequence), visible ? 1 : 0, atCall,
-                    static_cast<unsigned>(kExecDismissConfirmMs));
-            if (visible) {
-                DropPressLatch(L"dismiss-unconfirmed", L"confirmation");
+            // this says whether the window actually went away. A hidden window is
+            // confirmed; a visible one, or a probe that could not answer, is
+            // answered as its own outcome so the publisher can repair.
+            const int32_t answer =
+                visible == ProbeVisibility::Hidden
+                    ? kSwipeAckConfirmed
+                    : (visible == ProbeVisibility::Visible ? kSwipeAckUnconfirmed
+                                                           : kSwipeAckUnknown);
+            AnswerExec(sequence, answer, S_OK, ProbeVisibilityValue(visible));
+            FileLog(L"exec dismiss %s seq=%lld visible=%s at_call=%d after=%llu "
+                    L"ms",
+                    answer == kSwipeAckConfirmed
+                        ? L"confirmed"
+                        : (answer == kSwipeAckUnconfirmed ? L"unconfirmed"
+                                                          : L"unknown"),
+                    static_cast<long long>(sequence),
+                    ProbeVisibilityName(visible), atCall,
+                    static_cast<unsigned long long>(elapsed));
+            if (visible != ProbeVisibility::Hidden) {
+                // The window did not go away, or nothing can say it did; the
+                // latch has no landing to be served at.
+                DropPressLatch(answer == kSwipeAckUnconfirmed
+                                   ? L"dismiss-unconfirmed"
+                                   : L"dismiss-unknown",
+                               L"confirmation");
             }
         }
         return 0;
@@ -3693,6 +3987,20 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
     // is created there and that thread's loop dispatches its messages.
     CreateExecutorWindowOnUiThread(2000);
 
+    // Availability is published HERE, not by the thread that called CreateThread.
+    // The new thread can run (and exit) before CreateThread returns; a creator's
+    // store of `true` after the exit guard's `false` would leave the gate open for
+    // a worker that no longer exists. The positive publication, the exit
+    // withdrawal and the stop therefore all belong to this thread, and the gate
+    // also requires admission, which the stop closes first.
+    if (g_execAdmissionOpen.load(std::memory_order_acquire) &&
+        !g_disabled.load(std::memory_order_relaxed) &&
+        !g_initRefused.load(std::memory_order_relaxed)) {
+        g_execReady.store(true, std::memory_order_release);
+        FileLog(L"exec worker ready tid=%u window=%p", GetCurrentThreadId(),
+                g_execWindow.load(std::memory_order_relaxed));
+    }
+
     HANDLE events[2] = {g_execStopEvent, g_ipc.execEvent};
     for (;;) {
         const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
@@ -3768,8 +4076,34 @@ void StartExecutorWorker() {
         return;
     }
     g_execWorkerId = GetThreadId(g_execWorker);
-    g_execReady.store(true, std::memory_order_release);
     FileLog(L"exec worker started tid=%u", g_execWorkerId);
+}
+
+// Proves that no creator of this activation is still between CreateWindowExW and
+// its publication. Admission must already be closed: a creator that arrives
+// after this proof cannot start, so `false` here is a durable statement and not
+// one moment of an interleaving. A timeout is returned, never repaired by
+// clearing the reservation: a flag cleared by the reaper would let the same
+// window publish behind the snapshot it was cleared for.
+bool DrainExecutorCreator(const wchar_t* why) {
+    const ULONGLONG deadline = GetTickCount64() + kExecCreatorDrainMs;
+    while (g_execCreating.load(std::memory_order_acquire) &&
+           GetTickCount64() < deadline) {
+        Sleep(1);  // a creator is inside CreateWindowExW; its publish is next
+    }
+    if (g_execCreating.load(std::memory_order_acquire)) {
+        FileLog(L"exec creator still inside (%s)", why);
+        return false;
+    }
+    return true;
+}
+
+// The private shutdown. A generic WM_CLOSE would only say "close some window";
+// this request names the window this activation is tearing down, and the
+// procedure answers it only when that window is the recorded target.
+bool PostExecutorTeardown(HWND window) {
+    return PostMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0) !=
+           FALSE;
 }
 
 // The one window shutdown. Returns true only when no worker and no window of this
@@ -3779,39 +4113,41 @@ void StartExecutorWorker() {
 // destruction has completed.
 //
 // The order is the fix for a same-image re-enable. Admission closes first, so no
-// creator can publish a window behind the snapshot; the creator reservation is
-// drained, so a creation that already passed admission finishes and is seen. Then
-// the worker is joined, and only then is the identified window destroyed — directly
-// when this call already runs on its owner thread, otherwise with a WM_CLOSE the
-// owner acknowledges from WM_NCDESTROY.
+// creator can publish a window behind the snapshot and no command can be served;
+// the creator reservation is drained, so a creation that already passed admission
+// finishes and is seen. Then the worker is joined, and only then is the
+// identified window destroyed — directly when this call already runs on its owner
+// thread, otherwise with the private teardown the owner acknowledges from
+// WM_NCDESTROY.
 bool StopExecutorWorker() {
-    // From here on no dispatch may reach the launcher: the WndProc gates on this
-    // and the window's destruction below ends its timers. Every trigger falls
-    // through to the shell while this is false.
+    // Admission first, readiness second: the worker publishes its own readiness
+    // and the window's procedure requires admission, so a late positive
+    // publication from a worker that has not yet noticed the stop is never
+    // readable as a service.
+    g_execAdmissionOpen.store(false, std::memory_order_release);
     g_execReady.store(false, std::memory_order_release);
 
-    g_execAdmissionOpen.store(false, std::memory_order_release);
-    const ULONGLONG drainDeadline = GetTickCount64() + kExecCreatorDrainMs;
-    while (g_execCreating.load(std::memory_order_acquire) &&
-           GetTickCount64() < drainDeadline) {
-        Sleep(1);  // a creator is inside CreateWindowExW; its publish is next
-    }
-    const bool creatorDrained =
-        !g_execCreating.load(std::memory_order_acquire);
+    const bool creatorDrained = DrainExecutorCreator(L"stop");
     if (!creatorDrained) {
         FileLog(L"exec window creator did not leave in %u ms",
                 static_cast<unsigned>(kExecCreatorDrainMs));
     }
 
+    // A window that was already published belongs to this activation even when
+    // its creator has not released the reservation yet; a window that is still
+    // null under a live creator is not a snapshot this stop may record. The
+    // re-enable proves the creator out first and takes the window then.
     HWND window = g_execWindow.load(std::memory_order_acquire);
-    g_execStopTarget.store(window, std::memory_order_release);
-    if (window && g_execWindow.load(std::memory_order_acquire) != window) {
-        // The window was destroyed between the snapshot and the target store, so
-        // its WM_NCDESTROY could not see the target and cleared nothing. A stale
-        // target here would refuse every later enable forever.
-        g_execStopTarget.store(nullptr, std::memory_order_release);
-        FileLog(L"exec window already gone hwnd=%p", window);
-        window = nullptr;
+    if (window) {
+        g_execStopTarget.store(window, std::memory_order_release);
+        if (g_execWindow.load(std::memory_order_acquire) != window) {
+            // The window was destroyed between the snapshot and the target store,
+            // so its WM_NCDESTROY could not see the target and cleared nothing. A
+            // stale target here would refuse every later enable forever.
+            g_execStopTarget.store(nullptr, std::memory_order_release);
+            FileLog(L"exec window already gone hwnd=%p", window);
+            window = nullptr;
+        }
     }
 
     bool workerStopped = true;
@@ -3868,8 +4204,8 @@ bool StopExecutorWorker() {
                 FileLog(L"exec window gone before the close hwnd=%p", window);
             } else {
                 ResetEvent(g_execWindowGone);
-                if (!PostMessageW(window, WM_CLOSE, 0, 0)) {
-                    FileLog(L"exec window close post failed err=%u",
+                if (!PostExecutorTeardown(window)) {
+                    FileLog(L"exec window teardown post failed err=%u",
                             GetLastError());
                     windowStopped = false;
                 } else if (WaitForSingleObject(g_execWindowGone,
@@ -3878,10 +4214,10 @@ bool StopExecutorWorker() {
                     FileLog(L"exec window destroyed tid=%u",
                             static_cast<unsigned>(g_execThreadId));
                 } else {
-                    // WM_CLOSE kills the timers and destroys the window; the ack
-                    // is WM_NCDESTROY's, and it has not come. The dispatch gate
-                    // keeps the surviving window harmless, but the activation is
-                    // not gone and nothing is closed under it.
+                    // The teardown kills the timers and destroys the window; the
+                    // ack is WM_NCDESTROY's, and it has not come. The dispatch
+                    // gate keeps the surviving window harmless, but the
+                    // activation is not gone and nothing is closed under it.
                     FileLog(L"exec window close timeout tid=%u",
                             static_cast<unsigned>(g_execThreadId));
                     windowStopped = false;
@@ -3902,6 +4238,15 @@ bool StopExecutorWorker() {
 // as the unload would have destroyed it. A worker that has exited is joined and
 // its handles closed. True means nothing of that activation is left, which is the
 // one state a re-enable may inherit.
+//
+// The two moments of the old version are the bug this order removes. It read the
+// published HWND and then the creator reservation: a creator that publishes and
+// releases between those two reads was seen as "no HWND" and "no creator", and
+// the enable cleared the HWND that had just been written — the exact window the
+// reaper existed to destroy, still running with this image's procedure and a new
+// activation's channel. With admission closed, the reservation is drained FIRST;
+// the publish happens before the release, so a null HWND read after the drain is
+// a durable answer. The reservation is never cleared to look quiescent.
 bool ReapExecutorTeardown() {
     if (g_execWorker) {
         if (WaitForSingleObject(g_execWorker, 0) == WAIT_OBJECT_0) {
@@ -3913,12 +4258,18 @@ bool ReapExecutorTeardown() {
             return false;
         }
     }
+    if (!DrainExecutorCreator(L"reinit")) {
+        FileLog(L"exec reinit refused: a window creation from the previous "
+                L"activation is still inside");
+        return false;
+    }
     HWND target = g_execStopTarget.load(std::memory_order_acquire);
     if (!target) {
         target = g_execWindow.load(std::memory_order_acquire);
         if (target) {
-            // A window nobody was waiting for: the stop timed out on its creator
-            // or its close path gave up. From here it is the identified target.
+            // A window nobody was waiting for: the stop timed out on its creator.
+            // From here it is the identified target, and the creator proof above
+            // is what makes it the only one this activation can have.
             g_execStopTarget.store(target, std::memory_order_release);
             FileLog(L"exec teardown found a surviving window hwnd=%p", target);
         }
@@ -3930,9 +4281,12 @@ bool ReapExecutorTeardown() {
             FileLog(L"exec teardown cleared a dead window hwnd=%p", target);
         } else {
             // Finish the stop here rather than refusing forever: the window is
-            // this image's, so its own WM_CLOSE path is what destroys it and
+            // this image's, so its own teardown path destroys it and
             // acknowledges. The event is reset for this target, never read as an
-            // acknowledgement left by an earlier stop.
+            // acknowledgement left by an earlier stop. IsWindow alone is not the
+            // identity test — a recycled handle would answer it — which is why
+            // the request carries the private message and the owner checks it
+            // against the recorded target before destroying.
             if (!g_execWindowGone) {
                 g_execWindowGone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
                 if (!g_execWindowGone) {
@@ -3947,7 +4301,7 @@ bool ReapExecutorTeardown() {
             if (g_execThreadId == GetCurrentThreadId()) {
                 DestroyWindow(target);
                 destroyed = !IsWindow(target);
-            } else if (PostMessageW(target, WM_CLOSE, 0, 0) &&
+            } else if (PostExecutorTeardown(target) &&
                        WaitForSingleObject(g_execWindowGone, kExecJoinWaitMs) ==
                            WAIT_OBJECT_0) {
                 destroyed = true;
@@ -3964,10 +4318,13 @@ bool ReapExecutorTeardown() {
         }
     }
     if (g_execCreating.load(std::memory_order_acquire)) {
-        FileLog(L"exec reinit refused: a window creation from the previous "
-                L"activation is still inside");
+        // Cannot happen with admission closed and the drain above; kept as the
+        // refusal that would hold if a future path reopened admission early.
+        FileLog(L"exec reinit refused: a window creation appeared after the "
+                L"creator proof");
         return false;
     }
+    FileLog(L"exec teardown reaped hwnd=%p", static_cast<void*>(target));
     return true;
 }
 
@@ -4003,7 +4360,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.24.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.25.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
@@ -4015,6 +4372,12 @@ BOOL Wh_ModInit() {
     // activation refuses and leaves the previous state exactly as the unload
     // left it. The next enable tries again.
     const bool reinit = g_modulePin != nullptr;
+    if (reinit) {
+        // A re-enable takes the executor's lifetime over with admission closed.
+        // The proof in ReapExecutorTeardown is only durable while no creator can
+        // start, and ResetReinitState is the one place that reopens it.
+        g_execAdmissionOpen.store(false, std::memory_order_release);
+    }
     if (reinit && g_closeCalls.load(std::memory_order_acquire) != 0) {
         g_initRefused.store(true, std::memory_order_relaxed);
         FileLog(L"mod init refused: a close from the previous activation is "
@@ -4033,7 +4396,6 @@ BOOL Wh_ModInit() {
                 L"installed");
         return FALSE;
     }
-
     ResetReinitState();
     if (reinit) {
         FileLog(L"activation state reset");
