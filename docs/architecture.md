@@ -467,9 +467,13 @@ executable-range check, both prologue probes and the module poll thread that
 searched for the DLL for 20 seconds. Deleted with the animation instrumentation:
 the animation-request hook, its three argument getters and the debug switch that
 suppressed the shell's open storyboard. `PrepareRootElement` is resolved with one
-`HookSymbols` call from the already-loaded image, the late-load notification and
-an `AfterInit` recheck; a resolution or hook failure logs one reason, installs no
-root hook and withholds the controller service, so every press stays native.
+`HookSymbols` call, and that call runs on the mod's input thread: the first
+symbol load starts Windhawk's PDB fetch, and blocking the shell's loader thread
+makes the menu host look hung to the watchdog, which restarts it and restarts the
+fetch. The `LoadLibraryExW` notification only records the returned module; a
+false result while the fetch runs is pending with a 120 s deadline, and only the
+deadline logs `unresolved`, installs no root hook and withholds the controller
+service. The shell keeps pumping for the whole fetch.
 
 **v7** adds the Start side's activation identity at the tail: `peerEpoch` at 740,
 which the struct's alignment had already paid for, so the section stays 744 bytes

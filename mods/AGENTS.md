@@ -120,11 +120,14 @@ its debug switch; the root is resolved by symbol.
 mutex, counted module entries, stop-event-driven input thread, XAML revokes with
 the residual rules, the `peerState=gone` publish before every residual return,
 and the per-activation reset. The root hook is resolved by public symbol
-(`StartUI::App::PrepareRootElement`, one `HookSymbols` call) from the
-already-loaded image, from the `LoadLibraryExW` notification and again from
-`AfterInit`; the reference address `module+0xAD730` is logged as evidence, not
-required. A symbol or hook failure logs one reason, installs no root hook and
-withholds the peer service. There is no module poll thread. A disable/enable
+(`StartUI::App::PrepareRootElement`): the `LoadLibraryExW` notification only
+records the returned module, and the input thread runs `HookSymbols`, because
+the first call starts Windhawk's PDB fetch and blocking the shell's loader
+thread makes the menu host look hung. A false result while the fetch runs is
+pending (logged with its attempt, elapsed time and the 120 s deadline) and is
+retried; only the deadline produces `unresolved`, no root hook and no peer
+service. The reference address `module+0xAD730` is logged as evidence, not
+required. A disable/enable
 without a host restart reuses the XAML root and has no renderer until the host
 restarts (a measured limit, not a bug to paper over).
 

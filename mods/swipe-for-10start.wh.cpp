@@ -31,12 +31,14 @@ What it does:
   StartUI::App::PrepareRootElement(class Windows::UI::Xaml::Controls::Frame ^,
   class StartUI::PerFrameData ^,bool)`, the exact undecorated name in
   `StartUI.pdb`; the known reference build resolves it to `module + 0xAD730`,
-  which is logged as evidence and not required. The hook is installed from the
-  already-loaded image at init, from the `LoadLibraryExW` notification if
-  `StartUI_` loads later, and rechecked after init. A symbol, signature or hook
-  failure logs one reason (`startui root symbol unresolved ...`), installs
-  nothing and advertises no controller service, so the shell handles every
-  press natively.
+  which is logged as evidence and not required. StartUI_ loads lazily, so the
+  `LoadLibraryExW` notification only records the module; the mod's input thread
+  resolves it, because the first symbol load starts Windhawk's PDB fetch and
+  would hang the shell's loader thread. A false result while that fetch runs is
+  `startui root symbol pending ...` and is retried for up to 120 s; then
+  `startui root symbol unresolved ...` refuses the root hook, installs nothing
+  and advertises no controller service, so the shell handles every press
+  natively. The shell keeps pumping for the whole fetch.
 - At every setup it gets the Start CoreWindow HWND via `ICoreWindowInterop` and
   asks the taskbar which edge it is docked to. The work area cannot answer: with
   auto-hide enabled the shell reserves nothing, so the work area equals the
@@ -989,7 +991,10 @@ Diagnostics:
   window one release read, for a seam that felt like a drop,
   `startui root symbol resolved base=... at=... rva=... expected=0xAD730
   match=0|1` (the symbol is the contract; a different address is still used and
-  named), `startui root symbol unresolved name=...` (the one refusal reason; no
+  named), `startui root symbol pending attempt=... waited=...ms
+  deadline=120000ms` while Windhawk's PDB fetch runs (the shell keeps pumping;
+  the retry comes from the input thread), `startui root symbol deadline ...`
+  and `startui root symbol unresolved name=...` (the one refusal reason; no
   root hook and no controller service),
   `unload hid thread stopped` (or
   `unload hid thread still running; ipc view leaked` and
@@ -1098,10 +1103,14 @@ Known risks:
 - The root hook is resolved by symbol, not by address. The exact undecorated
   name is matched against the public symbols of `StartUI_.dll`; the known
   reference build resolves it to `module + 0xAD730`, which is logged and not
-  required. No PDB, a signature that no longer matches or a refused hook logs
-  one reason, `startui root symbol unresolved name=...`; without the root there
-  is no renderer, so no gesture starts and the controller advertises no service
-  (the shell handles every press natively).
+  required. The first load also starts Windhawk's PDB fetch (35 MB, seconds to
+  a minute on a cold cache); it runs on the mod's input thread, never on the
+  shell's loader thread, and reports `startui root symbol pending` until it
+  finishes. No PDB, a signature that no longer matches or a refused hook logs
+  one reason after the 120 s pending deadline,
+  `startui root symbol unresolved name=...`; without the root there is no
+  renderer, so no gesture starts and the controller advertises no service (the
+  shell handles every press natively).
 - The instance guard's name is process local:
   `Local\WindhawkLegacyStartSwipe.instance.<pid>`. A residual instance holds it
   for the life of the process, so re-enabling the mod there is refused with one
@@ -9351,6 +9360,11 @@ void UnregisterHidUsage(USAGE usage) {
     RegisterRawInputDevices(&device, 1, sizeof(device));
 }
 
+// Defined with the root-hook installer. Runs on the input thread only, because
+// the symbol load blocks for Windhawk's PDB fetch and must never block the
+// shell's loader thread.
+void ProbeRootSymbolFromInputThread();
+
 DWORD WINAPI HidInputThread(LPVOID) {
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -9433,11 +9447,19 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // LoadLibraryExW notification, and this thread publishes on the next tick —
     // still from the consumer itself, never from the loading thread.
     bool peerAnnounced = false;
+    // The root hook is resolved here and not by the LoadLibraryExW notification:
+    // the first symbol load blocks for Windhawk's PDB fetch, and this thread is
+    // the mod's own. A pending result leaves the peer unpublished.
+    ProbeRootSymbolFromInputThread();
     if (g_rootHookReady.load(std::memory_order_acquire)) {
         PublishPeerReady(L"consumer");
         peerAnnounced = true;
     }
     while (running) {
+        // The module appears after this thread starts in the measured host, so
+        // every tick is a chance to begin the fetch. The call is throttled while
+        // the result is pending and stops as soon as ready or refused is set.
+        ProbeRootSymbolFromInputThread();
         if (!peerAnnounced &&
             g_rootHookReady.load(std::memory_order_acquire)) {
             PublishPeerReady(L"consumer");
@@ -12073,11 +12095,27 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
 // Root hook: StartUI::App::PrepareRootElement by symbol
 // ---------------------------------------------------------------------------
 
-// The image whose symbol hook was attempted. One attempt per module: a loaded
-// StartUI_.dll is the same image for the life of the process, and a refusal
-// would pay for the same symbol load to reach the same answer.
+// The image the notification saw, and the image an install currently owns.
+// `Seen` is written by the `LoadLibraryExW` notification and read by the input
+// thread; `HookModule` is the one-attempt claim that keeps two install paths
+// from loading symbols at once. A failed attempt clears the claim so the input
+// thread can retry the same image.
+std::atomic<HMODULE> g_startUIModuleSeen{nullptr};
 std::atomic<HMODULE> g_startUIHookModule{nullptr};
 std::atomic<bool> g_afterInit{false};
+std::atomic<bool> g_loadHookMatchLogged{false};
+
+// The input thread's retry schedule for the root symbol. The first symbol load
+// also starts Windhawk's PDB fetch, which can take tens of seconds on a cold
+// cache; a false result before it finishes is `pending`, not a refusal. 120 s is
+// two full downloads at the measured ~600 KB/s for the 35 MB reference PDB, plus
+// the symbol parse, and still bounded before a user concludes the feature is
+// broken. Input thread only; ResetReinitState clears them before it exists.
+constexpr uint64_t kRootProbeMs = 100;
+constexpr uint64_t kRootPendingDeadlineMs = 120000;
+uint64_t g_rootProbeNextTick = 0;
+uint64_t g_rootProbeFirstTick = 0;
+int g_rootProbeAttempts = 0;
 
 // Serialises the symbol install against the stop. Wh_ModBeforeUninit takes it
 // before it sets g_disabled, so an install either finishes first or sees the
@@ -12085,21 +12123,24 @@ std::atomic<bool> g_afterInit{false};
 // it must not run beside the unload.
 SRWLOCK g_startUIHookLock = SRWLOCK_INIT;
 
-// The root hook is a prerequisite, not an optimisation: without it the panel
-// has no renderer, so a controller service would swallow a native toggle for a
-// menu it cannot animate. Failure is therefore a refusal with one reason in
-// each log, never a retry loop.
+// Attempts the root hook. This must never run on a thread the shell owns: the
+// first call starts Windhawk's PDB fetch and blocks for its duration, and
+// blocking the loader thread makes the menu host look hung to the shell's
+// watchdog, which then restarts it and the fetch starts over. The input thread
+// drives every attempt (the init probe only runs when StartUI_ is already
+// loaded, which is the warm case).
 //
 // Returns true only when this call installed the hook, so a caller applies the
-// queued hook operations only for an install it owns.
+// queued hook operations only for an install it owns. A false result is
+// `pending`: the caller decides when it becomes a refusal.
 bool InstallStartUIHooks(HMODULE module) {
     if (!module) {
         return false;
     }
 
     AcquireSRWLockExclusive(&g_startUIHookLock);
-    // Claim the image before the symbol load: a second notification for the
-    // same module must not start a second load.
+    // Claim the image before the symbol load: two install paths must not load
+    // symbols for the same image at once.
     HMODULE expected = nullptr;
     if (!g_startUIHookModule.compare_exchange_strong(expected, module)) {
         ReleaseSRWLockExclusive(&g_startUIHookLock);
@@ -12110,6 +12151,7 @@ bool InstallStartUIHooks(HMODULE module) {
         ReleaseSRWLockExclusive(&g_startUIHookLock);
         return false;
     }
+    FileLog(L"root install begin module=%p", module);
 
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {
@@ -12124,14 +12166,10 @@ bool InstallStartUIHooks(HMODULE module) {
     const uintptr_t resolved =
         reinterpret_cast<uintptr_t>(PrepareRootElement_Original);
     if (!hooked || !resolved) {
-        g_rootHookRefused.store(true, std::memory_order_release);
+        // Pending, not refused: while the engine is fetching or parsing the PDB
+        // this is the expected answer, and the input thread retries.
+        g_startUIHookModule.store(nullptr, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_startUIHookLock);
-        FileLog(L"startui root symbol unresolved name=StartUI::App::"
-                L"PrepareRootElement (symbol, signature or hook refused)");
-        Wh_Log(L"StartUI::App::PrepareRootElement could not be resolved in "
-               L"StartUI_.dll; the root hook is refused and the controller "
-               L"advertises no service");
-        PublishPeerGone(L"root-hook-refused");
         return false;
     }
 
@@ -12161,9 +12199,10 @@ bool InstallStartUIHooks(HMODULE module) {
     return true;
 }
 
-// One probe of the already-loaded image. The module is found by name; the
-// symbol API reads the actual image, so no address, file version or prologue
-// is checked here.
+// One probe of the already-loaded image, from init and AfterInit. The module is
+// found by name; the symbol API reads the actual image. StartUI_ is not loaded
+// at init in the measured host, so the normal first attempt happens later, on
+// the input thread.
 void TryInstallFromLoadedModules(bool apply) {
     if (g_disabled.load(std::memory_order_relaxed)) {
         return;
@@ -12176,10 +12215,74 @@ void TryInstallFromLoadedModules(bool apply) {
     if (!startUI) {
         return;
     }
+    g_startUIModuleSeen.store(startUI, std::memory_order_release);
     if (InstallStartUIHooks(startUI) && apply &&
         g_afterInit.load(std::memory_order_relaxed)) {
         Wh_ApplyHookOperations();
     }
+}
+
+// Resolves the root hook from the mod's own input thread. Called on every loop
+// tick: immediate when the module is first known, then throttled while the
+// result is pending. The shell keeps pumping for the whole fetch because no
+// symbol work ever runs on its threads.
+void ProbeRootSymbolFromInputThread() {
+    if (g_rootHookReady.load(std::memory_order_acquire) ||
+        g_rootHookRefused.load(std::memory_order_acquire) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    HMODULE module = g_startUIModuleSeen.load(std::memory_order_acquire);
+    if (!module) {
+        module = GetModuleHandleW(kStartUIModuleName);
+        if (!module) {
+            return;
+        }
+        g_startUIModuleSeen.store(module, std::memory_order_release);
+    }
+
+    const uint64_t now = GetTickCount64();
+    const bool first = g_rootProbeFirstTick == 0;
+    if (!first && now < g_rootProbeNextTick) {
+        return;
+    }
+    g_rootProbeNextTick = now + kRootProbeMs;
+    if (first) {
+        g_rootProbeFirstTick = now;
+    }
+
+    if (InstallStartUIHooks(module)) {
+        // The hook is queued; apply it now, from this thread (allowed until
+        // BeforeUninit returns).
+        Wh_ApplyHookOperations();
+        return;
+    }
+    if (g_rootHookReady.load(std::memory_order_acquire) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    g_rootProbeAttempts++;
+    const uint64_t waited = GetTickCount64() - g_rootProbeFirstTick;
+    if (waited >= kRootPendingDeadlineMs) {
+        g_rootHookRefused.store(true, std::memory_order_release);
+        FileLog(L"startui root symbol deadline attempts=%d waited=%llums "
+                L"deadline=%llums",
+                g_rootProbeAttempts, static_cast<unsigned long long>(waited),
+                static_cast<unsigned long long>(kRootPendingDeadlineMs));
+        FileLog(L"startui root symbol unresolved name=StartUI::App::"
+                L"PrepareRootElement (symbol, signature or hook refused)");
+        Wh_Log(L"StartUI::App::PrepareRootElement could not be resolved in "
+               L"StartUI_.dll within the %llu ms pending deadline; the root "
+               L"hook is refused and the controller advertises no service",
+               static_cast<unsigned long long>(kRootPendingDeadlineMs));
+        PublishPeerGone(L"root-hook-refused");
+        return;
+    }
+    FileLog(L"startui root symbol pending attempt=%d waited=%llums "
+            L"deadline=%llums",
+            g_rootProbeAttempts, static_cast<unsigned long long>(waited),
+            static_cast<unsigned long long>(kRootPendingDeadlineMs));
 }
 
 // ---------------------------------------------------------------------------
@@ -12195,15 +12298,18 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
                          ? LoadLibraryExW_Original(fileName, file, flags)
                          : nullptr;
 
-    // Filter on the returned module, not on the requested name: the call may
-    // have asked for another file and still brought StartUI_ in, and a refused
-    // or redirected request must not look like a load. This mod never
+    // Record the returned module and return. Nothing may resolve symbols here:
+    // this is the shell's loader thread, and the first symbol load blocks for
+    // the PDB fetch. The input thread picks the image up on its next tick.
+    // Filtering on the returned module, not the requested name, keeps a refused
+    // or redirected request from looking like a load; this mod never
     // force-loads StartUI_.
-    if (module && module == GetModuleHandleW(kStartUIModuleName) &&
-        !g_disabled.load(std::memory_order_relaxed) &&
-        !g_rootHookReady.load(std::memory_order_acquire) &&
-        !g_rootHookRefused.load(std::memory_order_acquire)) {
-        TryInstallFromLoadedModules(true);
+    if (module && module == GetModuleHandleW(kStartUIModuleName)) {
+        g_startUIModuleSeen.store(module, std::memory_order_release);
+        if (!g_loadHookMatchLogged.exchange(true)) {
+            FileLog(L"ll hook startui returned=%p file=%s", module,
+                    fileName ? fileName : L"(null)");
+        }
     }
 
     return module;
@@ -12537,6 +12643,11 @@ void ResetReinitState() {
     g_rootHookReady.store(false, std::memory_order_relaxed);
     g_rootHookRefused.store(false, std::memory_order_relaxed);
     g_startUIHookModule.store(nullptr, std::memory_order_relaxed);
+    g_startUIModuleSeen.store(nullptr, std::memory_order_relaxed);
+    g_loadHookMatchLogged.store(false, std::memory_order_relaxed);
+    g_rootProbeNextTick = 0;
+    g_rootProbeFirstTick = 0;
+    g_rootProbeAttempts = 0;
     g_hidThreadLeaked.store(false, std::memory_order_relaxed);
     g_hidThread = nullptr;
     g_hidStopEvent = nullptr;
