@@ -31,9 +31,9 @@ its lock; the close suppression.
   clears the suppression, drops the touch state and resyncs from the cloak.
 - `ApplyExecAck` / `CheckExecAckTimeout` — one ack per command. A refused show or
   a refused/expired dismiss runs `ReleaseExecutorOwnership`, which releases
-  `controllerOwning`, `controllerTouch` and the pending open entry in one step so
-  `owning/open/phase` resync from the cloak; a 400 ms silence does the same from
-  `g_pendingShowUntil` for a show and from `g_pendingDismissExecAt +
+  the controller direction, `controllerTouch` and the pending open entry in one
+  step so the direction resyncs from the cloak; a 400 ms silence does the same
+  from `g_pendingShowUntil` for a show and from `g_pendingDismissExecAt +
   400 ms` for a dismiss (the deadline the bridge was told to run at). A failed
   show while a dismiss is pending leaves the close's ownership alone.
 - `StartRevealFollow` — the band show request, once per open
@@ -116,17 +116,17 @@ unique per image, so a reinstall does not inherit the old WndProc.
   flight. Without them the trigger passes to the shell (`own pass trigger=...
   reason=...`); nothing is swallowed for a command nobody would execute. A failed
   worker startup is the same case for the life of the attachment.
-- `IntentShouldClose`: while `controllerOwning` is set, phase 2 is a reopen
-  (close in flight) and an owned phase 1 is a close; otherwise the cloak and the
-  internal state (1/3/5 open or opening, 7/9/11 closing) are the shell resync.
-  The shell's state is never the direction while the controller owns: a gesture
-  close retracts the panel with state 5 and the cloak open until the executor's
-  Dismiss. The controller publishes phase 2 in `TakeCloseOwnership` for exactly
-  that.
+- `IntentShouldClose`: the controller's one direction word decides. `2` is a
+  reopen (close in flight), `1` is a close, and `0` falls back to the cloak and
+  the internal state (1/3/5 open or opening, 7/9/11 closing). The shell's state
+  is never the direction while the controller owns: a gesture close retracts the
+  panel with state 5 and the cloak open until the executor's Dismiss. The
+  controller publishes `2` in `TakeCloseOwnership` for exactly that.
 - **Press latch.** One dispatch. A close still settling publishes open now when
-  no executor dismiss is armed; the Start side cancels the armed dismiss and the
-  close and settles the panel back from its live position. A hide in flight
-  (`InternalState` 9/11), or an executor dismiss already armed, latches the
+  no executor dismiss is armed; the Start side clears its local slot and any
+  pending command and settles the panel back from its live position. A hide in
+  flight (`InternalState` 9/11), or an executor dismiss already armed at the
+  bridge, latches the
   press (one slot, tick, trigger); the hidden event then arms a 50 ms timer and
   the timer serves the same open intent off the hidden event's stack. A show at
   the hidden event's own tick was swallowed (state stuck at 3), so the deferral
@@ -148,17 +148,21 @@ tapped-close watermark, and (0.22.0) the dormant old press-reopen:
 latch, the Start side's `intent open cancel` and `intent open recovered`.
 
 **Lifecycle.** Pinned image, the counted close-hook frames and executor
-dispatches for the v4 channel, the drain with `drained`/`stalled` reports, and the
+dispatches for the v5 channel, the drain with `drained`/`stalled` reports, and the
 re-enable refusal while a close frame or a timed-out worker is still inside. On
 unload the ready flag clears, the worker is joined before either handle is closed,
 and the launcher thread destroys the window and its three timers with an
 acknowledged `WM_CLOSE`.
 
-### swipe_ipc_shared.h (v4, 744 bytes)
+### swipe_ipc_shared.h (v5, 736 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**
-from v4; the records that ship are the open generation, the intent and its ack,
-the executor command and its ack, and the controller flags. Every offset is
-asserted; the magic is `0x53313053` and the version is 4.
+from v3 on; the records that ship are the open generation, the intent and its
+ack, the executor command and its ack, one controller direction word and the
+touch flag. Every offset is asserted; the magic is `0x53313053` and the version
+is 5. v5 replaces v4's owning/phase pair with that one direction word (the
+bridge reads one atomic value, never a pair) and drops `controllerOpen`, which
+no reader used; the section is 736 bytes and a v4 section is refused by
+`layoutBytes`.
 
 ### start_gesture_shared.h
 The older gesture mapping (`Local\WindhawkStartGestureShared`), kept for the

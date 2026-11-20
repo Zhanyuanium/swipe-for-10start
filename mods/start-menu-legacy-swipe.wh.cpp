@@ -320,9 +320,9 @@ What it does:
     function is attached, because the samples are the curve.
 
   One settle-and-arm helper serves both gesture families: it plays the
-  animation, opens the suppression window, publishes the close phase and arms
-  the executor dismiss for the end of the settle, which is that settle's own
-  duration. A close whose settle did not start publishes no phase and arms
+  animation, opens the suppression window, publishes the closing direction and
+  arms the executor dismiss for the end of the settle, which is that settle's own
+  duration. A close whose settle did not start publishes no direction and arms
   nothing. One line records each settle:
   `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
   frames=... zeta=...`. The settle line's `vel` is the speed toward the target
@@ -372,7 +372,7 @@ What it does:
 - A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
   the legacy menu ignores an injected `VK_ESCAPE`. Every close is the
   controller's one path: the panel retracts with its mirrored settle, the
-  controller publishes its close phase at the settle's start, and the bridge
+  controller publishes the closing direction at the settle's start, and the bridge
   calls `XamlLauncher::Dismiss` at the settle's end. A Win press during the
   retract is a reopen: it cancels the close and the panel settles back from its
   live position. A press after the hide is latched and served at the landing,
@@ -636,10 +636,10 @@ What it does:
   and lets the next open animate from 0.
   The Windows-key close is an intent this mod consumes and a command it
   publishes: the close intent runs the mirrored close from the live position,
-  publishes phase 2 before the settle's first frame, and schedules
+  publishes the closing direction before the settle's first frame, and schedules
   `exec dismiss` at the settle's end plus 30 ms; the bridge calls `Dismiss` on
-  the launcher thread and the shell's own duplicate Hide is swallowed while
-  `controllerOwning` is set. The panel slides out instead of vanishing. One
+  the launcher thread and the shell's own duplicate Hide is swallowed while the
+  controller owns the panel. The panel slides out instead of vanishing. One
   line per transition.
 - Every gesture close runs the same path with its own release settle: the
   release arms the executor dismiss for that settle's end, and the pull
@@ -664,8 +664,8 @@ What it does:
   `PeekProgressNow`, never `TakeProgressNow`: it is also where the late-release
   settle starts, and taking that settle at its first millisecond pinned the hidden
   rest and was the dead state's cause.
-- The batch observer is optional; the close is not. A close publishes its phase
-  and arms its dismiss before the batch registration resolves, so a registration
+- The batch observer is optional; the close is not. A close publishes its
+  direction and arms its dismiss before the batch registration resolves, so a registration
   that loses its serial (a reset or a take-over replaced the animation) or throws
   leaves a running settle with an armed dismiss: that is `close observer lost
   kind=dismiss`, and the close continues. Only a close that never started its
@@ -832,8 +832,8 @@ Debug channel (kept in the build):
 - The section outlives either process, so both sides record the sequence numbers
   at attach and act only on what is newer: an intent, a command or an open
   generation from a previous process is ignored by its sequence, never served.
-- The v4 section is 744 bytes: the command, the open generation, the intent and
-  its ack, the executor command and its ack, and the controller flags. Every
+- The v5 section is 736 bytes: the command, the open generation, the intent and
+  its ack, the executor command and its ack, and the controller direction. Every
   record is a seqlock, so the bridge never reads a half-written intent, command
   or open generation, and this side never reads half a command. The command
   record is also serialised by a named mutex, because more than one tool can
@@ -1070,7 +1070,7 @@ Known risks:
   requested, so the shell is never touched and the menu stays open. That check
   runs once, when the dismiss would be requested; a pull after it is a normal
   open of a closed menu.
-- The controller publishes phase 2 before the close's first frame. A Win press
+- The controller publishes the closing direction before the close's first frame. A Win press
   during the retract is therefore an open: it drops the armed dismiss and the
   pending executor command and settles the panel back from its live position.
   The recovery ticket for a dismiss that was already inside the shell stays set
@@ -1087,9 +1087,9 @@ Known risks:
   600 ms.
 - A keyboard, Start-button or click-away close is a mirrored settle and then a
   bridge `exec dismiss` 30 ms after it, because the Start side never calls the
-  launcher. A command the bridge refuses or never answers runs one repair:
-  `controllerOwning`, `controllerTouch` and the pending open entry are released
-  together and `owning`/`open`/`phase` resync from the cloak, so the shell's own
+  launcher. A command the bridge refuses or never answers runs one repair: the
+  direction, `controllerTouch` and the pending open entry are released
+  together and the controller state resyncs from the cloak, so the shell's own
   path serves the next press. A dismiss expires from the deadline it was scheduled
   for, not from the request.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
@@ -1154,8 +1154,8 @@ Known risks:
  *   OnGlobalAnimationRequested and its three argument getters), Raw Input
  *   (RegisterRawInputDevices/GetRawInputData/GetRawInputDeviceInfoW) for the
  *   digitizer, the window and DWM APIs for geometry/layout, the composition
- *   Visual/Element APIs for Progress, and swipe_ipc_shared.h v4 for the intents,
- *   executor commands/acks, open generation and controller flags. The bridge is
+ *   Visual/Element APIs for Progress, and swipe_ipc_shared.h v5 for the intents,
+ *   executor commands/acks, open generation and controller direction. The bridge is
  *   the only launcher caller; this mod never loads twinui.pcshell.dll.
  * [OUTPUT]: the panel's Progress through the one damped-spring settle, the
  *   reveal/dismiss follows, the coast, the geometry snapshot (axis, band,
@@ -1165,7 +1165,7 @@ Known risks:
  *   publish the bridge command; `exec ack`, `exec show failed`, `exec dismiss
  *   failed` and `exec ack timeout` (kind=show|dismiss) release ownership and
  *   resync from the cloak through one repair. One close path: TakeCloseOwnership
- *   (publishes controllerOwning phase 2 before the settle's first frame) +
+ *   (publishes the closing direction before the settle's first frame) +
  *   BeginMirrorCloseSettle(TakeProgressNow()) + the dismiss scheduled at
  *   settle+30 ms. An open intent
  *   while the window still shows cancels that close: its local dismiss slot is
@@ -3605,8 +3605,8 @@ struct GestureClose {
 };
 
 // The close every gesture path runs, from the value the coast left. A close
-// exists only once its settle started: the suppression, the close phase and the
-// armed dismiss follow that animation, never a failed one. The dismiss is armed
+// exists only once its settle started: the suppression, the closing direction and
+// the armed dismiss follow that animation, never a failed one. The dismiss is armed
 // for the end of the settle, so the panel is off screen when the shell hides the
 // window. The committed dismiss wraps this call in its settle batch; the reveal
 // cancel calls it directly.
@@ -3625,8 +3625,8 @@ GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
 // Puts the panel back for a close that provably never started.
 //
 // A close exists only once its settle starts: ArmGestureClose publishes the
-// close phase and arms the dismiss after BeginGestureSettle returned true. A
-// close that never started therefore published no phase and armed no dismiss, so
+// closing direction and arms the dismiss after BeginGestureSettle returned true. A
+// close that never started therefore published no direction and armed no dismiss, so
 // there is nothing to recall here; the restore is the whole operation. This is
 // the only path that
 // may restore a panel after a failed close, and the log names the visible
@@ -3673,7 +3673,7 @@ struct DismissCloseResult {
 //
 // Committed dismiss: the settle batch observes the settle, the shared close tail
 // arms the dismiss. The settle itself, the log line, the suppression window and
-// the close phase all come from BeginGestureClose, so this path and the reveal
+// the closing direction all come from BeginGestureClose, so this path and the reveal
 // cancel cannot diverge.
 //
 // The batch observer is optional; the close is not. When the registration loses
@@ -3714,7 +3714,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         if (!close.started) {
             // No animation, so the batch holds nothing and no handler may be
             // registered: a close that never settled must not clear a flag, and
-            // it published no phase and armed no dismiss.
+            // it published no direction and armed no dismiss.
             {
                 std::lock_guard lock(g_compositionMutex);
                 InvalidateDismissBatchLocked();
@@ -3723,8 +3723,8 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
             return result;
         }
 
-        // From here on the close exists: its settle runs, its close phase is
-        // published and its dismiss is scheduled. Nothing below may restore the
+        // From here on the close exists: its settle runs, its closing direction
+        // is published and its dismiss is scheduled. Nothing below may restore the
         // panel.
         result.start = DismissClose::StartedUnobserved;
 
@@ -3873,9 +3873,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_v4_Cmd     p=, t=, e=, anim=   (tools -> here)
-//   Local\SwipeFor10Start_v4_Intent  kind, trigger, method, flags, open (bridge)
-//   Local\SwipeFor10Start_v4_Exec    show, dismiss, cancel               (here)
+//   Local\SwipeFor10Start_v5_Cmd     p=, t=, e=, anim=   (tools -> here)
+//   Local\SwipeFor10Start_v5_Intent  kind, trigger, method, flags, open (bridge)
+//   Local\SwipeFor10Start_v5_Exec    show, dismiss, cancel               (here)
 //   ..._State.openSeq                "this is a new menu"               (here)
 //
 // Every record is a seqlock: this side bumps the counter to odd, writes, and
@@ -5233,15 +5233,15 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
                                  std::memory_order_relaxed);
     SwipeIpcSetControllerTouch(&g_ipc, false);
     // The controller publishes the close before its first frame. The bridge's
-    // one toggle rule reads this phase for a Win, Start-button or click-away
+    // one toggle rule reads this direction for a Win, Start-button or click-away
     // press, so a press during the settle is a reopen, not a second close. The
     // shell's state cannot answer that question: on this path the panel is
     // already retracting while the window still reports state 5 and the cloak
     // still reports open until the executor's Dismiss runs. Publishing the
-    // phase only at the settle's end left the whole settle readable
+    // direction only at the settle's end left the whole settle readable
     // as "open", and a press in it restarted the close instead of taking the
     // menu back.
-    SwipeIpcSetControllerOwning(&g_ipc, true, 0, 2);
+    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
     // A new close decides the menu: an earlier open that cancelled a close is
     // no longer owed.
     g_intentCancelPending = false;
@@ -5989,7 +5989,7 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
         InsertProgress(entry);
         g_intentOpenActive.store(true, std::memory_order_relaxed);
         g_intentOpenEntry.store(entry, std::memory_order_relaxed);
-        SwipeIpcSetControllerOwning(&g_ipc, true, 0, 1);
+        SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
         SwipeIpcSetControllerTouch(&g_ipc, true);
         RequestBridgeShow(1, 0);
         FileLog(L"reveal show request entry=%.3f", entry);
@@ -6715,7 +6715,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
         return;
     }
 
-    // Short reveal: the same settle, the same log line, the same close phase,
+    // Short reveal: the same settle, the same log line, the same close direction,
     // the same suppression window and the same armed dismiss as the committed
     // dismiss, from the same release speed. Both close paths read identically
     // from any finger position.
@@ -7109,9 +7109,9 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
             g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
             g_closeCancelledTick = tickMs;
             // The close is gone and the menu stays open, so the controller owns
-            // an open again. The phase must follow: phase 2 with a shown menu
+            // an open again. The direction must follow: closing with a shown menu
             // would turn the next press into a second reopen.
-            SwipeIpcSetControllerOwning(&g_ipc, true, 0, 1);
+            SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
             const float live = TakeProgressNow(L"new-contact");
             const float distance = ReadGestureGeometry().distance();
             if (distance > 0.0f &&
@@ -7482,7 +7482,7 @@ void RunPendingCloseTap(uint64_t tickMs) {
     // The close's settle has reached 0; the bridge is the only executor of the
     // shell's Dismiss. The controller owns the panel until the Hide lands, so
     // the bridge swallows the shell's own calls meanwhile.
-    SwipeIpcSetControllerOwning(&g_ipc, true, 0, 2);
+    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
     RequestBridgeDismiss(1, GetTickCount64(), 0);
     FileLog(L"close dismiss kind=%s", CloseKindName(kind));
 }
@@ -7817,7 +7817,7 @@ void ApplyBridgeIntent() {
         g_reveal = HidRevealSession{};
         g_contactOrigin = HidContactOrigin{};
         g_lateRelease = RevealLateRelease{};
-        SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
+        SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
         SwipeIpcSetControllerTouch(&g_ipc, false);
         g_commitNeedsProgressReset = false;
         FileLog(L"intent external drop trigger=%s slot=%d command=%d", trigger,
@@ -7825,8 +7825,8 @@ void ApplyBridgeIntent() {
     } else if (intent.kind == kSwipeIntentOpen) {
         CancelPendingDismiss(L"open-intent");
         // The controller owns an open from this line, whichever shape the press
-        // has; the bridge reads this phase for the next toggle.
-        SwipeIpcSetControllerOwning(&g_ipc, true, intent.open, 1);
+        // has; the bridge reads this direction for the next toggle.
+        SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
         const GestureGeometry geometry = ReadGestureGeometry();
         if (StartWindowIsOpen()) {
             // The close this press answers has not hidden the window yet, so the
@@ -7882,7 +7882,7 @@ void ApplyBridgeIntent() {
             ackHr = E_FAIL;
         } else {
             g_commitNeedsProgressReset = true;
-            SwipeIpcSetControllerOwning(&g_ipc, true, intent.open, 2);
+            SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
             const uint64_t executeAt =
                 GetTickCount64() + static_cast<uint64_t>(duration.count()) +
                 kBridgeDismissLeadMs;
@@ -7899,14 +7899,14 @@ void ApplyBridgeIntent() {
 
 // The one repair every terminal executor failure performs, whatever kind the
 // command was. The controller stops owning the panel and stops marking the touch
-// in the same step, and the pending open entry is dropped. `owning`, `open` and
-// `phase` then follow the window's cloak on the next poll, which is the one
+// in the same step, and the pending open entry is dropped. The published
+// direction then follows the window's cloak on the next poll, which is the one
 // source of truth for a panel the controller no longer drives. A failed dismiss
 // leaves the panel retracted with the window still shown; the suppression window
 // still expires, and the poll's unhealed rule then brings the panel back instead
 // of leaving an invisible menu attached to a shown window.
 void ReleaseExecutorOwnership() {
-    SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
+    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
     SwipeIpcSetControllerTouch(&g_ipc, false);
     g_intentOpenActive.store(false, std::memory_order_relaxed);
 }
@@ -8031,7 +8031,7 @@ bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
     InsertProgress(entry);
     g_intentOpenActive.store(true, std::memory_order_relaxed);
     g_intentOpenEntry.store(entry, std::memory_order_relaxed);
-    SwipeIpcSetControllerOwning(&g_ipc, true, 0, 1);
+    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
     if (pullReopen) {
         SwipeIpcSetControllerTouch(&g_ipc, true);
     }
@@ -8250,7 +8250,7 @@ void PollRootVisibility(uint64_t tickMs) {
         const SettledMeasureRequest closing = SnapshotMeasureRequest();
         AdvanceOpenGeneration();
         FileLog(L"win close observed");
-        SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
+        SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
         SwipeIpcSetControllerTouch(&g_ipc, false);
         g_intentOpenActive.store(false, std::memory_order_relaxed);
         g_pendingDismissExec.store(0, std::memory_order_relaxed);

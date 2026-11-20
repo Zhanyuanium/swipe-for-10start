@@ -54,12 +54,14 @@ the pull may open the next one. A close the Start side's own gesture causes runs
 the same command, scheduled at the settle's end.
 
 A press during a close is a reopen, and the direction comes from the Start side's
-published controller state, never from the shell's. That controller publishes
-phase 2 before a close's first frame, so the bridge's one toggle rule reads the
+published controller direction, never from the shell's. That controller publishes
+`closing` before a close's first frame, so the bridge's one toggle rule reads the
 press as an open for the whole close, including the window's last visible
-frame. A close still settling is cancelled: the Start side drops its local
-dismiss slot and cancels any executor command, and settles the panel back from
-its live position. A dismiss that has already entered the shell's `Dismiss` call
+frame. A close still settling is cancelled while it is still the Start side's to
+cancel: the Start side clears its local dismiss slot and any command it has not
+sent yet, and settles the panel back from its live position. Once the executor's
+dismiss is armed the bridge latches the press instead (below). A dismiss that
+has already entered the shell's `Dismiss` call
 cannot be recalled; a press there is latched (one slot) and served as the same
 open intent when the hide lands (`own press served wait=...`). The serve is armed by the hidden event and
 published 50 ms later, off that event's stack: a show at the hidden event's own
@@ -70,10 +72,13 @@ inside the shell's own Hide was measured to wedge the UI thread, so the latch is
 the action for that shape.
 
 External takeovers (`Win+Tab`, the lock/display method-7 path, and a modified
-Windows press the Win hook can recognise) pass through immediately: no close
-intent, no settle, no hold, no animation. Their only reaction is the cloak
-resync. The Start side drops a pull at the window close such a takeover causes
-(`reveal dropped (window closed by shell)`) instead of reopening it.
+Windows press the Win hook can recognise) publish `intent=external` and pass
+through immediately: no close intent, no settle, no hold, no animation. The Start
+side reacts to that intent: it revokes both close schedules (the local gesture
+deadline and the executor dismiss) and the cancel-recovery ticket, clears the
+suppression, drops the pull and resyncs from the cloak, so a pull that was under
+the takeover is dropped (`reveal dropped (window closed by shell)`) instead of
+reopening it. The bridge's own reaction is the cloak resync.
 
 The mod also observes the taskbar-edge gesture path in `twinui.pcshell.dll`,
 then publishes the live `GestureAnimationData` handle (source/provider id), the
@@ -86,10 +91,13 @@ A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
 shipping Start mod does not read it. Its live couplings are the intent and its
 ack, the executor command and its ack, the open generation and the controller
-flags, all in `Local\SwipeFor10Start_v4_*` (see `swipe_ipc_shared.h`).
+direction, all in `Local\SwipeFor10Start_v5_*` (see `swipe_ipc_shared.h`).
 
 
-Hooked functions are forwarded unchanged except for the close decision above.
+Hooked functions are forwarded unchanged except for the triggers above: the bare
+Win press and the Start button's open (ShowStartView method 11) and close
+(Dismiss method 6) are decided, and the shell's own duplicate show or dismiss is
+swallowed only while the controller owns the panel.
 The mod creates one hidden message-only window and one worker thread for the
 executor, and no COM objects. It refuses to initialize unless its own image can
 be pinned, and on unload it stops the executor first (the ready flag goes clear,
@@ -146,7 +154,7 @@ Notes:
   `activation state reset` when a re-enable re-initialises the pinned image (a
   refused one logs `mod init refused: ...` and installs nothing instead), and
   one `intent kind=... trigger=... seq=... open=...` line per decision.
-- The two channels have two lifetimes. The v4 channel (the section mapping and
+- The two channels have two lifetimes. The v5 channel (the section mapping and
   view, the mutex and the five events) is closed when the mod is disabled, and
   only then: the disable flag keeps new closes out of it, and the unload waits
   for every close that already entered to leave before it closes anything. That
@@ -241,10 +249,10 @@ Notes:
 
 The decision and the executor:
 
-- The bridge decides the direction from the Start side's published controller
-  flags. While `controllerOwning` is set, `controllerPhase` 2 means a close is in
-  flight, so a Win, Start-button or click-away press is a reopen; an owned phase
-  1 is the open the controller owns, so a press is a close. The shell's cloak and
+- The bridge decides the direction from the Start side's one published
+  direction word. `closing` means a close is in flight, so a Win, Start-button or
+  click-away press is a reopen; `open` is the open the controller owns, so a
+  press is a close; `unowned` falls back to the shell. The shell's cloak and
   `InternalState` are the resync only for a panel the controller does not own.
   The shell cannot decide a controller close: a gesture close retracts the panel
   with the window still uncloaked and state 5 until the executor's `Dismiss`.
@@ -279,8 +287,8 @@ The decision and the executor:
  *   Show/Hide for the observation lines. The launcher thread is the thread that
  *   runs OnHotkeyInvoke (measured tid=7108); the taskbar thread is a different
  *   thread and a show there fail-fasts explorer (measured). Also depends on
- *   swipe_ipc_shared.h v4 for the intent/ack, executor command/ack, open
- *   generation and controller flags, and on start_gesture_shared.h for the
+ *   swipe_ipc_shared.h v5 for the intent/ack, executor command/ack, open
+ *   generation and controller direction, and on start_gesture_shared.h for the
  *   diagnostic animation ids.
  * [OUTPUT]: the hidden executor window WindhawkSwipeExecutor_<WndProc> on the
  *   launcher thread, fed by a worker on the Exec event; every command logs an
@@ -293,12 +301,12 @@ The decision and the executor:
  *   click-away (HideStartAndCortana method 7). The three physical entries share
  *   one dispatcher, so a reopen from Dismiss(6) asks for Show(11) and a close
  *   from Show(11) asks for Dismiss(6); the click-away stays directional.
- *   IntentShouldClose is the only toggle rule (the controller owns the panel ->
- *   phase 2 is a reopen, phase 1 is a close; otherwise the cloak and the internal
- *   state are the shell resync). The direction is never read from the shell while
+ *   IntentShouldClose is the only toggle rule (the controller's one direction
+ *   word: closing is a reopen, open is a close; unowned falls back to the cloak
+ *   and the internal state). The direction is never read from the shell while
  *   the controller owns: a gesture close retracts the panel with the cloak still
  *   open and the state still 5 until the executor's Dismiss, which is why the
- *   controller publishes phase 2 at the close's start. Input is intercepted only
+ *   controller publishes closing at the close's start. Input is intercepted only
  *   while the channel is open and the executor worker runs; otherwise every
  *   trigger passes to the shell (`own pass trigger=... reason=...`). A press is
  *   never lost: a hide in flight (state 9/11) or a dismiss already armed is
@@ -311,10 +319,10 @@ The decision and the executor:
  *   issues while the window is appearing (state 1/3) and the Hide(7) inside our
  *   own ShowStartView in state 1/3 are the pointer-away check and are swallowed
  *   (`reason=opening`/`reason=own-show`). The shell's own show/dismiss is
- *   swallowed only while `controllerOwning` and only as a duplicate (method
- *   16/other dismiss); the opening touch's click-away is swallowed while
+ *   swallowed only while the controller owns the panel and only as a duplicate
+ *   (method 16/other dismiss); the opening touch's click-away is swallowed while
  *   `controllerTouch`. External takeovers (Win+Tab, lock/display, a forwarded
- *   modified press) publish `intent=external` and pass at once. The v4 channel
+ *   modified press) publish `intent=external` and pass at once. The v5 channel
  *   closes on unload after the worker is joined and the window and its timers
  *   are gone, at counted quiescence (`ipc unload drained`); the process-lifetime
  *   gesture mapping is kept for its independent consumer.
@@ -593,7 +601,7 @@ std::atomic<bool> g_disabled{false};
 std::atomic<bool> g_closeHookEnabled{false};
 // Close-hook frames currently inside, entry to exit: the decision hook's
 // HideStartAndCortana and the observation hook's Hide. Wh_ModUninit closes the
-// v4 channel only when this is zero, and Wh_ModInit refuses to re-activate this
+// v5 channel only when this is zero, and Wh_ModInit refuses to re-activate this
 // image while it is not. It is a lifetime guard for that channel, not a barrier
 // between two closes: it answers "is a close still inside", never "this close
 // runs after that one".
@@ -1808,8 +1816,9 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
 // The controller publishes closing before the close's first frame precisely so
 // this rule has the direction while the shell still looks open.
 bool IntentShouldClose(const OwnSnapshot& own) {
-    if (SwipeIpcControllerOwning(&g_ipc)) {
-        return SwipeIpcControllerPhase(&g_ipc) != 2;
+    const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
+    if (direction != kSwipeDirectionUnowned) {
+        return direction != kSwipeDirectionClosing;
     }
     if (own.open) {
         return true;
@@ -1948,15 +1957,15 @@ bool ServeLatchedPress(const wchar_t* reason) {
 // nothing. Both button entries now run the same rule as the Win key.
 void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags) {
-    const int32_t phase = SwipeIpcControllerPhase(&g_ipc);
+    const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
     const int32_t kind =
         IntentShouldClose(own) ? kSwipeIntentClose : kSwipeIntentOpen;
     // One decision line for every trigger. The method below is the one the action
     // will use, not the one the shell called with: a reopen from Dismiss(6) asks
     // for Show(11), and a close from Show(11) asks for Dismiss(6).
-    FileLog(L"own toggle decide trigger=%s state=%u open=%d kind=%s phase=%d",
+    FileLog(L"own toggle decide trigger=%s state=%u open=%d kind=%s dir=%d",
             PressTriggerName(trigger), own.state, own.open ? 1 : 0,
-            kind == kSwipeIntentClose ? L"close" : L"open", phase);
+            kind == kSwipeIntentClose ? L"close" : L"open", direction);
     if (kind == kSwipeIntentOpen &&
         (ShellHideInFlight(own) || g_pendingDismissSeq != 0)) {
         // The hide or the armed dismiss has already taken the window; the open
@@ -2160,7 +2169,7 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
         DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0);
         return S_OK;
     }
-    if (SwipeIpcControllerOwning(&g_ipc)) {
+    if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
         FileLog(L"exec swallow dismiss method=%u state=%u reason=owning",
                 method, own.state);
         return S_OK;
@@ -2203,7 +2212,7 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
         DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags);
         return S_OK;
     }
-    if (SwipeIpcControllerOwning(&g_ipc)) {
+    if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
         FileLog(L"exec swallow show method=%u flags=%u state=%u reason=owning",
                 method, flags, own.state);
         return S_OK;
@@ -3497,7 +3506,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.21.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.22.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
@@ -3609,11 +3618,11 @@ void Wh_ModBeforeUninit() {
     if (g_initRefused.load(std::memory_order_relaxed)) {
         return;
     }
-    // This must be set before Windhawk removes the hooks. Both close hooks read
-    // it: a close that is being held ends its wait at once, and a close that
-    // enters after this point skips the channel; one that is already inside
-    // holds its lease until it returns. The v4 channel is closed in
-    // Wh_ModUninit, after that flag and after the drain.
+    // This must be set before Windhawk removes the hooks. Every hook and the
+    // executor's WndProc reads it: a close or a dispatch that enters after this
+    // point skips the channel, and one that is already inside holds its lease
+    // until it returns. The v5 channel is closed in Wh_ModUninit, after that flag
+    // and after the drain.
     g_disabled = true;
     g_startPointTick.store(0, std::memory_order_relaxed);
 
@@ -3649,7 +3658,7 @@ void Wh_ModUninit() {
     // this instance is gone, not the handle lifetime. Process exit reclaims
     // every pair.
     //
-    // The v4 channel is closed, because its objects are named and its records
+    // The v5 channel is closed, because its objects are named and its records
     // belong to the other process: g_ipc is unmapped and its mapping, mutex and
     // five events are closed once no close hook and no executor dispatch can
     // still be inside them. g_disabled was set in Wh_ModBeforeUninit and the

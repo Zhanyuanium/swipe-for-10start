@@ -14,13 +14,13 @@
 // every record carries its own sequence number, and a reader accepts a record
 // only when that number did not move while the record was being copied.
 //
-//   Local\SwipeFor10Start_v4_State        SwipeIpcState
-//   Local\SwipeFor10Start_v4_Cmd          manual-reset, tools -> Start
-//   Local\SwipeFor10Start_v4_CmdWrite     mutex,         one command writer
-//   Local\SwipeFor10Start_v4_Intent       auto-reset,   bridge -> Start
-//   Local\SwipeFor10Start_v4_IntentAck    auto-reset,   Start -> bridge
-//   Local\SwipeFor10Start_v4_Exec         auto-reset,   Start -> bridge
-//   Local\SwipeFor10Start_v4_ExecAck      auto-reset,   bridge -> Start
+//   Local\SwipeFor10Start_v5_State        SwipeIpcState
+//   Local\SwipeFor10Start_v5_Cmd          manual-reset, tools -> Start
+//   Local\SwipeFor10Start_v5_CmdWrite     mutex,         one command writer
+//   Local\SwipeFor10Start_v5_Intent       auto-reset,   bridge -> Start
+//   Local\SwipeFor10Start_v5_IntentAck    auto-reset,   Start -> bridge
+//   Local\SwipeFor10Start_v5_Exec         auto-reset,   Start -> bridge
+//   Local\SwipeFor10Start_v5_ExecAck      auto-reset,   bridge -> Start
 //
 // The names are session-local because both processes run as the same user in the
 // same session. The version is part of every name, so a layout change is a new
@@ -102,27 +102,34 @@
 // names the dismiss sequence it supersedes. The bridge answers with execAck
 // (state, hr, visible), where visible is the IsVisible result.
 //
-// Controller flags (Start -> bridge): controllerOwning, controllerOpen,
-// controllerPhase (1 opening, 2 closing) and controllerTouch. They are plain
-// interlocked fields, not a seqlock: each is a word the bridge reads on its own.
+// Controller state (Start -> bridge): one direction word and one touch flag.
+// controllerDirection is the whole decision: the bridge reads that single word,
+// never a pair of flags, so it cannot see new ownership beside a stale phase.
+// Values: kSwipeDirectionUnowned / Open / Closing.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_v4_State";
+    L"Local\\SwipeFor10Start_v5_State";
 constexpr wchar_t kSwipeIpcCommandEventName[] =
-    L"Local\\SwipeFor10Start_v4_Cmd";
+    L"Local\\SwipeFor10Start_v5_Cmd";
 constexpr wchar_t kSwipeIpcCommandMutexName[] =
-    L"Local\\SwipeFor10Start_v4_CmdWrite";
+    L"Local\\SwipeFor10Start_v5_CmdWrite";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_v4_Intent";
+    L"Local\\SwipeFor10Start_v5_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_v4_IntentAck";
+    L"Local\\SwipeFor10Start_v5_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_v4_Exec";
+    L"Local\\SwipeFor10Start_v5_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_v4_ExecAck";
+    L"Local\\SwipeFor10Start_v5_ExecAck";
 
 constexpr uint32_t kSwipeIpcMagic = 0x53313053;  // 'S' '0' '1' 'S', LE
-constexpr uint32_t kSwipeIpcVersion = 4;
+// v5 replaces v4's `controllerOwning` + `controllerPhase` pair with one
+// direction word and drops `controllerOpen`, which no reader used. That changes
+// both the meaning of the tail and the section size (744 -> 736), so the version
+// is bumped deliberately and stays part of every object name: a v4 section left
+// by an older build is a different channel, and `layoutBytes` refuses it if one
+// is ever handed over anyway.
+constexpr uint32_t kSwipeIpcVersion = 5;
 
 // One command per line, in the same syntax `docs/ipc.md` documents.
 constexpr size_t kSwipeIpcCommandMaxBytes = 512;
@@ -230,15 +237,12 @@ struct SwipeIpcState {
     volatile LONG execAckHr;
     volatile LONG execAckVisible;
 
-    // M3: the Start-side session. 1 while the controller owns the panel (from
-    // the show intent until the dismiss lands), 0 otherwise. The bridge uses it
-    // to decide whether the shell's own show/hide is swallowed.
-    volatile LONG controllerOwning;
-    volatile LONG64 controllerOpen;
-    // 1 while the controller is opening, 2 while it is closing, 0 idle. The
-    // bridge reads it to decide a Win/Start-button toggle during a transition the
-    // cloak has not reported yet.
-    volatile LONG controllerPhase;
+    // M3/v5: the Start-side session. One authoritative direction word, so the
+    // bridge's toggle rule reads a single atomic value and can never see new
+    // ownership beside the previous phase. The v4 section published owning and
+    // phase as separate words; a reader could see owning=1 with the old phase,
+    // and the bridge read the still-open window as a close during a retract.
+    volatile LONG controllerDirection;  // kSwipeDirection*
     // 1 while a touch contact owns the opening panel. The bridge swallows the
     // shell's click-away from that same opening contact; it is the finger that
     // pulled the menu out, not a press outside it.
@@ -281,11 +285,9 @@ static_assert(offsetof(SwipeIpcState, execAckFor) == 704, "layout");
 static_assert(offsetof(SwipeIpcState, execAckState) == 712, "layout");
 static_assert(offsetof(SwipeIpcState, execAckHr) == 716, "layout");
 static_assert(offsetof(SwipeIpcState, execAckVisible) == 720, "layout");
-static_assert(offsetof(SwipeIpcState, controllerOwning) == 724, "layout");
-static_assert(offsetof(SwipeIpcState, controllerOpen) == 728, "layout");
-static_assert(offsetof(SwipeIpcState, controllerPhase) == 736, "layout");
-static_assert(offsetof(SwipeIpcState, controllerTouch) == 740, "layout");
-static_assert(sizeof(SwipeIpcState) == 744, "layout");
+static_assert(offsetof(SwipeIpcState, controllerDirection) == 724, "layout");
+static_assert(offsetof(SwipeIpcState, controllerTouch) == 728, "layout");
+static_assert(sizeof(SwipeIpcState) == 736, "layout");
 
 struct SwipeIpcChannel {
     SwipeIpcState* state;
@@ -830,30 +832,28 @@ inline bool SwipeIpcReadExecAck(SwipeIpcChannel* channel,
     return sequence != 0;
 }
 
-inline void SwipeIpcSetControllerOwning(SwipeIpcChannel* channel,
-                                        bool owning, uint64_t openGeneration,
-                                        int32_t phase = 0) {
-    if (!channel->state) {
-        return;
+// The controller's published direction, one atomic word. The three values are
+// the whole vocabulary the bridge needs: it is a close when the controller owns
+// an open, a reopen while the controller is closing, and the shell's cloak
+// otherwise. `controllerTouch` stays a separate flag because it answers a
+// different question (which contact owns the opening panel) and no reader
+// combines it with the direction.
+constexpr int32_t kSwipeDirectionUnowned = 0;
+constexpr int32_t kSwipeDirectionOpen = 1;
+constexpr int32_t kSwipeDirectionClosing = 2;
+
+inline void SwipeIpcSetControllerDirection(SwipeIpcChannel* channel,
+                                           int32_t direction) {
+    if (channel->state) {
+        InterlockedExchange(&channel->state->controllerDirection, direction);
     }
-    InterlockedExchange(&channel->state->controllerOwning, owning ? 1 : 0);
-    InterlockedExchange64(&channel->state->controllerOpen,
-                          static_cast<LONG64>(openGeneration));
-    InterlockedExchange(&channel->state->controllerPhase,
-                        owning ? phase : 0);
 }
 
-inline bool SwipeIpcControllerOwning(SwipeIpcChannel* channel) {
-    return channel->state &&
-           InterlockedCompareExchange(&channel->state->controllerOwning, 0,
-                                      0) != 0;
-}
-
-inline int32_t SwipeIpcControllerPhase(SwipeIpcChannel* channel) {
+inline int32_t SwipeIpcControllerDirection(SwipeIpcChannel* channel) {
     return channel->state
-               ? InterlockedCompareExchange(&channel->state->controllerPhase,
-                                            0, 0)
-               : 0;
+               ? InterlockedCompareExchange(
+                     &channel->state->controllerDirection, 0, 0)
+               : kSwipeDirectionUnowned;
 }
 
 inline void SwipeIpcSetControllerTouch(SwipeIpcChannel* channel, bool touch) {

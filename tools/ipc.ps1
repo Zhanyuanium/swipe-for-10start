@@ -35,9 +35,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_v4_State'
-$CommandEventName = 'Local\SwipeFor10Start_v4_Cmd'
-$CommandMutexName = 'Local\SwipeFor10Start_v4_CmdWrite'
+$StateName = 'Local\SwipeFor10Start_v5_State'
+$CommandEventName = 'Local\SwipeFor10Start_v5_Cmd'
+$CommandMutexName = 'Local\SwipeFor10Start_v5_CmdWrite'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -46,20 +46,6 @@ $OffsetCmdSeq = 8
 $OffsetCmdText = 16
 $CmdTextBytes = 512
 $OffsetCmdTick = 528
-$OffsetCloseSeq = 536
-$OffsetCloseTick = 544
-$OffsetCloseKind = 552
-$OffsetCloseDelayMs = 556
-$OffsetCloseTapped = 560
-$OffsetClosePull = 564
-$OffsetRetractRequestSeq = 568
-$OffsetRetractRequestTick = 576
-$OffsetRetractPlanMs = 584
-$OffsetRetractRequestOpen = 592
-$OffsetRetractRequestDeadline = 600
-$OffsetRetractPlanSeq = 608
-$OffsetRetractPlanRequest = 616
-$OffsetRetractCancelSeq = 624
 $OffsetOpenSeq = 536
 $OffsetOpenTick = 544
 $OffsetInitState = 552
@@ -90,11 +76,10 @@ $OffsetExecAckFor = 704
 $OffsetExecAckState = 712
 $OffsetExecAckHr = 716
 $OffsetExecAckVisible = 720
-$OffsetControllerOwning = 724
-$OffsetControllerOpen = 728
-$OffsetControllerPhase = 736
-$OffsetControllerTouch = 740
-$StateBytes = 744
+$OffsetControllerDirection = 724
+$OffsetControllerTouch = 728
+$StateVersion = 5
+$StateBytes = 736
 
 function Open-State {
     try {
@@ -145,13 +130,13 @@ if ($State) {
         $version = $view.ReadUInt32($OffsetVersion)
         $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
         $initState = $view.ReadInt32($OffsetInitState)
-        if ($initState -ne 2 -or $magic -ne 0x53313053 -or $version -ne 4 -or
-            $layoutBytes -ne $StateBytes) {
+        if ($initState -ne 2 -or $magic -ne 0x53313053 -or
+            $version -ne $StateVersion -or $layoutBytes -ne $StateBytes) {
             $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
                        'initState={3}') -f $magic, $version, $layoutBytes,
                        $initState
-            throw ("The section '$StateName' is not a ready v3 layout this " +
-                   "tool reads: $detail. Nothing was printed.")
+            throw ("The section '$StateName' is not the ready v$StateVersion " +
+                   "layout this tool reads: $detail. Nothing was printed.")
         }
 
         $cmd = Read-Record $view $OffsetCmdSeq {
@@ -225,10 +210,8 @@ if ($State) {
             exec       = $(if ($exec) { "kind=$($exec.Value.kind) method=$($exec.Value.method) flags=$($exec.Value.flags) executeAt=$($exec.Value.executeAt) open=$($exec.Value.open) target=$($exec.Value.target)" } else { 'unstable' })
             execAckSeq = $(if ($execAck) { $execAck.Seq } else { 'unstable' })
             execAck    = $(if ($execAck) { "command=$($execAck.Value.command) state=$($execAck.Value.state) hr=$($execAck.Value.hr) visible=$($execAck.Value.visible)" } else { 'unstable' })
-            controllerOwning = $view.ReadInt32($OffsetControllerOwning)
-            controllerOpen   = $view.ReadInt64($OffsetControllerOpen)
-            controllerPhase  = $view.ReadInt32($OffsetControllerPhase)
-            controllerTouch  = $view.ReadInt32($OffsetControllerTouch)
+            controllerDirection = $view.ReadInt32($OffsetControllerDirection)
+            controllerTouch     = $view.ReadInt32($OffsetControllerTouch)
         } | Format-List
         $view.Dispose()
     } finally {
@@ -292,13 +275,13 @@ try {
             throw ("The section '$StateName' is not ready " +
                    "(initState=$initState); nothing was sent.")
         }
-        if ($magic -ne 0x53313053 -or $version -ne 4 -or
+        if ($magic -ne 0x53313053 -or $version -ne $StateVersion -or
             $layoutBytes -ne $StateBytes) {
             $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
                        'initState={3}') -f $magic, $version, $layoutBytes,
                        $initState
-            throw ("The section '$StateName' is not the v2 layout this tool " +
-                   "writes: $detail. Nothing was sent.")
+            throw ("The section '$StateName' is not the v$StateVersion layout " +
+                   "this tool writes: $detail. Nothing was sent.")
         }
 
         # Seqlock: odd marks a write in progress, even publishes it. There is no

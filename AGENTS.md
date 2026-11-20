@@ -15,7 +15,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.2, Start 0.40.0 / bridge 0.21.0)
+## What ships (M3.2, Start 0.41.0 / bridge 0.22.0)
 
 Two mods, one path. `mods/start-menu-legacy-swipe.wh.cpp` runs in
 `StartMenuExperienceHost.exe` and owns the touch gesture, the panel claims, the
@@ -32,19 +32,20 @@ and then `exec dismiss`. External takeovers (Win+Tab, lock, display change, a
 forwarded modified Win press) publish `intent=external` and are never held.
 
 A press is never lost. The bridge's one dispatch reads the controller's published
-state: while `controllerOwning` is set, `controllerPhase` 2 (a close in flight)
-makes the press an open and an owned phase 1 makes it a close. The launcher's
+direction: `closing` (a close in flight)
+makes the press an open and `open` makes it a close. The launcher's
 state is only the resync for a panel the controller does not own. That direction
 cannot come from the shell: a gesture close retracts the panel with
 `InternalState` 5 and the cloak still open for the whole settle, until the
-executor's `Dismiss`; the controller publishes phase 2 in `TakeCloseOwnership`,
+executor's `Dismiss`; the controller publishes `closing` in `TakeCloseOwnership`,
 before the settle's first frame. A close still settling publishes open at once:
 the controller drops the local dismiss slot and cancels a pending executor
 command, then settles the panel back from its live position (`intent open cancel
-from=...`). A dismiss already inside the shell's `Dismiss` call cannot be
+from=...`); a ticket for that open is kept until a landing or an explicit
+superseding action. A dismiss already inside the shell's `Dismiss` call cannot be
 recalled; the window hides, and the landing reissues that open once (`intent open
 recovered entry=...`). A shell hide in flight (`InternalState` 9/11), or an
-executor dismiss already armed, latches the press (one slot, with its tick). The
+executor dismiss already armed at the bridge, latches the press (one slot, with its tick). The
 hidden event arms a 50 ms timer and the timer serves the same open intent after
 the event's stack has unwound; a show at the event's own tick was swallowed
 (state stuck at 3, no Shown). A second press replaces the slot and logs the
@@ -85,7 +86,12 @@ quoted.
 
 Deleted in M3: the `VK_LWIN` tap, the close record and its publishes, the retract
 request/answer and its cancel answer, the arbitration hold, the deferred
-candidate, and the reveal claim. `CloseInFlight` remains only as the
+candidate **as an arbitration mechanism**, and the reveal claim. The deferred
+candidate still has one live use, and it is not arbitration:
+`BeginEdgeCandidate` (the touch show's band admission) calls `StartRevealFollow`
+with `deferred=true` while `CloseInFlight`, so a contact that lands during a
+close is tracked without writing `Progress`; the landing (`PollRootVisibility`)
+releases it. `CloseInFlight` remains only as the
 suppression-window predicate: the settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
 `CloseInFlight` early return that guards the follow, so it could never fire; the
@@ -94,12 +100,13 @@ removes the retired v2 close/retract slots from the header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h` **v4**: one session-local section (744 bytes), seven
-events (State/Cmd/CmdWrite, Intent/IntentAck, Exec/ExecAck), every record a
+`mods/swipe_ipc_shared.h` **v5**: one session-local section (736 bytes), seven
+named objects (State/Cmd/CmdWrite, Intent/IntentAck, Exec/ExecAck), every record a
 seqlock with its own counter and an `offsetof` assert. The M2 close/retract slots
 are gone; the records are the command, the open generation, the intent and its
-ack, the executor command and its ack, and the controller flags. `tools/ipc.ps1`
-is the only command publisher and takes the mutex; `-State` reads v4/744.
+ack, the executor command and its ack, and one controller direction word plus
+the touch flag. `tools/ipc.ps1`
+is the only command publisher and takes the mutex; `-State` reads v5/736.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
 `initState` are refused, never waited on. Both mods open the channel at
 `Wh_ModInit`, never in a hook.
@@ -119,7 +126,7 @@ is revealed; the button test hovers the bottom edge first, then clicks physical
 ## Rules
 
 - One data source per claim: the cloak decides the shell state, the controller's
-  published flags decide the toggle, the geometry snapshot decides the mapping.
+  published direction decides the toggle, the geometry snapshot decides the mapping.
 - One mechanism, one log shape. A decision line and an executor line per
   trigger; no per-trigger branch in either mod.
 - A wrong-thread launcher call is not a clean error. Never call from a hook

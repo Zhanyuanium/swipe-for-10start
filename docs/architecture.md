@@ -1,7 +1,7 @@
 # M3.2 architecture — one controller, one executor
 
-> L3-level design record. Start **0.40.0**, bridge **0.21.0**, channel **v4 /
-> 744 B**. The measured evidence is quoted with the build and the layout it came
+> L3-level design record. Start **0.41.0**, bridge **0.22.0**, channel **v5 /
+> 736 B**. The measured evidence is quoted with the build and the layout it came
 > from; everything below was run on this machine. **Layouts:** *auto-hidden* =
 > work `0,0,1440,900`, the bar off screen, band `804..900`, panel
 > `236,265..1229,840`, trail 265, Distance 852 (current). *Docked* = work
@@ -11,11 +11,11 @@
 
 Two Windhawk mods:
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.40.0) runs in
+- `mods/start-menu-legacy-swipe.wh.cpp` (0.41.0) runs in
   `StartMenuExperienceHost.exe`. It owns the touch gesture, the claim on
   `Progress`, the settle planner, the gates and the decision state. It consumes
   bridge intents and publishes executor commands.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.21.0) runs in
+- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.22.0) runs in
   `explorer.exe`. It turns the Win key, the Start button and the click-away into
   intents, and executes the Start side's `show`/`dismiss`/`cancel` commands on
   the launcher's own thread. It also swallows the shell's own duplicate
@@ -70,11 +70,13 @@ crashed `explorer.exe` in `twinui.pcshell.dll+0x1BB010` with `0xC0000409`
 (fail-fast). A `Dismiss` on that thread happened to work, but the executor does
 not rely on the asymmetry: every command runs on the launcher thread.
 
-Shape: a hidden message-only window owned by the mod, created by a one-shot
-`WH_GETMESSAGE` hook on the launcher thread (or directly on the first decision
-hook, which already runs there). A worker waits on the channel event and posts
-`WM_APP+0x5A`; the WndProc reads the command and calls the launcher with an
-empty stack. The window class is unique per activation
+Shape: a hidden message-only window owned by the mod, created only from a known
+launcher entry — the first of `OnHotkeyInvoke`, `Dismiss`, `ShowStartView` or the
+manager's `Show` adopts the thread (`exec launcher thread`), and a window is
+never created from the `LoadLibraryExW` hook, which runs on whichever thread
+loaded twinui. A worker waits on the channel event and posts `WM_APP+0x5A`; the
+WndProc reads the command and calls the launcher with an empty stack. The window
+class is unique per activation
 (`WindhawkSwipeExecutor_<WndProc address>`); a fixed name would return
 `ERROR_CLASS_ALREADY_EXISTS` after a Windhawk reinstall and create the window
 with the previous image's WndProc, whose channel is already closed.
@@ -96,62 +98,73 @@ Triggers and their decision lines:
 | click-away | `HideStartAndCortana` method 7 | `intent close trigger=clickaway` |
 | touch | the Start side's band admission | `reveal show request` |
 
-`IntentShouldClose` is the only toggle rule: the controller's published flags
-decide while it owns the panel (phase 2 is a close in flight, so the press is an
-open; an owned phase 1 is the open it owns, so the press is a close), and the
-shell's cloak and internal state are the resync only for a panel the controller
-does not own. The shell cannot be the direction: a gesture close publishes phase
-2 in `TakeCloseOwnership`, before its first frame, because the window still
+`IntentShouldClose` is the only toggle rule: the controller's one direction word
+decides while it owns the panel (`2` is a close in flight, so the press is an
+open; `1` is the open it owns, so the press is a close), and the shell's cloak
+and internal state are the resync only for a panel the controller does not own.
+The shell cannot be the direction: a gesture close publishes `2` in
+`TakeCloseOwnership`, before its first frame, because the window still
 reports state 5 and the cloak still reports open for the whole retract, until
 the executor's `Dismiss` runs. Reading the shell there made a press during the
 retract a second close, and the owner's press did nothing. No trigger has its
 own branch.
 
-**A press is never lost — cancel or latch.** A close still settling has either a
-local dismiss slot not yet requested (a gesture close) or an executor dismiss
-armed for a future deadline (an intent close). Both publish open at once: the
-Start side clears the suppression, takes the panel where the retract left it and
-settles it back to 1 (`intent open cancel from=...`); it drops the local slot
-and, when one is pending, publishes `exec cancel` for the executor command. If
-the dismiss had already entered the shell's `Dismiss` call
-when the press landed, the window hides anyway; the landing reissues the open
-once (`intent open recovered entry=...`). A shell hide in flight
-(`InternalState` 9/11), or an executor dismiss already armed, is latched in one
-slot (tick, trigger, method, flags). The hidden event arms a 50 ms timer and the
-timer serves the same open intent after the event's stack has unwound: a show at
-the hidden event's own tick was swallowed (same tick, `exec visible=0`, state
+**A press is never lost — cancel, latch, or recover.** A close still settling
+has either a local dismiss slot not yet requested (a gesture close) or an
+executor dismiss armed for a future deadline (an intent close). Only the first
+shape is cancelled: the Start side clears the suppression, drops the local slot
+and, when a command is already pending, publishes `exec cancel`, then takes the
+panel where the retract left it and settles it back to 1
+(`intent open cancel from=...`). A press the bridge sees while the shell is
+already hiding (`InternalState` 9/11) or while its executor dismiss is armed is
+not published at all: it is latched in one slot (tick, trigger, method, flags).
+The hidden event arms a 50 ms timer and
+the timer serves the same open intent after the event's stack has unwound: a show
+at the hidden event's own tick was swallowed (same tick, `exec visible=0`, state
 stuck at 3, no Shown), while a show 16 ms after it opened normally. A second
 press replaces the slot (`own press latch replaced ...`); the serve logs `own
 press served wait=...` (current auto-hidden medians: 219 ms Win close, 210 ms
 Start-button, 234 ms click-away; the gesture latch is rare and measured 94 ms).
-The 400 ms timer is only the fallback for a landing the event missed. The
+The 400 ms timer is only the fallback for a landing the event missed. A dismiss
+that had already entered the shell's `Dismiss` call when the press landed hides
+the window anyway; the landing reissues the open once
+(`intent open recovered entry=...`), and the recovery ticket is kept until that
+landing or an explicit superseding action (a new close, an external takeover).
+The
 click-away that the shell issues while the window is appearing (state 1/3), and
 the Hide(7) it issues inside our own `ShowStartView` in state 1/3, are the
 pointer-away check, not a user click, and are swallowed
 (`reason=opening`/`reason=own-show`). Without that, the served open came back
 and was hidden in the same millisecond.
 
-The Start side answers each intent (`intent ack`), then publishes the executor
-command:
+The Start side publishes the executor command and then answers the intent
+(`intent ack`); the ack reports the decision and is not a barrier the bridge
+waits for before the command:
 
-- open: `exec show` immediately; the shell's own show is swallowed while
-  `controllerOwning` and the same opening touch is protected by
+- open: `exec show` immediately; the shell's own show is swallowed while the
+  controller owns the panel and the same opening touch is protected by
   `controllerTouch`;
 - close: `TakeCloseOwnership` + the mirrored settle from `TakeProgressNow()`,
   then `exec dismiss` at `settle + 30 ms`;
 - a new intent that takes over the closing panel publishes `exec cancel` with
   the dismiss sequence; the bridge kills its timer and the menu stays open;
 - external takeovers (Win+Tab, lock, display change, a modified forwarded Win
-  press) publish `intent=external` and are never held.
+  press) publish `intent=external`: the Start side revokes both close schedules
+  and the recovery ticket, clears the suppression, drops the touch state and
+  resyncs from the cloak.
 
 Fallbacks, each logged once:
 
-- no channel: the trigger passes through, the shell's own path serves it;
-- launcher not attached: `exec show` is refused, the Start side clears
-  `controllerOwning`/`controllerTouch` and resyncs from the cloak, and the
-  shell's own gesture opens the menu;
-- no executor ack within 400 ms: `exec ack timeout seq=… (resync from cloak)`,
-  same release.
+- no channel, no executor worker or no executor window: the trigger passes
+  through untouched (`own pass trigger=... reason=...`), the shell's own path
+  serves it;
+- launcher not attached: `exec show`/`exec dismiss` is refused, one repair
+  releases the direction entry, `controllerTouch` and the pending open entry, so
+  the controller state resyncs from the cloak, and the shell's own gesture opens
+  the menu;
+- no executor ack within 400 ms (a show from its request, a dismiss from the
+  deadline it was scheduled for): `exec ack timeout seq=… kind=show|dismiss
+  (resync from cloak)`, same repair.
 
 ## The open and the close (auto-hidden; docked numbers named)
 
@@ -196,14 +209,14 @@ the 18 ms idle release is held, so the candidate the open/landing is about to
 adopt survives. A real lift is a report and still ends the contact.
 
 Close: a Win, Start-button or click-away intent calls `TakeCloseOwnership`
-(sets `g_suppressRestoreUntil`, publishes `controllerOwning` phase 2 before the
+(sets `g_suppressRestoreUntil`, publishes the closing direction before the
 settle's first frame, mutes the contact, clears the reveal) and runs
 `BeginMirrorCloseSettle` from `TakeProgressNow()`: the open curve played
 backwards, full travel (387 ms at the current 852 DIP; 409 ms at the docked 900).
 The dismiss is scheduled at the end
 plus 30 ms. The bridge's timer runs `Dismiss`; the shell's hidden event follows
-and the Start side logs `win close observed`, clears
-`controllerOwning`/`controllerTouch`, and the next open is ready. The close is
+and the Start side logs `win close observed`, clears the direction and
+`controllerTouch`, and the next open is ready. The close is
 judged by that hidden event and `visible=0`, not by an internal `0xA` value;
 that value is not a criterion. A gesture close is the same path with its own
 release settle (160–520 ms) and no 30 ms lead: its dismiss is requested at the
@@ -293,9 +306,12 @@ The M2 mechanisms that no longer exist in the shipping path:
   `CloseInFlight` early return that guards the follow, so it could never fire;
   the pull-reopen and the press latch are the reopen paths that remain.
 
-**v4** removes the retired M2 slots from the header: the section is 744 bytes
+**v5** removes the retired M2 slots from the header: the section is 736 bytes
 and contains only the command, the open generation, the intent and its ack, the
-executor command and its ack, and the controller flags. No dead field remains.
+executor command and its ack, one controller direction word and the touch flag.
+No dead field remains; v5 also replaces v4's owning/phase pair with that one
+word, so the bridge's toggle rule cannot read new ownership beside a stale
+phase.
 
 ## The accepted cap, restated
 

@@ -25,7 +25,7 @@ contact lifts.
 1. **Band admission** — the first positioned report inside the band while the
    window is closed. `StartRevealFollow` records the down point, starts the
    timing, and requests `exec show` **once per open** (`g_intentOpenActive`).
-   It sets `controllerOwning` (phase 1) and `controllerTouch`.
+   It sets `controllerDirection` to `1` (open) and `controllerTouch`.
 2. **Shell open** — the bridge's executor calls `ShowStartView`; the shell
    uncloaks (245–268 ms worst case; the current auto-hidden Win open showed its
    first panel pixel at +82–187 ms from the key, median +115 over three runs; the
@@ -83,10 +83,10 @@ A gesture close runs the same pipeline with its own release settle and `exec
 dismiss` at that settle's end; it has no 30 ms lead.
 
 `TakeCloseOwnership` sets `g_suppressRestoreUntil` (the visibility poll must not
-heal the retracted panel), publishes `controllerOwning` phase 2 **before the
+heal the retracted panel), publishes the `closing` direction **before the
 settle's first frame**, mutes a contact still on the glass, and clears the reveal
-and `controllerTouch`. The phase is the whole toggle answer while it is set; the
-shell's cloak and state cannot answer it, because they still say open for the
+and `controllerTouch`. That one word is the whole toggle answer while it is set;
+the shell's cloak and state cannot answer it, because they still say open for the
 whole retract. The mirrored settle is the open curve played backwards, full
 travel (387 ms at the current 852 DIP; 409 at the docked 900), no seam speed,
 from the live position. The dismiss
@@ -106,8 +106,9 @@ controller's phase, so a press during the retract is an open:
   served wait=...`). A show at the hidden event's own tick was swallowed (state
   stuck at 3), which is why the serve is deferred. A shell hide in flight (state
   9/11) is latched the same way.
-A press while the open runs is a close: phase 1 makes it a close, and the settle
-starts from the live position (`from=0.542` measured 172 ms into an open).
+A press while the open runs is a close: the `open` direction makes it a close, and
+the settle starts from the live position (`from=0.542` measured 172 ms into an
+open).
 
 A pull that is still down when the close lands (or that lifted inside the 300 ms
 late window) takes the menu back: after `win close observed` the controller
