@@ -39,8 +39,6 @@
 - `tools/measure_swipe.ps1` — samples the Start window rect while a swipe runs
   and writes `artifacts/start-window.csv`; it asks for 8 ms and this host's
   15.6 ms timer quantum delivers ~16 ms, which the file itself shows.
-- `tools/read_shared_gesture.ps1` — reads the bridge's
-  `Local\WindhawkStartGestureShared` mapping, optionally while injecting a swipe.
 - `tools/probe_cursor_follow.ps1` — polls `GetCursorPos`/`GetCursorInfo` while an
   injected touch drag runs and writes `artifacts/cursor-follow.csv`.
 - `tools/native_flyout_frames.ps1` — capture the native Quick Settings flyout

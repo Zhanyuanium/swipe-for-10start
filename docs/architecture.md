@@ -454,6 +454,13 @@ The M2 mechanisms that no longer exist in the shipping path:
   `CloseInFlight` early return that guards the follow, so it could never fire;
   the pull-reopen and the press latch are the reopen paths that remain.
 
+0.7.0 also deleted the explorer gesture publisher: the four observer hooks
+(`InputGestureOperationStarted`/`Ended`, `ReportEdgeGesture`,
+`SetAnimationData`), the `CStartExperienceManager::Hide` observation hook, and
+the process-lifetime gesture mapping with its seqlock writer and the
+inactive-at-unload publication. The Start half's Raw Input is the product's
+contact source; that mapping only fed the Phase 0 probes.
+
 **v7** adds the Start side's activation identity at the tail: `peerEpoch` at 740,
 which the struct's alignment had already paid for, so the section stays 744 bytes
 and the **version word** — in the object names and in the section — is what

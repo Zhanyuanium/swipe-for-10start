@@ -259,7 +259,12 @@ thread-locals (`t_ownDecisionCall`, `t_ownForeignClose`, `t_ownCloseExecutor`) a
 `t_execCall` remain: both mark a live call. 0.25.0 deletes the generic `WM_CLOSE`
 shutdown (replaced by `kExecTeardownMessage`), the readiness publication written
 by the thread that called `CreateThread`, and the reaper's HWND-before-creator
-read order.
+read order. 0.7.0 deletes the gesture publisher: the four observer hooks
+(`InputGestureOperationStarted`/`Ended`, `ReportEdgeGesture`,
+`SetAnimationData`), the manager's `Hide` observation hook, the shared gesture
+mapping with its seqlock writer, and the inactive-at-unload publication. The
+Start half's Raw Input is the product's contact source; the decision and
+executor lines are the evidence that replaced it.
 
 **Lifecycle.** Pinned image, the counted close-hook frames and executor
 dispatches for the v7 channel, the drain with `drained`/`stalled` reports, and the
@@ -294,19 +299,12 @@ ack's outcome word gained values (`confirmed`,
 `unknown = -1`, both inside the existing `LONG` slots, so the version stays 7 and
 `tools/ipc.ps1`/`docs/ipc.md` only document the new names.
 
-### start_gesture_shared.h
-The older gesture mapping (`Local\WindhawkStartGestureShared`), kept for the
-process lifetime on purpose: a consumer and a late gesture callback may still
-hold its view. The bridge publishes the shell's `SetAnimationData` ids and the
-release position there for the probe mods.
-
 ## Diagnosis (not needed at runtime)
 
-- `start-menu-touch-gesture-probe.wh.cpp` / `start-menu-touch-gesture-consumer.wh.cpp`
-  — the early gesture-source experiments. Both stop their worker before final
-  unload: the probe refuses new hook installation from `Wh_ModBeforeUninit` and
-  keeps the log/handles when the scan thread does not join; the consumer wakes its
-  reader, joins it, and keeps the mapping when the join times out.
+- `start-menu-touch-gesture-probe.wh.cpp` — the early gesture-source experiment
+  for the explorer side. It stops its worker before final unload: the probe
+  refuses new hook installation from `Wh_ModBeforeUninit` and keeps the
+  log/handles when the scan thread does not join.
 - `msgprobe.wh.cpp` — pointer messages and `GetPointerInfo` ownership; writes
   `msgprobe.log` into the folder `Wh_GetModStoragePath` returns and mirrors each
   line to the Windhawk log. Its poller

@@ -5,12 +5,11 @@ Build self-contained Windhawk mod sources from the repo's mod sources, for the
 store submission or for a local install.
 
 .DESCRIPTION
-The mod ships as one source and still shares `mods/swipe_ipc_shared.h` (and, in
-this commit, `mods/start_gesture_shared.h`), which neither the store nor a
-Windhawk install can resolve: a pull request adds exactly one self-contained
-`mods/<id>.wh.cpp`, and Windhawk compiles the installed file from stdin with no
-repository beside it. This script produces that one file and changes nothing
-else. Two profiles:
+The mod ships as one source and shares `mods/swipe_ipc_shared.h`, which neither
+the store nor a Windhawk install can resolve: a pull request adds exactly one
+self-contained `mods/<id>.wh.cpp`, and Windhawk compiles the installed file from
+stdin with no repository beside it. This script produces that one file and
+changes nothing else. Two profiles:
 
 - `store` (the default) is the `ramensoftware/windhawk-mods` submission. Each
   `#include "..."` of a local header is replaced by the header body, inside a

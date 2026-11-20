@@ -64,8 +64,8 @@ One mod ships, in one source with two process halves (full member list in
   executor with no controller still decides from the window.
 
 Everything else in `mods/` (`msgprobe`, `inputprobe`,
-`start-menu-touch-gesture-probe`, `start-menu-touch-gesture-consumer`) is
-diagnosis from the investigation and is not needed at runtime; `inputprobe`
+`start-menu-touch-gesture-probe`) is diagnosis from the investigation and is not
+needed at runtime; `inputprobe`
 must not be enabled beside the shipping mod, because Raw Input allows one sink
 per usage per process and the probe takes the stream for itself.
 

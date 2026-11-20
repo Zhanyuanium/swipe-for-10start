@@ -6,7 +6,7 @@
 The collection (`ramensoftware/windhawk-mods`) accepts exactly one self-contained
 file per pull request, `mods/<id>.wh.cpp`, and its CI rejects a `@compilerOptions`
 that contains a double quote. The shipping source cannot be submitted as it sits
-here: it includes `swipe_ipc_shared.h` and, in this commit, `start_gesture_shared.h`.
+here: it includes `swipe_ipc_shared.h`.
 
 `tools/make_store_mods.ps1` produces the submittable file. It is generated, never
 hand-edited (`dist/` is ignored), and changes only what the collection requires:

@@ -1181,9 +1181,8 @@ Known risks:
  *   liveness. In explorer.exe (namespace bridge): twinui.pcshell.dll
  *   10.0.26100.9949 (the launcher singleton, ShowStartView, Dismiss, IsVisible,
  *   XamlLauncher::OnHotkeyInvoke, XamlLauncherState::OnStartShown/
- *   OnStartHidden/HideStartAndCortana, CStartExperienceManager::Show/Hide), the
- *   same v7 channel from the other end, and start_gesture_shared.h for the
- *   diagnostic gesture ids.
+ *   OnStartHidden/HideStartAndCortana, CStartExperienceManager::Show), the same
+ *   v7 channel from the other end.
  * [OUTPUT]: the panel's Progress through the one damped-spring settle, the
  *   reveal and dismiss follows, the coast and the geometry snapshot; the hidden
  *   executor window on explorer's launcher thread that runs the one shell call
@@ -1244,8 +1243,6 @@ Known risks:
 #else
 #define OWN_RETURN_ADDRESS() __builtin_return_address(0)
 #endif
-
-#include "start_gesture_shared.h"
 
 // ---------------------------------------------------------------------------
 // Roles
@@ -13399,12 +13396,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 constexpr uintptr_t kTwinuiPreferredBase = 0x180000000;
 
 // twinui.pcshell.dll 26100.9949 (x86-64), verified by the Phase 0 probe.
-constexpr uintptr_t kTouchEdgeGestureOperationStartedVa = 0x1800CAD80;
-constexpr uintptr_t kTouchEdgeGestureOperationEndedVa = 0x1805F8840;
-constexpr uintptr_t kReportEdgeGestureVa = 0x1806F63BC;
-constexpr uintptr_t kSetAnimationDataVa = 0x1803C7740;
 constexpr uintptr_t kShowVa = 0x180254C90;
-constexpr uintptr_t kHideVa = 0x1803C5960;
 // XamlLauncherState::HideStartAndCortana, the decision every shell close reaches.
 constexpr uintptr_t kHideStartAndCortanaVa = 0x18024BCB0;
 // The two decision entries (XamlLauncher): the Windows key / shell hook and the
@@ -13541,9 +13533,8 @@ constexpr DWORD kIpcUnloadMarkMs = 500;
 constexpr DWORD kIpcUnloadStallReportMs = 10000;
 
 // The cross-process channel (swipe_ipc_shared.h). Opened once at init. Its
-// handles are closed by Wh_ModUninit once no Hide can still be inside them; see
-// the two lifetimes there. The gesture mapping and its event, unlike this
-// channel, stay for the whole process lifetime.
+// handles are closed by RoleUninit once no close can still be inside them; see
+// the drain there.
 SwipeIpcChannel g_ipc;
 
 // M3 executor: one hidden window on explorer's launcher thread. The hooks post a
@@ -13665,22 +13656,6 @@ LONG64 g_execAcceptedSeq = 0;  // launcher thread only
 int g_dismissReadRetries = 0;  // launcher thread only
 constexpr int kExecDismissReadRetries = 10;
 constexpr uint32_t kExecDismissRetryMs = 10;
-// The confirmation probe: IsVisible right after Show returns is too early (the
-// window is cloaked until the shell's own show animation runs), so the answer is
-// read again 300 ms later on the same thread and logged with the command it
-// belongs to.
-struct Point {
-    float x;
-    float y;
-};
-
-struct GestureAnimationData {
-    uint64_t sourceId;
-    uint64_t providerId;
-};
-
-static_assert(sizeof(GestureAnimationData) == 16,
-              "GestureAnimationData layout must match Phase 0");
 
 // ---------------------------------------------------------------------------
 // State
@@ -13693,7 +13668,7 @@ std::atomic<bool> g_disabled{false};
 // close is ever arbitrated on a build where that hook was refused.
 std::atomic<bool> g_closeHookEnabled{false};
 // Close-hook frames currently inside, entry to exit: the decision hook's
-// HideStartAndCortana and the observation hook's Hide. Wh_ModUninit closes the
+// HideStartAndCortana. Wh_ModUninit closes the
 // v7 channel only when this is zero, and Wh_ModInit refuses to re-activate this
 // image while it is not. It is a lifetime guard for that channel, not a barrier
 // between two closes: it answers "is a close still inside", never "this close
@@ -13729,214 +13704,12 @@ struct CloseCallLease {
     CloseCallLease& operator=(const CloseCallLease&) = delete;
 };
 
-enum : int {
-    kSharedNotStarted = 0,
-    kSharedInitializing = 1,
-    kSharedReady = 2,
-    kSharedFailed = 3,
-};
-
-std::atomic<int> g_sharedInitState{kSharedNotStarted};
-StartGestureShared* g_shared = nullptr;  // Published before kSharedReady
-HANDLE g_sharedMapping = nullptr;
-HANDLE g_sharedEvent = nullptr;
-std::atomic<bool> g_sharedErrorLogged{false};
-
-// The start point belongs to the gesture identified by gestureStartTick, so a
-// later ReportEdgeGesture call for the same gesture never replaces it.
-std::atomic<uint64_t> g_startPointTick{0};
-
-// ---------------------------------------------------------------------------
-// Shared memory
-// ---------------------------------------------------------------------------
-
-void LogSharedErrorOnce(const wchar_t* what, DWORD error) {
-    if (!g_sharedErrorLogged.exchange(true)) {
-        Wh_Log(L"%s failed (error %u); gesture data may be incomplete", what,
-               static_cast<unsigned int>(error));
-    }
-}
-
-void ResetSharedFields(StartGestureShared* shared) {
-    // Unpublish first and publish magic last, so a consumer that mapped the
-    // section concurrently never sees a half-initialized struct.
-    shared->magic = 0;
-    shared->version = 0;
-    shared->sequence = 0;
-    shared->state = static_cast<uint32_t>(StartGestureState::None);
-    shared->edge = -1;
-    shared->sourceId = 0;
-    shared->providerId = 0;
-    // Negative coordinates are not valid screen positions; the consumer can
-    // use them to detect "no point reported yet".
-    shared->startX = -1.0f;
-    shared->startY = -1.0f;
-    shared->currentX = -1.0f;
-    shared->currentY = -1.0f;
-    shared->gestureStartTick = 0;
-    shared->lastUpdateTick = 0;
-    shared->version = kWindhawkStartGestureVersion;
-    shared->magic = kWindhawkStartGestureMagic;
-}
-
-StartGestureShared* CreateOrOpenShared() {
-    HANDLE mapping = CreateFileMappingW(
-        INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-        static_cast<DWORD>(sizeof(StartGestureShared)),
-        kWindhawkStartGestureMappingName);
-    if (!mapping) {
-        LogSharedErrorOnce(L"CreateFileMappingW", GetLastError());
-        return nullptr;
-    }
-
-    const bool fresh = GetLastError() != ERROR_ALREADY_EXISTS;
-
-    void* view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
-                               sizeof(StartGestureShared));
-    if (!view) {
-        LogSharedErrorOnce(L"MapViewOfFile", GetLastError());
-        CloseHandle(mapping);
-        return nullptr;
-    }
-    g_sharedMapping = mapping;
-
-    auto* shared = static_cast<StartGestureShared*>(view);
-    const bool valid = !fresh &&
-                       shared->magic == kWindhawkStartGestureMagic &&
-                       shared->version == kWindhawkStartGestureVersion;
-    // An odd sequence on an otherwise valid section means a previous mod
-    // instance was unloaded in the middle of a write; reset it too.
-    if (!valid || (shared->sequence & 1u) != 0u) {
-        ResetSharedFields(shared);
-    }
-
-    g_sharedEvent =
-        CreateEventW(nullptr, FALSE, FALSE, kWindhawkStartGestureEventName);
-    if (!g_sharedEvent) {
-        // Publishing still works; the consumer can poll the sequence.
-        LogSharedErrorOnce(L"CreateEventW", GetLastError());
-    }
-
-    return shared;
-}
-
-StartGestureShared* EnsureShared() {
-    const int state = g_sharedInitState.load(std::memory_order_acquire);
-    if (state == kSharedReady) {
-        return g_shared;
-    }
-    if (state == kSharedFailed) {
-        return nullptr;
-    }
-
-    int expected = kSharedNotStarted;
-    if (g_sharedInitState.compare_exchange_strong(expected,
-                                                  kSharedInitializing,
-                                                  std::memory_order_acq_rel)) {
-        StartGestureShared* shared = CreateOrOpenShared();
-        g_shared = shared;
-        g_sharedInitState.store(shared ? kSharedReady : kSharedFailed,
-                                std::memory_order_release);
-        return shared;
-    }
-
-    // Another thread is initializing. Don't wait inside a hook; this write is
-    // skipped and the next one will see the ready state.
-    return g_sharedInitState.load(std::memory_order_acquire) == kSharedReady
-               ? g_shared
-               : nullptr;
-}
-
-struct SharedUpdate {
-    bool written;
-    uint32_t previousState;
-    uint32_t newState;
-    int32_t edge;
-    int64_t sourceId;
-    int64_t providerId;
-};
-
-// Serializes the seqlock writers. The gesture callbacks run on the explorer UI
-// thread, but the unload path publishes from the Windhawk thread.
-SRWLOCK g_sharedWriteLock = SRWLOCK_INIT;
-
-// Bumps the seqlock around the write, updates the timestamp and signals the
-// consumer.
-template <typename Writer>
-SharedUpdate UpdateShared(Writer&& writer) {
-    SharedUpdate result{};
-
-    if (g_disabled.load(std::memory_order_relaxed)) {
-        return result;
-    }
-
-    StartGestureShared* shared = EnsureShared();
-    if (!shared) {
-        return result;
-    }
-
-    AcquireSRWLockExclusive(&g_sharedWriteLock);
-    InterlockedIncrement(
-        reinterpret_cast<volatile LONG*>(&shared->sequence));
-    result.previousState = shared->state;
-    writer(shared);
-    shared->lastUpdateTick = GetTickCount64();
-    result.newState = shared->state;
-    result.edge = shared->edge;
-    result.sourceId = shared->sourceId;
-    result.providerId = shared->providerId;
-    InterlockedIncrement(
-        reinterpret_cast<volatile LONG*>(&shared->sequence));
-
-    if (g_sharedEvent) {
-        SetEvent(g_sharedEvent);
-    }
-
-    ReleaseSRWLockExclusive(&g_sharedWriteLock);
-
-    result.written = true;
-    return result;
-}
-
-// Used while the mod is being disabled, when normal writes are already
-// blocked. Hooks are no longer applied after Wh_ModBeforeUninit returns.
-void PublishInactiveOnUnload() {
-    if (g_sharedInitState.load(std::memory_order_acquire) != kSharedReady) {
-        return;
-    }
-    StartGestureShared* shared = g_shared;
-    if (!shared) {
-        return;
-    }
-
-    AcquireSRWLockExclusive(&g_sharedWriteLock);
-    InterlockedIncrement(
-        reinterpret_cast<volatile LONG*>(&shared->sequence));
-    shared->state = static_cast<uint32_t>(StartGestureState::None);
-    shared->edge = -1;
-    shared->sourceId = 0;
-    shared->providerId = 0;
-    shared->startX = -1.0f;
-    shared->startY = -1.0f;
-    shared->currentX = -1.0f;
-    shared->currentY = -1.0f;
-    shared->gestureStartTick = 0;
-    shared->lastUpdateTick = GetTickCount64();
-    InterlockedIncrement(
-        reinterpret_cast<volatile LONG*>(&shared->sequence));
-    ReleaseSRWLockExclusive(&g_sharedWriteLock);
-
-    if (g_sharedEvent) {
-        SetEvent(g_sharedEvent);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Logging (state transitions only, never per frame)
 // ---------------------------------------------------------------------------
 
-// Appends to <mod storage>\bridge.log. Called once per gesture state
-// transition.
+// Appends to <mod storage>\bridge.log. One line per decision or executor
+// event, never per frame.
 void FileLog(const wchar_t* format, ...) {
     static SRWLOCK lock = SRWLOCK_INIT;
 
@@ -13978,17 +13751,6 @@ void FileLog(const wchar_t* format, ...) {
         CloseHandle(file);
     }
     ReleaseSRWLockExclusive(&lock);
-}
-
-void LogStateChange(const SharedUpdate& update, const wchar_t* reason) {
-    if (!update.written || update.previousState == update.newState) {
-        return;
-    }
-    FileLog(L"state=%u edge=%d src=%lld prov=%lld %s",
-            static_cast<unsigned int>(update.newState),
-            static_cast<int>(update.edge),
-            static_cast<long long>(update.sourceId),
-            static_cast<long long>(update.providerId), reason);
 }
 
 // ---------------------------------------------------------------------------
@@ -14241,129 +14003,9 @@ bool TwinuiBuildMatches(HMODULE module) {
 // twinui.pcshell.dll hooks
 // ---------------------------------------------------------------------------
 
-using InputGestureOperationStarted_t = void (*)(void*, const void*, const void*);
-InputGestureOperationStarted_t InputGestureOperationStarted_Original = nullptr;
-
-void InputGestureOperationStarted_Hook(void* self, const void* operation,
-                                       const void* args) {
-    const uint64_t now = GetTickCount64();
-    const SharedUpdate update = UpdateShared([now](StartGestureShared* shared) {
-        // The complete start record: no field of the previous gesture stays
-        // visible next to the new state and timestamp.
-        shared->state = static_cast<uint32_t>(StartGestureState::Active);
-        shared->edge = -1;
-        shared->sourceId = 0;
-        shared->providerId = 0;
-        shared->startX = -1.0f;
-        shared->startY = -1.0f;
-        shared->currentX = -1.0f;
-        shared->currentY = -1.0f;
-        shared->gestureStartTick = now;
-    });
-    LogStateChange(update, L"InputGestureOperationStarted");
-
-    if (InputGestureOperationStarted_Original) {
-        InputGestureOperationStarted_Original(self, operation, args);
-    }
-}
-
-using InputGestureOperationEnded_t = void (*)(void*, const void*, const void*);
-InputGestureOperationEnded_t InputGestureOperationEnded_Original = nullptr;
-
-void InputGestureOperationEnded_Hook(void* self, const void* operation,
-                                     const void* args) {
-    // Committed means only "the gesture finished while its handle was live",
-    // which is the open signal the Start side consumes. It is not a claim
-    // about what the shell did with the window.
-    const SharedUpdate update = UpdateShared([](StartGestureShared* shared) {
-        if (shared->state ==
-                static_cast<uint32_t>(StartGestureState::Active) &&
-            (shared->sourceId != 0 || shared->providerId != 0)) {
-            shared->state =
-                static_cast<uint32_t>(StartGestureState::Committed);
-        }
-    });
-    LogStateChange(update,
-                   L"InputGestureOperationEnded (ended with a live handle)");
-
-    // The handle is deliberately kept: the subsequent Hide clears it.
-    if (InputGestureOperationEnded_Original) {
-        InputGestureOperationEnded_Original(self, operation, args);
-    }
-}
-
-using ReportEdgeGesture_t = void (*)(void*, int, const GestureAnimationData*,
-                                     Point);
-ReportEdgeGesture_t ReportEdgeGesture_Original = nullptr;
-
-void ReportEdgeGesture_Hook(void* self, int edge,
-                            const GestureAnimationData* data, Point point) {
-    // Called once per gesture right after InputGestureOperationStarted. This
-    // is the first call that carries the edge, the handle and a real point, so
-    // it republishes the whole start record in one seqlock write.
-    const SharedUpdate update =
-        UpdateShared([edge, data, point](StartGestureShared* shared) {
-            const uint64_t now = GetTickCount64();
-            shared->state = static_cast<uint32_t>(StartGestureState::Active);
-            shared->edge = edge;
-
-            uint64_t startTick = shared->gestureStartTick;
-            if (startTick == 0) {
-                startTick = now;
-            }
-            // Keep the first point of this gesture if the shell reports the
-            // edge more than once.
-            if (g_startPointTick.load(std::memory_order_relaxed) !=
-                startTick) {
-                shared->startX = point.x;
-                shared->startY = point.y;
-                g_startPointTick.store(startTick, std::memory_order_relaxed);
-            }
-            shared->currentX = point.x;
-            shared->currentY = point.y;
-            shared->gestureStartTick = startTick;
-
-            if (data) {
-                shared->sourceId = static_cast<int64_t>(data->sourceId);
-                shared->providerId = static_cast<int64_t>(data->providerId);
-            }
-        });
-    LogStateChange(update, L"ReportEdgeGesture");
-
-    if (ReportEdgeGesture_Original) {
-        ReportEdgeGesture_Original(self, edge, data, point);
-    }
-}
-
-using SetAnimationData_t = HRESULT (*)(void*, uint64_t, uint64_t, uint64_t);
-SetAnimationData_t SetAnimationData_Original = nullptr;
-
-HRESULT SetAnimationData_Hook(void* self, uint64_t a, uint64_t b, uint64_t c) {
-    // Phase 0: a=0, b=SourceId, c=ProviderId at gesture start.
-    const uint64_t now = GetTickCount64();
-    const SharedUpdate update =
-        UpdateShared([b, c, now](StartGestureShared* shared) {
-            if (shared->state !=
-                static_cast<uint32_t>(StartGestureState::Active)) {
-                // A new gesture outside the Started path starts with a clean
-                // record rather than the previous gesture's edge/point.
-                shared->gestureStartTick = now;
-                shared->edge = -1;
-                shared->startX = -1.0f;
-                shared->startY = -1.0f;
-                shared->currentX = -1.0f;
-                shared->currentY = -1.0f;
-            }
-            shared->sourceId = static_cast<int64_t>(b);
-            shared->providerId = static_cast<int64_t>(c);
-            shared->state = static_cast<uint32_t>(StartGestureState::Active);
-        });
-    LogStateChange(update, L"SetAnimationData");
-
-    return SetAnimationData_Original ? SetAnimationData_Original(self, a, b, c)
-                                     : S_OK;
-}
-
+// CStartExperienceManager::Show: the shell's own open, and the touch-first
+// path's first launcher entry. The executor window is created here when no
+// Win/Start-button hook has run yet; the Show itself is never held.
 using Show_t = HRESULT (*)(void*, uint8_t, uint8_t, uint32_t);
 Show_t Show_Original = nullptr;
 
@@ -14371,53 +14013,15 @@ HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
     FileLog(L"show a=%u b=%u c=%u tid=%u", static_cast<unsigned int>(a),
             static_cast<unsigned int>(b), static_cast<unsigned int>(c),
             GetCurrentThreadId());
-    // The manager's Show is the shell's own open on the launcher thread. It is
-    // the touch-first path's first launcher entry: creating the window here keeps
-    // a band open working when no Win/Start-button hook ran yet. The gate adopts
-    // the thread only when no entry has been seen, and never creates a second
-    // window on a thread that is not that one.
+    // The manager's Show runs on the launcher thread. It is the touch-first
+    // path's first launcher entry: creating the window here keeps a band open
+    // working when no Win/Start-button hook ran yet. The gate adopts the thread
+    // only when no entry has been seen, and never creates a second window on a
+    // thread that is not that one.
     EnsureExecutorOnLauncherThread(L"show");
-
-    // Only a Show that follows a real gesture handle publication is a
-    // gesture-driven open. A normal mouse/keyboard open must not look like a
-    // gesture to the Start side.
-    StartGestureShared* sharedState = EnsureShared();
-    if (sharedState &&
-        (sharedState->sourceId != 0 || sharedState->providerId != 0)) {
-        const SharedUpdate update = UpdateShared([](StartGestureShared* shared) {
-            if (shared->sourceId != 0 || shared->providerId != 0) {
-                shared->state =
-                    static_cast<uint32_t>(StartGestureState::Active);
-            }
-        });
-        LogStateChange(update, L"Show (live handle)");
-    }
 
     return Show_Original ? Show_Original(self, a, b, c) : S_OK;
 }
-
-using Hide_t = HRESULT (*)(void*, uint32_t);
-Hide_t Hide_Original = nullptr;
-
-// Clears the published gesture record when the shell hides the Start window.
-void ClearSharedGestureState(const wchar_t* reason) {
-    const SharedUpdate update = UpdateShared([](StartGestureShared* shared) {
-        shared->state = static_cast<uint32_t>(StartGestureState::None);
-        // Drop the handle together with the Start window, so a later
-        // non-gesture Show cannot expose an expired handle.
-        shared->sourceId = 0;
-        shared->providerId = 0;
-        shared->gestureStartTick = 0;
-        shared->edge = -1;
-        shared->startX = -1.0f;
-        shared->startY = -1.0f;
-        shared->currentX = -1.0f;
-        shared->currentY = -1.0f;
-    });
-    LogStateChange(update, reason);
-    g_startPointTick.store(0, std::memory_order_relaxed);
-}
-
 
 using HideStartAndCortana_t = void (*)(void*, uint32_t);
 HideStartAndCortana_t HideStartAndCortana_Original = nullptr;
@@ -14937,26 +14541,6 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
             trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win", method,
             OwnInternalState(self));
 }
-// CStartExperienceManager::Hide(void* self, uint32_t reason) -> HRESULT
-// twinui.pcshell.dll 26100.9949, RVA 0x3C5960, vtable slot after Show.
-//
-// The prologue stores rcx (this) and edx (reason), zeroes dil and compares
-// `edx` with 7; r8 and r9 are written before they are read, so the function
-// takes two arguments. Both return paths set eax: 0 on success, the negative
-// HRESULT of a failing inner call otherwise, so the return type is HRESULT.
-//
-// Observation only, and every path calls the original. The pause belongs to the
-// decision hook above: a hold here would delay the same close a second time, and
-// a return without the original would strand the launcher's state at 9.
-HRESULT Hide_Hook(void* self, uint32_t reason) {
-    // The lease covers the whole call, so the unload's count includes this frame
-    // and its trampoline use for as long as it can run.
-    const CloseCallLease closeCall;
-    FileLog(L"hide reason=%u", reason);
-    ClearSharedGestureState(L"Hide");
-    return Hide_Original ? Hide_Original(self, reason) : S_OK;
-}
-
 // ---------------------------------------------------------------------------
 // The decision hooks: Windows key, Start button, and the two state events
 // ---------------------------------------------------------------------------
@@ -15553,7 +15137,7 @@ bool ImageRangeExecutable(HMODULE module, uintptr_t rva, size_t bytes) {
 // address is executable code of the loaded image, its first bytes match the
 // build's prologue, and its body still carries the manager call site the state
 // machine was traced through. Each failure has its own line, and only the close
-// hook is left out; the observation hooks keep working.
+// hook is left out.
 
 // ---------------------------------------------------------------------------
 // Own-hook probes
@@ -15867,34 +15451,11 @@ void InstallExplorerHooks(HMODULE module) {
                                        (preferredVa - kTwinuiPreferredBase));
     };
 
-    InstallHook(
-        at(kTouchEdgeGestureOperationStartedVa),
-        reinterpret_cast<void*>(InputGestureOperationStarted_Hook),
-        reinterpret_cast<void**>(&InputGestureOperationStarted_Original),
-        L"TouchEdgeGestureProcessor::InputGestureOperationStarted");
-
-    InstallHook(
-        at(kTouchEdgeGestureOperationEndedVa),
-        reinterpret_cast<void*>(InputGestureOperationEnded_Hook),
-        reinterpret_cast<void**>(&InputGestureOperationEnded_Original),
-        L"TouchEdgeGestureProcessor::InputGestureOperationEnded");
-
-    InstallHook(
-        at(kReportEdgeGestureVa),
-        reinterpret_cast<void*>(ReportEdgeGesture_Hook),
-        reinterpret_cast<void**>(&ReportEdgeGesture_Original),
-        L"EdgeAnimationRelationshipManager::ReportEdgeGesture");
-
-    InstallHook(at(kSetAnimationDataVa),
-                reinterpret_cast<void*>(SetAnimationData_Hook),
-                reinterpret_cast<void**>(&SetAnimationData_Original),
-                L"CStartExperienceManager::SetAnimationData");
-
     InstallHook(at(kShowVa), reinterpret_cast<void*>(Show_Hook),
                 reinterpret_cast<void**>(&Show_Original),
                 L"CStartExperienceManager::Show");
 
-    // The close executor first, so the observation hook below can never be the
+    // The close executor first, so the decision hook below can never be the
     // only one installed on a build whose state machine moved: the close is then
     // not animated at all instead of being delayed by a hook that cannot decide.
     bool closeHook = false;
@@ -15982,10 +15543,6 @@ void InstallExplorerHooks(HMODULE module) {
         g_ownEventsEnabled.store(true, std::memory_order_relaxed);
         FileLog(L"own hooks installed name=events");
     }
-
-    InstallHook(at(kHideVa), reinterpret_cast<void*>(Hide_Hook),
-                reinterpret_cast<void**>(&Hide_Original),
-                L"CStartExperienceManager::Hide");
 }
 
 void TryInstallFromLoadedModules(bool apply) {
@@ -16102,7 +15659,6 @@ void ResetReinitState() {
     g_afterInit.store(false, std::memory_order_relaxed);
     g_explorerHooked.store(false, std::memory_order_relaxed);
     g_closeHookEnabled.store(false, std::memory_order_relaxed);
-    g_startPointTick.store(0, std::memory_order_relaxed);
     // The decision layer's per-activation state: a re-enable starts with no
     // cached toggle, no latch, no forwarded mark and no primitives from the
     // previous activation. The executor's state belongs here too: a pending
@@ -16145,13 +15701,6 @@ void ResetReinitState() {
     AcquireSRWLockExclusive(&g_ownLock);
     g_ownOpen = false;
     ReleaseSRWLockExclusive(&g_ownLock);
-    // A failed gesture mapping is retried by the next activation, as it was
-    // when every activation loaded a fresh image. A ready one is kept: the
-    // section and this process's view of it are still valid.
-    if (g_sharedInitState.load(std::memory_order_relaxed) == kSharedFailed) {
-        g_sharedInitState.store(kSharedNotStarted, std::memory_order_relaxed);
-        g_sharedErrorLogged.store(false, std::memory_order_relaxed);
-    }
 }
 
 
@@ -17397,9 +16946,6 @@ BOOL RoleInit() {
         return FALSE;
     }
 
-    // Create the objects up front so the first gesture never pays for it.
-    EnsureShared();
-
     // The channel to the Start side. Opening it here means the section and its
     // events exist before the first Hide, and a Start mod that attaches later
     // joins the same ones. This is the only call: SwipeIpcOpen may sleep for its
@@ -17471,9 +17017,6 @@ void RoleBeforeUninit() {
     // until it returns. The v7 channel is closed in Wh_ModUninit, after that flag
     // and after the drain.
     g_disabled = true;
-    g_startPointTick.store(0, std::memory_order_relaxed);
-
-    PublishInactiveOnUnload();
 }
 
 void RoleUninit() {
@@ -17492,25 +17035,11 @@ void RoleUninit() {
     // next enable refuses until that join or destruction has completed.
     const bool executorStopped = StopExecutorWorker();
 
-    // Two channels, two lifetimes, for two reasons.
-    //
-    // The gesture mapping (Local\WindhawkStartGestureShared) and its event are
-    // kept for the rest of the explorer process lifetime, on purpose. A consumer
-    // maps the section independently and may poll it at any time, and an
-    // in-flight gesture callback can still hold the view pointer that
-    // EnsureShared cached; unmapping it here would turn either into an access to
-    // a freed view. A re-enable re-initialises this same pinned image and
-    // reuses the pair it already mapped; a different installed version maps its
-    // own handles and leaves the previous image's pair to process exit. The
-    // reset published by PublishInactiveOnUnload is what tells a reader that
-    // this instance is gone, not the handle lifetime. Process exit reclaims
-    // every pair.
-    //
     // The v7 channel is closed, because its objects are named and its records
     // belong to the other process: g_ipc is unmapped and its mapping, mutex and
     // five events are closed once no close hook and no executor dispatch can
     // still be inside them AND the executor's own teardown completed. g_disabled
-    // was set in Wh_ModBeforeUninit and the executor's ready flag was cleared by
+    // was set in RoleBeforeUninit and the executor's ready flag was cleared by
     // StopExecutorWorker, so neither a new close decision nor a queued command
     // reaches the channel; g_closeCalls names the frames that are already inside.
     //

@@ -1,7 +1,7 @@
 # Lifetime — pin, instance guard, counted entries, quiescence
 
 > 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
-> Part of [docs/README.md](README.md). The bridge's `Hide` drain this depends on is in [ipc.md](ipc.md).
+> Part of [docs/README.md](README.md). The close-hook drain this depends on is in [ipc.md](ipc.md).
 
 ## The two prerequisites of `Wh_ModInit`
 
@@ -120,9 +120,9 @@ not been destroyed, or a creator is still inside `CreateWindowExW`. A worker tha
 has exited since is joined and its handles closed when the enable asks, and a
 window destroyed since clears the stop target then, so the refusal is not
 permanent. Otherwise `ResetReinitState()` clears `g_disabled`, `g_afterInit`,
-`g_explorerHooked`, `g_closeHookEnabled`, `g_startPointTick`, the executor's
+`g_explorerHooked`, `g_closeHookEnabled`, the executor's
 pending command, press latch, confirmation sequence, accepted sequence, thread
-ids and stop target, reopens window admission, retries a failed gesture mapping,
+ids and stop target, reopens window admission,
 leaves `g_closeCalls` alone, and logs `activation state reset`; a drained unload
 closes the channel before it returns, so a re-enable opens a fresh one.
 `Wh_ModInit` still reuses a channel `g_ipc` already holds instead of mapping a
