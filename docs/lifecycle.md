@@ -49,7 +49,10 @@ Unload stops the module-scan thread (10 s wait), sets the event, waits 10 s for
 the input thread, revokes every XAML delegate on the UI thread and waits for
 that turn, detaches the settle batch's `Completed` handler, and drains every
 counted entry into module code (2 s bound), then frees the composition state
-and the IPC view. A thread or callback that misses its wait leaves every
+and the IPC view. Before any of those steps can return as a residual,
+`Wh_ModUninit` publishes `ipc peer gone` (`peerState=0`): the bridge stops
+intercepting at once, and it does so even when a leaked thread keeps the view
+and the section alive. A thread or callback that misses its wait leaves every
 resource in place and logs `unload residual=...; process must restart to finish
 unloading`; the timed-out thread's handle stays open so a later attempt can
 join it, a joined thread's handle is closed, and the hid-thread case also logs

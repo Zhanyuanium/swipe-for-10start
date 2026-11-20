@@ -15,7 +15,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.2, Start 0.41.0 / bridge 0.22.0)
+## What ships (M3.2, Start 0.42.0 / bridge 0.23.0)
 
 Two mods, one path. `mods/start-menu-legacy-swipe.wh.cpp` runs in
 `StartMenuExperienceHost.exe` and owns the touch gesture, the panel claims, the
@@ -30,6 +30,15 @@ one `intent(seq, kind, trigger, method, flags, open)`; the Start side answers
 (`intent ack`) and publishes `exec show`, or runs the one mirrored close settle
 and then `exec dismiss`. External takeovers (Win+Tab, lock, display change, a
 forwarded modified Win press) publish `intent=external` and are never held.
+
+The bridge intercepts only while the Start side is alive. The bridge creates the
+channel, so a mapped section says nothing about the controller; the Start side
+publishes `peerState` (alive/gone) and a `peerTick` refreshed from its input
+thread at most once per 100 ms, and every consuming hook reads them before any
+decision. A trigger with no live peer logs `own pass trigger=... reason=no-peer`
+(the close intent logs `exec pass hide method=... reason=no-peer`) and calls the
+original, so the shell's own toggle works exactly once. A clean disable writes
+`gone` at once; a killed host is caught after 600 ms without a tick.
 
 A press is never lost. The bridge's one dispatch reads the controller's published
 direction: `closing` (a close in flight)
@@ -100,13 +109,14 @@ removes the retired v2 close/retract slots from the header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h` **v5**: one session-local section (736 bytes), seven
+`mods/swipe_ipc_shared.h` **v6**: one session-local section (744 bytes), seven
 named objects (State/Cmd/CmdWrite, Intent/IntentAck, Exec/ExecAck), every record a
 seqlock with its own counter and an `offsetof` assert. The M2 close/retract slots
 are gone; the records are the command, the open generation, the intent and its
-ack, the executor command and its ack, and one controller direction word plus
-the touch flag. `tools/ipc.ps1`
-is the only command publisher and takes the mutex; `-State` reads v5/736.
+ack, the executor command and its ack, one controller direction word plus the
+touch flag, and the liveness pair `peerTick` (732) / `peerState` (736).
+`tools/ipc.ps1` is the only command publisher and takes the mutex; `-State` reads
+v6/744.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
 `initState` are refused, never waited on. Both mods open the channel at
 `Wh_ModInit`, never in a hook.
@@ -127,6 +137,9 @@ is revealed; the button test hovers the bottom edge first, then clicks physical
 
 - One data source per claim: the cloak decides the shell state, the controller's
   published direction decides the toggle, the geometry snapshot decides the mapping.
+- A mapped channel is not a live peer. Interception needs the Start side's
+  `peerState=alive` and a `peerTick` younger than 600 ms; otherwise the shell's
+  own path runs.
 - One mechanism, one log shape. A decision line and an executor line per
   trigger; no per-trigger branch in either mod.
 - A wrong-thread launcher call is not a clean error. Never call from a hook

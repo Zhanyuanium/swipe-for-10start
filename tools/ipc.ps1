@@ -4,8 +4,9 @@
 #          events and mutex `mods/swipe_ipc_shared.h` defines.
 # [OUTPUT]: `pwsh -File tools/ipc.ps1 p=0.5` publishes one command; -State
 #           prints one snapshot of the channel (each record with the sequence it
-#           was copied under) and refuses a section whose initState is not ready
-#           or whose magic, version or layoutBytes is not this header's.
+#           was copied under, plus the controller and peer liveness words) and
+#           refuses a section whose initState is not ready or whose magic,
+#           version or layoutBytes is not this header's.
 # [POS]: replaces writing into the mod's debug.txt from a shell. The offsets
 #        below are the contract in swipe_ipc_shared.h; the mod asserts the same
 #        numbers at compile time, and this tool compares the section's initState,
@@ -35,9 +36,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_v5_State'
-$CommandEventName = 'Local\SwipeFor10Start_v5_Cmd'
-$CommandMutexName = 'Local\SwipeFor10Start_v5_CmdWrite'
+$StateName = 'Local\SwipeFor10Start_v6_State'
+$CommandEventName = 'Local\SwipeFor10Start_v6_Cmd'
+$CommandMutexName = 'Local\SwipeFor10Start_v6_CmdWrite'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -78,8 +79,10 @@ $OffsetExecAckHr = 716
 $OffsetExecAckVisible = 720
 $OffsetControllerDirection = 724
 $OffsetControllerTouch = 728
-$StateVersion = 5
-$StateBytes = 736
+$OffsetPeerTick = 732
+$OffsetPeerState = 736
+$StateVersion = 6
+$StateBytes = 744
 
 function Open-State {
     try {
@@ -212,6 +215,8 @@ if ($State) {
             execAck    = $(if ($execAck) { "command=$($execAck.Value.command) state=$($execAck.Value.state) hr=$($execAck.Value.hr) visible=$($execAck.Value.visible)" } else { 'unstable' })
             controllerDirection = $view.ReadInt32($OffsetControllerDirection)
             controllerTouch     = $view.ReadInt32($OffsetControllerTouch)
+            peerTick            = $view.ReadUInt32($OffsetPeerTick)
+            peerState           = $view.ReadInt32($OffsetPeerState)
         } | Format-List
         $view.Dispose()
     } finally {

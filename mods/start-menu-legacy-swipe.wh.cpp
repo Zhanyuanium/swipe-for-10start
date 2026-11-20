@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.41.0
+// @version         0.42.0
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -832,12 +832,19 @@ Debug channel (kept in the build):
 - The section outlives either process, so both sides record the sequence numbers
   at attach and act only on what is newer: an intent, a command or an open
   generation from a previous process is ignored by its sequence, never served.
-- The v5 section is 736 bytes: the command, the open generation, the intent and
-  its ack, the executor command and its ack, and the controller direction. Every
-  record is a seqlock, so the bridge never reads a half-written intent, command
-  or open generation, and this side never reads half a command. The command
-  record is also serialised by a named mutex, because more than one tool can
-  publish into it.
+- The v6 section is 744 bytes: the command, the open generation, the intent and
+  its ack, the executor command and its ack, the controller direction and touch
+  flag, and the peer liveness pair. Every record is a seqlock, so the bridge
+  never reads a half-written intent, command or open generation, and this side
+  never reads half a command. The command record is also serialised by a named
+  mutex, because more than one tool can publish into it.
+- The liveness pair is the bridge's interception precondition. This side
+  publishes `peerState=alive` with a fresh `peerTick` once the channel is open,
+  the input thread refreshes the tick from its idle tick and from every
+  positioned report at most once per 100 ms, and `Wh_ModUninit` publishes
+  `gone` before it releases the view. The bridge creates the section, so a
+  mapped channel never proves this side is running; `gone` makes a clean disable
+  immediate, and the tick going older than 600 ms covers a killed host.
 - The files this channel replaced (`debug.txt`, `close-mode.txt`,
   `retract-plan.txt`) are deleted at init; they are transport, not state, and a
   leftover would invite a reader that no longer exists.
@@ -916,6 +923,7 @@ Diagnostics:
   `debug e=...`, `debug anim=...`,
   `ipc open created=... cmd=...`,
   `ipc open failed err=...`, `ipc legacy files removed=...`,
+  `ipc peer alive` (the bridge may intercept), `ipc peer gone` (it must pass),
   `gesture geometry updated axis=... dist=...` (or
   `gesture geometry axis=... dist=... (unchanged)` once per open),
   `gesture geometry deferred reason=panel-owned gen=...` (a layout change that
@@ -1154,9 +1162,10 @@ Known risks:
  *   OnGlobalAnimationRequested and its three argument getters), Raw Input
  *   (RegisterRawInputDevices/GetRawInputData/GetRawInputDeviceInfoW) for the
  *   digitizer, the window and DWM APIs for geometry/layout, the composition
- *   Visual/Element APIs for Progress, and swipe_ipc_shared.h v5 for the intents,
- *   executor commands/acks, open generation and controller direction. The bridge is
- *   the only launcher caller; this mod never loads twinui.pcshell.dll.
+ *   Visual/Element APIs for Progress, and swipe_ipc_shared.h v6 for the intents,
+ *   executor commands/acks, open generation, controller direction and peer
+ *   liveness. The bridge is the only launcher caller; this mod never loads
+ *   twinui.pcshell.dll.
  * [OUTPUT]: the panel's Progress through the one damped-spring settle, the
  *   reveal/dismiss follows, the coast, the geometry snapshot (axis, band,
  *   panel trail, distance), the scroll survey and gate, and the renderer.
@@ -1182,7 +1191,10 @@ Known risks:
  *   so the digitizer's pause does not drop the contact. One decision line and
  *   one executor line per trigger. The image is pinned, the instance
  *   guard names the PID, the input thread is stop-event driven, the XAML
- *   delegates are revoked at unload with the residual rules.
+ *   delegates are revoked at unload with the residual rules. The input thread
+ *   also publishes peer liveness (`peerTick` at most once per 100 ms from its
+ *   idle tick and every positioned report, `peerState=gone` at unload), which is
+ *   the bridge's interception precondition.
  * [POS]: the StartMenuExperienceHost side of the pair: it owns the touch gesture
  *   and the panel's motion, and it is the only process that can plan the settle
  *   (the travel belongs to the panel). The bridge owns the launcher call and the
@@ -3873,10 +3885,11 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_v5_Cmd     p=, t=, e=, anim=   (tools -> here)
-//   Local\SwipeFor10Start_v5_Intent  kind, trigger, method, flags, open (bridge)
-//   Local\SwipeFor10Start_v5_Exec    show, dismiss, cancel               (here)
+//   Local\SwipeFor10Start_v6_Cmd     p=, t=, e=, anim=   (tools -> here)
+//   Local\SwipeFor10Start_v6_Intent  kind, trigger, method, flags, open (bridge)
+//   Local\SwipeFor10Start_v6_Exec    show, dismiss, cancel               (here)
 //   ..._State.openSeq                "this is a new menu"               (here)
+//   ..._State.peerTick/peerState     "a controller is here"             (here)
 //
 // Every record is a seqlock: this side bumps the counter to odd, writes, and
 // bumps it to even, so the bridge can never accept a half-written intent, exec
@@ -3890,6 +3903,11 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 // command file did: a command or intent that predates this process belongs to
 // a menu this process never drew. An intent carries the open generation the
 // bridge saw, so a close is tied to the menu it was read for.
+//
+// The liveness pair is not a record: it is two words the bridge polls at a
+// decision, never a seqlock. The bridge creates the section, so peerState is how
+// this side says "the controller is here"; peerTick is the freshness that
+// survives a process kill. See "Peer liveness" in swipe_ipc_shared.h.
 // ---------------------------------------------------------------------------
 
 // The highest sequence this process has acted on. Set from the section at
@@ -3899,6 +3917,40 @@ LONG64 g_ipcCommandSeq = 0;
 // The low 32 bits of the open tick this process last published: input thread
 // only. It names the menu a later open record belongs to; it is not a claim.
 uint32_t g_ipcOpenTickLow = 0;
+
+// The last peer tick this side published, as GetTickCount64's low 32 bits. Set
+// by OpenIpcChannel before the input thread exists and by that thread from then
+// on, so the two writers never overlap. It is the throttle: an idle tick or a
+// report inside the same 100 ms window does not write again.
+uint32_t g_peerTickLast = 0;
+
+// Refreshes the bridge's liveness clock. Called from the input thread's idle
+// tick and from every positioned report, so silence on the digitizer cannot
+// make a live controller look gone; the idle tick alone already proves the
+// thread runs, and a report is the one moment its work is known to be current.
+void PublishPeerTick(uint64_t tickMs) {
+    if (!g_ipc.state) {
+        return;
+    }
+    const uint32_t now = static_cast<uint32_t>(tickMs);
+    if (now - g_peerTickLast < kSwipePeerTickIntervalMs) {
+        return;
+    }
+    g_peerTickLast = now;
+    SwipeIpcPublishPeerTick(&g_ipc, tickMs);
+}
+
+// The last word of a controller that served its last intent. It goes before the
+// view is released, and it also goes on a residual unload, when the view is kept
+// for a thread that is still inside it: the bridge must pass every trigger from
+// then on, whether or not this process finishes unloading.
+void PublishPeerGone() {
+    if (!g_ipc.state) {
+        return;
+    }
+    SwipeIpcSetPeerState(&g_ipc, kSwipePeerGone);
+    FileLog(L"ipc peer gone");
+}
 
 void OpenIpcChannel() {
     bool created = false;
@@ -3913,8 +3965,19 @@ void OpenIpcChannel() {
     // must be newer than anything the previous one could have written.
     g_ipcCommandSeq = SwipeIpcLoad64(&g_ipc.state->cmdSeq);
     g_ipcOpenTickLow = 0;
+
+    // Tick first, then alive: the bridge pairs an alive state with the tick it
+    // reads after it, so it never accepts the previous activation's tick as
+    // this one's. This is the one liveness write that is not throttled: it
+    // starts the window and it is what makes a re-enable immediate.
+    const uint64_t now = GetTickCount64();
+    g_peerTickLast = static_cast<uint32_t>(now);
+    SwipeIpcPublishPeerTick(&g_ipc, now);
+    SwipeIpcSetPeerState(&g_ipc, kSwipePeerAlive);
+
     FileLog(L"ipc open created=%d cmd=%lld", created ? 1 : 0,
             static_cast<long long>(g_ipcCommandSeq));
+    FileLog(L"ipc peer alive");
 }
 
 // Deletes the files this channel used before it moved to shared memory. They
@@ -5567,8 +5630,10 @@ void ResetActivationState() {
     g_animLogCount.store(0, std::memory_order_relaxed);
 
     // No reveal of this activation names a menu any more. The open tick is the
-    // only published identity left; there is no claim record to withdraw.
+    // only published identity left; there is no claim record to withdraw. The
+    // liveness throttle starts over with the next OpenIpcChannel.
     g_ipcOpenTickLow = 0;
+    g_peerTickLast = 0;
 
     EndContactTiming();
     FileLog(L"activation state reset");
@@ -7319,6 +7384,11 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
 // gesture; the idle tick only has to notice the silence, which is measured on
 // the QPC clock because the tick clock is quantised to 15.6 ms.
 void CheckHidIdleRelease(uint64_t tickMs) {
+    // The idle tick is this thread's heartbeat: it runs whether or not a finger
+    // is on the glass, so a live controller never looks stale between gestures.
+    // The throttle makes this one interlocked write per 100 ms at most.
+    PublishPeerTick(tickMs);
+
     HidGestureSession& session = g_hidSession;
     const uint64_t qpcNow = QpcMsNow();
     // One snapshot for the whole tick: the coast, the release and the reveal all
@@ -8349,6 +8419,11 @@ void NoteContactAlive(uint64_t tickMs) {
 // that collection's caps declare.
 void FeedContactPoint(HidDevice& device, long rawX, long rawY, USHORT reportId,
                       USHORT collection, uint64_t tickMs) {
+    // A positioned report is the moment this thread is known to be doing the
+    // work an intent would feed; refresh the bridge's liveness clock here as
+    // well as on the idle tick.
+    PublishPeerTick(tickMs);
+
     const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     if (screenWidth <= 1 || screenHeight <= 1) {
@@ -12396,7 +12471,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.41.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.42.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance
@@ -12644,6 +12719,12 @@ void Wh_ModUninit() {
         Wh_Log(L"Refused instance uninitialized");
         return;
     }
+
+    // The bridge's interception precondition fails here, before anything below
+    // can return as a residual: from this point no intent is consumed, so no
+    // trigger may be swallowed for one. Publishing only the state leaves the
+    // tick as it was; the state alone is the answer.
+    PublishPeerGone();
 
     // A thread that BeforeUninit did not stop is a residual: every resource it
     // can touch stays alive, the handle stays open for a later join, and the log
