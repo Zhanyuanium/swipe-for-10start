@@ -7803,8 +7803,14 @@ void RunPendingCloseTap(uint64_t tickMs) {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
     // The menu this close belongs to. The bridge refuses the record when the
     // section has already moved to a later open, so an old gesture dismiss cannot
-    // hide a newly opened menu.
-    if (!RequestBridgeDismiss(1, GetTickCount64(), g_ipcOpenTickLow)) {
+    // hide a newly opened menu. That identity is the section's open *generation*,
+    // which is what every other producer stamps into the record; the tick this
+    // close was published at is a different quantity and must not be substituted
+    // here.
+    uint64_t openGeneration = 0;
+    uint64_t openTick = 0;
+    SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick);
+    if (!RequestBridgeDismiss(1, GetTickCount64(), openGeneration)) {
         // Nothing can run this dismiss: the window would stay shown over a
         // retracted panel. Give the ownership up now, and the poll's unhealed
         // rule restores the panel once the suppression window ends.
