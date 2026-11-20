@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Decides the shell's Start close from explorer and publishes the live Win10 Start edge-gesture handle and state
-// @version         0.22.0
+// @version         0.23.0
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
@@ -90,8 +90,9 @@ edge, the start point and the gesture state to shared memory:
 A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
 shipping Start mod does not read it. Its live couplings are the intent and its
-ack, the executor command and its ack, the open generation and the controller
-direction, all in `Local\SwipeFor10Start_v5_*` (see `swipe_ipc_shared.h`).
+ack, the executor command and its ack, the open generation, the controller
+direction and the Start side's liveness, all in
+`Local\SwipeFor10Start_v6_*` (see `swipe_ipc_shared.h`).
 
 
 Hooked functions are forwarded unchanged except for the triggers above: the bare
@@ -132,11 +133,14 @@ Notes:
   the decision hooks (the primitives, the Win key and the Start button) are not
   installed and every unverified close passes to the shell. The installed close
   hook then answers `Unknown` for every caller and never animates one.
-- Input is intercepted only while a controller is attached and the executor
-  worker runs. With no channel or a failed worker startup, every trigger is
-  forwarded to the shell unchanged and logged as
-  `own pass trigger=... reason=...`; nothing is swallowed for a command nobody
-  would execute.
+- Input is intercepted only while the Start side is alive, its liveness tick is
+  younger than 600 ms, and the executor worker runs. The bridge creates the
+  channel, so a mapped section proves nothing by itself: with the Start mod
+  disabled the section is still live. Every trigger is then forwarded to the
+  shell unchanged and logged as `own pass trigger=... reason=no-peer` (or
+  `reason=no-executor`/`no-window` for a failed worker or window); nothing is
+  swallowed for a command nobody would execute. A clean disable publishes
+  `peerState=gone` at once; a killed host is caught when its tick goes stale.
 - Hooks are installed only after `twinui.pcshell.dll` is loaded, via a
   `LoadLibraryExW` hook plus the module check in `Wh_ModAfterInit`.
 - The sequence field is a seqlock: a reader must retry when it is odd or when
@@ -154,7 +158,7 @@ Notes:
   `activation state reset` when a re-enable re-initialises the pinned image (a
   refused one logs `mod init refused: ...` and installs nothing instead), and
   one `intent kind=... trigger=... seq=... open=...` line per decision.
-- The two channels have two lifetimes. The v5 channel (the section mapping and
+- The two channels have two lifetimes. The v6 channel (the section mapping and
   view, the mutex and the five events) is closed when the mod is disabled, and
   only then: the disable flag keeps new closes out of it, and the unload waits
   for every close that already entered to leave before it closes anything. That
@@ -287,9 +291,9 @@ The decision and the executor:
  *   Show/Hide for the observation lines. The launcher thread is the thread that
  *   runs OnHotkeyInvoke (measured tid=7108); the taskbar thread is a different
  *   thread and a show there fail-fasts explorer (measured). Also depends on
- *   swipe_ipc_shared.h v5 for the intent/ack, executor command/ack, open
- *   generation and controller direction, and on start_gesture_shared.h for the
- *   diagnostic animation ids.
+ *   swipe_ipc_shared.h v6 for the intent/ack, executor command/ack, open
+ *   generation, controller direction and peer liveness, and on
+ *   start_gesture_shared.h for the diagnostic animation ids.
  * [OUTPUT]: the hidden executor window WindhawkSwipeExecutor_<WndProc> on the
  *   launcher thread, fed by a worker on the Exec event; every command logs an
  *   `exec show`, `exec dismiss` or `exec visible` line with the sequence and the
@@ -307,8 +311,9 @@ The decision and the executor:
  *   the controller owns: a gesture close retracts the panel with the cloak still
  *   open and the state still 5 until the executor's Dismiss, which is why the
  *   controller publishes closing at the close's start. Input is intercepted only
- *   while the channel is open and the executor worker runs; otherwise every
- *   trigger passes to the shell (`own pass trigger=... reason=...`). A press is
+ *   while the Start side is alive (its published tick younger than 600 ms) and
+ *   the executor worker runs; otherwise every trigger passes to the shell
+ *   (`own pass trigger=... reason=no-peer|no-executor|no-window`). A press is
  *   never lost: a hide in flight (state 9/11) or a dismiss already armed is
  *   latched (one slot, tick) and served as the same open intent 50 ms after the
  *   hidden event (`own press served wait=...`); the deferral keeps the show off
@@ -322,7 +327,7 @@ The decision and the executor:
  *   swallowed only while the controller owns the panel and only as a duplicate
  *   (method 16/other dismiss); the opening touch's click-away is swallowed while
  *   `controllerTouch`. External takeovers (Win+Tab, lock/display, a forwarded
- *   modified press) publish `intent=external` and pass at once. The v5 channel
+ *   modified press) publish `intent=external` and pass at once. The v6 channel
  *   closes on unload after the worker is joined and the window and its timers
  *   are gone, at counted quiescence (`ipc unload drained`); the process-lifetime
  *   gesture mapping is kept for its independent consumer.
@@ -601,7 +606,7 @@ std::atomic<bool> g_disabled{false};
 std::atomic<bool> g_closeHookEnabled{false};
 // Close-hook frames currently inside, entry to exit: the decision hook's
 // HideStartAndCortana and the observation hook's Hide. Wh_ModUninit closes the
-// v5 channel only when this is zero, and Wh_ModInit refuses to re-activate this
+// v6 channel only when this is zero, and Wh_ModInit refuses to re-activate this
 // image while it is not. It is a lifetime guard for that channel, not a barrier
 // between two closes: it answers "is a close still inside", never "this close
 // runs after that one".
@@ -1639,11 +1644,22 @@ void OwnEventHidden() {
     }
 }
 
-// Input may be intercepted only while a controller is attached and the executor
-// that carries its command is running. Without both, the intent would be
-// swallowed with nobody to decide it, and a command the controller published
-// would have no thread to run it. Every trigger then falls through to the
-// shell's own path, which is what "no channel" has always meant.
+// The Start side's liveness. This process creates the channel and keeps it
+// mapped for its whole attachment, so a live section says only that the bridge
+// runs; with the Start mod disabled the section is still there, and a gate that
+// reads only the channel decides for a controller that is not listening. The
+// published pair is the real signal: the state is alive and the tick is younger
+// than the window. The window is six 100 ms refreshes: five consecutive
+// refreshes may be missed without closing the gate, so a settle or a busy
+// message loop is not mistaken for a dead controller, while a killed host
+// restores the shell's own toggle within 0.6 s.
+bool PeerAliveNow() {
+    return SwipeIpcPeerAlive(&g_ipc, GetTickCount64(), kSwipePeerStaleMs);
+}
+
+// The executor half of the gate: the worker that turns a command into a
+// launcher call. Without it, a command the controller publishes would have no
+// thread to run it.
 bool BridgeCanServe() {
     return g_ipc.state != nullptr &&
            g_execReady.load(std::memory_order_acquire) &&
@@ -1651,15 +1667,20 @@ bool BridgeCanServe() {
            !g_initRefused.load(std::memory_order_relaxed);
 }
 
-// The one gate every decision hook takes before it reads the panel: is there a
-// controller and a worker, and does this thread own the executor window? The
-// window is created here, on a known launcher entry, and never from the
-// library-load hook or the worker's wait loop. Creating it takes no wait, so
+// The one gate every decision hook takes before it reads the panel. The peer is
+// first: without a live controller an intent has no consumer, so deciding would
+// only delay the shell's own toggle. Then a started worker, and a window on this
+// thread. The window is created here, on a known launcher entry, and never from
+// the library-load hook or the worker's wait loop. Creating it takes no wait, so
 // this is safe inside the hook.
 bool BridgeCanServeOnLauncherThread(const wchar_t* trigger) {
+    if (!PeerAliveNow()) {
+        // No controller: the caller forwards to the shell. One line per press
+        // names the trigger and says why nothing was decided.
+        FileLog(L"own pass trigger=%s reason=no-peer", trigger);
+        return false;
+    }
     if (!BridgeCanServe()) {
-        // No controller or no executor: the caller forwards to the shell. One
-        // line per press names the trigger and says why nothing was decided.
         FileLog(L"own pass trigger=%s reason=no-executor", trigger);
         return false;
     }
@@ -1703,6 +1724,16 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         }
         FileLog(L"exec pass hide method=%u state=%u reason=executor", method,
                 execState);
+        callOriginal();
+        OwnResyncFromState(self);
+        return;
+    }
+
+    if (!PeerAliveNow()) {
+        // No controller to consume a close intent: publishing one would leave
+        // the panel shown with nobody to settle or dismiss it. The shell's own
+        // close runs instead, exactly as it would with no channel at all.
+        FileLog(L"exec pass hide method=%u reason=no-peer", method);
         callOriginal();
         OwnResyncFromState(self);
         return;
@@ -3506,7 +3537,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.22.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.23.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
@@ -3621,7 +3652,7 @@ void Wh_ModBeforeUninit() {
     // This must be set before Windhawk removes the hooks. Every hook and the
     // executor's WndProc reads it: a close or a dispatch that enters after this
     // point skips the channel, and one that is already inside holds its lease
-    // until it returns. The v5 channel is closed in Wh_ModUninit, after that flag
+    // until it returns. The v6 channel is closed in Wh_ModUninit, after that flag
     // and after the drain.
     g_disabled = true;
     g_startPointTick.store(0, std::memory_order_relaxed);
@@ -3658,7 +3689,7 @@ void Wh_ModUninit() {
     // this instance is gone, not the handle lifetime. Process exit reclaims
     // every pair.
     //
-    // The v5 channel is closed, because its objects are named and its records
+    // The v6 channel is closed, because its objects are named and its records
     // belong to the other process: g_ipc is unmapped and its mapping, mutex and
     // five events are closed once no close hook and no executor dispatch can
     // still be inside them. g_disabled was set in Wh_ModBeforeUninit and the

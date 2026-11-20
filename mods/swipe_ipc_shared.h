@@ -9,18 +9,18 @@
 // Shared-memory contract between the StartMenuExperienceHost-side controller and
 // the explorer-side bridge.
 //
-// Two processes, one session-local section, five auto-reset events, one
+// Two processes, one session-local section, four auto-reset events, one
 // manual-reset command event and one mutex. There is no file and no polling:
 // every record carries its own sequence number, and a reader accepts a record
 // only when that number did not move while the record was being copied.
 //
-//   Local\SwipeFor10Start_v5_State        SwipeIpcState
-//   Local\SwipeFor10Start_v5_Cmd          manual-reset, tools -> Start
-//   Local\SwipeFor10Start_v5_CmdWrite     mutex,         one command writer
-//   Local\SwipeFor10Start_v5_Intent       auto-reset,   bridge -> Start
-//   Local\SwipeFor10Start_v5_IntentAck    auto-reset,   Start -> bridge
-//   Local\SwipeFor10Start_v5_Exec         auto-reset,   Start -> bridge
-//   Local\SwipeFor10Start_v5_ExecAck      auto-reset,   bridge -> Start
+//   Local\SwipeFor10Start_v6_State        SwipeIpcState
+//   Local\SwipeFor10Start_v6_Cmd          manual-reset, tools -> Start
+//   Local\SwipeFor10Start_v6_CmdWrite     mutex,         one command writer
+//   Local\SwipeFor10Start_v6_Intent       auto-reset,   bridge -> Start
+//   Local\SwipeFor10Start_v6_IntentAck    auto-reset,   Start -> bridge
+//   Local\SwipeFor10Start_v6_Exec         auto-reset,   Start -> bridge
+//   Local\SwipeFor10Start_v6_ExecAck      auto-reset,   bridge -> Start
 //
 // The names are session-local because both processes run as the same user in the
 // same session. The version is part of every name, so a layout change is a new
@@ -106,30 +106,40 @@
 // controllerDirection is the whole decision: the bridge reads that single word,
 // never a pair of flags, so it cannot see new ownership beside a stale phase.
 // Values: kSwipeDirectionUnowned / Open / Closing.
+//
+// Peer liveness (Start -> bridge): peerState and peerTick. The bridge creates
+// the section, so a mapped section says nothing about whether the Start side
+// is running; this pair is the answer the bridge's interception gate needs.
+// peerState is alive after a successful init and gone when the Start mod
+// unloads; peerTick is the low 32 bits of GetTickCount64, refreshed from the
+// Start side's input thread at most once per kSwipePeerTickIntervalMs. The
+// bridge intercepts only while the state is alive and the tick is younger than
+// kSwipePeerStaleMs: a clean disable is immediate through peerState, and a
+// crashed host is caught by the tick going stale.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_v5_State";
+    L"Local\\SwipeFor10Start_v6_State";
 constexpr wchar_t kSwipeIpcCommandEventName[] =
-    L"Local\\SwipeFor10Start_v5_Cmd";
+    L"Local\\SwipeFor10Start_v6_Cmd";
 constexpr wchar_t kSwipeIpcCommandMutexName[] =
-    L"Local\\SwipeFor10Start_v5_CmdWrite";
+    L"Local\\SwipeFor10Start_v6_CmdWrite";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_v5_Intent";
+    L"Local\\SwipeFor10Start_v6_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_v5_IntentAck";
+    L"Local\\SwipeFor10Start_v6_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_v5_Exec";
+    L"Local\\SwipeFor10Start_v6_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_v5_ExecAck";
+    L"Local\\SwipeFor10Start_v6_ExecAck";
 
 constexpr uint32_t kSwipeIpcMagic = 0x53313053;  // 'S' '0' '1' 'S', LE
-// v5 replaces v4's `controllerOwning` + `controllerPhase` pair with one
-// direction word and drops `controllerOpen`, which no reader used. That changes
-// both the meaning of the tail and the section size (744 -> 736), so the version
-// is bumped deliberately and stays part of every object name: a v4 section left
-// by an older build is a different channel, and `layoutBytes` refuses it if one
-// is ever handed over anyway.
-constexpr uint32_t kSwipeIpcVersion = 5;
+// v6 adds the Start side's liveness pair (`peerTick`, `peerState`) at the tail.
+// v5 replaced v4's `controllerOwning` + `controllerPhase` pair with one
+// direction word and dropped `controllerOpen`, which no reader used. Each change
+// moves the section size, so the version is bumped deliberately and stays part
+// of every object name: a v5 section left by an older build is a different
+// channel, and `layoutBytes` refuses it if one is ever handed over anyway.
+constexpr uint32_t kSwipeIpcVersion = 6;
 
 // One command per line, in the same syntax `docs/ipc.md` documents.
 constexpr size_t kSwipeIpcCommandMaxBytes = 512;
@@ -174,6 +184,20 @@ constexpr ULONGLONG kSwipeIpcOpenBudgetMs =
 // nanoseconds; a writer that is preempted mid-record fails these attempts and
 // the caller falls back instead of spinning.
 constexpr int kSwipeIpcReadAttempts = 8;
+
+// Peer liveness. The publisher refreshes peerTick at most once per interval; the
+// reader declares the peer gone after the window without a refresh. The window
+// is six intervals: five consecutive refreshes may be missed without closing the
+// gate, so an ordinary stall of the input thread (a settle, a busy message loop)
+// does not flap it, while a killed Start host stops every interception within
+// 0.6 s.
+constexpr uint32_t kSwipePeerTickIntervalMs = 100;
+constexpr uint32_t kSwipePeerStaleMs = 600;
+
+// peerState values. A fresh section reads 0, so `gone` is also what the bridge
+// finds before the Start side ever attaches.
+constexpr int32_t kSwipePeerGone = 0;
+constexpr int32_t kSwipePeerAlive = 1;
 
 // The layout is written once, here, and both sides include this header.
 // Windhawk compiles each mod from stdin against the repository include path, and
@@ -247,6 +271,11 @@ struct SwipeIpcState {
     // shell's click-away from that same opening contact; it is the finger that
     // pulled the menu out, not a press outside it.
     volatile LONG controllerTouch;
+    // v6: the Start side's liveness. peerTick is the low 32 bits of
+    // GetTickCount64, so the reader compares by unsigned difference and a wrap
+    // after 49.7 days is not a discontinuity. peerState is kSwipePeer*.
+    volatile LONG peerTick;
+    volatile LONG peerState;
 };
 
 static_assert(offsetof(SwipeIpcState, magic) == 0, "layout");
@@ -287,7 +316,9 @@ static_assert(offsetof(SwipeIpcState, execAckHr) == 716, "layout");
 static_assert(offsetof(SwipeIpcState, execAckVisible) == 720, "layout");
 static_assert(offsetof(SwipeIpcState, controllerDirection) == 724, "layout");
 static_assert(offsetof(SwipeIpcState, controllerTouch) == 728, "layout");
-static_assert(sizeof(SwipeIpcState) == 736, "layout");
+static_assert(offsetof(SwipeIpcState, peerTick) == 732, "layout");
+static_assert(offsetof(SwipeIpcState, peerState) == 736, "layout");
+static_assert(sizeof(SwipeIpcState) == 744, "layout");
 
 struct SwipeIpcChannel {
     SwipeIpcState* state;
@@ -866,5 +897,52 @@ inline bool SwipeIpcControllerTouch(SwipeIpcChannel* channel) {
     return channel->state &&
            InterlockedCompareExchange(&channel->state->controllerTouch, 0,
                                       0) != 0;
+}
+
+// ---------------------------------------------------------------------------
+// Peer liveness (Start -> bridge)
+// ---------------------------------------------------------------------------
+
+// The Start side's input thread refreshes this from its idle tick and from every
+// positioned report, throttled by kSwipePeerTickIntervalMs. The bridge never
+// writes either word.
+inline void SwipeIpcPublishPeerTick(SwipeIpcChannel* channel, uint64_t tickMs) {
+    if (channel->state) {
+        InterlockedExchange(
+            &channel->state->peerTick,
+            static_cast<LONG>(static_cast<uint32_t>(tickMs)));
+    }
+}
+
+// `alive` must follow a fresh tick. The reader pairs an alive state with the
+// tick it reads after it, so the previous activation's tick is never accepted as
+// this one's.
+inline void SwipeIpcSetPeerState(SwipeIpcChannel* channel, int32_t state) {
+    if (channel->state) {
+        InterlockedExchange(&channel->state->peerState, state);
+    }
+}
+
+// True while the Start side is attached and its tick is younger than `staleMs`.
+// The state is read on both sides of the tick: the publisher writes the tick
+// before it publishes alive, so a tick read after an alive state is this
+// activation's, and a `gone` that lands during the read is not missed.
+inline bool SwipeIpcPeerAlive(SwipeIpcChannel* channel, uint64_t nowMs,
+                              uint32_t staleMs) {
+    if (!channel->state) {
+        return false;
+    }
+    if (InterlockedCompareExchange(&channel->state->peerState, 0, 0) !=
+        kSwipePeerAlive) {
+        return false;
+    }
+    const uint32_t tick = static_cast<uint32_t>(
+        InterlockedCompareExchange(&channel->state->peerTick, 0, 0));
+    if (InterlockedCompareExchange(&channel->state->peerState, 0, 0) !=
+        kSwipePeerAlive) {
+        return false;
+    }
+    const uint32_t now = static_cast<uint32_t>(nowMs);
+    return now - tick < staleMs;
 }
 

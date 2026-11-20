@@ -1,35 +1,40 @@
-# IPC — the v5 channel
+# IPC — the v6 channel
 
-> Start 0.41.0 / bridge 0.22.0. One session-local section, seven named objects,
+> Start 0.42.0 / bridge 0.23.0. One session-local section, seven named objects,
 > every record a seqlock. There is no file and no polling on either side.
 
 ## Names and layout
 
 ```
-Local\SwipeFor10Start_v5_State        SwipeIpcState (736 bytes, v5)
-Local\SwipeFor10Start_v5_Cmd          manual-reset, tools -> Start
-Local\SwipeFor10Start_v5_CmdWrite     mutex, one command writer
-Local\SwipeFor10Start_v5_Intent       auto-reset, bridge -> Start
-Local\SwipeFor10Start_v5_IntentAck    auto-reset, Start -> bridge
-Local\SwipeFor10Start_v5_Exec         auto-reset, Start -> bridge
-Local\SwipeFor10Start_v5_ExecAck      auto-reset, bridge -> Start
+Local\SwipeFor10Start_v6_State        SwipeIpcState (744 bytes, v6)
+Local\SwipeFor10Start_v6_Cmd          manual-reset, tools -> Start
+Local\SwipeFor10Start_v6_CmdWrite     mutex, one command writer
+Local\SwipeFor10Start_v6_Intent       auto-reset, bridge -> Start
+Local\SwipeFor10Start_v6_IntentAck    auto-reset, Start -> bridge
+Local\SwipeFor10Start_v6_Exec         auto-reset, Start -> bridge
+Local\SwipeFor10Start_v6_ExecAck      auto-reset, bridge -> Start
 ```
 
-`kSwipeIpcMagic = 0x53313053` (`S01S`), `kSwipeIpcVersion = 5`. The names carry
+`kSwipeIpcMagic = 0x53313053` (`S01S`), `kSwipeIpcVersion = 6`. The names carry
 the version, so a layout change is a new channel, never a silent mismatch. Every
 field's offset is pinned by a `static_assert` in `mods/swipe_ipc_shared.h`;
 `layoutBytes` publishes `sizeof(SwipeIpcState)` and a reader that sees a different
 value refuses with `ERROR_INVALID_DATA` instead of reading a foreign layout.
 
-**v5 replaces v4's controller words.** v4 published `controllerOwning` and
+**v6 adds the Start side's liveness pair.** `peerTick` and `peerState` extend the
+tail (736 -> 744). The bridge creates the section, so a mapped channel is not
+evidence that the Start side runs; this pair is the precondition every
+interception reads. It is not a seqlock: two independent words, written by the
+Start side only, read as one liveness answer (see "Peer liveness" below).
+
+**v5 replaced v4's controller words.** v4 published `controllerOwning` and
 `controllerPhase` as separate atomics, so a bridge reader could see new ownership
-with the previous phase and read a close in flight as an open. v5 publishes one
+with the previous phase and read a close in flight as an open. v5 published one
 `controllerDirection` word (`0` unowned, `1` open, `2` closing) that both sides
-read and write, and drops `controllerOpen`, which no reader used. That changes
-the tail's meaning and the section size (744 -> 736), so the version is bumped
-deliberately and the section is a different channel: a v4 section left by an
-older pair is refused by `layoutBytes`, not misread. The M2 close/retract slots
-are still **gone** (v3 reserved them; v4 removed them). The layout is:
+read and write, and dropped `controllerOpen`, which no reader used. That changed
+the tail's meaning and the section size (744 -> 736), so the version was bumped
+deliberately. The M2 close/retract slots are still **gone** (v3 reserved them;
+v4 removed them). The layout is:
 
 ```
 0    magic           4    version
@@ -48,7 +53,8 @@ are still **gone** (v3 reserved them; v4 removed them). The layout is:
 716  execAckHr       720  execAckVisible
 724  controllerDirection
 728  controllerTouch
-size 736
+732  peerTick         736  peerState
+size 744
 ```
 
 ## Seqlocks
@@ -113,8 +119,39 @@ before its dismiss is requested republishes `1` at the cancel. The bridge reads
 that single word: `2` makes a press a reopen, `1` makes it a close, and `0` falls
 back to the shell's cloak and internal state. A hide in flight (9/11) or an armed
 executor dismiss still latches the press instead of publishing into a no-op show.
-`controllerTouch` is the only reason a `HideStartAndCortana(7)` is not published
-as a close.
+`controllerTouch` is the only trigger-level reason a `HideStartAndCortana(7)`
+is not published as a close; the peer gate sits before every close intent, so a
+call with no live controller passes to the shell instead.
+
+### Peer liveness — Start -> bridge
+
+| Field | Meaning |
+|---|---|
+| `peerTick` | low 32 bits of the Start side's `GetTickCount64`, refreshed from its input thread |
+| `peerState` | `1` alive after a successful init, `0` gone when the Start mod unloads |
+
+The bridge creates the section, so the channel stays mapped and valid while the
+bridge runs even with the Start mod disabled. `peerState` is the controller's
+answer to "am I here"; `peerTick` is the freshness that survives a host kill.
+The bridge intercepts a trigger only while `peerState == 1` and
+`(uint32_t)now - peerTick < kSwipePeerStaleMs` (600 ms); otherwise it logs one
+`own pass trigger=... reason=no-peer` line and calls the shell's own path. The
+close intent at `HideStartAndCortana` logs `exec pass hide method=... reason=no-peer`
+and passes the same way.
+
+The Start side's `OpenIpcChannel` writes a fresh tick and then `alive`, so a
+reader that sees `alive` never pairs it with the previous activation's tick. The
+input thread refreshes the tick from its 5 ms idle tick and from every positioned
+report, at most once per `kSwipePeerTickIntervalMs` (100 ms). `Wh_ModUninit`
+writes `gone` before it releases the view, and it does so before any residual
+early return: a clean disable is immediate, and a residual unload also stops
+every interception. A killed host leaves `alive` behind; the tick stops, and the
+gate closes 600 ms later.
+
+The window is six refresh intervals: five consecutive refreshes may be missed
+without closing the gate, so a stalled input thread (a settle, a busy message
+loop) does not flap it, and a kill still restores the shell's own toggle within
+0.6 s.
 
 ## Initialisation
 
@@ -128,16 +165,17 @@ mods call it at `Wh_ModInit`, never in a hook.
 
 A reinstall maps a new image at a new base while the old one stays pinned. The
 new image opens the same section; the old image's handles are closed by its
-unload. The section's `layoutBytes` is the guard: a new 736-byte build refuses a
-v4 (744), a v3 (840) or a v2 (664) section an old build may still hold, logs
-`ipc open failed err=13` (`ERROR_INVALID_DATA`), and attaches on the next
-reload once the old handles are gone. Measured: install Start first, then the
-bridge; if the bridge still holds the old section, one reload of the Start mod
-attaches it.
+unload. The names carry the version, so a v6 build opens its own section and
+leaves a v5 (736 bytes) one to the old pair. If a section of another layout is
+handed over anyway, `SwipeIpcOpen` refuses it with `ipc open failed err=13`
+(`ERROR_INVALID_DATA`): `version` must be 6 and `layoutBytes` 744. A v4 section
+was also 744 bytes, so the version word, not the size, separates the two.
+Measured on the v5 upgrade: install Start first, then the bridge; a bridge that
+still held the old section was one Start reload behind.
 
 ## The debug command
 
-`Local\SwipeFor10Start_v5_Cmd` is the only command path: `tools/ipc.ps1` takes
+`Local\SwipeFor10Start_v6_Cmd` is the only command path: `tools/ipc.ps1` takes
 the mutex, writes one line, sets the event. The Start side's input thread takes
 it (`SwipeIpcTakeCommand`) and applies the documented debug lines. Nothing
 polls.

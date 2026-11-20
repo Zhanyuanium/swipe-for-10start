@@ -1,7 +1,7 @@
 # M3.2 architecture — one controller, one executor
 
-> L3-level design record. Start **0.41.0**, bridge **0.22.0**, channel **v5 /
-> 736 B**. The measured evidence is quoted with the build and the layout it came
+> L3-level design record. Start **0.42.0**, bridge **0.23.0**, channel **v6 /
+> 744 B**. The measured evidence is quoted with the build and the layout it came
 > from; everything below was run on this machine. **Layouts:** *auto-hidden* =
 > work `0,0,1440,900`, the bar off screen, band `804..900`, panel
 > `236,265..1229,840`, trail 265, Distance 852 (current). *Docked* = work
@@ -11,11 +11,11 @@
 
 Two Windhawk mods:
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.41.0) runs in
+- `mods/start-menu-legacy-swipe.wh.cpp` (0.42.0) runs in
   `StartMenuExperienceHost.exe`. It owns the touch gesture, the claim on
   `Progress`, the settle planner, the gates and the decision state. It consumes
-  bridge intents and publishes executor commands.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.22.0) runs in
+  bridge intents, publishes executor commands, and publishes its own liveness.
+- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.23.0) runs in
   `explorer.exe`. It turns the Win key, the Start button and the click-away into
   intents, and executes the Start side's `show`/`dismiss`/`cancel` commands on
   the launcher's own thread. It also swallows the shell's own duplicate
@@ -109,6 +109,22 @@ the executor's `Dismiss` runs. Reading the shell there made a press during the
 retract a second close, and the owner's press did nothing. No trigger has its
 own branch.
 
+**The interception precondition is the peer, not the section.** The bridge
+creates the channel, so a mapped section proves only that the bridge runs: with
+the Start mod disabled the section is still valid and the old gate decided for a
+controller that was not listening. Every consuming hook (`OnHotkeyInvoke`,
+`OnStartButtonPressed`, `Dismiss`, `ShowStartView`, and the close intent at
+`HideStartAndCortana`) reads the Start side's published liveness first:
+`peerState == alive` and the `peerTick` younger than 600 ms. Otherwise it logs
+one `own pass trigger=... reason=no-peer` line (the hide logs
+`exec pass hide method=... reason=no-peer`) and calls the original, so the
+shell's own toggle serves the press exactly once. The Start side refreshes the
+tick from its input thread at most once per 100 ms and publishes `gone` in
+`Wh_ModUninit`; a clean disable is immediate, and a killed host is caught when
+the tick is 600 ms old. 600 ms is six refresh intervals: five may be missed
+without closing the gate, so a busy input thread rides out, and a kill still
+returns the shell's path inside a fraction of a second.
+
 **A press is never lost — cancel, latch, or recover.** A close still settling
 has either a local dismiss slot not yet requested (a gesture close) or an
 executor dismiss armed for a future deadline (an intent close). Only the first
@@ -155,9 +171,10 @@ waits for before the command:
 
 Fallbacks, each logged once:
 
-- no channel, no executor worker or no executor window: the trigger passes
-  through untouched (`own pass trigger=... reason=...`), the shell's own path
-  serves it;
+- no live Start peer, no channel, no executor worker or no executor window: the
+  trigger passes through untouched
+  (`own pass trigger=... reason=no-peer|no-executor|no-window`), the shell's own
+  path serves it;
 - launcher not attached: `exec show`/`exec dismiss` is refused, one repair
   releases the direction entry, `controllerTouch` and the pending open entry, so
   the controller state resyncs from the cloak, and the shell's own gesture opens
@@ -306,12 +323,18 @@ The M2 mechanisms that no longer exist in the shipping path:
   `CloseInFlight` early return that guards the follow, so it could never fire;
   the pull-reopen and the press latch are the reopen paths that remain.
 
-**v5** removes the retired M2 slots from the header: the section is 736 bytes
-and contains only the command, the open generation, the intent and its ack, the
-executor command and its ack, one controller direction word and the touch flag.
-No dead field remains; v5 also replaces v4's owning/phase pair with that one
-word, so the bridge's toggle rule cannot read new ownership beside a stale
-phase.
+**v6** adds the Start side's liveness pair at the tail: `peerTick` at 732
+(GetTickCount64 low bits, refreshed at most once per 100 ms) and `peerState` at
+736 (alive/gone), taking the section from 736 to 744 bytes. It is the bridge's
+interception precondition, described above; it is not a seqlock, because each
+word is a single value written by the Start side and read whole.
+
+**v5** removed the retired M2 slots from the header: the section became 736
+bytes and contained only the command, the open generation, the intent and its
+ack, the executor command and its ack, one controller direction word and the
+touch flag. No dead field remains; v5 also replaced v4's owning/phase pair with
+that one word, so the bridge's toggle rule cannot read new ownership beside a
+stale phase.
 
 ## The accepted cap, restated
 

@@ -13,7 +13,8 @@ published at the close's start), the close cancel/recovery for a press during a
 retract, the press latch for a hide in flight, the click-away guards of an
 opening window, the pull-reopen at a close's landing, the auto-hidden
 timing/interruption chains (docked numbers named as historical), the accepted
-cloak cap, the v5 channel, and the deleted M2 mechanisms.
+cloak cap, the v6 channel, the peer-liveness interception precondition, and the
+deleted M2 mechanisms.
 
 re/: reverse-engineering records, read-only analysis of this build's shell, kept
 because every RVA and prologue check in the mods comes from here. close-decisions.md
@@ -40,8 +41,9 @@ geometry.md: the `GestureGeometry` snapshot and its lock, the panel-trail
 measurement and band, the taskbar axis probe, the deferred measurement, the
 scroll survey, and the measured layouts.
 
-ipc.md: the v5 channel — names, 736-byte layout, seqlocks, open generation,
-intent/ack, executor command/ack, controller direction, init handshake.
+ipc.md: the v6 channel — names, 744-byte layout, seqlocks, open generation,
+intent/ack, executor command/ack, controller direction, peer liveness (tick,
+state, the 600 ms window), init handshake.
 
 lifecycle.md: the pin, the instance guard, the counted entries, the unload
 order and residuals, the re-initialisation and the host's unload boundary.
