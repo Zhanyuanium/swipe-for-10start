@@ -3,7 +3,7 @@
 
 ## Shipping pair
 
-### start-menu-legacy-swipe.wh.cpp (0.40.0, StartMenuExperienceHost.exe)
+### start-menu-legacy-swipe.wh.cpp (0.41.0, StartMenuExperienceHost.exe)
 The controller and the touch gesture. It reads the digitizer through Raw Input
 (the XAML/DirectManipulation sources are empty on this UI), owns the panel's
 `Progress`, plans every settle, and decides the toggle from bridge intents.
@@ -16,20 +16,26 @@ scroll survey and its gate; the unhealed-window rule; the geometry snapshot and
 its lock; the close suppression.
 
 **M3 paths.**
-- `ApplyBridgeIntent` — the only intent consumer. `open` sets
-  `controllerOwning` phase 1; if the window is still shown (`StartWindowIsOpen`)
-  the press cancels the close: `DropPendingCloseTap`, the suppression cleared,
-  and one settle from `TakeProgressNow()` back to 1 (`intent open cancel
-  from=...`); the cancel sets `g_intentCancelPending` for the dismiss-won race.
-  If the window is closed it holds the entry (`RevealEntryProgress`), sets
-  `g_intentOpenActive` and asks for `exec show`. `close` calls
-  `TakeCloseOwnership` (which publishes phase 2 before the settle's first
-  frame), runs `BeginMirrorCloseSettle(TakeProgressNow())` and asks for
-  `exec dismiss` at `settle + 30 ms`; `external` drops the touch state and
-  resyncs from the cloak.
-- `ApplyExecAck` / `CheckExecAckTimeout` — one ack per command; a refused show
-  or a 400 ms silence releases `controllerOwning`/`controllerTouch` and the shell
-  path serves the gesture. A refused mirror close also releases them.
+- `ApplyBridgeIntent` — the only intent consumer. `open` sets the controller's
+  open direction; if the window is still shown (`StartWindowIsOpen`) the press
+  cancels the close: the local dismiss slot is cleared (`ClearLocalCloseTap`), the
+  suppression cleared, and one settle from `TakeProgressNow()` back to 1
+  (`intent open cancel from=...`); the cancel sets `g_intentCancelPending` for the
+  dismiss-won race. If the window is closed it holds the entry
+  (`RevealEntryProgress`), sets `g_intentOpenActive` and asks for `exec show`.
+  `close` cancels both close schedules (`CancelCloseSchedules`: the local slot and
+  the executor command), calls `TakeCloseOwnership` (which publishes the closing
+  direction before the settle's first frame), runs
+  `BeginMirrorCloseSettle(TakeProgressNow())` and asks for `exec dismiss` at
+  `settle + 30 ms`; `external` revokes both schedules and the recovery ticket,
+  clears the suppression, drops the touch state and resyncs from the cloak.
+- `ApplyExecAck` / `CheckExecAckTimeout` — one ack per command. A refused show or
+  a refused/expired dismiss runs `ReleaseExecutorOwnership`, which releases
+  `controllerOwning`, `controllerTouch` and the pending open entry in one step so
+  `owning/open/phase` resync from the cloak; a 400 ms silence does the same from
+  `g_pendingShowUntil` for a show and from `g_pendingDismissExecAt +
+  400 ms` for a dismiss (the deadline the bridge was told to run at). A failed
+  show while a dismiss is pending leaves the close's ownership alone.
 - `StartRevealFollow` — the band show request, once per open
   (`g_intentOpenActive`), sets `controllerTouch` so the 18 ms idle does not end
   the contact while the shell uncloaks.
@@ -38,14 +44,16 @@ its lock; the close suppression.
 - `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
   schedule point, not a Windows-key tap.
 - The pull cancel (`OnHidSampleStep`, a new contact while the dismiss is armed)
-  drops the armed dismiss and republishes phase 1, so a menu that stays open is
-  an owned open again.
+  drops both schedules and republishes the open direction, so a menu that stays
+  open is an owned open again.
 - `win close observed` — after the landing, a pull still down (or a release
   inside the 300 ms window) issues one fresh show and the open adopts it:
   `reveal reopen after close pull=1 late=0 entry=...`. The pull that was under
-  the close is the pull that takes the menu back. If the flag says an open
+  the close is the pull that takes the menu back. If the ticket says an open
   cancelled a close that still landed, the landing reissues that open
-  (`intent open recovered entry=...`).
+  (`intent open recovered entry=...`). Both landing opens run the one
+  `BeginLandingOpen` transaction; the pull keeps its precedence and marks the
+  touch.
 - The 18 ms idle is held through a touch show and through a close in flight, so
   the digitizer's pause during the key/hide cannot drop the contact.
 
