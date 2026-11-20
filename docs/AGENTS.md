@@ -5,17 +5,21 @@ The project's memory: what was measured, what was falsified, and why each
 decision was taken. The user-facing quick start is `../README.md` /
 `../README.zh-CN.md`.
 
-architecture.md: M3.2, the shipping design. The launcher read (`s_pLauncher`
-outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`),
+architecture.md: M3.3, the shipping design. The launcher read (`s_pLauncher`
+outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`
+checked again at the post-call resync),
 the executor thread (the `OnHotkeyInvoke` thread, not the taskbar thread), the
-window-creation/shutdown protocol and the deferred unload, one
+window-creation/shutdown protocol with the creator-before-HWND reaper order and
+the private teardown, one
 decision/one executor per trigger, the controller-direction toggle rule (closing
 published at the close's start), the close cancel/recovery for a press during a
-retract, the bounded press latch for a hide in flight, the click-away guards of an
-opening window, the pull-reopen at a close's landing, the command-expiry rule, the
+retract (the ticket only for a published command, bounded by its deadline), the
+bounded press latch for a hide in flight, the click-away guards of an
+opening window, the pull-reopen at a close's landing, the command-expiry rule
+(one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
 auto-hidden timing/interruption chains (docked numbers named as historical), the
-accepted cloak cap, the v7 channel, the peer-liveness/interception capability
-precondition, and the deleted M2 mechanisms.
+accepted cloak cap, the v7 channel, the intent-consumer readiness/interception
+capability precondition, and the deleted M2 mechanisms.
 
 re/: reverse-engineering records, read-only analysis of this build's shell, kept
 because every RVA and prologue check in the mods comes from here. close-decisions.md

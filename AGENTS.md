@@ -15,7 +15,7 @@ README.zh-CN.md - the Chinese page of the user-facing quick start
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.2, Start 0.43.0 / bridge 0.24.0)
+## What ships (M3.3, Start 0.44.0 / bridge 0.25.0)
 
 Two mods, one path. `mods/start-menu-legacy-swipe.wh.cpp` runs in
 `StartMenuExperienceHost.exe` and owns the touch gesture, the panel claims, the
@@ -36,15 +36,20 @@ channel, so a mapped section says nothing about the controller; the Start side
 publishes `peerEpoch` (its activation identity, claimed at attach), `peerState`
 (alive/gone) and `peerTick` (refreshed from its input thread at most once per
 100 ms), and every consuming hook reads them before any decision. Availability is
-published **from the ready consumer** — the input thread, once its window and
-registrations exist — and withdrawn before that thread is stopped and again as it
-leaves; the withdrawal also resets the shared direction and touch, so a kill while
-`closing` cannot be read as the next activation's decision. A trigger with no live
-peer logs `own pass trigger=... reason=no-peer` (the close intent logs
-`exec pass hide method=... reason=no-peer`) and calls the original, so the shell's
-own toggle works exactly once. A few presses during a start or a stop are served
-natively; that is the intended trade. 600 ms is a detection budget, not a delivery
-guarantee.
+published **from the ready consumer** — the input thread, once its window, its
+message loop and its intent event exist — and withdrawn before that thread is
+stopped and again as it leaves; the withdrawal also resets the shared direction and
+touch, so a kill while `closing` cannot be read as the next activation's decision.
+Readiness is *intent-consumer readiness*: a refused raw-input registration is
+logged (`hid reg ... ok=0`) and reported as `touch=`/`pen=` on the alive line, but
+it does not withdraw the intent half the interception needs. Publication and the
+terminal withdrawal share one critical section; a flag check followed by an
+independent store let the startup write `alive` after the unload wrote `gone`. A
+trigger with no live peer logs `own pass trigger=... reason=no-peer` (the close
+intent logs `exec pass hide method=... reason=no-peer`) and calls the original, so
+the shell's own toggle works exactly once. A few presses during a start or a stop
+are passed natively; that is the intended trade. 600 ms is a detection budget, not
+a delivery guarantee.
 
 The bridge's gate proves a capability, not just a peer: the recorded launcher
 thread (checked **before** any launcher-local field, including the existing-window
@@ -64,22 +69,32 @@ executor's `Dismiss`; the controller publishes `closing` in `TakeCloseOwnership`
 before the settle's first frame. A close still settling publishes open at once:
 the controller drops the local dismiss slot and cancels a pending executor
 command, then settles the panel back from its live position (`intent open cancel
-from=...`); the recovery ticket is bound to that menu's open generation and to the
-executor sequence it revoked, and is kept until a landing for the same menu or an
-explicit superseding action. A dismiss already inside the shell's `Dismiss` call
-cannot be recalled; the window hides, and the landing reissues that open once
+from=...`). The recovery ticket exists **only for a published command**: still
+queued or armed when the cancel ran (`cancelled != 0`), or executed with its hide
+not yet confirmed. A local-only cancel arms none, because no dismiss is inside
+the shell and a later hide of the same menu is not that press's close. It is bound
+to that menu's open generation, to the executor sequence it revoked, and to a
+deadline (that command's deadline plus the ack budget and the confirmation
+probe); a refused/expired/superseded answer for **that sequence** retires it, and
+the landing serves it only before the deadline. It is not cleared merely because
+one poll still sees the window open. A dismiss already inside the shell's `Dismiss`
+call cannot be recalled; the window hides, and the landing reissues that open once
 (`intent open recovered entry=...`) — after reconciling an `external` intent that
-arrived with the landing, because the idle timer outranks the intent event. A
+arrived with the landing (applying the record it examined, not a second read),
+because the idle timer outranks the intent event. A
 shell hide in flight (`InternalState` 9/11), or an executor dismiss already armed
-at the bridge, latches the press (one slot, with its tick and activation epoch).
-The hidden event arms a 50 ms timer and the timer serves the same open intent
-after the event's stack has unwound; a show at the event's own tick was swallowed
-(state stuck at 3, no Shown). Supersession lives in the shared dispatcher, so a
-newer press from any primitive discards the slot; a serve re-reads the peer and
-the epoch, a refused or expired dismiss invalidates the slot, and an unarmed timer
-drops it rather than showing on the hidden event's stack. The residual loss window
-is the peer's detection budget: a press after the gate closed, or a latch armed
-before a kill and served after it, is the shell's.
+at the bridge, latches the press (one slot, with its tick and **the epoch the
+admission was decided under**). The hidden event arms a 50 ms timer and the timer
+serves the same open intent after the event's stack has unwound; a show at the
+event's own tick was swallowed (state stuck at 3, no Shown). The arm is posted to
+the executor window when the event runs off the launcher thread. Supersession
+lives in the shared dispatcher, so a newer press from any primitive discards the
+slot; a serve re-reads the peer and the epoch, a refused or expired dismiss
+invalidates the slot, and a latch whose **initial** timer could not be armed is
+dropped rather than left with no guaranteed callback. The residual loss window is
+the peer's detection budget: a press after the gate closed, or a latch armed
+before a kill and served after it, is the shell's. A press the bridge already
+swallowed has no shell path left — it is dropped, not passed on.
 
 The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user
@@ -92,13 +107,25 @@ thread** — the thread that runs `OnHotkeyInvoke` and the shell's own
 `ShowStartView`. The launcher is the `IXamlLauncher` subobject at
 `s_pLauncher + 0x18` (`twinui.pcshell.dll + 0x948E80` holds the outer object);
 `[+0x160]` is the `IXamlLauncherState`, ready when `> 0x10000` (the sentinel is
-`0x100`). Show is confirmed by a 300 ms `IsVisible` probe (honest `0` right after
-the call, the shell is cloaking). Dismiss is **not** immediate in the same sense:
-`hr=0` says the primitive returned, and a second 300 ms probe records whether the
-window actually went away (`exec dismiss confirmed|unconfirmed seq=... visible=...`).
-A command dispatched more than 400 ms past its scheduled time is answered
-`expired` and never calls the launcher, because the publisher has already cleared
-the sequence and released the panel.
+`0x100`). The readiness floor is checked at every read, including the resync after
+a forwarded `Show`/`Dismiss`: the pre-call check cannot cover the pointer the
+post-call read gets, and an unready value leaves the cached direction untouched
+(`own state resync skipped reason=state-not-ready`). Show is confirmed by a 300 ms
+`IsVisible` probe (honest `0` right after the call, the shell is cloaking). Dismiss
+is **not** immediate in the same sense: `hr=0` says the primitive returned, and a
+second 300 ms probe records whether the window actually went away
+(`exec dismiss confirmed|unconfirmed|unknown seq=... visible=hidden|visible|unknown`).
+A probe with no launcher or a failed call is `unknown`, not hidden; the timer's
+elapsed time is printed, and the Start side treats `unconfirmed`/`unknown` as a
+terminal repair. A command dispatched at or past 400 ms after its scheduled time
+is answered `expired` and never calls the launcher, because the publisher has
+already cleared the sequence and released the panel; the bridge and the Start side
+share the `>= due + 400` comparison. A record whose publisher activation changed
+is answered `superseded` immediately before the call (the epoch is captured when
+the record is accepted), and a record that names a menu the section has already
+left is answered `superseded menu=... now=...`; the Start side also cancels a
+record the previous activation left queued when it attaches. No scheme recalls a call
+already inside the shell; an entered dismiss is handled by the landing rules.
 
 The open runs from the band contact: one `exec show` per open, the content settle
 starts at `RevealEntryProgress`, and the reveal takeover chases the mapped finger
@@ -115,8 +142,9 @@ close asks for the same dismiss at its own settle's end. The bridge's timer runs
 poll from healing the retracted panel before the dismiss lands.
 
 The close is judged by behaviour: the shell's hidden event (`own state
-event=hidden open=0`), the executor's `visible=0` at its bounded 300 ms
-confirmation, and the next open working.
+event=hidden open=0`), the executor's `confirmed` (hidden) at its bounded 300 ms
+confirmation — `unconfirmed`/`unknown` is a repair, not a hide — and the next open
+working.
 The internal `0xA` value is **not** an acceptance criterion and is no longer
 quoted.
 

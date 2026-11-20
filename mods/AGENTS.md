@@ -3,7 +3,7 @@
 
 ## Shipping pair
 
-### start-menu-legacy-swipe.wh.cpp (0.43.0, StartMenuExperienceHost.exe)
+### start-menu-legacy-swipe.wh.cpp (0.44.0, StartMenuExperienceHost.exe)
 The controller and the touch gesture. It reads the digitizer through Raw Input
 (the XAML/DirectManipulation sources are empty on this UI), owns the panel's
 `Progress`, plans every settle, and decides the toggle from bridge intents.
@@ -15,20 +15,27 @@ dismiss and reveal sessions; the band admission; the reveal entry and the
 scroll survey and its gate; the unhealed-window rule; the geometry snapshot and
 its lock; the close suppression; and the peer liveness the bridge's interception
 gate reads. `peerEpoch` is claimed once per attach; `peerState=alive` is
-published only by the input thread once its window and registrations exist, and
-the tick is refreshed from that thread's idle tick and every positioned report at
-most once per 100 ms. Withdrawal is recursive and precedes every stop: `gone`
-plus `controllerDirection=0` plus `controllerTouch=0`, written before the input
-thread is stopped and again as it leaves for any reason.
+published only by the input thread once its window, its message loop and its
+intent event exist (intent-consumer readiness — a refused raw-input registration
+is logged and does not withdraw it), and the tick is refreshed from that thread's
+idle tick and every positioned report at most once per 100 ms. Withdrawal is
+recursive and precedes every stop: `gone` plus `controllerDirection=0` plus
+`controllerTouch=0`, written before the input thread is stopped and again as it
+leaves for any reason. Publication and the terminal withdrawal share one SRW
+critical section, so a startup cannot write `alive` after the unload wrote `gone`;
+the consumer withdraws before it unregisters its devices.
 
 **M3 paths.**
-- `ApplyBridgeIntent` — the only intent consumer. `open` sets the controller's
+- `ApplyBridgeIntent` — the only intent consumer. The record is passed to
+  `ApplyBridgeIntentRecord`, so the landing reconciliation applies the record it
+  examined instead of re-reading. `open` sets the controller's
   open direction; if the window is still shown (`StartWindowIsOpen`) the press
   cancels the close: the local dismiss slot is cleared (`ClearLocalCloseTap`), the
   suppression cleared, and one settle from `TakeProgressNow()` back to 1
   (`intent open cancel from=...`); the cancel writes the recovery ticket
-  (`CloseCancelTicket`: open generation + the cancelled executor sequence) for the
-  dismiss-won race. If the window is closed it holds the entry
+  (`CloseCancelTicket`: open generation + the cancelled executor sequence + a
+  deadline) for the dismiss-won race, and arms it only for a published command
+  (still pending, or executed with its hide unconfirmed). If the window is closed it holds the entry
   (`RevealEntryProgress`), sets `g_intentOpenActive` and asks for `exec show`; a
   show that cannot be published is refused (`intent open refused ...
   reason=no-executor`), the panel is not claimed and the ack says refused.
@@ -38,12 +45,18 @@ thread is stopped and again as it leaves for any reason.
   `BeginMirrorCloseSettle(TakeProgressNow())` and asks for `exec dismiss` at
   `settle + 30 ms`; a dismiss that cannot be published releases the ownership and
   answers refused. `external` revokes both schedules and the recovery ticket,
-  clears the suppression, drops the touch state and resyncs from the cloak.
+  clears the suppression, drops the touch state and resyncs from the cloak. The
+  attach publishes `exec cancel target=0` so a record the previous activation left
+  queued cannot act on the menu this one opens.
 - `ApplyExecAck` / `CheckExecAckTimeout` — one ack per command. A refused show or
   a refused/expired dismiss runs `ReleaseExecutorOwnership`, which releases
   the controller direction, `controllerTouch` and the pending open entry in one
   step so the direction resyncs from the cloak; a failed dismiss also drops the
-  recovery ticket. A 400 ms silence does the same from `g_pendingShowUntil` for a
+  recovery ticket **by the ticket's own sequence**, which the already-cleared
+  pending slot can no longer name. An `executed` dismiss clears the pending slot
+  but keeps the command in `g_pendingDismissConfirm`; `confirmed` closes it,
+  `unconfirmed`/`unknown` is the same terminal repair, and `superseded` needs no
+  repair. A 400 ms silence does the same from `g_pendingShowUntil` for a
   show and from `g_pendingDismissExecAt + 400 ms` for a dismiss (the deadline the
   bridge was told to run at), and publishes an `exec cancel` naming the sequence
   (show: target 0) so the executor cannot read the stale record as its newest
@@ -90,16 +103,21 @@ and the per-activation reset. A disable/enable without a host
 restart reuses the XAML root and has no renderer until the host restarts (a
 measured limit, not a bug to paper over).
 
-### start-menu-touch-gesture-bridge.wh.cpp (0.24.0, explorer.exe)
+### start-menu-touch-gesture-bridge.wh.cpp (0.25.0, explorer.exe)
 The launcher executor and the non-touch triggers.
 
 **Launcher read.** `s_pLauncher` at `twinui.pcshell.dll + 0x948E80` is the
 outer object; the execution interface is `outer + 0x18`; `[+0x160]` is the
 `IXamlLauncherState` and must be `> 0x10000`. `ShowStartView` is
 `twinui+0x141AF0`, `Dismiss` `+0x25D670`, `IsVisible` `+0x1F9B40`. One checked
-reader answers readiness (`LauncherStateReady`): the hook paths and `LauncherNow`
-use it, so the constructor's `0x100` sentinel is never dereferenced and a delayed
-callback reacquires the singleton instead of holding a hook's pointer.
+reader answers readiness (`LauncherStateReady`): the hook paths, `LauncherNow`
+and `OwnResyncFromState` use it, so the constructor's `0x100` sentinel is never
+dereferenced. `OwnIsVisible`/`OwnInternalState` refuse an unready pointer
+themselves, because the post-call resync reads `[launcher+0x160]` again and the
+pre-call check cannot cover the new value; an unready resync logs
+`own state resync skipped reason=state-not-ready` and leaves the cached direction
+untouched. A delayed callback reacquires the singleton instead of holding a
+hook's pointer.
 
 **Executor.** A hidden message-only window, class
 `WindhawkSwipeExecutor_<WndProc>`, created only from a known launcher entry: the
@@ -110,8 +128,17 @@ nothing. The library-load hook never creates the window. Window creation and
 window shutdown are one protocol: a creator reserves `g_execCreating`, asks
 `g_execAdmissionOpen`, publishes the HWND and releases the reservation; the stop
 closes admission, drains the reservation, joins the worker, then destroys the
-identified owner window (directly on its thread, otherwise with a `WM_CLOSE` the
-owner acknowledges from `WM_NCDESTROY`; only that HWND signals). A worker waits on
+identified owner window (directly on its thread, otherwise through the private
+`kExecTeardownMessage` the owner answers from `WM_NCDESTROY`; only that HWND
+signals). A re-enable keeps admission closed and drains the reservation **before**
+it snapshots the HWND, so a creator that published and released between two reads
+cannot be seen as absent; it never clears the reservation to prove quiescence, and
+a creator that does not leave makes the enable refuse. The procedure refuses
+every dispatch (`kExecMessage`, timers) for an HWND other than the currently
+published one, so a survivor from a previous activation cannot act on this
+activation's channel. Readiness is published by the worker itself after its exit
+guard is installed, and the service gate also requires admission, so a late
+positive write from a stopping worker is unreadable. A worker waits on
 `Exec` and posts `WM_APP+0x5A`; the WndProc reads the command and calls the
 launcher with an empty stack, and a `WAIT_FAILED`/unexpected exit clears readiness.
 A launcher-thread watermark (`g_execAcceptedSeq`) accepts each record once, so a
@@ -119,11 +146,15 @@ double-delivered signal cannot run a show or a dismiss twice. `show`/`cancel` ru
 now; `dismiss` arms `kExecDismissTimer` for `executeAt`; an unarmable timer runs
 the dismiss at once instead of leaving it armed with no deadline. A record that
 cannot be read at its deadline retries ten times at 10 ms (ten timer arms, not a
-wall-clock deadline), then answers refused. A record that is dispatched more than
-400 ms past its scheduled time is answered `expired` and the primitive is not
-called. The 300 ms probe logs `exec visible`; a successful dismiss also owes a
-300 ms visibility confirmation (`exec dismiss confirmed|unconfirmed seq=...
-visible=...`) instead of treating `hr=0` as a hide. The window class name is
+wall-clock deadline), then answers refused. A record dispatched at or after
+`due + 400 ms` is answered `expired` and the primitive is not called; the record's
+publisher epoch is captured at acceptance and checked immediately before the
+call, a mismatch answering `superseded`; a record that names a menu the section
+has already left is answered `superseded menu=... now=...`. The 300 ms probe logs `exec visible`
+with `hidden|visible|unknown`; a successful dismiss also owes a
+300 ms visibility confirmation (`exec dismiss confirmed|unconfirmed|unknown
+seq=... visible=... after=<real ms>`) instead of treating `hr=0` as a hide, and a
+probe or timer failure is answered `unknown`. The window class name is
 unique per image, so a reinstall does not inherit the old WndProc.
 
 **Triggers.**
@@ -152,7 +183,10 @@ unique per image, so a reinstall does not inherit the old WndProc.
   side's `peerState=alive` and a `peerTick` younger than 600 ms, with the clock
   read after the tick. Then an open channel, a started worker and no disable in
   flight, then the recorded launcher thread (`reason=wrong-thread` otherwise),
-  then a window created on this thread. Without them the trigger passes to the
+  then a window created on this thread. The gate returns the **admitting epoch**:
+  the same read that proved the peer is the value the latch stores, so a restart
+  between admission and latch creation cannot relabel an old press. Without the
+  gate the trigger passes to the
   shell (`own pass trigger=... reason=no-peer` and the other reasons); nothing is
   swallowed for a command nobody would execute. The channel alone is not the
   condition: this mod creates it, so it stays valid with the Start mod disabled.
@@ -163,28 +197,34 @@ unique per image, so a reinstall does not inherit the old WndProc.
   the internal state (1/3/5 open or opening, 7/9/11 closing). The shell's state
   is never the direction while the controller owns: a gesture close retracts the
   panel with state 5 and the cloak open until the executor's Dismiss. The
-  controller publishes `2` in `TakeCloseOwnership` for exactly that.
+  controller publishes `2` in `TakeCloseOwnership` for exactly that. The
+  dispatcher samples the direction once and passes it to both the decision and
+  its log line, so the line cannot name a direction the decision did not use.
 - **Press latch.** One dispatch. A close still settling publishes open now when
   no executor dismiss is armed; the Start side clears its local slot and any
   pending command and settles the panel back from its live position. A hide in
   flight (`InternalState` 9/11), or an executor dismiss already armed at the
   bridge, latches the
-  press (one slot, tick, trigger, activation epoch); the hidden event then arms a
+  press (one slot, tick, trigger, and the epoch the admission was decided under);
+  the hidden event then arms a
   50 ms timer and the timer serves the same open intent off the hidden event's
   stack. A show at the hidden event's own tick was swallowed (state stuck at 3),
-  so the deferral is the serve point. Supersession lives in the shared
+  so the deferral is the serve point. The arm is posted to the executor window
+  when the hidden event runs off the launcher thread, so the slot and its timer
+  stay owned by that thread. Supersession lives in the shared
   `DispatchToggle`, so any newer press — Win key or either Start-button primitive
   — discards the slot (`own press latch dropped reason=superseded`). The serve
   re-reads the peer and the epoch (`reason=peer-gone|peer-changed`), drops a latch
   whose dismiss was refused or expired (`reason=dismiss-refused|dismiss-expired`)
   or whose hide never landed, and expires after 1200 ms. Timer-arming failures are
-  handled, never papered over: a latch that cannot be deferred is dropped rather
-  than shown on the hidden event's stack. A click-away in state 1/3, or a Hide(7)
+  handled, never papered over: a latch whose **initial** timer cannot be armed is
+  dropped, and one that cannot be deferred is dropped rather than shown on the
+  hidden event's stack. A click-away in state 1/3, or a Hide(7)
   inside our own `ShowStartView` in state 1/3, is the pointer-away check and is
   swallowed (`reason=opening`/`reason=own-show`); otherwise the served open is
   hidden the instant it appears. The latch is a best-effort obligation, not a
   guarantee: a press can still be lost when the peer dies inside the detection
-  window.
+  window, and a swallowed press has no shell fallback.
 
 **Deleted here.** The retract request/plan wait, the arbitration hold, the
 close-record read/seed, `OwnDecideFrom` and its open/close/reopen helpers, the
@@ -199,18 +239,25 @@ latch, the Start side's `intent open cancel` and `intent open recovered`.
 (`OwnDecisionCallGuard`, `OwnCloseExecutorGuard`, `OwnForeignCloseGuard`), their
 thread-locals (`t_ownDecisionCall`, `t_ownForeignClose`, `t_ownCloseExecutor`) and
 `g_ownCloseTrigger`, whose only writes were resets. `OwnExternalForwardGuard` and
-`t_execCall` remain: both mark a live call.
+`t_execCall` remain: both mark a live call. 0.25.0 deletes the generic `WM_CLOSE`
+shutdown (replaced by `kExecTeardownMessage`), the readiness publication written
+by the thread that called `CreateThread`, and the reaper's HWND-before-creator
+read order.
 
 **Lifecycle.** Pinned image, the counted close-hook frames and executor
 dispatches for the v7 channel, the drain with `drained`/`stalled` reports, and the
 re-enable refusal while a close frame or an unfinished executor teardown is still
-inside. On unload admission closes, the creator reservation drains, the worker is
-joined before either handle is closed, and the identified window and its four
-timers are destroyed (directly on the owner thread, otherwise through an
-acknowledged `WM_CLOSE`). A stop that did not complete keeps the handles and the
+inside. On unload admission closes (before readiness clears), the creator
+reservation drains, the worker is joined before either handle is closed, and the
+identified window and its four timers are destroyed (directly on the owner thread,
+otherwise through the private teardown the owner acknowledges). A stop that did
+not complete keeps the handles and the
 channel (`ipc close deferred`) and the next enable refuses (`exec reinit
 refused: ...`) until that join or destruction has completed; a worker that exited
-since is reaped.
+since is reaped. The re-enable drains the creator **before** it snapshots the
+HWND, and never clears the reservation itself; a creator that outlives the drain
+makes it refuse. See `docs/lifecycle.md` for the test-build hold that stages the
+creator/reaper interleaving.
 
 ### swipe_ipc_shared.h (v7, 744 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**
@@ -224,8 +271,10 @@ value, never a pair) and dropped `controllerOpen`, which no reader used. v6 adde
 the liveness pair and took the section from 736 to 744 bytes. v7 adds `peerEpoch`
 at 740, which the 8-byte alignment had already paid for, so the size stays 744 and
 the **version word** is what refuses a v6 section handed over by an older build.
-`peerEpoch` answers which Start activation is answering now: the bridge reads it
-beside a latched press and invalidates the latch when it changed.
+0.44.0/0.25.0 add no field: the ack's outcome word gained values (`confirmed`,
+`unconfirmed`, `unknown`, `superseded`) and the visible word gained
+`unknown = -1`, both inside the existing `LONG` slots, so the version stays 7 and
+`tools/ipc.ps1`/`docs/ipc.md` only document the new names.
 
 ### start_gesture_shared.h
 The older gesture mapping (`Local\WindhawkStartGestureShared`), kept for the
@@ -236,11 +285,18 @@ release position there for the probe mods.
 ## Diagnosis (not needed at runtime)
 
 - `start-menu-touch-gesture-probe.wh.cpp` / `start-menu-touch-gesture-consumer.wh.cpp`
-  — the early gesture-source experiments.
-- `msgprobe.wh.cpp` — pointer messages and `GetPointerInfo` ownership.
+  — the early gesture-source experiments. Both stop their worker before final
+  unload: the probe refuses new hook installation from `Wh_ModBeforeUninit` and
+  keeps the log/handles when the scan thread does not join; the consumer wakes its
+  reader, joins it, and keeps the mapping when the join times out.
+- `msgprobe.wh.cpp` — pointer messages and `GetPointerInfo` ownership. Its poller
+  and summary thread are woken, joined, and released only after the join; a join
+  timeout keeps the handle so a later attempt can still join.
 - `inputprobe.wh.cpp` — the Raw Input dump. It must not be enabled beside the
   shipping mod: Raw Input allows one sink per usage per process and the probe
-  takes the stream.
+  takes the stream. Its window subclasses are detached on their owner threads
+  (`kProbeDetachMessage`), never from the unload thread, and a chain with a later
+  subclass is reported instead of restored over.
 
 ## Laws
 

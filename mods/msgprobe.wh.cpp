@@ -572,13 +572,20 @@ void StopActivePoller() {
     HANDLE thread = nullptr;
     AcquireSRWLockExclusive(&g_pollLock);
     thread = g_pollThread;
-    g_pollThread = nullptr;
-    ReleaseSRWLockExclusive(&g_pollLock);
-
     if (thread) {
-        WaitForSingleObject(thread, 2000);
-        CloseHandle(thread);
+        // The handle is cleared only after the join proved the thread out. On a
+        // timeout the thread may still be inside the summary or the probe, and
+        // closing its handle (or leaving it unnamed) would make a later retry
+        // impossible; it stays here so BeforeUninit/Uninit can try again.
+        const DWORD waited = WaitForSingleObject(thread, 2000);
+        if (waited == WAIT_OBJECT_0) {
+            CloseHandle(thread);
+            g_pollThread = nullptr;
+        } else {
+            LogFormat("poll thread join timeout; handles kept");
+        }
     }
+    ReleaseSRWLockExclusive(&g_pollLock);
 }
 
 void StartPoller(UINT32 id, int x, int y, UINT32 flags) {
@@ -601,6 +608,16 @@ void StartPoller(UINT32 id, int x, int y, UINT32 flags) {
     // generation change, writes its summary and history, and exits.
     StopActivePoller();
     if (g_shuttingDown.load(std::memory_order_relaxed)) {
+        return;
+    }
+    AcquireSRWLockShared(&g_pollLock);
+    const bool previousAlive = g_pollThread != nullptr;
+    ReleaseSRWLockShared(&g_pollLock);
+    if (previousAlive) {
+        // The previous poller did not leave inside its join budget; a second one
+        // would write the same summaries and its handle would replace the one the
+        // unload still has to join.
+        LogFormat("poll skipped reason=previous-thread-running");
         return;
     }
 
@@ -869,8 +886,15 @@ void Wh_ModUninit() {
     StopActivePoller();
 
     if (g_summaryThread) {
-        WaitForSingleObject(g_summaryThread, 3000);
-        CloseHandle(g_summaryThread);
-        g_summaryThread = nullptr;
+        // Wake, join, then release. A timeout keeps the handle and the state the
+        // thread can still touch; the caller can retry, but releasing under a
+        // thread that has not reached its exit is not an option.
+        const DWORD waited = WaitForSingleObject(g_summaryThread, 3000);
+        if (waited == WAIT_OBJECT_0) {
+            CloseHandle(g_summaryThread);
+            g_summaryThread = nullptr;
+        } else {
+            LogFormat("summary thread join timeout; handle kept");
+        }
     }
 }

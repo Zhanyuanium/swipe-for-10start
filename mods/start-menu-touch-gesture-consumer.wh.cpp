@@ -160,8 +160,22 @@ BOOL Wh_ModInit() {
 
 void Wh_ModUninit() {
     g_stop = true;
+    // Wake before joining: the reader waits on the shared event with a 50 ms
+    // timeout, and the event is the one wake that does not depend on the timeout.
+    if (g_event) {
+        SetEvent(g_event);
+    }
     if (g_thread) {
-        WaitForSingleObject(g_thread, 1000);
+        const DWORD waited = WaitForSingleObject(g_thread, 1000);
+        if (waited != WAIT_OBJECT_0) {
+            // A timeout means the reader may still be inside ReadSnapshot or
+            // LogSnapshot. Every resource it can touch stays mapped, and the
+            // handle stays open; releasing them here is the use-after-unmap this
+            // path exists to avoid.
+            Wh_Log(L"Consumer uninit residual: reader thread still running; "
+                   L"mapping kept");
+            return;
+        }
         CloseHandle(g_thread);
         g_thread = nullptr;
     }

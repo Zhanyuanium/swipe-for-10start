@@ -40,14 +40,15 @@ it.
 Two mods ship together (full member list in
 [../mods/AGENTS.md](../mods/AGENTS.md)):
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.43.0) — runs in
+- `mods/start-menu-legacy-swipe.wh.cpp` (0.44.0) — runs in
   `StartMenuExperienceHost.exe`; the whole gesture, follow and animation, the
   controller that consumes bridge intents and publishes executor commands, the
   closing direction it publishes before the settle's first frame, the open that
   cancels a close still on screen, the pull-reopen at a close's landing, the one
-  close path (a mirrored settle from the live position, then `dismiss`), and the
-  peer liveness the bridge gates on.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.24.0) — runs in
+  close path (a mirrored settle from the live position, then `dismiss`), the
+  recovery ticket that exists only for a published command, and the peer
+  liveness (intent-consumer readiness) the bridge gates on.
+- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.25.0) — runs in
   `explorer.exe`; executes `ShowStartView`/`Dismiss`/`IsVisible` on the
   launcher's own thread from a hidden window, turns the Win key, the Start
   button and the click-away into intents, reads the toggle direction from the
@@ -55,7 +56,10 @@ Two mods ship together (full member list in
   that lands inside the shell's hide and serves it at the landing, swallows the
   shell's duplicate calls and the pointer-away close of an opening window,
   passes every trigger when the Start side is not alive, and never decides a
-  toggle itself.
+  toggle itself. It reads the shell's state only when the controller publishes
+  no direction: the shell's cloak and `InternalState` are the resync for a
+  panel the controller does not own, so a bridge with no controller still
+  decides from the window.
 
 Everything else in `mods/` (`msgprobe`, `inputprobe`,
 `start-menu-touch-gesture-probe`, `start-menu-touch-gesture-consumer`) is

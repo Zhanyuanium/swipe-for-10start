@@ -107,7 +107,7 @@ reads the controller's phase, so a press during the retract is an open:
   landing is for the same menu the cancel named and no external takeover
   arrived with it (`intent reconcile ... (before landing recovery)`);
 - an intent close has its dismiss armed for a future deadline, so the bridge
-  latches the press (one slot, tick, activation epoch); the hidden event arms a
+  latches the press (one slot, tick, the epoch the admission was decided under); the hidden event arms a
   50 ms timer and the timer serves the open after the event's stack has unwound
   (`own press served wait=...`). A show at the hidden event's own tick was
   swallowed (state stuck at 3), which is why the serve is deferred. A shell hide
@@ -121,6 +121,14 @@ there is no consumer left — a press after the 600 ms liveness gate closed, or 
 latch armed before a kill and served after it. There the shell's own toggle
 serves the press, which is the intended fallback: one interception may be lost, a
 wedged menu never is.
+
+That fallback is **not** available for a press the bridge already swallowed: the
+shell never saw it, so "the shell's own toggle serves it" would be false. Such a
+press is decided by the paths above — the cancel, the latch, or the landing
+recovery — and a press that loses all three (peer gone between the gate and the
+latch's serve, epoch changed) is lost, not passed to the shell. A local-only
+cancel (no executor command was pending) arms no recovery ticket, so an unrelated
+hide of the same menu cannot be mistaken for the close that press cancelled.
 
 A press while the open runs is a close: the `open` direction makes it a close, and
 the settle starts from the live position (`from=0.542` measured 172 ms into an

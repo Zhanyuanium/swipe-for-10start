@@ -129,13 +129,54 @@ closes the channel before it returns, so a re-enable opens a fresh one.
 second one over it — and that reuse is exactly why the refusal above exists: a
 surviving worker still waits on that channel's `Exec` event.
 
-The unload order on the bridge is the executor first, then the drain: readiness
-clears, admission to window creation closes, a creator is drained, the worker is
-joined, and the identified window and its four timers are destroyed — directly
-when the unload already runs on its owner thread, otherwise through a `WM_CLOSE`
-the owner acknowledges from `WM_NCDESTROY`, where only that HWND signals.
-**Acknowledged destruction is conditional.** A join timeout, a close-post
-failure, an unacknowledged `WM_CLOSE` or a creator that does not leave in 500 ms
+**The invariant and its one narrow hole.** The intended invariant is: while a
+re-enable runs, no window from the previous activation exists. The stop enforces
+it by closing admission, draining the creator reservation, joining the worker and
+destroying the identified window; the re-enable then *proves* the same three
+facts before `ResetReinitState` clears anything. The hole the earlier version had
+was a two-moment read: it snapshotted the published HWND, then read the creator
+reservation, so a creator that published and released between those two reads
+looked like "no window, no creator". The enable then cleared the HWND and the
+window survived with this image's procedure and the new activation's globals. The
+fix is an order, not a flag: admission stays closed across the unload, the
+reservation is drained **before** the HWND snapshot (the publish precedes the
+release, so a null HWND read after the drain is durable), and the reservation is
+never cleared to manufacture quiescence. A creator that does not leave inside
+500 ms makes the enable refuse; a refused enable is acceptable, a second window is
+not. Two further guards make a survivor harmless even if a future path reopens
+admission early: the procedure refuses every dispatch for an HWND other than the
+one currently published (a stale window's armed dismiss cannot fire into a new
+menu), and the shutdown is a private `WM_APP` teardown answered only when the
+window equals the recorded stop target, not a generic `WM_CLOSE`. The target is
+still only an HWND, so `IsWindow` alone is not identity; the answer is the
+target check inside the procedure.
+
+**Staging the creator/reaper interleaving on a test build.** The interleaving is
+not reachable on the shipping build by timing alone. A test build inserts a hold
+of ~1.5 s between `CreateWindowExW` returning and `g_execWindow.store(...)` in
+`EnsureExecutorWindow` (and a second hold before the `CreatorDone` destructor).
+Then: enable the mod, make one Start press so the creator enters the hold,
+disable during the hold (the stop drains 500 ms, times out, defers and keeps every
+resource), wait for the hold to expire, and enable again. With the fix the re-enable
+either drains the now-published window and logs `exec teardown completed late` or
+refuses with `exec creator still inside (reinit)`; without it, `activation state
+reset` appears while the old HWND is still alive. The observable is one
+`exec window hwnd=` per activation, a `Get-Process`/Spy++ check that the old HWND
+no longer exists, and no `exec dismiss`/`exec visible` line from the old
+activation after the new one starts. The same hold stages the variant where the
+creator publishes and releases before the re-enable: the log must show
+`exec teardown found a surviving window` and then `exec teardown completed late`.
+
+The unload order on the bridge is the executor first, then the drain: admission
+closes, readiness clears, a creator is drained, the worker is joined, and the
+identified window and its four timers are destroyed — directly
+when the unload already runs on its owner thread, otherwise through the private
+`kExecTeardownMessage` the owner answers from `WM_NCDESTROY`, where only that
+HWND signals. Readiness is published by the worker itself, after its exit guard
+is installed, and the gate also requires admission, so a creator that stores
+`true` after a stop cleared it cannot be read as a service.
+**Acknowledged destruction is conditional.** A join timeout, a teardown-post
+failure, an unacknowledged teardown or a creator that does not leave in 500 ms
 leaves the window, the worker or both alive; the unload then keeps the handles
 **and the channel** and logs `ipc close deferred: ...` instead of pretending to
 have closed it. That is the path a re-enable must refuse, and the unacknowledged
