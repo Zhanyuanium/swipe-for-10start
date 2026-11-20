@@ -56,7 +56,7 @@ pwsh -File .\tools\install_mods.ps1
 
 - 日志写进模组的 Windhawk 存储目录（Windhawk 在模组页面上显示该路径）下的两个文件：Start 半边的 `renderer.log` 和 Explorer 半边的 `bridge.log`，都在 `local@swipe-for-10start` 下。
 - 禁用再启用模组后要重启 `StartMenuExperienceHost.exe`——手势无法挂到已经存在的菜单窗口上。
-- 本模组要求 `StartUI_.dll` 的版本正好是 `10.0.22621.3733`；版本不符则不启动任何手势，日志里会看到 `startui root hook skipped ...`。
+- 根钩子按公开符号查找，不依赖固定地址。若 `StartUI_.dll` 不含 `StartUI::App::PrepareRootElement`（或读不到符号），手势不会启动，日志里会看到 `startui root symbol unresolved ...`；此时所有按键都交给系统自行处理。
 - 拖动菜单期间，菜单内容仍在原位置接收触摸——这是已知限制；另一条已知限制：本模组假设触摸面板覆盖主显示器。
 - 完整的技术文档在 [docs/](docs/README.md)（英文），其中有测量数据、被证伪的方案和每项设计决定的理由，也包括完整的[已知限制列表](docs/limits.md)。
 - 每次发布的 tag 与对应的版本号见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)（英文版 [CHANGELOG.md](CHANGELOG.md)）。

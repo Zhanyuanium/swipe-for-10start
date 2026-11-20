@@ -29,7 +29,7 @@
 # Examples:
 #   pwsh -NoProfile -File tools\ipc.ps1 -State
 #   pwsh -NoProfile -File tools\ipc.ps1 p=0.5
-#   pwsh -NoProfile -File tools\ipc.ps1 anim=0
+#   pwsh -NoProfile -File tools\ipc.ps1 e=-300,0
 
 [CmdletBinding()]
 param(
@@ -251,7 +251,7 @@ if ($State) {
 }
 
 if (-not $Command) {
-    throw 'Usage: ipc.ps1 <command> | ipc.ps1 -State  (commands: p=, t=, e=, anim=)'
+    throw 'Usage: ipc.ps1 <command> | ipc.ps1 -State  (commands: p=, t=, e=)'
 }
 
 $text = $Command.Trim()

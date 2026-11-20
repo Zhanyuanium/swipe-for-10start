@@ -25,26 +25,18 @@ message queue.
 
 What it does:
 
-- Hooks `StartUI::App::PrepareRootElement` (`StartUI_.dll`, RVA `0xAD730` on
-  build 10.0.22621.3733, the build the RVA was derived from), captures the
-  returned root after it loads and enables Composition translation. The hook is
-  gated on that build: the fixed RVA must lie in an executable section of the
-  loaded image, the file version of `StartUI_.dll` must match exactly, and
-  the target must carry the reference prologue and its first call target.
-  Anything else logs one line, `startui root hook skipped build=...
-  expected=10.0.22621.3733` (or `... prologue mismatch`, or `(target not
-  readable)` when the address is not code in this image), and nothing is
-  installed.
-- Hooks `StartUI::SplitViewFrame::OnGlobalAnimationRequested` (`StartUI_.dll`,
-  RVA `0x4164C0`, same build) and can drop the request whose `AnimationType` is
-  0 when the debug line `anim=0` sets the switch; the switch starts at `anim=1`,
-  the original behaviour. The hook itself is installed on every load and passes
-  every request through: it costs one detour per animation request, three
-  vtable reads for the arguments and the first four `startui anim` log lines,
-  and only an explicit debug command changes what it does. The close request
-  (`AnimationType` 1) always reaches the original unchanged. The animation type
-  is read from the event arguments with the same three int getters the original
-  calls, not from a call argument.
+- Hooks `StartUI::App::PrepareRootElement` by its public symbol, captures the
+  returned root after it loads and enables Composition translation. The symbol
+  is `private: static class Windows::UI::Xaml::UIElement ^ __cdecl
+  StartUI::App::PrepareRootElement(class Windows::UI::Xaml::Controls::Frame ^,
+  class StartUI::PerFrameData ^,bool)`, the exact undecorated name in
+  `StartUI.pdb`; the known reference build resolves it to `module + 0xAD730`,
+  which is logged as evidence and not required. The hook is installed from the
+  already-loaded image at init, from the `LoadLibraryExW` notification if
+  `StartUI_` loads later, and rechecked after init. A symbol, signature or hook
+  failure logs one reason (`startui root symbol unresolved ...`), installs
+  nothing and advertises no controller service, so the shell handles every
+  press natively.
 - At every setup it gets the Start CoreWindow HWND via `ICoreWindowInterop` and
   asks the taskbar which edge it is docked to. The work area cannot answer: with
   auto-hide enabled the shell reserves nothing, so the work area equals the
@@ -684,13 +676,9 @@ What it does not do:
   crosses the process boundary goes through the shared section and its events.
 - It does not attach XAML pointer handlers and has no DirectManipulation
   hook.
-- It does not remove the shell's open storyboard. Measured with `anim=0`:
-  dropping the open request leaves the Start window uncloaked with no pane
-  drawn, because the same request is the step that presents the content. The
-  switch therefore stays at `anim=1` and the open still slides from the shell.
-  The hook is installed anyway, because the debug command has to reach it
-  without a reload; it passes the request through and costs one detour plus
-  three vtable reads.
+- It does not touch the shell's open storyboard. The shell raises and runs it
+  itself; the mod only moves `Progress` through the composition translation, so
+  the open still slides in from the shell's own animation.
 
 Unload:
 
@@ -718,17 +706,17 @@ Unload:
   logs `instance guard held name=...`. Only a clean
   unload closes the handle, and only a clean unload can, because a residual
   unload returns with every resource in place.
-- A joined thread handle is kept when its wait times out: `g_hidThread` and
-  `g_pollThread` stay set on the residual path, so a later attempt can still join
+- A joined thread handle is kept when its wait times out: `g_hidThread` stays set
+  on the residual path, so a later attempt can still join
   that thread instead of losing the only handle on it.
 - One stop event ends the input thread, and the thread's wait sees it even when
   the thread has not published its window yet. The stop event is a prerequisite:
   if it cannot be created at init, the input thread is not started at all
   (`hid thread not started (stop event unavailable)`), because a gesture source
-  that cannot be stopped is worse than none. Every wait on the input thread and
-  on the module poll thread is bounded or watches that event, so the stop is
-  observed within one short wait. `Wh_ModBeforeUninit` stops and
-  waits the module poll thread for 10 s, sets the stop event, posts the close
+  that cannot be stopped is worse than none. Every wait on the input thread is
+  bounded or watches that event, so the stop is
+  observed within one short wait. `Wh_ModBeforeUninit` sets the stop event and
+  posts the close
   message as a second signal for a queued message that wins the wait, and waits
   10 s for the input thread. `Wh_ModUninit` then revokes every XAML delegate on
   the UI thread and waits for that turn, detaches the settle batch's `Completed`
@@ -815,9 +803,6 @@ Debug channel (kept in the build):
     thread.
   - `pwsh -File tools\ipc.ps1 e=-300,0` sets `Properties["Offset"]` and
     `Visual.Offset` on the visual.
-  - `pwsh -File tools\ipc.ps1 anim=0` suppresses the shell's open storyboard;
-    `anim=1` restores it. The default is `anim=1`, because suppression leaves
-    the pane undrawn.
   - `pwsh -File tools\ipc.ps1 -State` prints the counters: the command sequence,
     the open generation, the intent and its ack, the executor command and its
     ack, and the controller flags.
@@ -931,7 +916,7 @@ Diagnostics:
   `attached root=...`, `dismiss axis=...` (with `src=appbar|bar|work` and what
   every source said), `dismiss axis=... kept, no source named an edge` (once per
   undecided episode; the last edge stays in force), `debug p=...`, `debug t=...`,
-  `debug e=...`, `debug anim=...`,
+  `debug e=...`,
   `ipc open created=... cmd=... intent=... epoch=...`,
   `ipc open failed err=...`, `ipc legacy files removed=...`,
   `ipc peer alive reason=consumer epoch=...` (the bridge may intercept),
@@ -1002,17 +987,13 @@ Diagnostics:
   `vel window count=... calls=... repeats=... rel=... newest=... age=... first=...
   firstage=... d=... raw=...` behind `g_debugVelocity` (false): the release-speed
   window one release read, for a seam that felt like a drop,
-  `startui anim hooked`,
-  `startui anim hook skipped`, `startui anim hook skipped (target not readable)`
-  (the fixed RVAs are not executable code of this image, so the probe never read
-  them), `startui root hook skipped ...`,
-  `startui root hook skipped (target not readable)`, and the first
-  four `startui anim type=... edge=... trans=... suppress=...` calls go to
-  `renderer.log`,
+  `startui root symbol resolved base=... at=... rva=... expected=0xAD730
+  match=0|1` (the symbol is the contract; a different address is still used and
+  named), `startui root symbol unresolved name=...` (the one refusal reason; no
+  root hook and no controller service),
   `unload hid thread stopped` (or
   `unload hid thread still running; ipc view leaked` and
-  `unload hid thread wait=... ms timed out`), `unload poll thread still running`
-  and `unload poll thread wait=... ms timed out` when a thread outlives its wait,
+  `unload hid thread wait=... ms timed out`),
   `unload entries outstanding=...` when the module-entry drain times out,
   and `unload residual=...; process must restart to finish unloading` naming the
   resource left in place.
@@ -1114,21 +1095,13 @@ Known risks:
   for, not from the request.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
-- The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
-  `StartUI_.dll` 10.0.22621.3733. Both hooks check that their fixed RVAs are
-  executable code of the loaded image — inside `SizeOfImage` and inside a section
-  marked `IMAGE_SCN_MEM_EXECUTE` — before a byte is read, so a shorter or
-  differently laid-out DLL is refused instead of faulting while the gate decides.
-  They then check their target and refuse on any other build. The root hook reads
-  the file version first, then the target prologue and its first call target, and
-  logs `startui root hook skipped build=... expected=10.0.22621.3733` (or
-  `... prologue mismatch`); without the root there is no renderer, so no gesture
-  starts. The animation hook checks the prologue and the three argument getters,
-  logs `startui anim hook skipped` and keeps the original animation. An address
-  that is not executable code logs
-  `startui root hook skipped (target not readable)` or
-  `startui anim hook skipped (target not readable)` instead: not a supported
-  build is a different answer from cannot read the target safely.
+- The root hook is resolved by symbol, not by address. The exact undecorated
+  name is matched against the public symbols of `StartUI_.dll`; the known
+  reference build resolves it to `module + 0xAD730`, which is logged and not
+  required. No PDB, a signature that no longer matches or a refused hook logs
+  one reason, `startui root symbol unresolved name=...`; without the root there
+  is no renderer, so no gesture starts and the controller advertises no service
+  (the shell handles every press natively).
 - The instance guard's name is process local:
   `Local\WindhawkLegacyStartSwipe.instance.<pid>`. A residual instance holds it
   for the life of the process, so re-enabling the mod there is refused with one
@@ -1172,8 +1145,7 @@ Known risks:
 /*
  * [INPUT]: one image in two hosts, never both in one process. In
  *   StartMenuExperienceHost.exe (namespace start): StartUI_.dll
- *   (PrepareRootElement, SplitViewFrame::OnGlobalAnimationRequested and its
- *   three argument getters), Raw Input (RegisterRawInputDevices/
+ *   (PrepareRootElement and the root it returns), Raw Input (RegisterRawInputDevices/
  *   GetRawInputData/GetRawInputDeviceInfoW) for the digitizer, the window, DWM
  *   and taskbar APIs for geometry and layout, the composition Visual/Element
  *   APIs for Progress, and swipe_ipc_shared.h v7 for the intents, executor
@@ -1317,76 +1289,22 @@ void FileLog(const wchar_t* format, ...) {
     ReleaseSRWLockExclusive(&lock);
 }
 
-constexpr uintptr_t kPreferredBase = 0x180000000;
-
-// StartUI::App::PrepareRootElement(Frame^, PerFrameData^, bool) -> UIElement^
-// StartUI_.dll 10.0.22621.3733 (x86-64), the build this RVA was derived from.
-// The RVA moves with the build, so the installer refuses any other one: it
-// checks the file version first and then the target bytes below.
-constexpr uintptr_t kPrepareRootElementVa = 0x1800AD730;
-
-// The reference build's StartUI_.dll version. `Wh_ModInit` resolves version.dll
-// at runtime and `StartUIBuildMatches` compares all four parts; a different
-// build gets no root hook instead of a hook at a guessed address.
-constexpr WORD kStartUIBuildMajor = 10;
-constexpr WORD kStartUIBuildMinor = 0;
-constexpr WORD kStartUIBuildNumber = 22621;
-constexpr WORD kStartUIBuildRevision = 3733;
-
-// Bytes 0x00..0x1C of PrepareRootElement on the reference build:
-//   mov [rsp+8], rbx; mov [rsp+0x10], rsi; mov [rsp+0x18], rdi
-//   push rbp; push r12; push r13; push r14; push r15
-//   mov rbp, rsp; sub rsp, 0x80
-//   mov rsi, rdx (perFrameData); mov r13, rcx (frame)
-// A `call` to the function's first helper follows at +0x3E; its rel32 target
-// is resolved as well, so the RVA cannot point at a different function that
-// happens to start with the same eleven instructions.
-constexpr uint8_t kPreparePrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08,  // mov qword ptr [rsp+0x08], rbx
-    0x48, 0x89, 0x74, 0x24, 0x10,  // mov qword ptr [rsp+0x10], rsi
-    0x48, 0x89, 0x7C, 0x24, 0x18,  // mov qword ptr [rsp+0x18], rdi
-    0x55,                          // push rbp
-    0x41, 0x54,                    // push r12
-    0x41, 0x55,                    // push r13
-    0x41, 0x56,                    // push r14
-    0x41, 0x57,                    // push r15
-    0x48, 0x8B, 0xEC,              // mov  rbp, rsp
-    0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,  // sub rsp, 0x80
-    0x48, 0x8B, 0xF2,              // mov  rsi, rdx
-    0x4C, 0x8B, 0xE9,              // mov  r13, rcx
-};
-constexpr size_t kPrepareCallOffset = 0x3E;
-constexpr uintptr_t kPrepareFirstCalleeVa = 0x1800B2684;
-
-// StartUI::SplitViewFrame::OnGlobalAnimationRequested(sender, args) -> void
-// StartUI_.dll 10.0.22621.3733 (x86-64).
+// StartUI::App::PrepareRootElement(Frame^, PerFrameData^, bool) -> UIElement^,
+// a private static C++/CX function. It is resolved by its public symbol, not by
+// an address: the address moves with the build, the name does not.
 //
-// The handler forwards the shell's animation request to a delegate stored at
-// this+0x3C0. The animation type is NOT an argument: the handler reads three
-// ints from the args object through the wrappers below (vtable slots 6, 7 and
-// 8). The function never writes eax and has no direct call site, so its return
-// value is unused and the hook must return void as well.
-constexpr uintptr_t kOnGlobalAnimationRequestedVa = 0x1804164C0;
-constexpr uintptr_t kAnimTypeGetterVa = 0x18041A978;
-constexpr uintptr_t kAnimEdgeGetterVa = 0x18041AA20;
-constexpr uintptr_t kAnimTransitionGetterVa = 0x18041A9CC;
-
-// Bytes 0x00..0x27 of the target. The three E8 calls at +0x27, +0x33 and
-// +0x3F read the animation type, the taskbar edge and the transition type; the
-// installer resolves their rel32 targets before it trusts this layout.
-constexpr uint8_t kAnimPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x10,  // mov qword ptr [rsp+0x10], rbx
-    0x48, 0x89, 0x74, 0x24, 0x20,  // mov qword ptr [rsp+0x20], rsi
-    0x57,                          // push rdi
-    0x48, 0x83, 0xEC, 0x70,        // sub  rsp, 0x70
-    0x48, 0x8B, 0x05,              // mov  rax, [rip+cookie]
-    0x00, 0x00, 0x00, 0x00,        //      ... displacement, checked below
-    0x48, 0x33, 0xC4,              // xor  rax, rsp
-    0x48, 0x89, 0x44, 0x24, 0x60,  // mov  qword ptr [rsp+0x60], rax
-    0x49, 0x8B, 0xD8,              // mov  rbx, r8   (args)
-    0x48, 0x8B, 0xF9,              // mov  rdi, rcx  (self)
-    0x49, 0x8B, 0xC8,              // mov  rcx, r8
-};
+// The spelling below is the exact undecorated name, read from the reference
+// StartUI.pdb (10.0.22621.3733) with the same DIA undecorator the Windhawk
+// symbol API matches against. The decorated spelling of the same function is
+//   ?PrepareRootElement@App@StartUI@@CAPE$AAVUIElement@Xaml@UI@Windows@@PE$AAVFrame@Controls@456@PE$AAVPerFrameData@2@_N@Z
+// and the reference address is module + 0xAD730. That address is a test
+// expectation: a resolved address that differs is logged, not refused.
+constexpr wchar_t kPrepareRootElementSymbol[] =
+    L"private: static class Windows::UI::Xaml::UIElement ^ __cdecl "
+    L"StartUI::App::PrepareRootElement(class Windows::UI::Xaml::Controls::"
+    L"Frame ^,class StartUI::PerFrameData ^,bool)";
+constexpr uintptr_t kPrepareRootElementExpectedRva = 0xAD730;
+constexpr wchar_t kStartUIModuleName[] = L"StartUI_.dll";
 
 // ---------------------------------------------------------------------------
 // The gesture settle: one damped spring, two parameter sets
@@ -1916,14 +1834,6 @@ class ModuleEntryLease {
     ModuleEntryLease& operator=(const ModuleEntryLease&) = delete;
 };
 
-// The open storyboard drops only when the debug line `anim=0` asks for it.
-// Measured on this build: skipping the open request leaves the window open
-// (DWMWA_CLOAKED 0) with no pane drawn, because that request is also the step
-// that presents the SplitViewFrame content. The switch therefore starts at the
-// original behaviour.
-std::atomic<bool> g_suppressOpenAnim{false};
-std::atomic<int32_t> g_animLogCount{0};
-
 // ---------------------------------------------------------------------------
 // The settle style setting
 //
@@ -2302,15 +2212,6 @@ std::atomic<HWND> g_coreHwnd{nullptr};
 // dwmapi.dll in the import table.
 std::atomic<DwmGetWindowAttribute_t> g_dwmGetWindowAttribute{nullptr};
 
-// The version.dll entry points the root hook's build gate needs. Resolved at
-// init like the two above, so the mod links without version.lib.
-using GetFileVersionInfoSizeW_t = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
-using GetFileVersionInfoW_t = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
-using VerQueryValueW_t = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
-std::atomic<GetFileVersionInfoSizeW_t> g_getFileVersionInfoSize{nullptr};
-std::atomic<GetFileVersionInfoW_t> g_getFileVersionInfo{nullptr};
-std::atomic<VerQueryValueW_t> g_verQueryValue{nullptr};
-
 // Filled in at setup and on every PrepareRootElement.
 int32_t g_dismissAxis = static_cast<int32_t>(DismissAxis::Left);
 float g_dismissDistance = 0.0f;
@@ -2649,7 +2550,15 @@ HANDLE g_hidStopEvent = nullptr;
 // place and says so: the module cannot honestly claim it is gone while module
 // code still runs on a thread Windhawk is about to unmap.
 std::atomic<bool> g_hidThreadLeaked{false};
-std::atomic<bool> g_pollThreadLeaked{false};
+
+// The root hook's outcome. `ready` is set only when
+// StartUI::App::PrepareRootElement resolved and its hook was installed;
+// `refused` when the symbol, the signature or the hook failed. PublishPeerReady
+// reads `ready`: a controller that cannot drive the panel must not advertise an
+// interception service, or the bridge would swallow a native toggle for a menu
+// that never animates.
+std::atomic<bool> g_rootHookReady{false};
+std::atomic<bool> g_rootHookRefused{false};
 
 // One count per registered XAML callback (Loaded, SizeChanged, LayoutUpdated,
 // ViewChanged). Every registration is revoked on the object it was made on; the
@@ -3931,7 +3840,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_v7_Cmd     p=, t=, e=, anim=   (tools -> here)
+//   Local\SwipeFor10Start_v7_Cmd     p=, t=, e=   (tools -> here)
 //   Local\SwipeFor10Start_v7_Intent  kind, trigger, method, flags, open (bridge)
 //   Local\SwipeFor10Start_v7_Exec    show, dismiss, cancel               (here)
 //   ..._State.openSeq                "this is a new menu"               (here)
@@ -4070,6 +3979,15 @@ void PublishPeerGone(const wchar_t* why) {
 // the intent half that the bridge's interception depends on still runs.
 void PublishPeerReady(const wchar_t* why) {
     if (!g_ipc.state) {
+        return;
+    }
+    // A controller that could not resolve its root hook cannot drive the panel:
+    // it must not advertise an interception service, or the bridge would
+    // swallow a native toggle for a menu this side cannot animate. The refusal
+    // already logged its one reason; this is the service being withheld.
+    if (!g_rootHookReady.load(std::memory_order_acquire)) {
+        FileLog(L"ipc peer not published reason=no-root-hook refused=%d",
+                g_rootHookRefused.load(std::memory_order_acquire) ? 1 : 0);
         return;
     }
     if (!g_ipc.intentEvent) {
@@ -4303,23 +4221,6 @@ void ApplyDebugLine(const char* line) {
                     PanelPhaseName(phase));
             return;
         }
-    }
-
-    // anim=0 drops the shell's own open storyboard, anim=1 restores it. The
-    // switch is its own command word, so it is matched before the one-letter
-    // commands and their `letter=value` shape.
-    if (std::strncmp(line, "anim=", 5) == 0) {
-        const char* value = line + 5;
-        while (*value == ' ' || *value == '\t') {
-            ++value;
-        }
-        if (*value != '0' && *value != '1') {
-            return;
-        }
-        const int anim = *value - '0';
-        g_suppressOpenAnim.store(anim == 0, std::memory_order_relaxed);
-        FileLog(L"debug anim=%d", anim);
-        return;
     }
 
     if (line[1] != '=') {
@@ -5858,9 +5759,6 @@ void ResetActivationState() {
     g_scrollerRejectLogTick = 0;
     g_bandTailLogTick = 0;
     g_closeCancelledTick = 0;
-
-    g_suppressOpenAnim.store(false, std::memory_order_relaxed);
-    g_animLogCount.store(0, std::memory_order_relaxed);
 
     // No reveal of this activation names a menu any more. The open tick is the
     // only published identity left; there is no claim record to withdraw. The
@@ -9529,8 +9427,22 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // intents. Availability is published from this point and never from init: an
     // `alive` written earlier promises a service that does not exist yet, and the
     // bridge would swallow a press for a consumer that has not begun to serve.
-    PublishPeerReady(L"consumer");
+    //
+    // The root hook is the second condition. It is normally installed before
+    // this thread exists; a StartUI_ that loads later is picked up by the
+    // LoadLibraryExW notification, and this thread publishes on the next tick —
+    // still from the consumer itself, never from the loading thread.
+    bool peerAnnounced = false;
+    if (g_rootHookReady.load(std::memory_order_acquire)) {
+        PublishPeerReady(L"consumer");
+        peerAnnounced = true;
+    }
     while (running) {
+        if (!peerAnnounced &&
+            g_rootHookReady.load(std::memory_order_acquire)) {
+            PublishPeerReady(L"consumer");
+            peerAnnounced = true;
+        }
         // Bounded, so the stop flag is observed even if the stop event were
         // missing from the set; the event itself is object 0 and wakes this at
         // once.
@@ -12158,464 +12070,114 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
 }
 
 // ---------------------------------------------------------------------------
-// Hook: StartUI::SplitViewFrame::OnGlobalAnimationRequested
-//
-// The shell raises this request to start the XAML open and close storyboards.
-// Dropping the open request leaves the pane at its final layout position, so
-// the composition `Progress` expression is the only remaining motion. The
-// close request (type 1) always reaches the original.
+// Root hook: StartUI::App::PrepareRootElement by symbol
 // ---------------------------------------------------------------------------
 
-using OnGlobalAnimationRequested_t = void (*)(void*, void*, void*);
-OnGlobalAnimationRequested_t OnGlobalAnimationRequested_Original = nullptr;
-
-// The args object exposes the three ints through vtable slots 6, 7 and 8; the
-// wrappers at the RVAs above dispatch exactly those slots and return the value
-// in eax. Null until the layout check in InstallAnimHook succeeds.
-using AnimArgsIntGetter_t = int (*)(void*);
-AnimArgsIntGetter_t g_animTypeGetter = nullptr;
-AnimArgsIntGetter_t g_animEdgeGetter = nullptr;
-AnimArgsIntGetter_t g_animTransitionGetter = nullptr;
-
-void OnGlobalAnimationRequested_Hook(void* self, void* sender, void* args) {
-    int type = -1;
-    int edge = -1;
-    int transition = -1;
-    if (args && g_animTypeGetter && g_animEdgeGetter &&
-        g_animTransitionGetter) {
-        type = g_animTypeGetter(args);
-        edge = g_animEdgeGetter(args);
-        transition = g_animTransitionGetter(args);
-    }
-
-    // Type 0 is the open request. Any other value, and any unreadable type,
-    // keeps the shell's own behaviour.
-    const bool suppress =
-        type == 0 && g_suppressOpenAnim.load(std::memory_order_relaxed);
-
-    if (g_animLogCount.fetch_add(1, std::memory_order_relaxed) < 4) {
-        FileLog(L"startui anim type=%d edge=%d trans=%d suppress=%d", type,
-                edge, transition, suppress ? 1 : 0);
-    }
-
-    if (suppress) {
-        return;
-    }
-
-    if (OnGlobalAnimationRequested_Original) {
-        OnGlobalAnimationRequested_Original(self, sender, args);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Hook installation
-// ---------------------------------------------------------------------------
-
-std::atomic<bool> g_startUIHooked{false};
-std::atomic<bool> g_rootHookRefused{false};
-std::atomic<bool> g_animHookAttempted{false};
+// The image whose symbol hook was attempted. One attempt per module: a loaded
+// StartUI_.dll is the same image for the life of the process, and a refusal
+// would pay for the same symbol load to reach the same answer.
+std::atomic<HMODULE> g_startUIHookModule{nullptr};
 std::atomic<bool> g_afterInit{false};
-std::atomic<bool> g_stopPolling{false};
-HANDLE g_pollThread = nullptr;
 
-// The file version of StartUI_.dll, read through version.dll. `known` is false
-// when the resource or the export is missing, which is a refusal like any other.
-struct StartUIBuild {
-    WORD major = 0;
-    WORD minor = 0;
-    WORD build = 0;
-    WORD revision = 0;
-    bool known = false;
-};
+// Serialises the symbol install against the stop. Wh_ModBeforeUninit takes it
+// before it sets g_disabled, so an install either finishes first or sees the
+// stop and installs nothing. HookSymbols loads symbols and queues the hook, so
+// it must not run beside the unload.
+SRWLOCK g_startUIHookLock = SRWLOCK_INIT;
 
-StartUIBuild ReadStartUIBuild(HMODULE module) {
-    StartUIBuild result;
-
-    const GetFileVersionInfoSizeW_t sizeFn =
-        g_getFileVersionInfoSize.load(std::memory_order_relaxed);
-    const GetFileVersionInfoW_t infoFn =
-        g_getFileVersionInfo.load(std::memory_order_relaxed);
-    const VerQueryValueW_t queryFn =
-        g_verQueryValue.load(std::memory_order_relaxed);
-    if (!sizeFn || !infoFn || !queryFn) {
-        return result;
-    }
-
-    WCHAR path[MAX_PATH] = {};
-    if (!GetModuleFileNameW(module, path, ARRAYSIZE(path))) {
-        return result;
-    }
-
-    DWORD ignored = 0;
-    const DWORD bytes = sizeFn(path, &ignored);
-    if (bytes == 0 || bytes > 64 * 1024) {
-        return result;
-    }
-
-    std::vector<BYTE> data(bytes);
-    if (!infoFn(path, 0, bytes, data.data())) {
-        return result;
-    }
-
-    VS_FIXEDFILEINFO* fixed = nullptr;
-    UINT fixedBytes = 0;
-    if (!queryFn(data.data(), L"\\", reinterpret_cast<LPVOID*>(&fixed),
-                 &fixedBytes) ||
-        !fixed || fixedBytes < sizeof(VS_FIXEDFILEINFO)) {
-        return result;
-    }
-
-    result.major = HIWORD(fixed->dwFileVersionMS);
-    result.minor = LOWORD(fixed->dwFileVersionMS);
-    result.build = HIWORD(fixed->dwFileVersionLS);
-    result.revision = LOWORD(fixed->dwFileVersionLS);
-    result.known = true;
-    return result;
-}
-
-bool StartUIBuildMatches(const StartUIBuild& build) {
-    return build.known && build.major == kStartUIBuildMajor &&
-           build.minor == kStartUIBuildMinor &&
-           build.build == kStartUIBuildNumber &&
-           build.revision == kStartUIBuildRevision;
-}
-
-// True when [rva, rva + bytes) lies inside an executable section of the loaded
-// image and inside its SizeOfImage. Both probes read fixed RVAs, so this is what
-// separates "this build is not the supported one" from "the address is not code
-// at all": without it a shorter or differently laid-out image faults while the
-// gate is still deciding.
+// The root hook is a prerequisite, not an optimisation: without it the panel
+// has no renderer, so a controller service would swallow a native toggle for a
+// menu it cannot animate. Failure is therefore a refusal with one reason in
+// each log, never a retry loop.
 //
-// Every read is bounded by a value already read from the mapped header page: the
-// DOS header, the NT signature, the optional header and the section table all
-// live in the first page of every image the loader maps. An image whose header
-// is not there is refused like any other unreadable target.
-bool ImageRangeExecutable(HMODULE module, uintptr_t rva, size_t bytes) {
-    if (!module || bytes == 0) {
+// Returns true only when this call installed the hook, so a caller applies the
+// queued hook operations only for an install it owns.
+bool InstallStartUIHooks(HMODULE module) {
+    if (!module) {
         return false;
     }
 
-    constexpr size_t kHeaderPage = 0x1000;
-    const auto* base = reinterpret_cast<const uint8_t*>(module);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return false;
-    }
-
-    const size_t ntOffset = static_cast<size_t>(dos->e_lfanew);
-    if (ntOffset < sizeof(IMAGE_DOS_HEADER) ||
-        ntOffset + sizeof(IMAGE_NT_HEADERS64) > kHeaderPage) {
-        return false;
-    }
-
-    const auto* nt =
-        reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + ntOffset);
-    if (nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
-        nt->FileHeader.NumberOfSections == 0) {
-        return false;
-    }
-
-    const size_t sizeOfImage = nt->OptionalHeader.SizeOfImage;
-    if (sizeOfImage == 0 || rva > sizeOfImage || bytes > sizeOfImage - rva) {
-        return false;
-    }
-
-    const size_t sectionTable = ntOffset + sizeof(DWORD) +
-                                sizeof(IMAGE_FILE_HEADER) +
-                                nt->FileHeader.SizeOfOptionalHeader;
-    const size_t sectionBytes = static_cast<size_t>(
-                                    nt->FileHeader.NumberOfSections) *
-                                sizeof(IMAGE_SECTION_HEADER);
-    if (sectionTable > kHeaderPage || sectionBytes > kHeaderPage ||
-        sectionTable + sectionBytes > kHeaderPage) {
-        return false;
-    }
-
-    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
-        base + sectionTable);
-    for (size_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        const IMAGE_SECTION_HEADER& section = sections[i];
-        const uint64_t start = section.VirtualAddress;
-        const uint64_t span = std::max<uint64_t>(section.Misc.VirtualSize,
-                                                 section.SizeOfRawData);
-        if (span == 0 || rva < start || rva - start >= span) {
-            continue;
-        }
-        if (bytes > span - (rva - start)) {
-            continue;
-        }
-        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// The outcome of a hook probe: a supported image, a readable image that is not
-// the build the RVA was taken from, or an address the probe may not read.
-enum class HookProbe {
-    Match,
-    Mismatch,
-    Unreadable,
-};
-
-// Confirms that the target is the function the RVA was derived from: the address
-// is executable code of this image, the prologue matches exactly and the first
-// call resolves to the reference target. The caller checks the file version
-// first, so this only ever probes the reference build's own image.
-HookProbe PrepareRootElementProbe(HMODULE module) {
-    const uintptr_t functionRva = kPrepareRootElementVa - kPreferredBase;
-    // The prologue bytes plus the opcode and rel32 of the first call.
-    constexpr size_t kInspected = kPrepareCallOffset + 5;
-    if (!ImageRangeExecutable(module, functionRva, kInspected)) {
-        return HookProbe::Unreadable;
-    }
-
-    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
-    const uintptr_t function = base + functionRva;
-    const auto* code = reinterpret_cast<const uint8_t*>(function);
-
-    for (size_t i = 0; i < sizeof(kPreparePrologue); ++i) {
-        if (code[i] != kPreparePrologue[i]) {
-            return HookProbe::Mismatch;
-        }
-    }
-
-    if (code[kPrepareCallOffset] != 0xE8) {
-        return HookProbe::Mismatch;
-    }
-
-    int32_t displacement = 0;
-    std::memcpy(&displacement, code + kPrepareCallOffset + 1,
-                sizeof(displacement));
-    return function + kPrepareCallOffset + 5 + displacement ==
-                   base + (kPrepareFirstCalleeVa - kPreferredBase)
-               ? HookProbe::Match
-               : HookProbe::Mismatch;
-}
-
-void InstallStartUIHooks(HMODULE module) {
-    if (!module || g_startUIHooked.exchange(true)) {
-        return;
-    }
-    if (g_disabled.load(std::memory_order_relaxed)) {
-        g_startUIHooked.store(false);
-        return;
-    }
-
-    // The RVA is a build constant, not a pattern: refuse any other StartUI_ and
-    // say which build refused. One line per process; the poll thread stops
-    // retrying because a different build cannot become the right one.
-    const StartUIBuild build = ReadStartUIBuild(module);
-    if (!StartUIBuildMatches(build)) {
-        g_startUIHooked.store(false);
-        if (!g_rootHookRefused.exchange(true)) {
-            if (build.known) {
-                FileLog(L"startui root hook skipped build=%u.%u.%u.%u "
-                        L"expected=10.0.22621.3733",
-                        static_cast<unsigned>(build.major),
-                        static_cast<unsigned>(build.minor),
-                        static_cast<unsigned>(build.build),
-                        static_cast<unsigned>(build.revision));
-                Wh_Log(L"StartUI_.dll %u.%u.%u.%u is not the 10.0.22621.3733 "
-                       L"build this RVA was derived from; the root hook is "
-                       L"refused",
-                       static_cast<unsigned>(build.major),
-                       static_cast<unsigned>(build.minor),
-                       static_cast<unsigned>(build.build),
-                       static_cast<unsigned>(build.revision));
-            } else {
-                FileLog(L"startui root hook skipped build=? (no version "
-                        L"resource)");
-                Wh_Log(L"StartUI_.dll has no readable version; the root hook "
-                       L"is refused");
-            }
-        }
-        return;
-    }
-
-    const HookProbe rootProbe = PrepareRootElementProbe(module);
-    if (rootProbe != HookProbe::Match) {
-        g_startUIHooked.store(false);
-        if (!g_rootHookRefused.exchange(true)) {
-            if (rootProbe == HookProbe::Unreadable) {
-                // A readable image with a different build is the mismatch line
-                // below; this one says the probe never got as far as comparing.
-                FileLog(L"startui root hook skipped (target not readable)");
-                Wh_Log(L"StartUI_.dll does not map the PrepareRootElement "
-                       L"address into an executable section of the image; the "
-                       L"root hook is refused");
-            } else {
-                FileLog(L"startui root hook skipped build=10.0.22621.3733 "
-                        L"prologue mismatch");
-                Wh_Log(L"StartUI_.dll 10.0.22621.3733 does not carry the "
-                       L"PrepareRootElement prologue this hook was written for; "
-                       L"the root hook is refused");
-            }
-        }
-        return;
-    }
-
-    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
-    void* target = reinterpret_cast<void*>(
-        base + (kPrepareRootElementVa - kPreferredBase));
-
-    if (!Wh_SetFunctionHook(target,
-                            reinterpret_cast<void*>(PrepareRootElement_Hook),
-                            reinterpret_cast<void**>(
-                                &PrepareRootElement_Original))) {
-        Wh_Log(L"Failed to hook StartUI::App::PrepareRootElement at %p",
-               target);
-        g_startUIHooked.store(false);
-        return;
-    }
-
-    Wh_Log(L"Hooked StartUI::App::PrepareRootElement at %p", target);
-}
-
-// Confirms that the target is the function the hook was written for: the
-// address and the three getter entries are executable code of this image, the
-// prologue matches, and the three int getters are called in order. A different
-// StartUI_ build fails here and the hook is left out instead of being installed
-// on a guessed ABI; an image whose fixed RVAs are not code at all is refused
-// before a byte is read.
-HookProbe AnimHookAbiProbe(HMODULE module) {
-    const uintptr_t functionRva = kOnGlobalAnimationRequestedVa - kPreferredBase;
-    // The prologue bytes plus the opcode and rel32 of the last getter call.
-    constexpr size_t kGetterCallOffsets[] = {0x27, 0x33, 0x3F};
-    constexpr size_t kInspected = kGetterCallOffsets[2] + 5;
-    if (!ImageRangeExecutable(module, functionRva, kInspected)) {
-        return HookProbe::Unreadable;
-    }
-
-    const uintptr_t getterRvas[] = {
-        kAnimTypeGetterVa - kPreferredBase,
-        kAnimEdgeGetterVa - kPreferredBase,
-        kAnimTransitionGetterVa - kPreferredBase,
-    };
-    for (const uintptr_t getterRva : getterRvas) {
-        // The hook calls these three, so their entries must be code as well.
-        if (!ImageRangeExecutable(module, getterRva, 1)) {
-            return HookProbe::Unreadable;
-        }
-    }
-
-    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
-    const auto* code = reinterpret_cast<const uint8_t*>(base + functionRva);
-    constexpr size_t kCookieDispBegin = 0x12;
-    constexpr size_t kCookieDispEnd = 0x16;
-
-    for (size_t i = 0; i < sizeof(kAnimPrologue); ++i) {
-        if (i >= kCookieDispBegin && i < kCookieDispEnd) {
-            continue;
-        }
-        if (code[i] != kAnimPrologue[i]) {
-            return HookProbe::Mismatch;
-        }
-    }
-
-    const uintptr_t getters[] = {
-        base + getterRvas[0],
-        base + getterRvas[1],
-        base + getterRvas[2],
-    };
-    // The three calls are separated by their result stores, so they are not
-    // adjacent: call type, store; call edge, store; call transition, store.
-    const uintptr_t function = reinterpret_cast<uintptr_t>(code);
-    for (size_t i = 0; i < ARRAYSIZE(getters); ++i) {
-        const size_t offset = kGetterCallOffsets[i];
-        if (code[offset] != 0xE8) {
-            return HookProbe::Mismatch;
-        }
-        int32_t displacement = 0;
-        std::memcpy(&displacement, code + offset + 1, sizeof(displacement));
-        if (function + offset + 5 + displacement != getters[i]) {
-            return HookProbe::Mismatch;
-        }
-    }
-
-    return HookProbe::Match;
-}
-
-bool InstallAnimHook(HMODULE module) {
-    if (!module || g_animHookAttempted.exchange(true)) {
+    AcquireSRWLockExclusive(&g_startUIHookLock);
+    // Claim the image before the symbol load: a second notification for the
+    // same module must not start a second load.
+    HMODULE expected = nullptr;
+    if (!g_startUIHookModule.compare_exchange_strong(expected, module)) {
+        ReleaseSRWLockExclusive(&g_startUIHookLock);
         return false;
     }
     if (g_disabled.load(std::memory_order_relaxed)) {
-        g_animHookAttempted.store(false);
+        // The stop won the race. No hook may be added after BeforeUninit.
+        ReleaseSRWLockExclusive(&g_startUIHookLock);
         return false;
     }
 
-    const HookProbe probe = AnimHookAbiProbe(module);
-    if (probe != HookProbe::Match) {
-        if (probe == HookProbe::Unreadable) {
-            Wh_Log(L"StartUI_.dll does not map the "
-                   L"OnGlobalAnimationRequested layout into executable code");
-            FileLog(L"startui anim hook skipped (target not readable)");
-        } else {
-            Wh_Log(L"StartUI_.dll does not match the expected "
-                   L"OnGlobalAnimationRequested layout");
-            FileLog(L"startui anim hook skipped");
-        }
-        return false;
-    }
-
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {kPrepareRootElementSymbol},
+            &PrepareRootElement_Original,
+            &PrepareRootElement_Hook,
+        },
+    };
+    const bool hooked =
+        WindhawkUtils::HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));
     const uintptr_t base = reinterpret_cast<uintptr_t>(module);
-    void* target = reinterpret_cast<void*>(
-        base + (kOnGlobalAnimationRequestedVa - kPreferredBase));
-
-    const AnimArgsIntGetter_t typeGetter = reinterpret_cast<AnimArgsIntGetter_t>(
-        base + (kAnimTypeGetterVa - kPreferredBase));
-    const AnimArgsIntGetter_t edgeGetter = reinterpret_cast<AnimArgsIntGetter_t>(
-        base + (kAnimEdgeGetterVa - kPreferredBase));
-    const AnimArgsIntGetter_t transitionGetter =
-        reinterpret_cast<AnimArgsIntGetter_t>(
-            base + (kAnimTransitionGetterVa - kPreferredBase));
-
-    if (!Wh_SetFunctionHook(
-            target, reinterpret_cast<void*>(OnGlobalAnimationRequested_Hook),
-            reinterpret_cast<void**>(&OnGlobalAnimationRequested_Original))) {
-        Wh_Log(L"Failed to hook "
-               L"StartUI::SplitViewFrame::OnGlobalAnimationRequested at %p",
-               target);
-        FileLog(L"startui anim hook skipped");
+    const uintptr_t resolved =
+        reinterpret_cast<uintptr_t>(PrepareRootElement_Original);
+    if (!hooked || !resolved) {
+        g_rootHookRefused.store(true, std::memory_order_release);
+        ReleaseSRWLockExclusive(&g_startUIHookLock);
+        FileLog(L"startui root symbol unresolved name=StartUI::App::"
+                L"PrepareRootElement (symbol, signature or hook refused)");
+        Wh_Log(L"StartUI::App::PrepareRootElement could not be resolved in "
+               L"StartUI_.dll; the root hook is refused and the controller "
+               L"advertises no service");
+        PublishPeerGone(L"root-hook-refused");
         return false;
     }
 
-    g_animTypeGetter = typeGetter;
-    g_animEdgeGetter = edgeGetter;
-    g_animTransitionGetter = transitionGetter;
+    const uintptr_t rva = resolved - base;
+    g_rootHookReady.store(true, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_startUIHookLock);
 
-    Wh_Log(L"Hooked StartUI::SplitViewFrame::OnGlobalAnimationRequested at %p",
-           target);
-    FileLog(L"startui anim hooked");
+    FileLog(L"startui root symbol resolved base=0x%llX at=0x%llX rva=0x%llX "
+            L"expected=0x%llX match=%d",
+            static_cast<unsigned long long>(base),
+            static_cast<unsigned long long>(resolved),
+            static_cast<unsigned long long>(rva),
+            static_cast<unsigned long long>(kPrepareRootElementExpectedRva),
+            rva == kPrepareRootElementExpectedRva ? 1 : 0);
+    if (rva == kPrepareRootElementExpectedRva) {
+        Wh_Log(L"StartUI::App::PrepareRootElement resolved at %p "
+               L"(module+0x%llX, the reference address)",
+               reinterpret_cast<void*>(resolved),
+               static_cast<unsigned long long>(rva));
+    } else {
+        Wh_Log(L"StartUI::App::PrepareRootElement resolved at %p "
+               L"(module+0x%llX; the reference is module+0x%llX)",
+               reinterpret_cast<void*>(resolved),
+               static_cast<unsigned long long>(rva),
+               static_cast<unsigned long long>(kPrepareRootElementExpectedRva));
+    }
     return true;
 }
 
+// One probe of the already-loaded image. The module is found by name; the
+// symbol API reads the actual image, so no address, file version or prologue
+// is checked here.
 void TryInstallFromLoadedModules(bool apply) {
     if (g_disabled.load(std::memory_order_relaxed)) {
         return;
     }
-
-    bool installed = false;
-    HMODULE startUI = GetModuleHandleW(L"StartUI_.dll");
-    if (startUI) {
-        if (!g_startUIHooked.load(std::memory_order_relaxed) &&
-            !g_rootHookRefused.load(std::memory_order_relaxed)) {
-            InstallStartUIHooks(startUI);
-            installed = true;
-        }
-        if (!g_animHookAttempted.load(std::memory_order_relaxed)) {
-            if (InstallAnimHook(startUI)) {
-                installed = true;
-            }
-        }
+    if (g_rootHookReady.load(std::memory_order_acquire) ||
+        g_rootHookRefused.load(std::memory_order_acquire)) {
+        return;
     }
-
-    if (installed && apply && g_afterInit.load(std::memory_order_relaxed)) {
+    HMODULE startUI = GetModuleHandleW(kStartUIModuleName);
+    if (!startUI) {
+        return;
+    }
+    if (InstallStartUIHooks(startUI) && apply &&
+        g_afterInit.load(std::memory_order_relaxed)) {
         Wh_ApplyHookOperations();
     }
 }
@@ -12633,34 +12195,18 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
                          ? LoadLibraryExW_Original(fileName, file, flags)
                          : nullptr;
 
-    if (module && !g_startUIHooked.load(std::memory_order_relaxed) &&
-        !g_rootHookRefused.load(std::memory_order_relaxed)) {
-        if (module == GetModuleHandleW(L"StartUI_.dll")) {
-            TryInstallFromLoadedModules(true);
-        }
+    // Filter on the returned module, not on the requested name: the call may
+    // have asked for another file and still brought StartUI_ in, and a refused
+    // or redirected request must not look like a load. This mod never
+    // force-loads StartUI_.
+    if (module && module == GetModuleHandleW(kStartUIModuleName) &&
+        !g_disabled.load(std::memory_order_relaxed) &&
+        !g_rootHookReady.load(std::memory_order_acquire) &&
+        !g_rootHookRefused.load(std::memory_order_acquire)) {
+        TryInstallFromLoadedModules(true);
     }
 
     return module;
-}
-
-DWORD WINAPI PollModulesThread(LPVOID) {
-    // The wait is the stop signal itself, so a disable is observed at once
-    // instead of after the current sleep. 2000 x 10 ms is the same 20 s budget
-    // the old 400 x 50 ms loop had.
-    for (int i = 0; i < 2000 && !g_stopPolling.load(std::memory_order_relaxed);
-         i++) {
-        TryInstallFromLoadedModules(true);
-        if (g_startUIHooked.load(std::memory_order_relaxed) ||
-            g_rootHookRefused.load(std::memory_order_relaxed)) {
-            break;
-        }
-        if (g_hidStopEvent) {
-            WaitForSingleObject(g_hidStopEvent, 10);
-        } else {
-            Sleep(10);
-        }
-    }
-    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -12987,15 +12533,12 @@ void ResetReinitState() {
     g_disabled.store(false, std::memory_order_relaxed);
     g_unloading.store(false, std::memory_order_relaxed);
     g_stopDismissCallback.store(false, std::memory_order_relaxed);
-    g_stopPolling.store(false, std::memory_order_relaxed);
     g_afterInit.store(false, std::memory_order_relaxed);
-    g_startUIHooked.store(false, std::memory_order_relaxed);
-    g_animHookAttempted.store(false, std::memory_order_relaxed);
+    g_rootHookReady.store(false, std::memory_order_relaxed);
     g_rootHookRefused.store(false, std::memory_order_relaxed);
+    g_startUIHookModule.store(nullptr, std::memory_order_relaxed);
     g_hidThreadLeaked.store(false, std::memory_order_relaxed);
-    g_pollThreadLeaked.store(false, std::memory_order_relaxed);
     g_hidThread = nullptr;
-    g_pollThread = nullptr;
     g_hidStopEvent = nullptr;
     g_uiRegistrationCount.store(0, std::memory_order_relaxed);
     g_moduleEntryCount.store(0, std::memory_order_relaxed);
@@ -13075,30 +12618,6 @@ BOOL RoleInit() {
         Wh_Log(L"DwmGetWindowAttribute not resolved; gestures stay disabled");
     }
 
-    // The root hook's build gate reads the file version of StartUI_.dll. The
-    // exports are resolved at runtime for the same reason as dwmapi: no
-    // version.lib in the compiler options and no dangling import.
-    HMODULE version = LoadLibraryW(L"version.dll");
-    if (version) {
-        g_getFileVersionInfoSize.store(
-            reinterpret_cast<GetFileVersionInfoSizeW_t>(
-                GetProcAddress(version, "GetFileVersionInfoSizeW")),
-            std::memory_order_relaxed);
-        g_getFileVersionInfo.store(
-            reinterpret_cast<GetFileVersionInfoW_t>(
-                GetProcAddress(version, "GetFileVersionInfoW")),
-            std::memory_order_relaxed);
-        g_verQueryValue.store(
-            reinterpret_cast<VerQueryValueW_t>(
-                GetProcAddress(version, "VerQueryValueW")),
-            std::memory_order_relaxed);
-    }
-    if (!g_getFileVersionInfoSize.load(std::memory_order_relaxed) ||
-        !g_getFileVersionInfo.load(std::memory_order_relaxed) ||
-        !g_verQueryValue.load(std::memory_order_relaxed)) {
-        Wh_Log(L"version.dll not resolved; the root hook is refused");
-    }
-
     // The 1 ms timer period is what makes the release land 18-22 ms after the
     // last report instead of 31. Resolved at runtime; the module is kept loaded
     // for the process lifetime so the resolved pointers never dangle.
@@ -13125,21 +12644,22 @@ BOOL RoleInit() {
                                                    "LoadLibraryExW"))
                               : nullptr;
     if (!loadLibraryExW) {
-        Wh_Log(L"LoadLibraryExW not found; relying on polling");
+        // Without the notification the root hook is still installed from the
+        // already-loaded image below; only a StartUI_ that loads later than
+        // this init would be missed.
+        Wh_Log(L"LoadLibraryExW not found; the late StartUI_ load is not "
+               L"notified");
     } else if (!Wh_SetFunctionHook(
                    reinterpret_cast<void*>(loadLibraryExW),
                    reinterpret_cast<void*>(LoadLibraryExW_Hook),
                    reinterpret_cast<void**>(&LoadLibraryExW_Original))) {
-        Wh_Log(L"Failed to hook LoadLibraryExW; relying on polling");
+        Wh_Log(L"Failed to hook LoadLibraryExW; the late StartUI_ load is not "
+               L"notified");
     }
 
+    // The usual case: StartUI_ is already loaded when the host creates its
+    // window, and this is the attempt that installs the root hook.
     TryInstallFromLoadedModules(false);
-
-    g_pollThread =
-        CreateThread(nullptr, 0, PollModulesThread, nullptr, 0, nullptr);
-    if (!g_pollThread) {
-        Wh_Log(L"Failed to create the module polling thread");
-    }
 
     return TRUE;
 }
@@ -13154,8 +12674,11 @@ void RoleAfterInit() {
         return;
     }
     g_afterInit = true;
-    TryInstallFromLoadedModules(false);
+    // The LoadLibraryExW notification takes effect here; only after this can a
+    // StartUI_ that loaded during init be trusted to have been seen, so the
+    // recheck is after the apply, not before it.
     Wh_ApplyHookOperations();
+    TryInstallFromLoadedModules(false);
 
     FileLog(L"hid init");
     if (!g_hidStopEvent) {
@@ -13181,10 +12704,13 @@ void RoleBeforeUninit() {
 
     // Stop hook registration and code that can run on its own thread before
     // Windhawk removes the hooks (Wh_SetFunctionHook/Wh_ApplyHookOperations
-    // must not be called after this function returns).
+    // must not be called after this function returns). The symbol install takes
+    // the same lock, so a late StartUI_.dll load either finished before this
+    // point or sees g_disabled and installs nothing.
+    AcquireSRWLockExclusive(&g_startUIHookLock);
     g_disabled = true;
+    ReleaseSRWLockExclusive(&g_startUIHookLock);
     g_unloading = true;
-    g_stopPolling = true;
 
     // Stop the asynchronous dismiss-settle callback from touching state once
     // the module starts to unload. The handler reads this before it takes any
@@ -13197,27 +12723,8 @@ void RoleBeforeUninit() {
     // thread is told to stop it can no longer serve an intent, so the bridge must
     // not intercept one. The same write resets the shared direction and touch, so
     // a disable in the middle of a close cannot leave `closing` readable as the
-    // next activation's decision. It also happens before the poll-thread wait,
-    // which can be long, so the gate closes at once.
+    // next activation's decision.
     PublishPeerGone(L"unload");
-
-    if (g_pollThread) {
-        if (WaitForSingleObject(g_pollThread, kUnloadThreadWaitMs) ==
-            WAIT_OBJECT_0) {
-            CloseHandle(g_pollThread);
-            g_pollThread = nullptr;
-        } else {
-            // The loop watches the stop event every 10-50 ms, so this is a stuck
-            // thread, not a slow one. The handle stays open, so a later attempt
-            // can still join it, and every module resource stays in place: the
-            // process must restart to finish the unload. The handle is left in
-            // g_pollThread for exactly that reason.
-            g_pollThreadLeaked.store(true, std::memory_order_relaxed);
-            FileLog(L"unload poll thread still running");
-            FileLog(L"unload poll thread wait=%u ms timed out",
-                    static_cast<unsigned>(kUnloadThreadWaitMs));
-        }
-    }
 
     // 1. Stop the input thread. The event does not depend on the window: the
     //    thread may still be between CreateThread and publishing the HWND, and
@@ -13287,21 +12794,12 @@ void RoleUninit() {
         g_hidThreadLeaked.store(true, std::memory_order_relaxed);
         FileLog(L"unload hid thread still running; ipc view leaked");
     }
-    if (g_pollThread && !g_pollThreadLeaked.load(std::memory_order_relaxed)) {
-        g_pollThreadLeaked.store(true, std::memory_order_relaxed);
-        FileLog(L"unload poll thread still running");
-    }
 
     const bool hidLeaked =
         g_hidThreadLeaked.load(std::memory_order_relaxed);
-    const bool pollLeaked =
-        g_pollThreadLeaked.load(std::memory_order_relaxed);
-    if (hidLeaked || pollLeaked) {
-        FileLog(L"unload residual=%s%s; process must restart to finish "
-                L"unloading",
-                hidLeaked ? L"hid thread" : L"",
-                pollLeaked ? (hidLeaked ? L",poll thread" : L"poll thread")
-                           : L"");
+    if (hidLeaked) {
+        FileLog(L"unload residual=hid thread; process must restart to finish "
+                L"unloading");
         Wh_Log(L"Unload left resources in place: a worker thread is still "
                L"running; restart StartMenuExperienceHost to finish unloading");
         return;

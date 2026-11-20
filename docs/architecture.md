@@ -461,6 +461,16 @@ the process-lifetime gesture mapping with its seqlock writer and the
 inactive-at-unload publication. The Start half's Raw Input is the product's
 contact source; that mapping only fed the Phase 0 probes.
 
+The same release moved the Start root hook from a fixed address to a public
+symbol. Deleted with the address: the `StartUI_.dll` file-version compare, the
+executable-range check, both prologue probes and the module poll thread that
+searched for the DLL for 20 seconds. Deleted with the animation instrumentation:
+the animation-request hook, its three argument getters and the debug switch that
+suppressed the shell's open storyboard. `PrepareRootElement` is resolved with one
+`HookSymbols` call from the already-loaded image, the late-load notification and
+an `AfterInit` recheck; a resolution or hook failure logs one reason, installs no
+root hook and withholds the controller service, so every press stays native.
+
 **v7** adds the Start side's activation identity at the tail: `peerEpoch` at 740,
 which the struct's alignment had already paid for, so the section stays 744 bytes
 and the **version word** — in the object names and in the section — is what

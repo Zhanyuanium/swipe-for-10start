@@ -111,14 +111,22 @@ the consumer withdraws before it unregisters its devices.
 request handler/answer, the reveal claim, the deferred candidate's close
 machinery, the `win open continued` ticket (its stamp sat behind the follow's
 own `CloseInFlight` guard, so it never fired) and the two-curve style switch.
-The remaining close scheduler is the one dismiss path.
+The remaining close scheduler is the one dismiss path. 0.7.0 also deletes the
+fixed-address gate (the file-version compare, the executable-range check, both
+prologue probes and the module poll thread) and the animation-request hook with
+its debug switch; the root is resolved by symbol.
 
 **Lifecycle.** Pinned image (`GetModuleHandleExW(...PIN)`), per-process instance
 mutex, counted module entries, stop-event-driven input thread, XAML revokes with
 the residual rules, the `peerState=gone` publish before every residual return,
-and the per-activation reset. A disable/enable without a host
-restart reuses the XAML root and has no renderer until the host restarts (a
-measured limit, not a bug to paper over).
+and the per-activation reset. The root hook is resolved by public symbol
+(`StartUI::App::PrepareRootElement`, one `HookSymbols` call) from the
+already-loaded image, from the `LoadLibraryExW` notification and again from
+`AfterInit`; the reference address `module+0xAD730` is logged as evidence, not
+required. A symbol or hook failure logs one reason, installs no root hook and
+withholds the peer service. There is no module poll thread. A disable/enable
+without a host restart reuses the XAML root and has no renderer until the host
+restarts (a measured limit, not a bug to paper over).
 
 ### The executor (namespace bridge, explorer.exe)
 The launcher executor and the non-touch triggers.

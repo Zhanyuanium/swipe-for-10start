@@ -89,7 +89,7 @@ lifecycle state (`ResetReinitState`) and then runs one per-activation reset
 thread's exit runs too: the tracked contact, the contact latch, both sessions,
 the close mute, the deferred flag, the pending dismiss and the pull generation it
 was armed under, the pull serial, the coast, both velocity windows, the diagnostic
-latches, the `anim` override, the executor's pending show and dismiss sequences
+latches, the executor's pending show and dismiss sequences
 with their deadlines, the pending open entry, the last consumed intent sequence
 and the recovery ticket all start over. The attach then withdraws the peer's
 `alive` word, resets the shared direction and touch, seeds the intent boundary

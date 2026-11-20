@@ -118,8 +118,10 @@ without an Explorer restart on this build.
 - After disabling and re-enabling the mod, restart
   `StartMenuExperienceHost.exe` — gestures cannot attach to the already-open
   menu window.
-- The mod requires `StartUI_.dll` build `10.0.22621.3733`; on any other build
-  no gesture starts and the log shows `startui root hook skipped ...`.
+- The root hook is found by public symbol, not by address. If `StartUI_.dll`
+  does not carry `StartUI::App::PrepareRootElement` (or its symbols cannot be
+  read), no gesture starts and the log shows `startui root symbol unresolved
+  ...`; the shell then handles every press natively.
 - While the menu is being dragged, its contents still receive touches at their
   original positions — a known limit, along with the assumption that the touch
   panel covers the primary monitor.
