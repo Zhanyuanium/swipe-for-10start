@@ -358,6 +358,17 @@ What this costs: the name of the event source. What it does not cost: the
 receiver and the state path are pinned, and a refusal at `HideStartAndCortana`
 covers this trigger because the measured close enters exactly there.
 
+**2026-11-21 update (symbol install).** The mod no longer matches return
+addresses. The measured desktop click-away was classified through the
+`ImmersiveMonitorHelper::ActiveZBandChangedForMonitor` wrapper (its synchronous
+method-7 call at `0x24FDDE`), so the close that `sub_4916D0` forwards runs inside
+that caller's scope. DIA names the invoker's instantiation after a
+`CortanaExperienceManager` typed event
+(`Microsoft::WRL::Details::DelegateArgTraits<...CortanaExperienceManager...>::DelegateInvokeHelper<...>::Invoke`);
+WRL shares one invoker per signature, so the name does not identify the event
+source. The invoker has no public symbol and is not wrapped; a Hide it reaches
+outside a wrapped caller is treated as unknown and runs natively.
+
 ## Why the three triggers do not behave the same
 
 Two mechanisms, both visible in the code above.

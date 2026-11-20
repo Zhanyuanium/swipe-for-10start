@@ -188,7 +188,7 @@ does not exist. A press the bridge has already swallowed is a different case:
 it is ours, and the recovery paths below decide it.
 
 The close intent's capability is checked separately (`HideCanServeClose`): peer,
-proven caller sites, a started worker, the **recorded** launcher thread (a Hide
+the caller wrappers, a started worker, the **recorded** launcher thread (a Hide
 never adopts one), a window on that thread, and a callable `Dismiss`. One missing
 piece and the shell's close runs, because converting a native close into a
 command nothing can execute leaves the window shown over the controller's
@@ -474,6 +474,30 @@ fetch. The `LoadLibraryExW` notification only records the returned module; a
 false result while the fetch runs is pending with a 120 s deadline, and only the
 deadline logs `unresolved`, installs no root hook and withholds the controller
 service. The shell keeps pumping for the whole fetch.
+
+The explorer half moved the same way. The launcher entry points, the
+`s_pLauncher` slot and `IsVisible` are resolved by one `HookSymbols` call on
+`twinui.pcshell.dll`; the fixed VAs, the `twinui` file-version/timestamp gate,
+the executable-range check and the prologue/body probes are deleted. The
+`LoadLibraryExW` notification only records the returned image; the executor
+worker runs the resolution at most once per 100 ms with a 240 s pending
+deadline. A still-blocked PDB fetch leaves the mod passive — every press runs
+the shell's own path — and never blocks `explorer.exe`, because the fetch runs
+on the mod's worker rather than on a thread the shell owns. Every resolved
+address is logged against the reference RVA; the set line
+`exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence,
+and one missing symbol refuses the whole set instead of installing half a
+toggle.
+
+The close caller is a thread-local category set around a wrapper of each proven
+caller, not a return-address match: `DismissStartAndCortana` is ordinary,
+`DismissSynchronouslyWithoutTransition` is lock/display, and
+`ImmersiveMonitorHelper::ActiveZBandChangedForMonitor` is the click-away (its
+synchronous `mov edx,7; call [vtable+0x48]` is verified in the binary). The
+unnamed `0x4916D0` WRL delegate invoker cannot be reached by symbol and is not
+classified; a Hide it reaches outside those scopes stays `unknown` and runs
+natively. The measured desktop click-away is inside the ActiveZBand scope, so
+it keeps the animated close.
 
 The controller advertises that service only once the root is attached
 (`PublishPeerReady` requires `g_rendererReady`, not just the hook). A session

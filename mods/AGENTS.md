@@ -150,6 +150,25 @@ pre-call check cannot cover the new value; an unready resync logs
 untouched. A delayed callback reacquires the singleton instead of holding a
 hook's pointer.
 
+**Launcher symbols.** Every launcher entry point, the `s_pLauncher` slot and
+`IsVisible` are resolved by one `WindhawkUtils::SYMBOL_HOOK` array and one
+`HookSymbols` call on the loaded `twinui.pcshell.dll`. The names are DIA's
+undecorated public-symbol strings for 10.0.26100.9949. The fixed VAs, the
+file-version/timestamp compare, the executable-range check and the prologue/body
+probes are deleted. The `LoadLibraryExW` notification only records the returned
+module; the executor worker runs the resolution, because the first call starts
+Windhawk's PDB fetch and blocking a thread Explorer owns freezes the shell. The
+worker probes at most once per 100 ms, so a false result while the fetch runs is
+pending (`exec launcher symbols pending attempt=... waited=...ms
+deadline=240000ms`), never a refusal. The deadline produces `unresolved` and no
+launcher hook; a still-blocked fetch leaves the mod passive (the shell's own
+path serves every trigger) but never blocks Explorer. Each resolved address is
+logged against the reference RVA (`exec launcher symbol label=... rva=...
+expected=... match=0|1`); the set line
+`exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence
+line. One missing symbol refuses the whole set and the hooks are not applied: a
+toggle that can open but not close is worse than the shell's path.
+
 **Executor.** A hidden message-only window, class
 `WindhawkSwipeExecutor_<WndProc>`, created only from a known launcher entry: the
 first of `OnHotkeyInvoke`, `Dismiss`, `ShowStartView`, the manager's `Show` or the
@@ -169,9 +188,11 @@ every dispatch (`kExecMessage`, timers) for an HWND other than the currently
 published one, so a survivor from a previous activation cannot act on this
 activation's channel. Readiness is published by the worker itself after its exit
 guard is installed, and the service gate also requires admission, so a late
-positive write from a stopping worker is unreadable. A worker waits on
-`Exec` and posts `WM_APP+0x5A`; the WndProc reads the command and calls the
-launcher with an empty stack, and a `WAIT_FAILED`/unexpected exit clears readiness.
+positive write from a stopping worker is unreadable. A worker waits on `Exec`
+with a 100 ms timeout and posts `WM_APP+0x5A`; each timeout runs the launcher
+symbol probe, so the same thread owns the fetch and the commands but never a
+thread Explorer uses. The WndProc reads the command and calls the launcher with
+an empty stack, and a `WAIT_FAILED`/unexpected exit clears readiness.
 A launcher-thread watermark (`g_execAcceptedSeq`) accepts each record once, so a
 double-delivered signal cannot run a show or a dismiss twice. `show`/`cancel` run
 now; `dismiss` arms `kExecDismissTimer` for `executeAt`; an unarmable timer runs
@@ -203,12 +224,29 @@ unique per image, so a reinstall does not inherit the old WndProc.
   modified press publish `intent=external` and pass; method 7 is a close intent
   unless `controllerTouch` is set (the opening contact's shell click-away is
   swallowed); every other Hide is a close intent. Its capability gate is one
-  function (`HideCanServeClose`): peer, proven caller sites, started worker,
+  function (`HideCanServeClose`): peer, caller wrappers verified, started worker,
   recorded launcher thread (never adopted by a Hide), a window on this thread and
   a callable `Dismiss`. Any missing piece passes with
   `exec pass hide method=... reason=no-peer|callers-unverified|no-executor|
   wrong-thread|no-window|no-primitive`, because a native close converted into a
   command nothing can execute is worse than the shell's own close.
+- **Caller classification.** The caller is a thread-local category set by a
+  wrapper hook around a proven caller's original call, restoring the previous
+  value so nesting and re-entry are safe; it is not a return-address match.
+  `XamlLauncherState::DismissStartAndCortana` (0x4991C0) is Ordinary,
+  `XamlLauncher::DismissSynchronouslyWithoutTransition` (0x48F7C0) is Lock, and
+  `ImmersiveMonitorHelper::ActiveZBandChangedForMonitor` (0x24FC50) is
+  ClickAway; its body carries the synchronous `mov edx,7; call [vtable+0x48]`
+  (0x24FDDE). A ClickAway scope with any other method is treated as unclassified
+  and passes external, never as a second click-away. The old fourth return
+  address, 0x4916D0, is a WRL delegate invoker with no public symbol; DIA names
+  the instantiation after a `CortanaExperienceManager` typed event, but WRL
+  shares one invoker per signature, so the name does not identify the event
+  source. It forwards `edx` to the same Hide and is not wrapped: a Hide it
+  reaches outside a wrapped caller stays `unknown` and native. The measured
+  desktop click-away runs inside the `ActiveZBandChangedForMonitor` scope
+  (`intent close trigger=clickaway method=7`), so the animation is not lost.
+
 - **The service gate.** Every decision hook runs `BridgeCanServeOnLauncherThread`
   before it reads the panel, and the peer is the first condition: the Start
   side's `peerState=alive` and a `peerTick` younger than 600 ms, with the clock

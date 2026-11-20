@@ -13,6 +13,16 @@
   acquire it before the shell's own uncloak (measured: the window was already
   uncloaked when the ticket was obtained, `before=0`). Early uncloak is not
   attempted: it may reveal an unpainted window. This is the accepted cap.
+- **A stalled symbol fetch leaves the mod passive for that session.**
+  `HookSymbols` runs on the executor worker, never on an Explorer thread, so a
+  cold `twinui.pcshell.pdb` fetch cannot freeze the shell. The call itself
+  cannot be cancelled or given a timeout: if the transfer stalls, the worker
+  stays inside it, the 240 s deadline cannot fire, and every press runs the
+  shell's own path until Explorer restarts. The same rule applies to
+  `StartUI_.dll` on the Start side. Windhawk caches a failed symbol load for
+  four hours for a mod loaded at startup (one minute for a mod loaded later),
+  so a boot without the symbol server stays passive after the network returns;
+  enabling the mod's debug logging disables that throttle for the next attempt.
 - **The launcher must be attached.** `[outer+0x18+0x160] > 0x10000`; zero means
   no `IXamlLauncherState`. The constructor's sentinel is `0x100`. A first open
   after a fresh logon can therefore be refused; the shell's own gesture then

@@ -1220,13 +1220,6 @@ Known risks:
 
 #include "swipe_ipc_shared.h"
 
-#if defined(_MSC_VER)
-#include <intrin.h>
-#define OWN_RETURN_ADDRESS() _ReturnAddress()
-#else
-#define OWN_RETURN_ADDRESS() __builtin_return_address(0)
-#endif
-
 // ---------------------------------------------------------------------------
 // Roles
 // ---------------------------------------------------------------------------
@@ -13028,43 +13021,72 @@ void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr);
 void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                          uint32_t flags);
 
-constexpr uintptr_t kTwinuiPreferredBase = 0x180000000;
+// twinui.pcshell.dll is resolved by public symbol, not by address. Every string
+// below is the exact DIA undecorated name for 10.0.26100.9949, read from
+// twinui.pcshell.pdb with the same undecorator the Windhawk symbol API matches;
+// the expected RVA beside it is evidence in the log, never a fallback. The
+// decorated spellings are in docs/re/ and are not used.
+constexpr wchar_t kSymShow[] =
+    L"public: virtual long __cdecl CStartExperienceManager::Show(unsigned "
+    L"char,unsigned char,unsigned int)";
+constexpr wchar_t kSymHideStartAndCortana[] =
+    L"public: virtual void __cdecl "
+    L"XamlLauncherState::HideStartAndCortana(enum "
+    L"IMMERSIVELAUNCHERDISMISSMETHOD)";
+constexpr wchar_t kSymOnStartShown[] =
+    L"public: long __cdecl XamlLauncherState::OnStartShown(struct "
+    L"Windows::Internal::Shell::Experience::IStartExperienceManager *,struct "
+    L"IInspectable *)";
+constexpr wchar_t kSymOnStartHidden[] =
+    L"public: long __cdecl XamlLauncherState::OnStartHidden(struct "
+    L"Windows::Internal::Shell::Experience::IStartExperienceManager *,struct "
+    L"IInspectable *)";
+constexpr wchar_t kSymOnHotkeyInvoke[] =
+    L"private: long __cdecl XamlLauncher::OnHotkeyInvoke(enum "
+    L"IMMERSIVELAUNCHERSHOWFLAGS)";
+constexpr wchar_t kSymOnStartButtonPressed[] =
+    L"public: virtual long __cdecl "
+    L"XamlLauncher::OnStartButtonPressed(enum "
+    L"IMMERSIVELAUNCHERSHOWMETHOD,enum IMMERSIVELAUNCHERDISMISSMETHOD)";
+constexpr wchar_t kSymDismiss[] =
+    L"public: virtual long __cdecl XamlLauncher::Dismiss(enum "
+    L"IMMERSIVELAUNCHERDISMISSMETHOD)";
+constexpr wchar_t kSymShowStartView[] =
+    L"public: virtual long __cdecl XamlLauncher::ShowStartView(enum "
+    L"IMMERSIVELAUNCHERSHOWMETHOD,enum IMMERSIVELAUNCHERSHOWFLAGS)";
+constexpr wchar_t kSymLauncherSlot[] =
+    L"private: static class XamlLauncher * XamlLauncher::s_pLauncher";
+constexpr wchar_t kSymLauncherIsVisible[] =
+    L"public: virtual long __cdecl XamlLauncher::IsVisible(int *)";
+constexpr wchar_t kSymDismissStartAndCortana[] =
+    L"public: virtual void __cdecl "
+    L"XamlLauncherState::DismissStartAndCortana(enum "
+    L"IMMERSIVELAUNCHERDISMISSMETHOD)";
+constexpr wchar_t kSymDismissSynchronously[] =
+    L"public: virtual long __cdecl "
+    L"XamlLauncher::DismissSynchronouslyWithoutTransition(void)";
+constexpr wchar_t kSymActiveZBand[] =
+    L"public: virtual long __cdecl "
+    L"ImmersiveMonitorHelper::ActiveZBandChangedForMonitor(unsigned long,"
+    L"unsigned long,struct IImmersiveMonitor *,enum MODE_CHANGE_REASON)";
 
-// twinui.pcshell.dll 26100.9949 (x86-64), verified by the Phase 0 probe.
-constexpr uintptr_t kShowVa = 0x180254C90;
-// XamlLauncherState::HideStartAndCortana, the decision every shell close reaches.
-constexpr uintptr_t kHideStartAndCortanaVa = 0x18024BCB0;
-// The two decision entries (XamlLauncher): the Windows key / shell hook and the
-// taskbar Start button. Both are plain member functions; the launcher pointer is
-// `self` for the button and `self + 0x18` for the hotkey.
-constexpr uintptr_t kOnHotkeyInvokeVa = 0x18014195C;
-constexpr uintptr_t kOnStartButtonPressedVa = 0x180492C90;
-// The execution primitives: XamlLauncher::Dismiss (a forwarder to the state's
-// DismissStartAndCortana) and XamlLauncher::ShowStartView (no state gate).
-constexpr uintptr_t kDismissVa = 0x18025D670;
-constexpr uintptr_t kShowStartViewVa = 0x180141AF0;
-// The launcher state's two events. OnStartShown completes an open (state = 5);
-// OnStartHidden completes a close (9 -> 0xA, 0x11 -> 0, 0xB -> 0, 0xE -> 7).
-constexpr uintptr_t kOnStartShownVa = 0x180141DF0;
-constexpr uintptr_t kOnStartHiddenVa = 0x180065E70;
-// The three call sites that reach HideStartAndCortana, used as the caller
-// discriminator. Ordinary is the direct call from DismissStartAndCortana
-// (0x499252); ClickAway is the delegate sub_4916D0 (0x4916E2); Lock is
-// DismissSynchronouslyWithoutTransition (0x48F7FB, method 7). The recorded value
-// is the return address (call site + 5), so a runtime match is exact.
-constexpr uintptr_t kHideCallerOrdinaryVa = 0x499257;
-constexpr uintptr_t kHideCallerClickAwayVa = 0x4916EB;
-constexpr uintptr_t kHideCallerLockVa = 0x48F804;
-// The click-away measured on this layout: a desktop click enters
-// XamlLauncherState's dismiss handler at 0x24FC50, which calls
-// HideStartAndCortana(7) directly at 0x24FDDE. It is a close of ours and must
-// animate; the lock path above is the only method-7 close that passes.
-constexpr uintptr_t kHideCallerAwayVa = 0x24FDE3;
-constexpr uintptr_t kClickAwayHandlerVa = 0x18024FC50;
-// The three functions those return addresses belong to, used by the probe.
-constexpr uintptr_t kDismissStartAndCortanaVa = 0x1804991C0;
-constexpr uintptr_t kClickAwayDelegateVa = 0x1804916D0;
-constexpr uintptr_t kLockDismissVa = 0x18048F7C0;
+// The reference RVAs, for the resolution log only. A different value is reported
+// and the symbol is still used: the name is the contract, the address is
+// evidence.
+constexpr uintptr_t kRvaShow = 0x254C90;
+constexpr uintptr_t kRvaHideStartAndCortana = 0x24BCB0;
+constexpr uintptr_t kRvaOnStartShown = 0x141DF0;
+constexpr uintptr_t kRvaOnStartHidden = 0x65E70;
+constexpr uintptr_t kRvaOnHotkeyInvoke = 0x14195C;
+constexpr uintptr_t kRvaOnStartButtonPressed = 0x492C90;
+constexpr uintptr_t kRvaDismiss = 0x25D670;
+constexpr uintptr_t kRvaShowStartView = 0x141AF0;
+constexpr uintptr_t kRvaLauncherSlot = 0x948E80;
+constexpr uintptr_t kRvaLauncherIsVisible = 0x1F9B40;
+constexpr uintptr_t kRvaDismissStartAndCortana = 0x4991C0;
+constexpr uintptr_t kRvaDismissSynchronously = 0x48F7C0;
+constexpr uintptr_t kRvaActiveZBand = 0x24FC50;
+
 // The launcher keeps its IXamlLauncherState interface at +0x160 (the hotkey's
 // outer object keeps the launcher at +0x18, and the same state at +0x178).
 constexpr uintptr_t kLauncherStatePointerOffset = 0x160;
@@ -13077,68 +13099,6 @@ constexpr uintptr_t kHotkeyShellOpenFlagOffset = 0x161;
 constexpr uintptr_t kLauncherInternalStateOffset = 0x28;
 
 constexpr wchar_t kTwinuiModuleName[] = L"twinui.pcshell.dll";
-
-// The build the RVAs above were derived from.
-constexpr unsigned kTwinuiVersion[4] = {10, 0, 26100, 9949};
-
-// The first bytes of HideStartAndCortana on that build: `mov [rsp+18],rbx;
-// mov [rsp+20],rsi; push rbp; push rdi; push r14; lea rbp,[rsp-0x200];
-// sub rsp,...`.
-constexpr uint8_t kHideStartAndCortanaPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24,
-    0x20, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24,
-    0x00, 0xFE, 0xFF, 0xFF, 0x48, 0x81};
-
-// The body bytes the probe requires beyond the prologue: the transient state
-// write (`mov dword ptr [rcx+28],9`), the manager load (`mov rcx,[rdi+38]`) and
-// its Hide slot (`mov rax,[rax+40]`). A build whose state machine moved but
-// whose prologue survived is still refused.
-constexpr size_t kHideStartAndCortanaProbeBytes = 0x400;
-
-// The prologues of the four own hooks and the three close entrants, from
-// twinui.pcshell.dll 10.0.26100.9949. A probe compares the first 24 bytes before
-// a hook is installed; a mismatch logs `own hook skipped ...` and only that hook
-// is left out.
-constexpr uint8_t kOnHotkeyInvokePrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x7C, 0x24,
-    0x20, 0x55, 0x48, 0x8B, 0xEC, 0x48, 0x83, 0xEC, 0x70,
-    0x8B, 0xFA, 0x48, 0x8B, 0xD9, 0x48};
-constexpr uint8_t kOnStartButtonPressedPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24,
-    0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
-    0x41, 0x8B, 0xF0, 0x48, 0x8B, 0x89};
-constexpr uint8_t kDismissPrologue[] = {
-    0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x89, 0x60, 0x01,
-    0x00, 0x00, 0x48, 0x85, 0xC9, 0x75, 0x07, 0xB8, 0x90,
-    0x04, 0x07, 0x80, 0xEB, 0x0E, 0x48};
-constexpr uint8_t kShowStartViewPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41,
-    0x56, 0x41, 0x57, 0x48, 0x8D, 0xAC, 0x24, 0x70, 0xFF,
-    0xFF, 0xFF, 0x48, 0x81, 0xEC, 0x90};
-constexpr uint8_t kOnStartShownPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24,
-    0x18, 0x55, 0x57, 0x41, 0x56, 0x48, 0x8D, 0xAC, 0x24,
-    0x00, 0xFF, 0xFF, 0xFF, 0x48, 0x81};
-constexpr uint8_t kOnStartHiddenPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC,
-    0x40, 0x48, 0x8B, 0xF9, 0x48, 0x8D, 0x59, 0x40, 0x8B,
-    0x03, 0x89, 0x44, 0x24, 0x20, 0x8B};
-constexpr uint8_t kClickAwayDelegatePrologue[] = {
-    0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0x41, 0x10, 0x48,
-    0x8B, 0x88, 0xA8, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x01,
-    0x48, 0x8B, 0x40, 0x48, 0xE8, 0x25};
-constexpr uint8_t kLockDismissPrologue[] = {
-    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9,
-    0x48, 0x8B, 0x89, 0x60, 0x01, 0x00, 0x00, 0x48, 0x85,
-    0xC9, 0x75, 0x07, 0xB8, 0x90, 0x04};
-constexpr uint8_t kClickAwayHandlerPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x20, 0x44, 0x89, 0x44, 0x24,
-    0x18, 0x89, 0x54, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41,
-    0x56, 0x41, 0x57, 0x48, 0x83, 0xEC};
-constexpr uint8_t kDismissStartAndCortanaPrologue[] = {
-    0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC,
-    0x20, 0x83, 0x64, 0x24, 0x38, 0x00, 0x8B, 0xFA, 0x48,
-    0x8B, 0xD9, 0x89, 0x91, 0x18, 0x01};
 
 // The Windows-key dismiss method (the shell's own measurement) and the method a
 // Win+Tab close carries. Method 5 is an external takeover: it is never held and
@@ -13256,12 +13216,16 @@ constexpr DWORD kExecJoinWaitMs = 2000;
 // timer fires in the message loop after the event has unwound; 50 ms keeps a
 // margin over the measured 16 ms.
 constexpr uint64_t kPressServeDelayMs = 50;
-constexpr uintptr_t kLauncherSingletonRva = 0x948E80;
-constexpr uintptr_t kLauncherStateOffset = 0x160;
-constexpr uintptr_t kLauncherIsVisibleRva = 0x1F9B40;
 constexpr uint64_t kLauncherStateReadyFloor = 0x10000;
 
 using LauncherIsVisibleFn = HRESULT(WINAPI*)(void*, BOOL*);
+
+// Resolved once by symbol. `g_launcherSlot` is the address of the s_pLauncher
+// pointer slot; the singleton is read from it on each execution, on its owner
+// thread, and never cached. `g_launcherIsVisible` is the visibility primitive.
+void** g_launcherSlot = nullptr;
+LauncherIsVisibleFn g_launcherIsVisible = nullptr;
+
 LONG64 g_pendingDismissSeq = 0;   // UI thread only
 LONG64 g_pendingShowSeq = 0;       // UI thread only
 // The dismiss that returned success and is still owed its visibility
@@ -13296,9 +13260,30 @@ constexpr uint32_t kExecDismissRetryMs = 10;
 // State
 // ---------------------------------------------------------------------------
 
-std::atomic<bool> g_explorerHooked{false};
+// The twinui.pcshell.dll image the notification saw, the image an install
+// currently owns, and the resolution outcome. The bridge's worker probes the
+// recorded module; a false result while Windhawk's PDB fetch runs is pending,
+// not a refusal.
+std::atomic<HMODULE> g_explorerModuleSeen{nullptr};
+std::atomic<HMODULE> g_explorerSymbolClaim{nullptr};
+std::atomic<bool> g_explorerSymbolsReady{false};
+std::atomic<bool> g_explorerSymbolsRefused{false};
+std::atomic<bool> g_explorerLoadLogged{false};
 std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_disabled{false};
+// Serialises the symbol install against the stop: Wh_ModBeforeUninit takes it
+// before it sets g_disabled, so a fetch that is still running either finishes
+// first or the install sees the stop and adds nothing.
+SRWLOCK g_explorerSymbolLock = SRWLOCK_INIT;
+// The worker's retry schedule. Worker thread only; ResetReinitState clears these
+// before that thread exists. The deadline covers the 33 MB twinui.pcshell.pdb
+// (the measured download took 180 s) and one retry after a failed parse; it is
+// printed on every pending line.
+constexpr uint64_t kExecSymbolProbeMs = 100;
+constexpr uint64_t kExecSymbolPendingDeadlineMs = 240000;
+uint64_t g_execProbeNextTick = 0;
+uint64_t g_execProbeFirstTick = 0;
+int g_execProbeAttempts = 0;
 // Set only after Wh_SetFunctionHook accepted the close-decision hook, so no
 // close is ever arbitrated on a build where that hook was refused.
 std::atomic<bool> g_closeHookEnabled{false};
@@ -13389,252 +13374,6 @@ void FileLog(const wchar_t* format, ...) {
 }
 
 // ---------------------------------------------------------------------------
-// Build gate
-//
-// The hardcoded RVAs are only valid for the build they were taken from. The
-// gate checks the file version of the loaded module and, when the file can be
-// read, that its PE timestamp is the one in memory. A mismatch installs
-// nothing.
-// ---------------------------------------------------------------------------
-
-using GetFileVersionInfoSizeW_t = decltype(&GetFileVersionInfoSizeW);
-using GetFileVersionInfoW_t = decltype(&GetFileVersionInfoW);
-using VerQueryValueW_t = decltype(&VerQueryValueW);
-
-struct VersionApi {
-    HMODULE module = nullptr;
-    bool ownsReference = false;
-    GetFileVersionInfoSizeW_t size = nullptr;
-    GetFileVersionInfoW_t info = nullptr;
-    VerQueryValueW_t query = nullptr;
-};
-
-void UnloadVersionApi(VersionApi& api) {
-    if (api.ownsReference && api.module) {
-        FreeLibrary(api.module);
-    }
-    api = {};
-}
-
-bool LoadVersionApi(VersionApi* api) {
-    HMODULE module = GetModuleHandleW(L"version.dll");
-    if (!module) {
-        module = LoadLibraryW(L"version.dll");
-        if (!module) {
-            return false;
-        }
-        api->ownsReference = true;
-    }
-    api->module = module;
-
-    api->size = reinterpret_cast<GetFileVersionInfoSizeW_t>(
-        GetProcAddress(module, "GetFileVersionInfoSizeW"));
-    api->info = reinterpret_cast<GetFileVersionInfoW_t>(
-        GetProcAddress(module, "GetFileVersionInfoW"));
-    api->query = reinterpret_cast<VerQueryValueW_t>(
-        GetProcAddress(module, "VerQueryValueW"));
-
-    if (!api->size || !api->info || !api->query) {
-        UnloadVersionApi(*api);
-        return false;
-    }
-    return true;
-}
-
-// Reads FileVersion from the first StringFileInfo translation. The fixed
-// version resource can lag the string on incremental Windows updates, so the
-// string is what the gate compares.
-bool QueryFileVersionString(const VersionApi& api, const wchar_t* path,
-                            wchar_t* out, size_t outCount) {
-    DWORD handle = 0;
-    const DWORD size = api.size(path, &handle);
-    if (size == 0 || size > 8192) {
-        return false;
-    }
-
-    BYTE buffer[8192];
-    if (!api.info(path, 0, size, buffer)) {
-        return false;
-    }
-
-    struct Translation {
-        WORD language;
-        WORD codePage;
-    };
-
-    Translation* translations = nullptr;
-    UINT translationBytes = 0;
-    if (!api.query(buffer, L"\\VarFileInfo\\Translation",
-                   reinterpret_cast<void**>(&translations),
-                   &translationBytes) ||
-        !translations) {
-        return false;
-    }
-
-    const size_t translationCount = translationBytes / sizeof(Translation);
-    for (size_t i = 0; i < translationCount; i++) {
-        wchar_t key[64] = {};
-        swprintf_s(key, ARRAYSIZE(key),
-                   L"\\StringFileInfo\\%04x%04x\\FileVersion",
-                   translations[i].language, translations[i].codePage);
-
-        wchar_t* value = nullptr;
-        UINT valueChars = 0;
-        if (!api.query(buffer, key, reinterpret_cast<void**>(&value),
-                       &valueChars) ||
-            !value || valueChars == 0) {
-            continue;
-        }
-
-        size_t length = 0;
-        while (length + 1 < outCount && value[length] != L'\0') {
-            out[length] = value[length];
-            length++;
-        }
-        out[length] = L'\0';
-        return length != 0;
-    }
-
-    return false;
-}
-
-// Parses the leading "a.b.c.d" of a file version string; a suffix such as
-// " (WinBuild...)" is ignored.
-bool ParseVersion(const wchar_t* text, unsigned* parts) {
-    const wchar_t* cursor = text;
-    for (int i = 0; i < 4; i++) {
-        while (*cursor == L' ' || *cursor == L'\t') {
-            cursor++;
-        }
-        if (*cursor < L'0' || *cursor > L'9') {
-            return false;
-        }
-
-        unsigned value = 0;
-        while (*cursor >= L'0' && *cursor <= L'9') {
-            value = value * 10 + static_cast<unsigned>(*cursor - L'0');
-            if (value > 0xFFFF) {
-                return false;
-            }
-            cursor++;
-        }
-        parts[i] = value;
-
-        if (i < 3) {
-            if (*cursor != L'.') {
-                return false;
-            }
-            cursor++;
-        }
-    }
-    return true;
-}
-
-bool ReadLoadedPeTimestamp(HMODULE module, DWORD* timestamp) {
-    const auto* base = reinterpret_cast<const BYTE*>(module);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 ||
-        dos->e_lfanew > 0x1000) {
-        return false;
-    }
-
-    const auto* nt =
-        reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) {
-        return false;
-    }
-    *timestamp = nt->FileHeader.TimeDateStamp;
-    return true;
-}
-
-bool ReadFilePeTimestamp(const wchar_t* path, DWORD* timestamp) {
-    HANDLE file = CreateFileW(path, GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                  FILE_SHARE_DELETE,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-
-    bool ok = false;
-    IMAGE_DOS_HEADER dos{};
-    DWORD read = 0;
-    if (ReadFile(file, &dos, sizeof(dos), &read, nullptr) &&
-        read == static_cast<DWORD>(sizeof(dos)) &&
-        dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 &&
-        dos.e_lfanew <= 0x1000) {
-        LARGE_INTEGER offset{};
-        offset.QuadPart = dos.e_lfanew;
-        if (SetFilePointerEx(file, offset, nullptr, FILE_BEGIN)) {
-            IMAGE_NT_HEADERS nt{};
-            if (ReadFile(file, &nt, sizeof(nt), &read, nullptr) &&
-                read == static_cast<DWORD>(sizeof(nt)) &&
-                nt.Signature == IMAGE_NT_SIGNATURE) {
-                *timestamp = nt.FileHeader.TimeDateStamp;
-                ok = true;
-            }
-        }
-    }
-
-    CloseHandle(file);
-    return ok;
-}
-
-bool TwinuiBuildMatches(HMODULE module) {
-    wchar_t path[MAX_PATH] = {};
-    if (!GetModuleFileNameW(module, path, ARRAYSIZE(path))) {
-        Wh_Log(L"twinui build mismatch unknown; refusing to install hooks");
-        return false;
-    }
-
-    wchar_t rawVersion[64] = {};
-    wchar_t displayVersion[64] = L"unknown";
-    unsigned parts[4] = {};
-    bool versionMatches = false;
-
-    VersionApi api;
-    if (LoadVersionApi(&api)) {
-        if (QueryFileVersionString(api, path, rawVersion,
-                                   ARRAYSIZE(rawVersion)) &&
-            ParseVersion(rawVersion, parts)) {
-            swprintf_s(displayVersion, ARRAYSIZE(displayVersion),
-                       L"%u.%u.%u.%u", parts[0], parts[1], parts[2],
-                       parts[3]);
-            versionMatches = true;
-            for (int i = 0; i < 4; i++) {
-                if (parts[i] != kTwinuiVersion[i]) {
-                    versionMatches = false;
-                    break;
-                }
-            }
-        }
-        UnloadVersionApi(api);
-    }
-
-    if (!versionMatches) {
-        Wh_Log(L"twinui build mismatch %s; refusing to install hooks",
-               displayVersion);
-        return false;
-    }
-
-    // A version match is enough to proceed; the timestamp check is an extra
-    // guard against a file that was replaced while the module is loaded.
-    DWORD loadedTimestamp = 0;
-    DWORD fileTimestamp = 0;
-    if (ReadLoadedPeTimestamp(module, &loadedTimestamp) &&
-        ReadFilePeTimestamp(path, &fileTimestamp) &&
-        loadedTimestamp != fileTimestamp) {
-        Wh_Log(L"twinui build mismatch %s (timestamp 0x%08X != 0x%08X); "
-               L"refusing to install hooks",
-               displayVersion, loadedTimestamp, fileTimestamp);
-        return false;
-    }
-
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // twinui.pcshell.dll hooks
 // ---------------------------------------------------------------------------
 
@@ -13685,11 +13424,41 @@ HideStartAndCortana_t HideStartAndCortana_Original = nullptr;
 // Nothing here writes InternalState and nothing caches a manager or a state
 // pointer across calls.
 
+// The caller category is a thread-local scope set by the wrapper hook around a
+// proven caller's original call, not a return-address match. Each wrapper saves
+// and restores the previous value, so nesting and re-entry are safe; an
+// invocation from a function that is not wrapped stays Unknown and passes to the
+// shell. The three sites measured on this layout:
+//   DismissStartAndCortana            -> Ordinary (direct call at 0x499252)
+//   ActiveZBandChangedForMonitor      -> ClickAway (synchronous method-7 call at
+//                                        0x24FDDE, verified in the binary)
+//   DismissSynchronouslyWithoutTransition -> Lock (method 7, 0x48F7FF)
+// The old fourth return address, 0x4916D0, is a WRL delegate invoker with no
+// public symbol: DIA names this instantiation after a CortanaExperienceManager
+// typed event, but WRL shares one invoker per signature, so the name does not
+// identify the event source (the RE notes record it as unidentified). The
+// invoker forwards edx to vtable+0x48, the same Hide, so it cannot be classified
+// by name. It is not wrapped: a Hide it reaches outside a wrapped caller stays
+// Unknown and native. The measured desktop click-away runs inside the
+// ActiveZBandChangedForMonitor scope above, which covers it.
 enum class OwnCaller : int {
-    Ordinary = 0,  // DismissStartAndCortana: Win, Start button, our Dismiss
-    ClickAway,     // the delegate sub_4916D0
-    Lock,          // DismissSynchronouslyWithoutTransition (lock, display)
-    Unknown,       // never held: an unrecognised close passes at once
+    Ordinary = 0,
+    ClickAway,
+    Lock,
+    Unknown,
+};
+
+thread_local int t_ownCaller = static_cast<int>(OwnCaller::Unknown);
+
+struct OwnCallerScope {
+    OwnCaller previous;
+    explicit OwnCallerScope(OwnCaller caller)
+        : previous(static_cast<OwnCaller>(t_ownCaller)) {
+        t_ownCaller = static_cast<int>(caller);
+    }
+    ~OwnCallerScope() { t_ownCaller = static_cast<int>(previous); }
+    OwnCallerScope(const OwnCallerScope&) = delete;
+    OwnCallerScope& operator=(const OwnCallerScope&) = delete;
 };
 
 const wchar_t* OwnCallerName(OwnCaller caller) {
@@ -13710,7 +13479,6 @@ using ShowStartViewFn = HRESULT (*)(void*, uint32_t, uint32_t);
 
 DismissFn g_dismiss = nullptr;
 ShowStartViewFn g_showStartView = nullptr;
-uintptr_t g_twinuiBase = 0;
 
 // Guards the cached toggle. Every hook runs on explorer's launcher thread, but
 // the unload and a re-init run elsewhere, so the transitions are serialised; the
@@ -13724,10 +13492,11 @@ std::atomic<bool> g_ownWinEnabled{false};
 std::atomic<bool> g_ownButtonEnabled{false};
 std::atomic<bool> g_ownEventsEnabled{false};
 std::atomic<bool> g_ownPrimitivesEnabled{false};
-// The caller-site probe's result. Without it no close can be attributed to the
-// lock screen, a click-away or an ordinary close, so the hooks that turn a call
-// into a decision are refused (InstallExplorerHooks) and every unverified call
-// passes to the shell.
+// The caller-classification capability. True only after every launcher symbol
+// resolved and every caller wrapper is installed; without it no close can be
+// attributed to the lock screen, a click-away or an ordinary close, so the hooks
+// that turn a call into a decision stay pass-through and every unverified call
+// goes to the shell.
 std::atomic<bool> g_callersVerified{false};
 
 
@@ -13807,28 +13576,14 @@ uint32_t OwnInternalState(void* state) {
         static_cast<const uint8_t*>(state) + kLauncherInternalStateOffset);
 }
 
-OwnCaller OwnResolveCaller(void* returnAddress) {
-    if (!g_twinuiBase || !g_callersVerified.load(std::memory_order_relaxed)) {
-        // Nothing proved these call sites on this build. An unverified return
-        // address is not a lock, a click-away or an ordinary close; the caller
-        // passes to the shell instead of being animated as one of them.
+// The classification capability: true only when every caller wrapper (and the
+// Hide hook) is installed, so a thread-local category exists for every close the
+// mod animates. A capability, not a warning: without it no close is intercepted.
+OwnCaller OwnCallerNow() {
+    if (!g_callersVerified.load(std::memory_order_relaxed)) {
         return OwnCaller::Unknown;
     }
-    const uintptr_t rva =
-        reinterpret_cast<uintptr_t>(returnAddress) - g_twinuiBase;
-    if (rva == kHideCallerOrdinaryVa) {
-        return OwnCaller::Ordinary;
-    }
-    if (rva == kHideCallerClickAwayVa) {
-        return OwnCaller::ClickAway;
-    }
-    if (rva == kHideCallerAwayVa) {
-        return OwnCaller::ClickAway;
-    }
-    if (rva == kHideCallerLockVa) {
-        return OwnCaller::Lock;
-    }
-    return OwnCaller::Unknown;
+    return static_cast<OwnCaller>(t_ownCaller);
 }
 
 struct OwnSnapshot {
@@ -14047,9 +13802,9 @@ bool HideCanServeClose(const wchar_t** reason) {
         return false;
     }
     if (!g_callersVerified.load(std::memory_order_relaxed)) {
-        // The return address is the only thing that tells a lock screen from the
-        // click-away; without the proven call sites every close is
-        // unattributable and must not be animated.
+        // The caller wrappers are the only thing that tells a lock screen from
+        // the click-away; without them every close is unattributable and must not
+        // be animated.
         *reason = L"callers-unverified";
         return false;
     }
@@ -14124,7 +13879,20 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         return;
     }
 
-    const OwnCaller caller = OwnResolveCaller(OWN_RETURN_ADDRESS());
+    const OwnCaller caller = OwnCallerNow();
+    // The ActiveZBand wrapper covers its whole function; only the synchronous
+    // method-7 call verified in it is the click-away. Anything else reached in
+    // that scope stays unclassified and passes to the shell.
+    if (caller == OwnCaller::ClickAway && method != kDismissMethodClickAway) {
+        FileLog(L"intent external trigger=hide caller=unknown method=%u "
+                L"reason=unexpected-method",
+                method);
+        PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
+                            method, 0);
+        callOriginal();
+        OwnResyncFromState(self);
+        return;
+    }
     if (caller == OwnCaller::Lock || caller == OwnCaller::Unknown ||
         method == kDismissMethodWinTab || OwnTakeExternalForward(method)) {
         FileLog(L"intent external trigger=hide caller=%s method=%u", 
@@ -14307,24 +14075,31 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
 // instead of publishing from its stack. See kPressServeDelayMs.
 //
 // The slot and its timer are launcher-thread state. The hidden event is expected
-// there, but the check is not an assumption: a callback on another thread posts
-// one private notification to the executor window and the owner arms it.
+// there, but the check is not an assumption: the owner-thread test comes before
+// the first read of the latch. A callback on another thread posts one private
+// notification to the executor window and the owner arms it; it never reads the
+// slot itself.
 void ArmLatchedServe() {
-    if (!g_pressLatch.pending) {
-        return;
-    }
     HWND window = g_execWindow.load(std::memory_order_relaxed);
-    if (!window) {
-        DropPressLatch(L"no-window", L"hidden");
-        return;
-    }
     if (!ExecutorWindowOnThisThread()) {
+        if (!window) {
+            // No window to post to. The latch's own timeout timer runs on its
+            // owner thread, so there is nothing to do from here.
+            return;
+        }
         if (!PostMessageW(window, kExecLatchMessage, kExecLatchMagic, 0)) {
             FileLog(L"own press latch arm post failed err=%u", GetLastError());
         } else {
             FileLog(L"own press latch arm posted tid=%u owner=%u",
                     GetCurrentThreadId(), g_execThreadId);
         }
+        return;
+    }
+    if (!g_pressLatch.pending) {
+        return;
+    }
+    if (!window) {
+        DropPressLatch(L"no-window", L"hidden");
         return;
     }
     g_pressServeReason = L"hidden";
@@ -14493,11 +14268,12 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
                        ? OnHotkeyInvoke_Original(self, flags)
                        : S_OK;
         }
-        FileLog(L"own win pass reason=external open=0 state=%u (no open)",
+        FileLog(L"own win pass reason=external open=0 state=%u (forwarded)",
                 own.state);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                             kDismissMethodWin, flags);
-        return S_OK;
+        return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
+                                       : S_OK;
     }
 
     if (static_cast<const uint8_t*>(self)[kHotkeyShellOpenFlagOffset] != 0) {
@@ -14552,38 +14328,42 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
     return S_OK;
 }
 
-using OnStartShown_t = void (*)(void*);
+// The symbols are `long __cdecl XamlLauncherState::OnStartShown(
+// IStartExperienceManager*, IInspectable*)`; the hook keeps that exact shape and
+// returns the original's result, because the detour replaces the function the
+// shell called.
+using OnStartShown_t = HRESULT (*)(void*, void*, void*);
 OnStartShown_t OnStartShown_Original = nullptr;
 
-// XamlLauncherState::OnStartShown(self): `self` is the launcher state object;
-// its IXamlLauncherState interface is `self + 0x18` and its InternalState is
-// `[self + 0x40]`, which is the same dword the interface reads at +0x28.
-void OnStartShown_Hook(void* self) {
+// `self` is the launcher state object; its IXamlLauncherState interface is
+// `self + 0x18` and its InternalState is `[self + 0x40]`, which is the same
+// dword the interface reads at +0x28.
+HRESULT OnStartShown_Hook(void* self, void* manager, void* inspectable) {
     const CloseCallLease closeCall;
-    if (OnStartShown_Original) {
-        OnStartShown_Original(self);
-    }
+    const HRESULT hr = OnStartShown_Original
+                           ? OnStartShown_Original(self, manager, inspectable)
+                           : S_OK;
     if (!g_ownEventsEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed)) {
-        return;
+        return hr;
     }
     OwnEventShown();
+    return hr;
 }
 
-using OnStartHidden_t = void (*)(void*);
+using OnStartHidden_t = HRESULT (*)(void*, void*, void*);
 OnStartHidden_t OnStartHidden_Original = nullptr;
 
-// XamlLauncherState::OnStartHidden(self): runs after the original, so the state
-// is already the settled closed value and the latch's ShowStartView cannot be
-// overwritten by this transition again.
-void OnStartHidden_Hook(void* self) {
+// Runs after the original, so the state is already the settled closed value and
+// the latch's ShowStartView cannot be overwritten by this transition again.
+HRESULT OnStartHidden_Hook(void* self, void* manager, void* inspectable) {
     const CloseCallLease closeCall;
-    if (OnStartHidden_Original) {
-        OnStartHidden_Original(self);
-    }
+    const HRESULT hr = OnStartHidden_Original
+                           ? OnStartHidden_Original(self, manager, inspectable)
+                           : S_OK;
     if (!g_ownEventsEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed)) {
-        return;
+        return hr;
     }
     OwnEventHidden();
     // The landing the latch exists for. The serve is deferred off this event's
@@ -14591,6 +14371,7 @@ void OnStartHidden_Hook(void* self) {
     // (kPressServeDelayMs). If the cloak has already flipped, the press becomes
     // the same open intent a normal press would have published.
     ArmLatchedServe();
+    return hr;
 }
 
 // XamlLauncher::Dismiss / XamlLauncher::ShowStartView. The taskbar's Start
@@ -14691,518 +14472,13 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
 
 
 // ---------------------------------------------------------------------------
-// Hook installation
+// Launcher symbols
 // ---------------------------------------------------------------------------
 
-// True when [rva, rva + bytes) lies inside an executable section of the loaded
-// image and inside its SizeOfImage. Both probe reads use fixed RVAs, so this is
-// what separates "this build is not the supported one" from "the address is not
-// code at all": without it a shorter or differently laid-out image faults while
-// the gate is still deciding.
-//
-// Every read is bounded by a value already read from the mapped header page: the
-// DOS header, the NT signature, the optional header and the section table all
-// live in the first page of every image the loader maps. An image whose header
-// is not there is refused like any other unreadable target.
-bool ImageRangeExecutable(HMODULE module, uintptr_t rva, size_t bytes) {
-    if (!module || bytes == 0) {
-        return false;
-    }
-
-    constexpr size_t kHeaderPage = 0x1000;
-    const auto* base = reinterpret_cast<const uint8_t*>(module);
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        return false;
-    }
-
-    const size_t ntOffset = static_cast<size_t>(dos->e_lfanew);
-    if (ntOffset < sizeof(IMAGE_DOS_HEADER) ||
-        ntOffset + sizeof(IMAGE_NT_HEADERS64) > kHeaderPage) {
-        return false;
-    }
-
-    const auto* nt =
-        reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + ntOffset);
-    if (nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
-        nt->FileHeader.NumberOfSections == 0) {
-        return false;
-    }
-
-    const size_t sizeOfImage = nt->OptionalHeader.SizeOfImage;
-    if (sizeOfImage == 0 || rva > sizeOfImage || bytes > sizeOfImage - rva) {
-        return false;
-    }
-
-    const size_t sectionTable = ntOffset + sizeof(DWORD) +
-                                sizeof(IMAGE_FILE_HEADER) +
-                                nt->FileHeader.SizeOfOptionalHeader;
-    const size_t sectionBytes = static_cast<size_t>(
-                                    nt->FileHeader.NumberOfSections) *
-                                sizeof(IMAGE_SECTION_HEADER);
-    if (sectionTable > kHeaderPage || sectionBytes > kHeaderPage ||
-        sectionTable + sectionBytes > kHeaderPage) {
-        return false;
-    }
-
-    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(
-        base + sectionTable);
-    for (size_t i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-        const IMAGE_SECTION_HEADER& section = sections[i];
-        const uint64_t start = section.VirtualAddress;
-        const uint64_t span = std::max<uint64_t>(section.Misc.VirtualSize,
-                                                 section.SizeOfRawData);
-        if (span == 0 || rva < start || rva - start >= span) {
-            continue;
-        }
-        if (bytes > span - (rva - start)) {
-            continue;
-        }
-        if ((section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Confirms that the target is the function the decision was read from: the
-// address is executable code of the loaded image, its first bytes match the
-// build's prologue, and its body still carries the manager call site the state
-// machine was traced through. Each failure has its own line, and only the close
-// hook is left out.
-
-// ---------------------------------------------------------------------------
-// Own-hook probes
-//
-// A fixed RVA is only trusted after four checks: the range is executable code of
-// the loaded image, the prologue matches this build, the body still carries the
-// landmark the decision was read from, and every direct call site the executor
-// depends on still targets the function it names. A failure logs one line with
-// the hook's name and leaves only that hook out.
-// ---------------------------------------------------------------------------
-
-bool PrologueMatches(HMODULE module, uintptr_t rva, const uint8_t* expected,
-                     size_t count) {
-    if (!ImageRangeExecutable(module, rva, count)) {
-        return false;
-    }
-    const uint8_t* code = reinterpret_cast<const uint8_t*>(module) + rva;
-    return std::memcmp(code, expected, count) == 0;
-}
-
-bool BodyContains(HMODULE module, uintptr_t rva, size_t span,
-                  const uint8_t* needle, size_t count) {
-    if (count == 0 || span < count || !ImageRangeExecutable(module, rva, span)) {
-        return false;
-    }
-    const uint8_t* code = reinterpret_cast<const uint8_t*>(module) + rva;
-    for (size_t i = 0; i + count <= span; i++) {
-        if (std::memcmp(code + i, needle, count) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool DirectCallTargets(HMODULE module, uintptr_t callRva, uintptr_t targetRva) {
-    if (!ImageRangeExecutable(module, callRva, 5)) {
-        return false;
-    }
-    const uint8_t* code = reinterpret_cast<const uint8_t*>(module) + callRva;
-    if (code[0] != 0xE8) {
-        return false;
-    }
-    int32_t displacement = 0;
-    std::memcpy(&displacement, code + 1, sizeof(displacement));
-    return callRva + 5 + static_cast<int64_t>(displacement) == targetRva;
-}
-
-// XamlLauncher::OnHotkeyInvoke: `[self+0x178]` is the state, `vtable+0x68` is
-// IsStartVisible, `Dismiss(self+0x18, 1)` is the close and
-// `ShowStartView(self+0x18, 1, flags)` the open.
-bool OnHotkeyInvokeProbe(HMODULE module) {
-    const uintptr_t rva = kOnHotkeyInvokeVa - kTwinuiPreferredBase;
-    const uint8_t stateLoad[] = {0x48, 0x8B, 0x89, 0x78, 0x01, 0x00, 0x00};
-    const uint8_t isVisible[] = {0x48, 0x8B, 0x40, 0x68};
-    const uint8_t launcherBias[] = {0x48, 0x8D, 0x4B, 0x18};
-    if (!PrologueMatches(module, rva, kOnHotkeyInvokePrologue,
-                         sizeof(kOnHotkeyInvokePrologue)) ||
-        !BodyContains(module, rva, 0x400, stateLoad, sizeof(stateLoad)) ||
-        !BodyContains(module, rva, 0x400, isVisible, sizeof(isVisible)) ||
-        !BodyContains(module, rva, 0x400, launcherBias,
-                      sizeof(launcherBias)) ||
-        !DirectCallTargets(module, 0x1419A2, 0x25D670) ||
-        !DirectCallTargets(module, 0x141AC9, 0x141AF0)) {
-        FileLog(L"own hook skipped name=win build=10.0.26100.9949 body moved");
-        Wh_Log(L"OnHotkeyInvoke does not carry the state, launcher bias and "
-               L"Dismiss/ShowStartView calls this hook was written for; the "
-               L"Windows-key hook is refused");
-        return false;
-    }
-    return true;
-}
-
-// XamlLauncher::OnStartButtonPressed: `[self+0x160]` is the state, the visible
-// branch calls the state's DismissStartAndCortana (vtable+0x40) and the else
-// branch calls ShowStartView.
-bool OnStartButtonPressedProbe(HMODULE module) {
-    const uintptr_t rva = kOnStartButtonPressedVa - kTwinuiPreferredBase;
-    const uint8_t stateLoad[] = {0x48, 0x8B, 0x89, 0x60, 0x01, 0x00, 0x00};
-    const uint8_t isVisible[] = {0x48, 0x8B, 0x40, 0x68};
-    const uint8_t dismissSlot[] = {0x48, 0x8B, 0x40, 0x40};
-    if (!PrologueMatches(module, rva, kOnStartButtonPressedPrologue,
-                         sizeof(kOnStartButtonPressedPrologue)) ||
-        !BodyContains(module, rva, 0x100, stateLoad, sizeof(stateLoad)) ||
-        !BodyContains(module, rva, 0x100, isVisible, sizeof(isVisible)) ||
-        !BodyContains(module, rva, 0x100, dismissSlot, sizeof(dismissSlot)) ||
-        !DirectCallTargets(module, 0x492CFA, 0x141AF0)) {
-        FileLog(L"own hook skipped name=startbutton build=10.0.26100.9949 "
-                L"body moved");
-        Wh_Log(L"OnStartButtonPressed does not carry the state, the dismiss "
-               L"slot and the ShowStartView call this hook was written for; "
-               L"the Start-button hook is refused");
-        return false;
-    }
-    return true;
-}
-
-bool DismissProbe(HMODULE module) {
-    const uintptr_t rva = kDismissVa - kTwinuiPreferredBase;
-    const uint8_t stateLoad[] = {0x48, 0x8B, 0x89, 0x60, 0x01, 0x00, 0x00};
-    const uint8_t dismissSlot[] = {0x48, 0x8B, 0x40, 0x40};
-    if (!PrologueMatches(module, rva, kDismissPrologue,
-                         sizeof(kDismissPrologue)) ||
-        !BodyContains(module, rva, 0x40, stateLoad, sizeof(stateLoad)) ||
-        !BodyContains(module, rva, 0x40, dismissSlot,
-                      sizeof(dismissSlot))) {
-        FileLog(L"own hook skipped name=dismiss build=10.0.26100.9949 body "
-                L"moved");
-        return false;
-    }
-    return true;
-}
-
-bool ShowStartViewProbe(HMODULE module) {
-    const uintptr_t rva = kShowStartViewVa - kTwinuiPreferredBase;
-    const uint8_t stateCheck[] = {0x48, 0x83, 0xB9, 0x60, 0x01,
-                                  0x00, 0x00, 0x00};
-    const uint8_t showSlot[] = {0x48, 0x8B, 0x40, 0x38};
-    if (!PrologueMatches(module, rva, kShowStartViewPrologue,
-                         sizeof(kShowStartViewPrologue)) ||
-        !BodyContains(module, rva, 0x400, stateCheck, sizeof(stateCheck)) ||
-        !BodyContains(module, rva, 0x400, showSlot, sizeof(showSlot))) {
-        FileLog(L"own hook skipped name=showstartview build=10.0.26100.9949 "
-                L"body moved");
-        return false;
-    }
-    return true;
-}
-
-// The event hooks read the state object at [self+0x40] (the same dword the
-// IXamlLauncherState interface reads at +0x28). OnStartShown writes 5 there;
-// OnStartHidden completes the known transitions.
-bool OnStartShownProbe(HMODULE module) {
-    const uintptr_t rva = kOnStartShownVa - kTwinuiPreferredBase;
-    const uint8_t stateBias[] = {0x48, 0x8D, 0x77, 0x40};
-    const uint8_t stateFive[] = {0xC7, 0x06, 0x05, 0x00, 0x00, 0x00};
-    if (!PrologueMatches(module, rva, kOnStartShownPrologue,
-                         sizeof(kOnStartShownPrologue)) ||
-        !BodyContains(module, rva, 0x600, stateBias, sizeof(stateBias)) ||
-        !BodyContains(module, rva, 0x600, stateFive, sizeof(stateFive))) {
-        FileLog(L"own hook skipped name=shown build=10.0.26100.9949 body "
-                L"moved");
-        return false;
-    }
-    return true;
-}
-
-bool OnStartHiddenProbe(HMODULE module) {
-    const uintptr_t rva = kOnStartHiddenVa - kTwinuiPreferredBase;
-    const uint8_t stateBias[] = {0x48, 0x8D, 0x59, 0x40};
-    const uint8_t stateTen[] = {0xC7, 0x03, 0x0A, 0x00, 0x00, 0x00};
-    const bool prologue = PrologueMatches(module, rva, kOnStartHiddenPrologue,
-                                          sizeof(kOnStartHiddenPrologue));
-    const bool bias =
-        BodyContains(module, rva, 0x100, stateBias, sizeof(stateBias));
-    const bool ten =
-        BodyContains(module, rva, 0x100, stateTen, sizeof(stateTen));
-    if (!prologue || !bias || !ten) {
-        FileLog(L"own hook skipped name=hidden build=10.0.26100.9949 "
-                L"prologue=%d bias=%d ten=%d",
-                prologue ? 1 : 0, bias ? 1 : 0, ten ? 1 : 0);
-        return false;
-    }
-    return true;
-}
-
-// The three entrances the caller discriminator names. Each is proven twice: the
-// function body is the one the RVA was read from, and the return address the
-// hook will see is the instruction after a call that is still there.
-bool HideCallerSitesProbe(HMODULE module) {
-    // The caller constants are RVAs; only the three function starts below are
-    // preferred VAs.
-    const uintptr_t ordinaryRva = kHideCallerOrdinaryVa - 5;
-    const uintptr_t clickAwayRva = kHideCallerClickAwayVa - 5;
-    const uintptr_t lockRva = kHideCallerLockVa - 5;
-    const uint8_t vtableSlot[] = {0x48, 0x8B, 0x40, 0x48};
-
-    const bool ordinary =
-        PrologueMatches(module, kDismissStartAndCortanaVa - kTwinuiPreferredBase,
-                        kDismissStartAndCortanaPrologue,
-                        sizeof(kDismissStartAndCortanaPrologue)) &&
-        DirectCallTargets(module, ordinaryRva,
-                          kHideStartAndCortanaVa - kTwinuiPreferredBase);
-    const bool clickAway =
-        PrologueMatches(module, kClickAwayDelegateVa - kTwinuiPreferredBase,
-                        kClickAwayDelegatePrologue,
-                        sizeof(kClickAwayDelegatePrologue)) &&
-        BodyContains(module, clickAwayRva - 4, 4, vtableSlot,
-                     sizeof(vtableSlot)) &&
-        DirectCallTargets(module, clickAwayRva, 0x76E010);
-    const uint8_t lockSite[] = {0xBA, 0x07, 0x00, 0x00, 0x00, 0x48,
-                                0x8B, 0x01, 0x48, 0x8B, 0x40, 0x48};
-    const bool lock =
-        PrologueMatches(module, kLockDismissVa - kTwinuiPreferredBase,
-                        kLockDismissPrologue,
-                        sizeof(kLockDismissPrologue)) &&
-        BodyContains(module, kLockDismissVa - kTwinuiPreferredBase,
-                     0x60, lockSite, sizeof(lockSite)) &&
-        DirectCallTargets(module, lockRva, 0x76E010);
-
-    const uint8_t awaySite[] = {0xBA, 0x07, 0x00, 0x00, 0x00, 0x48,
-                                0x8B, 0x01, 0x48, 0x8B, 0x40, 0x48};
-    const bool away =
-        PrologueMatches(module, kClickAwayHandlerVa - kTwinuiPreferredBase,
-                        kClickAwayHandlerPrologue,
-                        sizeof(kClickAwayHandlerPrologue)) &&
-        BodyContains(module, kClickAwayHandlerVa - kTwinuiPreferredBase, 0x200,
-                     awaySite, sizeof(awaySite)) &&
-        DirectCallTargets(module, kHideCallerAwayVa - 5, 0x76E010);
-
-    if (!ordinary || !clickAway || !lock || !away) {
-        FileLog(L"own hook skipped name=callers build=10.0.26100.9949 "
-                L"ordinary=%d clickaway=%d lock=%d away=%d",
-                ordinary ? 1 : 0, clickAway ? 1 : 0, lock ? 1 : 0,
-                away ? 1 : 0);
-        return false;
-    }
-    return true;
-}
-
-bool HideStartAndCortanaProbe(HMODULE module) {
-    const uintptr_t functionRva = kHideStartAndCortanaVa - kTwinuiPreferredBase;
-    if (!ImageRangeExecutable(module, functionRva,
-                              kHideStartAndCortanaProbeBytes)) {
-        FileLog(L"close hook skipped (target not readable)");
-        Wh_Log(L"twinui.pcshell.dll does not map the HideStartAndCortana "
-               L"address into an executable section of the image; the close "
-               L"hook is refused");
-        return false;
-    }
-
-    const auto* code = reinterpret_cast<const uint8_t*>(module) + functionRva;
-    for (size_t i = 0; i < sizeof(kHideStartAndCortanaPrologue); i++) {
-        if (code[i] != kHideStartAndCortanaPrologue[i]) {
-            FileLog(L"close hook skipped build=10.0.26100.9949 prologue "
-                    L"mismatch");
-            Wh_Log(L"twinui.pcshell.dll 10.0.26100.9949 does not carry the "
-                   L"HideStartAndCortana prologue this hook was written for; "
-                   L"the close hook is refused");
-            return false;
-        }
-    }
-
-    // The three body markers: the transient write 5 -> 9, the manager load from
-    // this object's +0x38 and the Hide slot +0x40. They are what proves the
-    // function still moves the state the decision depends on.
-    const uint8_t stateNine[] = {0xC7, 0x41, 0x28, 0x09, 0x00, 0x00, 0x00};
-    const uint8_t managerLoad[] = {0x48, 0x8B, 0x4F, 0x38};
-    const uint8_t hideSlot[] = {0x48, 0x8B, 0x40, 0x40};
-    bool foundState = false;
-    bool foundManager = false;
-    bool foundSlot = false;
-    for (size_t i = 0; i + sizeof(stateNine) <= kHideStartAndCortanaProbeBytes;
-         i++) {
-        if (!foundState &&
-            std::memcmp(code + i, stateNine, sizeof(stateNine)) == 0) {
-            foundState = true;
-        }
-        if (!foundManager &&
-            std::memcmp(code + i, managerLoad, sizeof(managerLoad)) == 0) {
-            foundManager = true;
-        }
-        if (!foundSlot && std::memcmp(code + i, hideSlot, sizeof(hideSlot)) == 0) {
-            foundSlot = true;
-        }
-    }
-    if (!foundState || !foundManager || !foundSlot) {
-        FileLog(L"close hook skipped build=10.0.26100.9949 state machine moved");
-        Wh_Log(L"twinui.pcshell.dll 10.0.26100.9949 carries the "
-               L"HideStartAndCortana prologue but not the state write and "
-               L"manager call this hook was written for; the close hook is "
-               L"refused");
-        return false;
-    }
-
-    return true;
-}
-
-bool InstallHook(void* target, void* hook, void** original,
-                 const wchar_t* name) {
-    if (!target) {
-        Wh_Log(L"Cannot hook %s: null target", name);
-        return false;
-    }
-    if (!Wh_SetFunctionHook(target, hook, original)) {
-        Wh_Log(L"Failed to hook %s", name);
-        return false;
-    }
-    Wh_Log(L"Hooked %s", name);
-    return true;
-}
-
-void InstallExplorerHooks(HMODULE module) {
-    if (!module) {
-        return;
-    }
-    if (g_disabled.load(std::memory_order_relaxed)) {
-        return;
-    }
-    // One attempt per process: a mismatch is not retried on every module load.
-    if (g_explorerHooked.exchange(true)) {
-        return;
-    }
-    if (!TwinuiBuildMatches(module)) {
-        // The gate logged the mismatch; no hook is installed at all.
-        return;
-    }
-
-    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
-    const auto at = [base](uintptr_t preferredVa) -> void* {
-        return reinterpret_cast<void*>(base +
-                                       (preferredVa - kTwinuiPreferredBase));
-    };
-
-    InstallHook(at(kShowVa), reinterpret_cast<void*>(Show_Hook),
-                reinterpret_cast<void**>(&Show_Original),
-                L"CStartExperienceManager::Show");
-
-    // The close executor first, so the decision hook below can never be the
-    // only one installed on a build whose state machine moved: the close is then
-    // not animated at all instead of being delayed by a hook that cannot decide.
-    bool closeHook = false;
-    if (HideStartAndCortanaProbe(module) &&
-        InstallHook(at(kHideStartAndCortanaVa),
-                    reinterpret_cast<void*>(HideStartAndCortana_Hook),
-                    reinterpret_cast<void**>(&HideStartAndCortana_Original),
-                    L"XamlLauncherState::HideStartAndCortana")) {
-        g_closeHookEnabled.store(true, std::memory_order_relaxed);
-        closeHook = true;
-        g_twinuiBase = base;
-        FileLog(L"close trigger hook installed rva=24bcb0");
-    }
-
-    // The caller discriminator is what keeps the lock screen out of the
-    // animation and the click-away in it. Its result is a capability, not a
-    // warning: without the proven sites every close is unattributable, so the
-    // hook that turns a close into a decision is refused and every close passes
-    // to the shell (OwnResolveCaller answers Unknown for the same reason).
-    const bool callers = closeHook && HideCallerSitesProbe(module);
-    g_callersVerified.store(callers, std::memory_order_relaxed);
-    if (closeHook && !callers) {
-        FileLog(L"own close hook installed without callers; no close decision "
-                L"is intercepted");
-    }
-
-    // The primitives the two decision hooks call. Probed together: a decision
-    // that can only close or only open would be half a toggle. They also depend
-    // on the caller capability, because a primitive that receives method 6/11
-    // without it cannot tell a physical press from a caller the build moved.
-    const bool primitives =
-        closeHook && callers && DismissProbe(module) && ShowStartViewProbe(module);
-    if (primitives) {
-        g_dismiss = reinterpret_cast<DismissFn>(at(kDismissVa));
-        g_showStartView = reinterpret_cast<ShowStartViewFn>(at(kShowStartViewVa));
-        if (InstallHook(at(kDismissVa),
-                        reinterpret_cast<void*>(Dismiss_Hook),
-                        reinterpret_cast<void**>(&Dismiss_Original),
-                        L"XamlLauncher::Dismiss") &&
-            InstallHook(at(kShowStartViewVa),
-                        reinterpret_cast<void*>(ShowStartView_Hook),
-                        reinterpret_cast<void**>(&ShowStartView_Original),
-                        L"XamlLauncher::ShowStartView")) {
-            g_ownPrimitivesEnabled.store(true, std::memory_order_relaxed);
-            FileLog(L"own hooks installed name=primitives");
-        }
-    } else {
-        FileLog(L"own hook skipped name=primitives build=10.0.26100.9949 "
-                L"callers=%d",
-                callers ? 1 : 0);
-    }
-
-    // Both decisions share the one owner state. Each hook is probed and installed
-    // alone: a refused Windows-key hook leaves the Start button working and the
-    // shell's own decision for the key, and the reverse.
-    if (primitives && OnHotkeyInvokeProbe(module) &&
-        InstallHook(at(kOnHotkeyInvokeVa),
-                    reinterpret_cast<void*>(OnHotkeyInvoke_Hook),
-                    reinterpret_cast<void**>(&OnHotkeyInvoke_Original),
-                    L"XamlLauncher::OnHotkeyInvoke")) {
-        g_ownWinEnabled.store(true, std::memory_order_relaxed);
-        FileLog(L"own hook installed name=win rva=14195c");
-    }
-    if (primitives && OnStartButtonPressedProbe(module) &&
-        InstallHook(at(kOnStartButtonPressedVa),
-                    reinterpret_cast<void*>(OnStartButtonPressed_Hook),
-                    reinterpret_cast<void**>(&OnStartButtonPressed_Original),
-                    L"XamlLauncher::OnStartButtonPressed")) {
-        g_ownButtonEnabled.store(true, std::memory_order_relaxed);
-        FileLog(L"own hook installed name=startbutton rva=492c90");
-    }
-
-    // The events only mirror the boolean and serve the reopen latch. Both are
-    // probed together: a Shown without a Hidden would show an open that no close
-    // ever clears.
-    if (OnStartShownProbe(module) && OnStartHiddenProbe(module) &&
-        InstallHook(at(kOnStartShownVa),
-                    reinterpret_cast<void*>(OnStartShown_Hook),
-                    reinterpret_cast<void**>(&OnStartShown_Original),
-                    L"XamlLauncherState::OnStartShown") &&
-        InstallHook(at(kOnStartHiddenVa),
-                    reinterpret_cast<void*>(OnStartHidden_Hook),
-                    reinterpret_cast<void**>(&OnStartHidden_Original),
-                    L"XamlLauncherState::OnStartHidden")) {
-        g_ownEventsEnabled.store(true, std::memory_order_relaxed);
-        FileLog(L"own hooks installed name=events");
-    }
-}
-
-void TryInstallFromLoadedModules(bool apply) {
-    if (g_disabled.load(std::memory_order_relaxed)) {
-        return;
-    }
-
-    bool installed = false;
-    if (!g_explorerHooked.load(std::memory_order_relaxed)) {
-        HMODULE twinui = GetModuleHandleW(kTwinuiModuleName);
-        if (twinui) {
-            InstallExplorerHooks(twinui);
-            installed = true;
-        }
-    }
-
-    if (installed && apply && g_afterInit.load(std::memory_order_relaxed)) {
-        Wh_ApplyHookOperations();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Late load of twinui.pcshell.dll
-// ---------------------------------------------------------------------------
-
+// The notification only records the image. Resolution runs on the executor
+// worker: HookSymbols starts Windhawk's PDB fetch for twinui.pcshell.pdb (33 MB)
+// and blocks until it finishes, and doing that on a thread Explorer owns would
+// freeze the shell -- the same failure the Start side measured and fixed.
 using LoadLibraryExW_t = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
 LoadLibraryExW_t LoadLibraryExW_Original = nullptr;
 
@@ -15212,20 +14488,258 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
                          ? LoadLibraryExW_Original(fileName, file, flags)
                          : nullptr;
 
-    if (module && !g_explorerHooked.load(std::memory_order_relaxed)) {
-        if (module == GetModuleHandleW(kTwinuiModuleName)) {
-            TryInstallFromLoadedModules(true);
-            // Nothing is created here. This hook runs on whichever thread called
-            // LoadLibraryExW -- a late load can be any thread, and a window on
-            // the wrong one is never pumped (the taskbar thread is the one this
-            // project measured as an explorer fail-fast for a show). The window
-            // is created from the next known launcher entry (OnHotkeyInvoke,
-            // Dismiss, ShowStartView, the manager's Show) or by the worker's
-            // WH_GETMESSAGE hook targeted at the launcher thread it observed.
+    // Filter on the returned module, not on the requested name: the call may
+    // have asked for another file and still brought twinui in, and a refused or
+    // redirected request must not look like a load. This mod never force-loads
+    // twinui.
+    if (module && module == GetModuleHandleW(kTwinuiModuleName)) {
+        g_explorerModuleSeen.store(module, std::memory_order_release);
+        if (!g_explorerLoadLogged.exchange(true)) {
+            FileLog(L"exec launcher module seen module=%p", module);
         }
     }
 
     return module;
+}
+
+// The proven caller wrappers: a thread-local category around the original call,
+// restoring the previous value. They never decide anything and always call the
+// original; the Hide hook reads the category.
+using DismissStartAndCortana_t = void (*)(void*, uint32_t);
+DismissStartAndCortana_t DismissStartAndCortana_Original = nullptr;
+
+void DismissStartAndCortana_Hook(void* self, uint32_t method) {
+    const OwnCallerScope scope(OwnCaller::Ordinary);
+    if (DismissStartAndCortana_Original) {
+        DismissStartAndCortana_Original(self, method);
+    }
+}
+
+using DismissSynchronously_t = HRESULT (*)(void*);
+DismissSynchronously_t DismissSynchronously_Original = nullptr;
+
+HRESULT DismissSynchronously_Hook(void* self) {
+    const OwnCallerScope scope(OwnCaller::Lock);
+    return DismissSynchronously_Original ? DismissSynchronously_Original(self)
+                                         : E_FAIL;
+}
+
+// ImmersiveMonitorHelper::ActiveZBandChangedForMonitor is the click-away scope:
+// its body carries the synchronous `mov edx, 7; call [vtable+0x48]` at +0x18E
+// (verified on 10.0.26100.9949), so a method-7 Hide reached inside it is the
+// desktop click. Any other Hide from that scope is treated as unclassified by
+// the Hide hook, not as a second click-away.
+using ActiveZBand_t = HRESULT (*)(void*, unsigned long, unsigned long, void*,
+                                  int);
+ActiveZBand_t ActiveZBand_Original = nullptr;
+
+HRESULT ActiveZBand_Hook(void* self, unsigned long a, unsigned long b,
+                         void* monitor, int reason) {
+    const OwnCallerScope scope(OwnCaller::ClickAway);
+    return ActiveZBand_Original ? ActiveZBand_Original(self, a, b, monitor, reason)
+                                : E_FAIL;
+}
+
+// One resolution attempt. Returns true only when this call installed every hook;
+// a false result while the PDB fetch runs is pending, and the worker retries.
+bool InstallExplorerHooks(HMODULE module) {
+    if (!module) {
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&g_explorerSymbolLock);
+    HMODULE expected = nullptr;
+    if (!g_explorerSymbolClaim.compare_exchange_strong(expected, module)) {
+        ReleaseSRWLockExclusive(&g_explorerSymbolLock);
+        return false;
+    }
+    if (g_disabled.load(std::memory_order_relaxed)) {
+        ReleaseSRWLockExclusive(&g_explorerSymbolLock);
+        return false;
+    }
+    FileLog(L"exec launcher symbols begin module=%p", module);
+
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {{kSymShow}, &Show_Original, &Show_Hook},
+        {{kSymHideStartAndCortana}, &HideStartAndCortana_Original,
+         &HideStartAndCortana_Hook},
+        {{kSymOnStartShown}, &OnStartShown_Original, &OnStartShown_Hook},
+        {{kSymOnStartHidden}, &OnStartHidden_Original, &OnStartHidden_Hook},
+        {{kSymOnHotkeyInvoke}, &OnHotkeyInvoke_Original, &OnHotkeyInvoke_Hook},
+        {{kSymOnStartButtonPressed}, &OnStartButtonPressed_Original,
+         &OnStartButtonPressed_Hook},
+        {{kSymDismiss}, &Dismiss_Original, &Dismiss_Hook},
+        {{kSymShowStartView}, &ShowStartView_Original, &ShowStartView_Hook},
+        {{kSymDismissStartAndCortana}, &DismissStartAndCortana_Original,
+         &DismissStartAndCortana_Hook},
+        {{kSymDismissSynchronously}, &DismissSynchronously_Original,
+         &DismissSynchronously_Hook},
+        {{kSymActiveZBand}, &ActiveZBand_Original, &ActiveZBand_Hook},
+        {{kSymLauncherSlot}, &g_launcherSlot, nullptr},
+        {{kSymLauncherIsVisible}, &g_launcherIsVisible, nullptr},
+    };
+    const bool hooked =
+        WindhawkUtils::HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));
+
+    // Every symbol is required. A partially resolved set is not installed at
+    // all: a toggle that can open but not close (or a close that cannot be
+    // classified) is worse than the shell's own path.
+    if (!hooked || !Show_Original || !HideStartAndCortana_Original ||
+        !OnStartShown_Original || !OnStartHidden_Original ||
+        !OnHotkeyInvoke_Original || !OnStartButtonPressed_Original ||
+        !Dismiss_Original || !ShowStartView_Original ||
+        !DismissStartAndCortana_Original || !DismissSynchronously_Original ||
+        !ActiveZBand_Original || !g_launcherSlot || !g_launcherIsVisible) {
+        g_explorerSymbolClaim.store(nullptr, std::memory_order_release);
+        ReleaseSRWLockExclusive(&g_explorerSymbolLock);
+        return false;
+    }
+
+    // The executor calls the trampolines: its own calls are not triggers.
+    // t_execCall still marks the frame for the Hide hook.
+    g_dismiss = Dismiss_Original;
+    g_showStartView = ShowStartView_Original;
+    g_closeHookEnabled.store(true, std::memory_order_relaxed);
+    g_ownPrimitivesEnabled.store(true, std::memory_order_relaxed);
+    g_ownWinEnabled.store(true, std::memory_order_relaxed);
+    g_ownButtonEnabled.store(true, std::memory_order_relaxed);
+    g_ownEventsEnabled.store(true, std::memory_order_relaxed);
+    g_callersVerified.store(true, std::memory_order_relaxed);
+    g_explorerSymbolsReady.store(true, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_explorerSymbolLock);
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
+    struct ResolvedSymbol {
+        const wchar_t* label;
+        const void* address;
+        uintptr_t expectedRva;
+    };
+    const ResolvedSymbol resolved[] = {
+        {L"show", reinterpret_cast<const void*>(Show_Original), kRvaShow},
+        {L"hide", reinterpret_cast<const void*>(HideStartAndCortana_Original),
+         kRvaHideStartAndCortana},
+        {L"shown", reinterpret_cast<const void*>(OnStartShown_Original),
+         kRvaOnStartShown},
+        {L"hidden", reinterpret_cast<const void*>(OnStartHidden_Original),
+         kRvaOnStartHidden},
+        {L"win", reinterpret_cast<const void*>(OnHotkeyInvoke_Original),
+         kRvaOnHotkeyInvoke},
+        {L"button", reinterpret_cast<const void*>(OnStartButtonPressed_Original),
+         kRvaOnStartButtonPressed},
+        {L"dismiss", reinterpret_cast<const void*>(Dismiss_Original),
+         kRvaDismiss},
+        {L"showview", reinterpret_cast<const void*>(ShowStartView_Original),
+         kRvaShowStartView},
+        {L"ordinary", reinterpret_cast<const void*>(DismissStartAndCortana_Original),
+         kRvaDismissStartAndCortana},
+        {L"lock", reinterpret_cast<const void*>(DismissSynchronously_Original),
+         kRvaDismissSynchronously},
+        {L"clickaway", reinterpret_cast<const void*>(ActiveZBand_Original),
+         kRvaActiveZBand},
+        {L"slot", reinterpret_cast<const void*>(g_launcherSlot),
+         kRvaLauncherSlot},
+        {L"visible", reinterpret_cast<const void*>(g_launcherIsVisible),
+         kRvaLauncherIsVisible},
+    };
+    int matches = 0;
+    for (const ResolvedSymbol& symbol : resolved) {
+        const uintptr_t rva =
+            reinterpret_cast<uintptr_t>(symbol.address) - base;
+        const bool match = rva == symbol.expectedRva;
+        matches += match ? 1 : 0;
+        FileLog(L"exec launcher symbol label=%s rva=0x%llX expected=0x%llX "
+                L"match=%d",
+                symbol.label, static_cast<unsigned long long>(rva),
+                static_cast<unsigned long long>(symbol.expectedRva),
+                match ? 1 : 0);
+    }
+    FileLog(L"exec launcher symbols resolved base=0x%llX count=%d matches=%d "
+            L"match=%d",
+            static_cast<unsigned long long>(base),
+            static_cast<int>(ARRAYSIZE(resolved)), matches,
+            matches == static_cast<int>(ARRAYSIZE(resolved)) ? 1 : 0);
+    Wh_Log(L"twinui.pcshell.dll symbols resolved at %p (%d/%d at the reference "
+           L"RVAs); launcher hooks installed",
+           reinterpret_cast<void*>(base), matches,
+           static_cast<int>(ARRAYSIZE(resolved)));
+    return true;
+}
+
+// Records an already-loaded twinui. Called from init and AfterInit; it never
+// resolves anything (that is the worker's job, so the shell's thread is never
+// blocked by the PDB fetch).
+void NoteLoadedExplorerModule() {
+    if (g_disabled.load(std::memory_order_relaxed) ||
+        g_explorerSymbolsReady.load(std::memory_order_acquire) ||
+        g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
+        return;
+    }
+    HMODULE twinui = GetModuleHandleW(kTwinuiModuleName);
+    if (twinui) {
+        g_explorerModuleSeen.store(twinui, std::memory_order_release);
+    }
+}
+
+// Resolves the launcher symbols from the executor worker. Called on every wait
+// timeout: immediate when the module is first known, then throttled while the
+// result is pending. Never called on a thread Explorer owns.
+void ProbeExplorerSymbolsFromWorker() {
+    if (!g_afterInit.load(std::memory_order_relaxed) ||
+        g_disabled.load(std::memory_order_relaxed) ||
+        g_explorerSymbolsReady.load(std::memory_order_acquire) ||
+        g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
+        return;
+    }
+    HMODULE module = g_explorerModuleSeen.load(std::memory_order_acquire);
+    if (!module) {
+        module = GetModuleHandleW(kTwinuiModuleName);
+        if (!module) {
+            return;
+        }
+        g_explorerModuleSeen.store(module, std::memory_order_release);
+    }
+
+    const uint64_t now = GetTickCount64();
+    const bool first = g_execProbeFirstTick == 0;
+    if (!first && now < g_execProbeNextTick) {
+        return;
+    }
+    g_execProbeNextTick = now + kExecSymbolProbeMs;
+    if (first) {
+        g_execProbeFirstTick = now;
+    }
+
+    if (InstallExplorerHooks(module)) {
+        Wh_ApplyHookOperations();
+        FileLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
+        return;
+    }
+    if (g_explorerSymbolsReady.load(std::memory_order_acquire) ||
+        g_disabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    g_execProbeAttempts++;
+    const uint64_t waited = GetTickCount64() - g_execProbeFirstTick;
+    if (waited >= kExecSymbolPendingDeadlineMs) {
+        g_explorerSymbolsRefused.store(true, std::memory_order_release);
+        FileLog(L"exec launcher symbols deadline attempts=%d waited=%llums "
+                L"deadline=%llums",
+                g_execProbeAttempts, static_cast<unsigned long long>(waited),
+                static_cast<unsigned long long>(
+                    kExecSymbolPendingDeadlineMs));
+        FileLog(L"exec launcher symbols unresolved name=twinui.pcshell.dll "
+                L"(symbol, signature or hook refused)");
+        Wh_Log(L"twinui.pcshell.dll symbols could not be resolved within the "
+               L"%llu ms pending deadline; no launcher hook is installed and "
+               L"every press stays native",
+               static_cast<unsigned long long>(kExecSymbolPendingDeadlineMs));
+        return;
+    }
+    FileLog(L"exec launcher symbols pending attempt=%d waited=%llums "
+            L"deadline=%llums",
+            g_execProbeAttempts, static_cast<unsigned long long>(waited),
+            static_cast<unsigned long long>(kExecSymbolPendingDeadlineMs));
 }
 
 // ---------------------------------------------------------------------------
@@ -15292,7 +14806,14 @@ void ResetReinitState() {
     g_initRefused.store(false, std::memory_order_relaxed);
     g_disabled.store(false, std::memory_order_relaxed);
     g_afterInit.store(false, std::memory_order_relaxed);
-    g_explorerHooked.store(false, std::memory_order_relaxed);
+    g_explorerSymbolsReady.store(false, std::memory_order_relaxed);
+    g_explorerSymbolsRefused.store(false, std::memory_order_relaxed);
+    g_explorerModuleSeen.store(nullptr, std::memory_order_relaxed);
+    g_explorerSymbolClaim.store(nullptr, std::memory_order_relaxed);
+    g_explorerLoadLogged.store(false, std::memory_order_relaxed);
+    g_execProbeNextTick = 0;
+    g_execProbeFirstTick = 0;
+    g_execProbeAttempts = 0;
     g_closeHookEnabled.store(false, std::memory_order_relaxed);
     // The decision layer's per-activation state: a re-enable starts with no
     // cached toggle, no latch, no forwarded mark and no primitives from the
@@ -15308,7 +14829,24 @@ void ResetReinitState() {
     g_callersVerified.store(false, std::memory_order_relaxed);
     g_dismiss = nullptr;
     g_showStartView = nullptr;
-    g_twinuiBase = 0;
+    g_launcherSlot = nullptr;
+    g_launcherIsVisible = nullptr;
+    // The hook originals point into the previous activation's trampolines, which
+    // Windhawk frees when it removes the hooks. A re-enable resolves them again;
+    // until it does, a null original means "not installed", not "call freed
+    // code".
+    Show_Original = nullptr;
+    HideStartAndCortana_Original = nullptr;
+    OnStartShown_Original = nullptr;
+    OnStartHidden_Original = nullptr;
+    OnHotkeyInvoke_Original = nullptr;
+    OnStartButtonPressed_Original = nullptr;
+    Dismiss_Original = nullptr;
+    ShowStartView_Original = nullptr;
+    DismissStartAndCortana_Original = nullptr;
+    DismissSynchronously_Original = nullptr;
+    ActiveZBand_Original = nullptr;
+    LoadLibraryExW_Original = nullptr;
     g_execReady.store(false, std::memory_order_relaxed);
     g_execWindow.store(nullptr, std::memory_order_relaxed);
     g_execThreadId = 0;
@@ -15358,12 +14896,12 @@ void* LauncherNow(uint64_t* stateOut, void** outerOut) {
     if (outerOut) {
         *outerOut = nullptr;
     }
-    if (!g_twinuiBase) {
+    if (!g_launcherSlot) {
         return nullptr;
     }
-    void** slot = reinterpret_cast<void**>(
-        g_twinuiBase + kLauncherSingletonRva);
-    void* outer = *slot;
+    // Read the pointer slot on each execution, on the caller's thread; the
+    // singleton is never cached here.
+    void* outer = *g_launcherSlot;
     if (outerOut) {
         *outerOut = outer;
     }
@@ -15372,7 +14910,7 @@ void* LauncherNow(uint64_t* stateOut, void** outerOut) {
     }
     void* launcher = static_cast<uint8_t*>(outer) + kHotkeyLauncherOffset;
     const uint64_t state = *reinterpret_cast<uint64_t*>(
-        static_cast<uint8_t*>(launcher) + kLauncherStateOffset);
+        static_cast<uint8_t*>(launcher) + kLauncherStatePointerOffset);
     if (stateOut) {
         *stateOut = state;
     }
@@ -15416,13 +14954,11 @@ const wchar_t* ProbeVisibilityName(ProbeVisibility value) {
 }
 
 ProbeVisibility LauncherVisibleNow(void* launcher) {
-    if (!launcher || !g_twinuiBase) {
+    if (!launcher || !g_launcherIsVisible) {
         return ProbeVisibility::Unknown;
     }
-    const LauncherIsVisibleFn isVisible = reinterpret_cast<LauncherIsVisibleFn>(
-        g_twinuiBase + kLauncherIsVisibleRva);
     BOOL visible = FALSE;
-    const HRESULT hr = isVisible(launcher, &visible);
+    const HRESULT hr = g_launcherIsVisible(launcher, &visible);
     if (FAILED(hr)) {
         return ProbeVisibility::Unknown;
     }
@@ -16172,13 +15708,23 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
 
     HANDLE events[2] = {g_execStopEvent, g_ipc.execEvent};
     for (;;) {
-        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        // A bounded wait, because this worker also owns the launcher symbol
+        // install. HookSymbols blocks on Windhawk's PDB fetch for
+        // twinui.pcshell.pdb, and running that on a thread Explorer owns freezes
+        // the shell. The timeout only schedules the probe; the command event
+        // still wakes the loop at once.
+        const DWORD wait = WaitForMultipleObjects(
+            2, events, FALSE, static_cast<DWORD>(kExecSymbolProbeMs));
         if (wait == WAIT_OBJECT_0) {
             return 0;
         }
         if (wait == WAIT_FAILED) {
             FileLog(L"exec worker wait failed err=%u", GetLastError());
             return 0;
+        }
+        if (wait == WAIT_TIMEOUT) {
+            ProbeExplorerSymbolsFromWorker();
+            continue;
         }
         if (wait != WAIT_OBJECT_0 + 1) {
             FileLog(L"exec worker wait ended unexpectedly result=%u", wait);
@@ -16626,7 +16172,9 @@ BOOL RoleInit() {
         Wh_Log(L"Hooked LoadLibraryExW");
     }
 
-    TryInstallFromLoadedModules(false);
+    // Record the image if it is already loaded; resolution happens on the
+    // executor worker so the PDB fetch never blocks Explorer's thread.
+    NoteLoadedExplorerModule();
 
     return TRUE;
 }
@@ -16636,7 +16184,7 @@ void RoleAfterInit() {
         return;
     }
     g_afterInit = true;
-    TryInstallFromLoadedModules(false);
+    NoteLoadedExplorerModule();
     Wh_ApplyHookOperations();
 }
 
@@ -16651,7 +16199,14 @@ void RoleBeforeUninit() {
     // point skips the channel, and one that is already inside holds its lease
     // until it returns. The v7 channel is closed in Wh_ModUninit, after that flag
     // and after the drain.
+    //
+    // The lock is what makes the flag authoritative for the worker's symbol
+    // install: a HookSymbols call that is already inside the lock finishes first
+    // (and its install sees the flag), and one that starts after this point
+    // refuses before it queues anything.
+    AcquireSRWLockExclusive(&g_explorerSymbolLock);
     g_disabled = true;
+    ReleaseSRWLockExclusive(&g_explorerSymbolLock);
 }
 
 void RoleUninit() {

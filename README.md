@@ -37,8 +37,12 @@ in StartMenuExperienceHost and the executor in Explorer.
   the hide lands. The key never goes dead. A touch pull still down when a close
   lands reopens through the controller. Win+Tab, the lock screen and a display
   change pass through untouched, so a lock never waits. If the executor half is
-  refused by the Explorer build, the menu still opens and closes, but the close
-  is instant.
+  refused — the Explorer build does not match, or the launcher's public symbols
+  cannot be resolved — the menu still opens and closes, but the close is instant.
+  The launcher hooks are found by public symbol, not by address. While the
+  symbols are being fetched, Explorer keeps working and every press runs the
+  shell's own path; the log shows `exec launcher symbols pending ...` and then
+  `exec launcher symbols resolved ... match=1`.
 
 ## Install
 
