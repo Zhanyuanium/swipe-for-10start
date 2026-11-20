@@ -1,6 +1,6 @@
 # IPC — the v7 channel
 
-> Start 0.43.0 / bridge 0.24.0. One session-local section, seven named objects,
+> Start 0.44.0 / bridge 0.25.0. One session-local section, seven named objects,
 > every record a seqlock. There is no file and no polling on either side.
 
 ## Names and layout
@@ -120,7 +120,9 @@ delivered twice). `execTick` is the publication tick and is the deadline of a
 show and a cancel.
 
 **Expiry.** The controller's budget is 400 ms: a show is answered within 400 ms
-of its publication, a dismiss within 400 ms of the deadline it was given. A
+of its publication, a dismiss within 400 ms of the deadline it was given. The
+comparison is `>= due + 400` on both sides, so a dispatch exactly at the boundary
+is expired for the bridge and for the publisher. A
 dispatch that starts after that is stale — the publisher has already cleared its
 sequence, published a cancel where it could, and released ownership — so the
 bridge answers `kSwipeAckExpired` and does not call the primitive. The publisher
@@ -128,14 +130,29 @@ does the same from its side: an unanswered dismiss is cancelled by sequence at i
 timeout, and an unanswered show, which has no armed command to revoke, is
 invalidated by the executor's age check.
 
+A deadline is **not** a guaranteed response and not a lease on the shell call. A
+primitive can enter before the deadline and return after the publisher timed out;
+the timeout is a repair, not a cancel, and no scheme can recall a call already
+inside the shell. What the bridge can still do is refuse a record whose publisher
+activation changed: it reads `peerEpoch` when it accepts the record and again
+immediately before the call, and answers `kSwipeAckSuperseded` on a mismatch. A
+record that names a menu (`execOpen`; a dismiss carries the menu's open tick when
+it is known, a show has no menu yet) is also refused when the section has already
+moved to a later open generation (`exec dismiss ... superseded menu=... now=...`).
+The Start side publishes a `cancel(target=0)` at attach for the same reason: a record
+from the previous activation must not act on the menu the new one opens.
+
 The bridge answers on `execAckSeq` with `(command, state, hr, visible)`, where
-`visible` is the `IsVisible` result: 0 right after Show, 1 at the 300 ms probe, 0
-after Dismiss. For a dismiss it is **advisory**: `hr=0` says the primitive
-returned, and the window can still be visible until the shell's own hide runs. The
-bridge keeps that confirmation as an obligation and logs
-`exec dismiss confirmed seq=... visible=0` or
-`exec dismiss unconfirmed seq=... visible=1 at_call=… after=300 ms` 300 ms later;
-it never reports success as a hide.
+`visible` is the visibility probe, now three-valued: `kSwipeVisibilityHidden` (0),
+`kSwipeVisibilityVisible` (1), and `kSwipeVisibilityUnknown` (-1) when there is no
+launcher or `IsVisible` failed. A dismiss is answered in two steps: `executed`
+means the primitive returned; then the 300 ms probe answers `confirmed` (hidden),
+`unconfirmed` (visible), or `unknown` (probe or timer failed). A record replaced by
+a newer one is answered `superseded`, which is distinct from `expired`. The log
+prints the probe's real elapsed time (`after=<n> ms`), not the requested delay.
+`unconfirmed` and `unknown` are terminal repairs for the Start side, which releases
+ownership and reads the cloak on the next poll; `executed` alone is never taken
+as a hide.
 
 ### Controller direction — Start -> bridge
 
@@ -188,6 +205,16 @@ Start side refreshes the tick from its input thread at most once per
 stops, and the gate closes 600 ms later. A few presses during a start or a stop
 are therefore served natively by the shell, by design.
 
+`alive` means **intent-consumer readiness**: that thread's window, its message
+loop and the intent event exist. It is not a claim about the digitizer: a refused
+raw-input registration is logged by `RegisterHidUsage` and the intent half still
+runs; the `ipc peer alive` line prints `touch=`/`pen=` so the difference is
+visible. The publication and the terminal withdrawal are serialised in one
+critical section, so a startup that is already in flight either lands before the
+withdrawal or is refused after it; a flag check followed by an independent store
+would let `alive` overwrite `gone`.
+
+
 The window is six refresh intervals: five consecutive refreshes may be missed
 without closing the gate, so a stalled input thread (a settle, a busy message
 loop) does not flap it, and a kill still restores the shell's own toggle within
@@ -221,7 +248,10 @@ bridge; a bridge that still held the old section was one Start reload behind.
 `Local\SwipeFor10Start_v7_Cmd` is the only command path: `tools/ipc.ps1` takes
 the mutex, writes one line, sets the event. The Start side's input thread takes
 it (`SwipeIpcTakeCommand`) and applies the documented debug lines. Nothing
-polls.
+polls. `tools/ipc.ps1 -State` prints the executor ack with its outcome name
+(`executed|confirmed|unconfirmed|unknown|superseded|refused|expired`) and the
+visibility word as `hidden|visible|unknown` beside the raw numbers, so the three
+outcomes are told apart without decoding the constants by hand.
 
 ## What is not in the channel
 

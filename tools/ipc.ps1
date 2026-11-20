@@ -88,6 +88,24 @@ $OffsetPeerEpoch = 740
 $StateVersion = 7
 $StateBytes = 744
 
+# The ack outcome and visibility words are shared constants (swipe_ipc_shared.h).
+# A missing key prints a blank name, the number is still shown beside it.
+$AckNames = @{
+    0 = 'pending'
+    1 = 'executed'
+    2 = 'refused'
+    3 = 'expired'
+    4 = 'confirmed'
+    5 = 'unconfirmed'
+    6 = 'unknown'
+    7 = 'superseded'
+}
+$VisibilityNames = @{
+    -1 = 'unknown'
+    0  = 'hidden'
+    1  = 'visible'
+}
+
 function Open-State {
     try {
         return [System.IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting(
@@ -192,10 +210,12 @@ if ($State) {
         }
         $execAck = Read-Record $view $OffsetExecAckSeq {
             [pscustomobject]@{
-                command = $view.ReadInt64($OffsetExecAckFor)
-                state   = $view.ReadInt32($OffsetExecAckState)
-                hr      = $view.ReadInt32($OffsetExecAckHr)
-                visible = $view.ReadInt32($OffsetExecAckVisible)
+                command  = $view.ReadInt64($OffsetExecAckFor)
+                state    = $view.ReadInt32($OffsetExecAckState)
+                stateName = $script:AckNames[$view.ReadInt32($OffsetExecAckState)]
+                hr       = $view.ReadInt32($OffsetExecAckHr)
+                visible  = $view.ReadInt32($OffsetExecAckVisible)
+                visibleName = $script:VisibilityNames[$view.ReadInt32($OffsetExecAckVisible)]
             }
         }
 
@@ -216,7 +236,7 @@ if ($State) {
             execSeq    = $(if ($exec) { $exec.Seq } else { 'unstable' })
             exec       = $(if ($exec) { "kind=$($exec.Value.kind) method=$($exec.Value.method) flags=$($exec.Value.flags) executeAt=$($exec.Value.executeAt) open=$($exec.Value.open) target=$($exec.Value.target)" } else { 'unstable' })
             execAckSeq = $(if ($execAck) { $execAck.Seq } else { 'unstable' })
-            execAck    = $(if ($execAck) { "command=$($execAck.Value.command) state=$($execAck.Value.state) hr=$($execAck.Value.hr) visible=$($execAck.Value.visible)" } else { 'unstable' })
+            execAck    = $(if ($execAck) { "command=$($execAck.Value.command) state=$($execAck.Value.state)($($execAck.Value.stateName)) hr=$($execAck.Value.hr) visible=$($execAck.Value.visible)($($execAck.Value.visibleName))" } else { 'unstable' })
             controllerDirection = $view.ReadInt32($OffsetControllerDirection)
             controllerTouch     = $view.ReadInt32($OffsetControllerTouch)
             peerTick            = $view.ReadUInt32($OffsetPeerTick)

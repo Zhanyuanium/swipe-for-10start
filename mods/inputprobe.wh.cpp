@@ -230,6 +230,14 @@ SubclassEntry g_subclass[kMaxSubclass];
 std::atomic<int> g_subclassCount{0};
 SRWLOCK g_subclassLock = SRWLOCK_INIT;
 std::atomic<bool> g_subclassFullLogged{false};
+// The private detach request. The subclass is installed on windows whose owner
+// thread is not this mod's scan thread, so the restore runs in that thread's
+// WindowSubclassProc, not in the unload thread: SetWindowLongPtrW from another
+// thread is not ordered against a procedure call that is already running. The
+// counter lets the unload prove the detach happened instead of releasing the
+// module under a live pointer.
+constexpr UINT kProbeDetachMessage = WM_APP + 0x51;
+std::atomic<int> g_subclassDetached{0};
 
 std::atomic<int> g_enumLogLines{0};
 std::atomic<int> g_scanLogLines{0};
@@ -333,6 +341,39 @@ void SubclassInputWindow(HWND hwnd, const WCHAR* className) {
 
 LRESULT CALLBACK WindowSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
                                     LPARAM lParam) {
+    if (msg == kProbeDetachMessage) {
+        // The owner thread detaches. Only a chain whose current procedure is
+        // still this one can be restored without clobbering a later subclass; a
+        // later one keeps its saved original pointing here, which no thread can
+        // rewrite, so it is reported and left.
+        WNDPROC original = nullptr;
+        AcquireSRWLockExclusive(&g_subclassLock);
+        const int count = g_subclassCount.load(std::memory_order_relaxed);
+        for (int i = 0; i < count; ++i) {
+            if (g_subclass[i].hwnd == hwnd) {
+                original = g_subclass[i].original;
+                g_subclass[i].hwnd = nullptr;
+                g_subclass[i].original = nullptr;
+                break;
+            }
+        }
+        ReleaseSRWLockExclusive(&g_subclassLock);
+        if (original &&
+            GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
+                reinterpret_cast<LONG_PTR>(WindowSubclassProc)) {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                              reinterpret_cast<LONG_PTR>(original));
+            g_subclassDetached.fetch_add(1, std::memory_order_relaxed);
+            LogFormat("subclass detached hwnd=%p tid=%u",
+                      static_cast<void*>(hwnd),
+                      static_cast<unsigned>(GetCurrentThreadId()));
+        } else {
+            LogFormat("subclass detach left hwnd=%p reason=%s",
+                      static_cast<void*>(hwnd),
+                      original ? "later-subclass" : "not-tracked");
+        }
+        return 0;
+    }
     WNDPROC original = nullptr;
     AcquireSRWLockShared(&g_subclassLock);
     const int count = g_subclassCount.load(std::memory_order_relaxed);
@@ -1181,39 +1222,69 @@ void Wh_ModUninit() {
         SetEvent(g_hidStopEvent);
     }
 
+    // Wake what can be woken, join, then release. The scan thread sleeps in
+    // 250 ms steps and has no event; the raw-input thread waits on the stop
+    // event. A timeout means the thread may still be inside this module, so the
+    // handle stays open and nothing it can reach is released.
     if (g_scanThread) {
-        WaitForSingleObject(g_scanThread, 3000);
-        CloseHandle(g_scanThread);
-        g_scanThread = nullptr;
+        if (WaitForSingleObject(g_scanThread, 3000) == WAIT_OBJECT_0) {
+            CloseHandle(g_scanThread);
+            g_scanThread = nullptr;
+        } else {
+            LogFormat("scan thread join timeout; unload residual=scan thread");
+        }
     }
 
-    // Restore every window procedure before the DLL can be unloaded. A new
-    // subclass installed by another mod after ours is left untouched.
-    AcquireSRWLockExclusive(&g_subclassLock);
-    const int count = g_subclassCount.load(std::memory_order_relaxed);
-    for (int i = 0; i < count; ++i) {
+    // Detach the subclasses on their owner threads. Only after that proof is the
+    // procedure's module safe to leave: the restore itself runs on the thread
+    // that owns each window, and the counter says it ran.
+    AcquireSRWLockShared(&g_subclassLock);
+    int tracked = 0;
+    int posted = 0;
+    for (int i = 0; i < g_subclassCount.load(std::memory_order_relaxed); ++i) {
         HWND hwnd = g_subclass[i].hwnd;
-        WNDPROC original = g_subclass[i].original;
-        if (hwnd && original && IsWindow(hwnd) &&
-            GetWindowLongPtrW(hwnd, GWLP_WNDPROC) ==
-                reinterpret_cast<LONG_PTR>(WindowSubclassProc)) {
-            SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
-                              reinterpret_cast<LONG_PTR>(original));
+        if (!hwnd) {
+            continue;
         }
-        g_subclass[i].hwnd = nullptr;
-        g_subclass[i].original = nullptr;
+        ++tracked;
+        if (!IsWindow(hwnd)) {
+            continue;
+        }
+        if (PostMessageW(hwnd, kProbeDetachMessage, 0, 0)) {
+            ++posted;
+        } else {
+            LogFormat("subclass detach post failed hwnd=%p err=%u",
+                      static_cast<void*>(hwnd),
+                      static_cast<unsigned>(GetLastError()));
+        }
     }
-    g_subclassCount.store(0, std::memory_order_release);
-    ReleaseSRWLockExclusive(&g_subclassLock);
+    ReleaseSRWLockShared(&g_subclassLock);
+    const ULONGLONG detachDeadline = GetTickCount64() + 1000;
+    while (g_subclassDetached.load(std::memory_order_relaxed) < posted &&
+           GetTickCount64() < detachDeadline) {
+        Sleep(5);
+    }
+    const int detached = g_subclassDetached.load(std::memory_order_relaxed);
+    if (detached < posted) {
+        // A window whose thread did not pump keeps this module's procedure in
+        // its chain. Releasing nothing here would not make the unload safer (the
+        // image is the host's), so the remaining entries stay named and the log
+        // records the residual instead of pretending the detach completed.
+        LogFormat("subclass detach incomplete posted=%d detached=%d tracked=%d",
+                  posted, detached, tracked);
+    }
 
     if (g_hidThread) {
         const DWORD waitResult = WaitForSingleObject(g_hidThread, 3000);
-        CloseHandle(g_hidThread);
-        g_hidThread = nullptr;
-        // The cache belongs to the raw input thread; free it only after that
-        // thread has actually exited.
         if (waitResult == WAIT_OBJECT_0) {
+            CloseHandle(g_hidThread);
+            g_hidThread = nullptr;
+            // The cache belongs to the raw input thread; free it only after that
+            // thread has actually exited.
             FreeHidDeviceCache();
+        } else {
+            LogFormat("hid thread join timeout; unload residual=hid thread; "
+                      "cache kept");
         }
     }
     if (g_hidStopEvent) {

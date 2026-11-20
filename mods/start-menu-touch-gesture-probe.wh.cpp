@@ -52,6 +52,11 @@ std::atomic<bool> g_explorerHooked{false};
 std::atomic<bool> g_startUIHooked{false};
 std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_stopPolling{false};
+// Hook installation is refused once the unload begins. Wh_ModBeforeUninit is the
+// last point at which Wh_SetFunctionHook/Wh_ApplyHookOperations may be called;
+// the scan thread therefore stops installing there, and the unload proves the
+// thread is out before it releases the log.
+std::atomic<bool> g_stopHooks{false};
 std::atomic<uint32_t> g_continueCount{0};
 // The module-scan thread and the event it waits on. The thread is kept so the
 // unload can join it before the log it writes to is released: this mod is a
@@ -148,6 +153,10 @@ void LogTarget(const char* name, void* target) {
 }
 
 bool InstallHook(void* target, void* hook, void** original, const char* name) {
+    if (g_stopHooks.load(std::memory_order_relaxed)) {
+        Log("%s skipped reason=stopping", name);
+        return false;
+    }
     LogTarget(name, target);
     if (!target) {
         return false;
@@ -554,6 +563,9 @@ using LoadLibraryExW_t = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
 LoadLibraryExW_t LoadLibraryExW_Original = nullptr;
 
 void TryInstallFromLoadedModules(bool apply) {
+    if (g_stopHooks.load(std::memory_order_relaxed)) {
+        return;  // the unload owns the module from here on
+    }
     bool installed = false;
 
     if (!g_explorerHooked.load()) {
@@ -646,8 +658,20 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Log("Wh_ModAfterInit");
     g_afterInit = true;
+    if (g_stopHooks.load(std::memory_order_relaxed)) {
+        return;
+    }
     TryInstallFromLoadedModules(false);
     Wh_ApplyHookOperations();
+}
+
+void Wh_ModBeforeUninit() {
+    // Last point at which hook installation is legal. The scan thread must not
+    // call Wh_SetFunctionHook/Wh_ApplyHookOperations after this function returns,
+    // so installation is refused here and the thread is joined before the final
+    // unload releases anything.
+    g_stopHooks = true;
+    Log("Wh_ModBeforeUninit");
 }
 
 void Wh_ModUninit() {
@@ -655,7 +679,10 @@ void Wh_ModUninit() {
     // The fourth unload path: the scan thread is woken, joined, and only then are
     // its handles and the log released. Closing the mutex first (as this used to)
     // let a poll iteration that was still inside Log() release a handle that had
-    // been closed under it.
+    // been closed under it. The proof is the join: a timeout keeps the handle,
+    // the event and the log, because the thread may still be inside this module
+    // or inside a hook operation.
+    g_stopHooks = true;
     g_stopPolling = true;
     if (g_stopEvent) {
         SetEvent(g_stopEvent);
@@ -663,14 +690,12 @@ void Wh_ModUninit() {
     if (g_pollThread) {
         const DWORD waited = WaitForSingleObject(g_pollThread, 5000);
         Log("poll thread join=%s", waited == WAIT_OBJECT_0 ? "ok" : "timeout");
-        if (waited == WAIT_OBJECT_0) {
-            CloseHandle(g_pollThread);
-        }
-        // A timeout keeps the handle and the log alive: the thread may still be
-        // inside Log, and closing either under it is worse than one leaked pair.
         if (waited != WAIT_OBJECT_0) {
+            // Not provable as gone: every resource it can still reach stays.
+            Log("unload residual=poll thread; log and handles kept");
             return;
         }
+        CloseHandle(g_pollThread);
         g_pollThread = nullptr;
     }
     if (g_stopEvent) {

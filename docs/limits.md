@@ -26,7 +26,7 @@
   named after the image's WndProc, so a new activation does not inherit the old
   image's procedure and its closed channel.
 - **A press that lands inside the shell's hide is a no-op show.** The bridge
-  latches it (one slot, tick, activation epoch) and, 50 ms after the hidden event,
+  latches it (one slot, tick, the epoch the admission was decided under) and, 50 ms after the hidden event,
   serves it as the same open intent (`own press served wait=...`). The
   deferral is measured: a show at the hidden event's own tick was swallowed
   (state stuck at 3) while a show 16 ms later opened. The shell still owns the
@@ -34,7 +34,9 @@
   normal open. The latch is bounded, not a guarantee: a newer press supersedes it,
   a refused or expired dismiss invalidates it, a serve whose peer is gone or
   replaced drops it, and it expires after 1200 ms. A press lost to the 600 ms
-  liveness budget is served by the shell, not recovered.
+  liveness budget is served by the shell — but only if the bridge never swallowed
+  it. A press already swallowed and then lost (peer or epoch changed before the
+  serve) has no shell path left; it is dropped, not passed on.
 
 ## The touch show
 

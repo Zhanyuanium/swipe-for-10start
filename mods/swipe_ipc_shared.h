@@ -175,6 +175,23 @@ constexpr int32_t kSwipeAckPending = 0;
 constexpr int32_t kSwipeAckExecuted = 1;
 constexpr int32_t kSwipeAckRefused = 2;
 constexpr int32_t kSwipeAckExpired = 3;
+// The dismiss confirmation, kept apart from the call's own outcome. `Executed`
+// means the primitive returned; `Confirmed` means a later probe read the window
+// hidden; `Unconfirmed` means the probe read it visible; `Unknown` means the
+// probe could not answer (no launcher, no state, a failed call). A dismiss is
+// never reported as a hide on the strength of its return value alone.
+constexpr int32_t kSwipeAckConfirmed = 4;
+constexpr int32_t kSwipeAckUnconfirmed = 5;
+constexpr int32_t kSwipeAckUnknown = 6;
+// A record a newer command or a new activation superseded before it could run.
+// Distinct from `Expired`, which means the publisher's budget ran out.
+constexpr int32_t kSwipeAckSuperseded = 7;
+
+// The `execAckVisible` word. Negative means the probe could not answer; it is
+// not a hidden window.
+constexpr int32_t kSwipeVisibilityUnknown = -1;
+constexpr int32_t kSwipeVisibilityHidden = 0;
+constexpr int32_t kSwipeVisibilityVisible = 1;
 
 // initState values; see "Who initialises the section" above.
 constexpr LONG kSwipeIpcBlank = 0;
@@ -266,7 +283,10 @@ struct SwipeIpcState {
     volatile LONG64 execTarget;       // the dismiss sequence a cancel names
 
     // M3: bridge -> Start executor answer (seqlock). state is the outcome; hr is
-    // the launcher's HRESULT and visible is IsVisible afterwards.
+    // the launcher's HRESULT and visible is the visibility probe afterwards
+    // (kSwipeVisibility*). A dismiss is answered twice: once when the primitive
+    // returns (`Executed`) and once when the confirmation probe reads the window
+    // (`Confirmed`/`Unconfirmed`/`Unknown`).
     volatile LONG64 execAckSeq;
     volatile LONG64 execAckFor;
     volatile LONG execAckState;

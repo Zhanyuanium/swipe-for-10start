@@ -30,7 +30,8 @@ param(
     [int]$W = 780,
     [int]$H = 1240,
     [int]$RunMs = 500,
-    [string]$Prefix = 'C:\Users\doubao\AppData\Local\Temp\opencode\qsa'
+    [string]$Prefix = [System.IO.Path]::Combine(
+        [System.IO.Path]::GetTempPath(), 'qsa')
 )
 
 $ErrorActionPreference = 'Stop'
