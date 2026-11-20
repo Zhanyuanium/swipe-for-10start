@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.42.0
+// @version         0.43.0
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -834,17 +834,24 @@ Debug channel (kept in the build):
   generation from a previous process is ignored by its sequence, never served.
 - The v7 section is 744 bytes: the command, the open generation, the intent and
   its ack, the executor command and its ack, the controller direction and touch
-  flag, and the peer liveness pair. Every record is a seqlock, so the bridge
+  flag, and the peer liveness triple. Every record is a seqlock, so the bridge
   never reads a half-written intent, command or open generation, and this side
   never reads half a command. The command record is also serialised by a named
   mutex, because more than one tool can publish into it.
-- The liveness pair is the bridge's interception precondition. This side
-  publishes `peerState=alive` with a fresh `peerTick` once the channel is open,
-  the input thread refreshes the tick from its idle tick and from every
-  positioned report at most once per 100 ms, and `Wh_ModUninit` publishes
-  `gone` before it releases the view. The bridge creates the section, so a
-  mapped channel never proves this side is running; `gone` makes a clean disable
-  immediate, and the tick going older than 600 ms covers a killed host.
+- The liveness triple is the bridge's interception precondition. `peerEpoch` is
+  claimed once per attach, before anything else this activation writes;
+  `peerState=alive` is published from the input thread only when its window and
+  its raw-input registrations exist and it is about to wait on the intents; the
+  input thread refreshes `peerTick` from its idle tick and from every positioned
+  report at most once per 100 ms. Availability is withdrawn before that thread is
+  stopped (`Wh_ModBeforeUninit`) and again as it leaves for any reason, and the
+  withdrawal resets the shared direction and touch in the same step, so a kill
+  while `closing` cannot be read as the next activation's decision. The bridge
+  creates the section, so a mapped channel never proves this side is running;
+  `gone` makes a clean disable immediate, and the tick going older than 600 ms
+  covers a killed host. That 600 ms is a detection budget, not a delivery
+  guarantee: a press taken inside it can be published after this side is gone,
+  and a few startup/shutdown presses are served natively by the shell by design.
 - The files this channel replaced (`debug.txt`, `close-mode.txt`,
   `retract-plan.txt`) are deleted at init; they are transport, not state, and a
   leftover would invite a reader that no longer exists.
@@ -921,9 +928,10 @@ Diagnostics:
   every source said), `dismiss axis=... kept, no source named an edge` (once per
   undecided episode; the last edge stays in force), `debug p=...`, `debug t=...`,
   `debug e=...`, `debug anim=...`,
-  `ipc open created=... cmd=...`,
+  `ipc open created=... cmd=... intent=... epoch=...`,
   `ipc open failed err=...`, `ipc legacy files removed=...`,
-  `ipc peer alive` (the bridge may intercept), `ipc peer gone` (it must pass),
+  `ipc peer alive reason=consumer epoch=...` (the bridge may intercept),
+  `ipc peer gone reason=attach|unload|consumer-exit|uninit` (it must pass),
   `gesture geometry updated axis=... dist=...` (or
   `gesture geometry axis=... dist=... (unchanged)` once per open),
   `gesture geometry deferred reason=panel-owned gen=...` (a layout change that
@@ -1180,9 +1188,12 @@ Known risks:
  *   while the window still shows cancels that close: its local dismiss slot is
  *   dropped and a pending executor command is cancelled, and the panel settles
  *   back from its live position
- *   (`intent open cancel from=...`); the recovery ticket stays set until a
- *   landing proves the dismiss was already inside the shell (then
+ *   (`intent open cancel from=...`); the recovery ticket is bound to that close
+ *   (open generation and executor sequence) and stays set until a landing for the
+ *   same menu proves the dismiss was already inside the shell (then
  *   `intent open recovered entry=...`) or an explicit action supersedes it. A
+ *   landing reconciles an already-published `external` intent before it may
+ *   recover, because the idle timer is waited on before the intent event. A
  *   pull still
  *   down at `win close observed` (or lifted inside the 300 ms late window)
  *   issues one fresh show (`reveal reopen after close pull=1 late=0 entry=...`)
@@ -1192,9 +1203,11 @@ Known risks:
  *   one executor line per trigger. The image is pinned, the instance
  *   guard names the PID, the input thread is stop-event driven, the XAML
  *   delegates are revoked at unload with the residual rules. The input thread
- *   also publishes peer liveness (`peerTick` at most once per 100 ms from its
- *   idle tick and every positioned report, `peerState=gone` at unload), which is
- *   the bridge's interception precondition.
+ *   publishes peer liveness when it is ready to serve (`ipc peer alive
+ *   reason=consumer`), refreshes `peerTick` at most once per 100 ms from its idle
+ *   tick and every positioned report, and withdraws availability before it stops
+ *   and again as it exits; the withdrawal also resets the shared direction and
+ *   touch. That triple is the bridge's interception precondition.
  * [POS]: the StartMenuExperienceHost side of the pair: it owns the touch gesture
  *   and the panel's motion, and it is the only process that can plan the settle
  *   (the travel belongs to the panel). The bridge owns the launcher call and the
@@ -2440,15 +2453,24 @@ std::atomic<LONG64> g_pendingDismissExec{0};
 std::atomic<uint64_t> g_pendingDismissExecAt{0};
 std::atomic<LONG64> g_pendingShowExec{0};
 std::atomic<uint64_t> g_pendingShowUntil{0};
-LONG64 g_lastIntentSeq = 0;  // input thread only
+LONG64 g_lastIntentSeq = 0;  // input thread only; seeded by OpenIpcChannel
 // An open intent that cancelled a close whose window was still on screen. The
 // window keeps showing (the local dismiss slot and the executor command are
-// dropped), but the
-// dismiss can already be inside the shell's Dismiss call when the press lands.
-// That close still lands, so `win close observed` reissues the same open once.
-// Set by the open-intent cancel path, cleared by a new close or by a poll that
-// sees the menu stay open.
-bool g_intentCancelPending = false;  // input thread only
+// dropped), but the dismiss can already be inside the shell's Dismiss call when
+// the press lands. That close still lands, so `win close observed` reissues the
+// same open once.
+//
+// The ticket is bound to the close it belongs to, not to "a landing": openTick is
+// the open generation the cancel was issued under and dismissSeq is the executor
+// command it revoked (0 when the close had none yet). A landing for a different
+// menu can therefore never serve it. Set by the open-intent cancel path, cleared
+// by a new close, an external takeover, or the landing that consumes it.
+struct CloseCancelTicket {
+    bool pending = false;
+    uint32_t openTick = 0;
+    LONG64 dismissSeq = 0;
+};
+CloseCancelTicket g_intentCancel;  // input thread only
 
 float TrailEdge(int32_t axis, float left, float top, float right, float bottom);
 float GeometryTrailDip(const GestureGeometry& geometry);
@@ -3931,6 +3953,11 @@ uint32_t g_peerTickLast = 0;
 // comparison; 0 means this attachment never opened a channel.
 uint32_t g_peerEpoch = 0;
 
+// Whether the shared section currently says `alive`. Only the transition is
+// logged, so the withdraw on a clean unload and the one the consumer runs as it
+// exits do not read as two different events.
+std::atomic<bool> g_peerPublished{false};
+
 // Refreshes the bridge's liveness clock. Called from the input thread's idle
 // tick and from every positioned report, so silence on the digitizer cannot
 // make a live controller look gone; the idle tick alone already proves the
@@ -3947,16 +3974,44 @@ void PublishPeerTick(uint64_t tickMs) {
     SwipeIpcPublishPeerTick(&g_ipc, tickMs);
 }
 
-// The last word of a controller that served its last intent. It goes before the
-// view is released, and it also goes on a residual unload, when the view is kept
-// for a thread that is still inside it: the bridge must pass every trigger from
-// then on, whether or not this process finishes unloading.
-void PublishPeerGone() {
+// Withdraws availability and, in the same step, the words that were only
+// meaningful while it was there. This runs before the consumer stops (a disable)
+// and again as the consumer leaves for any reason, so the bridge never reads
+// this activation's last direction as the next one's, and never treats a killed
+// `closing` (or `touch=1`) as a decision it may act on.
+//
+// It is the last word of a controller that served its last intent: it goes before
+// the view is released, and it also goes on a residual unload, when the view is
+// kept for a thread that is still inside it. The bridge must pass every trigger
+// from then on, whether or not this process finishes unloading.
+void PublishPeerGone(const wchar_t* why) {
     if (!g_ipc.state) {
         return;
     }
     SwipeIpcSetPeerState(&g_ipc, kSwipePeerGone);
-    FileLog(L"ipc peer gone");
+    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
+    SwipeIpcSetControllerTouch(&g_ipc, false);
+    if (g_peerPublished.exchange(false, std::memory_order_relaxed)) {
+        FileLog(L"ipc peer gone reason=%s", why);
+    }
+}
+
+// Publishes availability from the consumer that is about to serve the intents,
+// never from init: an `alive` written before that thread runs is a promise of a
+// service that does not exist yet, and a press in that window would be swallowed
+// for a consumer that is not there. Tick first, then alive: the bridge pairs an
+// alive state with the tick it reads after it, so it never accepts the previous
+// activation's tick as this one's. This write is not throttled.
+void PublishPeerReady(const wchar_t* why) {
+    if (!g_ipc.state) {
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    g_peerTickLast = static_cast<uint32_t>(now);
+    SwipeIpcPublishPeerTick(&g_ipc, now);
+    SwipeIpcSetPeerState(&g_ipc, kSwipePeerAlive);
+    g_peerPublished.store(true, std::memory_order_relaxed);
+    FileLog(L"ipc peer alive reason=%s epoch=%u", why, g_peerEpoch);
 }
 
 void OpenIpcChannel() {
@@ -3967,10 +4022,20 @@ void OpenIpcChannel() {
         return;
     }
 
+    // The section may still carry the previous activation's `alive` and its last
+    // decision. Both are withdrawn before this attach claims anything: the bridge
+    // must not decide for a consumer that has not started, and a kill while
+    // `closing` must not survive into this activation.
+    PublishPeerGone(L"attach");
+
     // Everything published before this attach belongs to an earlier menu. The
     // raw counters are enough for a seed: the first record this process accepts
     // must be newer than anything the previous one could have written.
     g_ipcCommandSeq = SwipeIpcLoad64(&g_ipc.state->cmdSeq);
+    // An intent published while no consumer was listening belongs to no menu of
+    // this activation: the seed is the boundary, and only a record newer than it
+    // is consumed.
+    g_lastIntentSeq = SwipeIpcLoad64(&g_ipc.state->intentSeq);
     g_ipcOpenTickLow = 0;
     // The activation identity goes before anything this activation publishes. A
     // bridge decision that was latched against the previous activation can then
@@ -3978,18 +4043,9 @@ void OpenIpcChannel() {
     // image.
     g_peerEpoch = SwipeIpcBeginPeerActivation(&g_ipc);
 
-    // Tick first, then alive: the bridge pairs an alive state with the tick it
-    // reads after it, so it never accepts the previous activation's tick as
-    // this one's. This is the one liveness write that is not throttled: it
-    // starts the window and it is what makes a re-enable immediate.
-    const uint64_t now = GetTickCount64();
-    g_peerTickLast = static_cast<uint32_t>(now);
-    SwipeIpcPublishPeerTick(&g_ipc, now);
-    SwipeIpcSetPeerState(&g_ipc, kSwipePeerAlive);
-
-    FileLog(L"ipc open created=%d cmd=%lld epoch=%u", created ? 1 : 0,
-            static_cast<long long>(g_ipcCommandSeq), g_peerEpoch);
-    FileLog(L"ipc peer alive");
+    FileLog(L"ipc open created=%d cmd=%lld intent=%lld epoch=%u",
+            created ? 1 : 0, static_cast<long long>(g_ipcCommandSeq),
+            static_cast<long long>(g_lastIntentSeq), g_peerEpoch);
 }
 
 // Deletes the files this channel used before it moved to shared memory. They
@@ -4225,56 +4281,85 @@ void ApplyDebugCommands(char* text) {
 // first Setup neither mechanism has an object to act on; a command that arrives
 // then stays in the section and is replaced by the next one.
 // M3 executor requests. The bridge owns ShowStartView/Dismiss; these publish the
-// command and its sequence. The bridge acks through execAck; a command that is
-// not acked expires on the bridge and the Start side resyncs from the cloak.
+// command and its sequence. Each returns whether a consumer can actually run it:
+// no section, or no Exec event to wake the worker, means nothing will execute the
+// command, and the caller must not claim a panel for it. A command that is not
+// acked expires at the bridge and the Start side resyncs from the cloak.
 constexpr uint64_t kBridgeDismissLeadMs = 30;
 constexpr uint64_t kBridgeAckTimeoutMs = 400;
 
-void RequestBridgeShow(uint32_t method, uint32_t flags) {
-    if (!g_ipc.state) {
-        return;
+bool RequestBridgeShow(uint32_t method, uint32_t flags) {
+    if (!g_ipc.state || !g_ipc.execEvent) {
+        FileLog(L"exec show request skipped seq=none method=%u reason=%s",
+                method, g_ipc.state ? L"no-executor" : L"no-channel");
+        return false;
     }
     const LONG64 sequence = SwipeIpcPublishExec(
         &g_ipc, kSwipeExecShow, static_cast<int32_t>(method),
         static_cast<int32_t>(flags), 0, 0);
+    if (sequence <= 0) {
+        FileLog(L"exec show request skipped seq=none method=%u "
+                L"reason=no-sequence",
+                method);
+        return false;
+    }
     g_pendingShowExec.store(sequence, std::memory_order_relaxed);
     g_pendingShowUntil.store(GetTickCount64() + kBridgeAckTimeoutMs,
                              std::memory_order_relaxed);
     FileLog(L"exec show request seq=%lld method=%u flags=%u",
             static_cast<long long>(sequence), method, flags);
+    return true;
 }
 
-void RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
-    if (!g_ipc.state) {
-        return;
+bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
+    if (!g_ipc.state || !g_ipc.execEvent) {
+        FileLog(L"exec dismiss request skipped seq=none method=%u reason=%s",
+                method, g_ipc.state ? L"no-executor" : L"no-channel");
+        return false;
     }
     const LONG64 sequence = SwipeIpcPublishExec(
         &g_ipc, kSwipeExecDismiss, static_cast<int32_t>(method), 0, executeAt,
         open);
+    if (sequence <= 0) {
+        FileLog(L"exec dismiss request skipped seq=none method=%u "
+                L"reason=no-sequence",
+                method);
+        return false;
+    }
     g_pendingDismissExec.store(sequence, std::memory_order_relaxed);
     g_pendingDismissExecAt.store(executeAt, std::memory_order_relaxed);
     FileLog(L"exec dismiss request seq=%lld method=%u executeAt=%llu open=%llu",
             static_cast<long long>(sequence), method,
             static_cast<unsigned long long>(executeAt),
             static_cast<unsigned long long>(open));
+    return true;
 }
 
-// Stops the executor's dismiss timer, if one was requested. Returns whether a
-// command was actually cancelled; the log line is written only for one.
-bool CancelPendingDismiss(const wchar_t* reason) {
+// Stops the executor's dismiss timer, if one was requested. Returns the cancelled
+// sequence, or 0 when nothing was armed; the log line is written only for one.
+// The caller keeps the sequence when it must bind a later recovery to this close.
+LONG64 CancelPendingDismiss(const wchar_t* reason) {
     const LONG64 target =
         g_pendingDismissExec.exchange(0, std::memory_order_relaxed);
     g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
     if (target == 0) {
-        return false;
+        return 0;
     }
     if (g_ipc.state) {
         SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, target);
     }
     FileLog(L"exec cancel request target=%lld reason=%s",
             static_cast<long long>(target), reason);
-    return true;
+    return target;
 }
+
+// The repair every terminal executor failure performs, whatever kind the command
+// was: the controller stops owning the panel and stops marking the touch in the
+// same step, and the pending open entry is dropped. The published direction then
+// follows the window's cloak on the next poll, which is the one source of truth
+// for a panel the controller no longer drives. Declared here because the open
+// and close paths above use it; defined with the ack handling.
+void ReleaseExecutorOwnership();
 
 void ApplyPendingCommand() {
     ResetEvent(g_ipc.commandEvent);
@@ -5319,7 +5404,7 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
     // A new close decides the menu: an earlier open that cancelled a close is
     // no longer owed.
-    g_intentCancelPending = false;
+    g_intentCancel = CloseCancelTicket{};
 
     // A new close decides the menu, so a release record left by an earlier pull
     // is moot: its open either already came or never will. The record of a pull
@@ -5617,6 +5702,19 @@ void ResetActivationState() {
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
     g_pullSerial = 0;
+    // The executor side of the same activation: a sequence or a deadline from the
+    // previous one would answer this activation's channel with a command nobody
+    // wrote, and an open entry would seed the next menu from a menu that is gone.
+    g_pendingShowExec.store(0, std::memory_order_relaxed);
+    g_pendingShowUntil.store(0, std::memory_order_relaxed);
+    g_pendingDismissExec.store(0, std::memory_order_relaxed);
+    g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+    g_intentOpenActive.store(false, std::memory_order_relaxed);
+    g_intentOpenEntry.store(0.0f, std::memory_order_relaxed);
+    // The attach seeds the next intent boundary; 0 here means this activation has
+    // acted on nothing, and OpenIpcChannel overwrites it before the thread runs.
+    g_lastIntentSeq = 0;
+    g_intentCancel = CloseCancelTicket{};
 
     g_panel.coasting.store(false, std::memory_order_relaxed);
     g_panel.coastStartQpc = 0;
@@ -5626,7 +5724,7 @@ void ResetActivationState() {
     ResetEndVelocity();
 
     g_commitNeedsProgressReset = false;
-    g_intentCancelPending = false;
+    g_intentCancel = CloseCancelTicket{};
     g_rootWasOpen = false;
     g_openCheckValid = false;
     g_openCheckOpen = false;
@@ -6068,8 +6166,18 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
         g_intentOpenEntry.store(entry, std::memory_order_relaxed);
         SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
         SwipeIpcSetControllerTouch(&g_ipc, true);
-        RequestBridgeShow(1, 0);
-        FileLog(L"reveal show request entry=%.3f", entry);
+        if (!RequestBridgeShow(1, 0)) {
+            // No executor can present this open, so the controller must not claim
+            // it: the direction, the touch mark and the pending entry go back in
+            // one step, and the shell's own band gesture remains the owner of the
+            // open. The pull keeps its candidate and its release history, so an
+            // open the shell performs anyway is adopted at the next poll.
+            ReleaseExecutorOwnership();
+            FileLog(L"reveal show request failed entry=%.3f reason=no-executor",
+                    entry);
+        } else {
+            FileLog(L"reveal show request entry=%.3f", entry);
+        }
     }
 
     // The new pull owns the panel from this report on. It starts a new pull
@@ -6288,7 +6396,7 @@ bool ClearLocalCloseTap() {
 // both"; the local-only operation above is a different thing.
 CloseScheduleCancel CancelCloseSchedules(const wchar_t* reason) {
     CloseScheduleCancel dropped;
-    dropped.command = CancelPendingDismiss(reason);
+    dropped.command = CancelPendingDismiss(reason) != 0;
     dropped.slot = ClearLocalCloseTap();
     return dropped;
 }
@@ -7565,7 +7673,15 @@ void RunPendingCloseTap(uint64_t tickMs) {
     // shell's Dismiss. The controller owns the panel until the Hide lands, so
     // the bridge swallows the shell's own calls meanwhile.
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
-    RequestBridgeDismiss(1, GetTickCount64(), 0);
+    if (!RequestBridgeDismiss(1, GetTickCount64(), 0)) {
+        // Nothing can run this dismiss: the window would stay shown over a
+        // retracted panel. Give the ownership up now, and the poll's unhealed
+        // rule restores the panel once the suppression window ends.
+        ReleaseExecutorOwnership();
+        FileLog(L"close dismiss skipped kind=%s reason=no-executor",
+                CloseKindName(kind));
+        return;
+    }
     FileLog(L"close dismiss kind=%s", CloseKindName(kind));
 }
 
@@ -7889,7 +8005,7 @@ void ApplyBridgeIntent() {
         // suppression goes too: this takeover's close is the shell's, and the
         // poll must classify its landing as external (drop the pull, no reopen).
         const CloseScheduleCancel dropped = CancelCloseSchedules(L"external");
-        g_intentCancelPending = false;
+        g_intentCancel = CloseCancelTicket{};
         g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
         g_intentOpenActive.store(false, std::memory_order_relaxed);
         if (g_hidSession.active) {
@@ -7905,7 +8021,7 @@ void ApplyBridgeIntent() {
         FileLog(L"intent external drop trigger=%s slot=%d command=%d", trigger,
                 dropped.slot ? 1 : 0, dropped.command ? 1 : 0);
     } else if (intent.kind == kSwipeIntentOpen) {
-        CancelPendingDismiss(L"open-intent");
+        const LONG64 cancelled = CancelPendingDismiss(L"open-intent");
         // The controller owns an open from this line, whichever shape the press
         // has; the bridge reads this direction for the next toggle.
         SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
@@ -7924,23 +8040,39 @@ void ApplyBridgeIntent() {
             g_intentOpenActive.store(false, std::memory_order_relaxed);
             // A dismiss that already entered the shell's Dismiss call cannot be
             // recalled by the cancel above; if it still hides the window, the
-            // close's landing reissues this open once.
-            g_intentCancelPending = true;
+            // close's landing reissues this open once. The ticket names the menu
+            // and the command it revoked, so no other landing can serve it.
+            g_intentCancel = CloseCancelTicket{true, g_ipcOpenTickLow, cancelled};
             const float live = TakeProgressNow(L"intent-open-cancel");
             std::chrono::milliseconds duration{0};
             if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
                 ShowAtRest();
             }
-            FileLog(L"intent open cancel from=%.3f", live);
+            FileLog(L"intent open cancel from=%.3f ticket_open=%u ticket_seq=%lld",
+                    live, g_intentCancel.openTick,
+                    static_cast<long long>(g_intentCancel.dismissSeq));
         } else {
             const float entry =
                 std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
             g_intentOpenEntry.store(entry, std::memory_order_relaxed);
             g_intentOpenActive.store(true, std::memory_order_relaxed);
             g_panel.Begin(&entry);
-            RequestBridgeShow(intent.method ? intent.method : 1, intent.flags);
-            ackEntry = static_cast<int32_t>(std::llround(entry * 1000.0f));
-            FileLog(L"intent open entry=%.3f", entry);
+            if (RequestBridgeShow(intent.method ? intent.method : 1,
+                                  intent.flags)) {
+                ackEntry = static_cast<int32_t>(std::llround(entry * 1000.0f));
+                FileLog(L"intent open entry=%.3f", entry);
+            } else {
+                // No sequence was published, so there is nothing a timeout could
+                // repair. The panel is not claimed: the shell's own gesture (the
+                // band contact) opens the menu and the next poll adopts it.
+                ShowAtRest();
+                g_commitNeedsProgressReset = false;
+                ReleaseExecutorOwnership();
+                ackState = kSwipeAckRefused;
+                ackHr = E_FAIL;
+                FileLog(L"intent open refused entry=%.3f reason=no-executor",
+                        entry);
+            }
         }
     } else if (intent.kind == kSwipeIntentClose) {
         // One close at a time: a close intent supersedes whatever an earlier
@@ -7968,11 +8100,21 @@ void ApplyBridgeIntent() {
             const uint64_t executeAt =
                 GetTickCount64() + static_cast<uint64_t>(duration.count()) +
                 kBridgeDismissLeadMs;
-            RequestBridgeDismiss(intent.method ? intent.method : 1, executeAt,
-                                 intent.open);
-            ackDuration = static_cast<int32_t>(duration.count());
-            FileLog(L"intent close from=%.3f dur=%lld", from,
-                    static_cast<long long>(duration.count()));
+            if (RequestBridgeDismiss(intent.method ? intent.method : 1,
+                                     executeAt, intent.open)) {
+                ackDuration = static_cast<int32_t>(duration.count());
+                FileLog(L"intent close from=%.3f dur=%lld", from,
+                        static_cast<long long>(duration.count()));
+            } else {
+                // Nothing will hide this window. The settle already retracted the
+                // panel; the ownership goes back now and the poll's unhealed rule
+                // restores the panel after the suppression window.
+                ReleaseExecutorOwnership();
+                ackState = kSwipeAckRefused;
+                ackHr = E_FAIL;
+                FileLog(L"intent close refused from=%.3f reason=no-executor",
+                        from);
+            }
         }
     }
     SwipeIpcAnswerIntent(&g_ipc, intent.seq, ackState, ackDuration, ackEntry,
@@ -7991,6 +8133,7 @@ void ReleaseExecutorOwnership() {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
     SwipeIpcSetControllerTouch(&g_ipc, false);
     g_intentOpenActive.store(false, std::memory_order_relaxed);
+    g_intentOpenEntry.store(0.0f, std::memory_order_relaxed);
 }
 
 void ApplyExecAck() {
@@ -8013,6 +8156,10 @@ void ApplyExecAck() {
         g_pendingDismissExec.store(0, std::memory_order_relaxed);
         g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
         if (failed) {
+            // The close this ticket was waiting for will not land: a refused or
+            // expired dismiss leaves the window shown, and the ticket must not
+            // fire on some later landing.
+            g_intentCancel = CloseCancelTicket{};
             ReleaseExecutorOwnership();
             FileLog(L"exec dismiss failed command=%lld state=%u hr=%08X",
                     static_cast<long long>(ack.command), ack.state,
@@ -8044,11 +8191,22 @@ void ApplyExecAck() {
 // does for any open it did not perform. A dismiss expires from the deadline it
 // was scheduled for, not from the request: the bridge's timer runs at
 // `executeAt`, so the ack cannot be expected before that plus the same budget.
+//
+// The timeout invalidates the record at the publisher, not only in this process's
+// bookkeeping. The executor can still have the record queued or armed, and a
+// retracted panel waiting for a dismiss that never comes would be answered by
+// running it late; the cancel names the sequence for a dismiss, and a show—which
+// has no armed command to revoke—is superseded by a cancel record so the executor
+// can never read it as its newest command.
 void CheckExecAckTimeout(uint64_t now) {
     const LONG64 show = g_pendingShowExec.load(std::memory_order_relaxed);
     if (show != 0 && now >= g_pendingShowUntil.load(std::memory_order_relaxed)) {
         g_pendingShowExec.store(0, std::memory_order_relaxed);
         g_pendingShowUntil.store(0, std::memory_order_relaxed);
+        if (g_ipc.state) {
+            SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, 0);
+            FileLog(L"exec cancel request target=0 reason=show-expired");
+        }
         // Same rule as a refused show: a pending close owns the panel and its
         // state is not this silence's to clear.
         if (g_pendingDismissExec.load(std::memory_order_relaxed) == 0) {
@@ -8069,6 +8227,11 @@ void CheckExecAckTimeout(uint64_t now) {
     }
     g_pendingDismissExec.store(0, std::memory_order_relaxed);
     g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+    if (g_ipc.state) {
+        SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, dismiss);
+        FileLog(L"exec cancel request target=%lld reason=dismiss-expired",
+                static_cast<long long>(dismiss));
+    }
     ReleaseExecutorOwnership();
     FileLog(L"exec ack timeout seq=%lld kind=dismiss open=%d (resync from "
             L"cloak)",
@@ -8096,6 +8259,26 @@ void CheckExecAckTimeout(uint64_t now) {
 // without a system event: the XAML root is reused between opens, so
 // PrepareRootElement does not fire again and the axis, Distance and DirX/DirY
 // captured by Setup can belong to a taskbar that has moved since.
+// A superseding intent that arrived with the landing. See PollRootVisibility: the
+// idle timer is waited on before the intent event, so the landing can be served
+// first. Only `external` is reconciled here — an open or close intent is the user
+// talking to a menu, and the landing's own pull/cancel rules already own that
+// case. ApplyBridgeIntent consumes the record, so the event's later wake finds
+// nothing new.
+void ReconcileSupersedingIntentBeforeLanding() {
+    SwipeIpcIntent intent{};
+    if (!SwipeIpcReadIntent(&g_ipc, &intent) || intent.seq == 0 ||
+        intent.seq == g_lastIntentSeq) {
+        return;
+    }
+    if (intent.kind != kSwipeIntentExternal) {
+        return;
+    }
+    FileLog(L"intent reconcile seq=%lld kind=external (before landing recovery)",
+            static_cast<long long>(intent.seq));
+    ApplyBridgeIntent();
+}
+
 // The one landing-open transaction. Both reasons a close's landing can serve an
 // open end here: a pull that was down (or lifted inside the late window) when the
 // close landed, and an open intent that cancelled a close whose dismiss still
@@ -8117,7 +8300,15 @@ bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
     if (pullReopen) {
         SwipeIpcSetControllerTouch(&g_ipc, true);
     }
-    RequestBridgeShow(1, 0);
+    if (!RequestBridgeShow(1, 0)) {
+        // The landing cannot present anything: the panel stays retracted with the
+        // window hidden, and the controller claims nothing. The next open
+        // (the shell's own or a later pull) starts from the entry again.
+        ReleaseExecutorOwnership();
+        FileLog(L"landing open failed entry=%.3f pull=%d reason=no-executor",
+                entry, pullReopen ? 1 : 0);
+        return false;
+    }
     if (pullReopen) {
         FileLog(L"reveal reopen after close pull=%d late=%d entry=%.3f",
                 pullDown ? 1 : 0, lateFresh ? 1 : 0, entry);
@@ -8258,22 +8449,37 @@ void PollRootVisibility(uint64_t tickMs) {
             !g_hidSession.active && !g_reveal.edgeCandidate);
         PostGeometryMeasurement(request, false);
     } else if (!open && g_rootWasOpen) {
+        // A landing must not outrun a takeover that arrived with it. The idle
+        // timer and the intent event are two wait objects of this thread, and the
+        // timer has the lower index: the landing can be served before the
+        // `external` intent that came with it is processed, and processing it
+        // afterwards does not revoke a Show this branch already issued. The
+        // already-published superseding intent is reconciled first, and it clears
+        // the suppression and the recovery ticket as any external takeover does.
+        ReconcileSupersedingIntentBeforeLanding();
         // Whether this landing belongs to a close this mod started. It is read
-        // before the suppression is cleared: an external takeover (Win+Tab,
-        // Win+Shift+S, the lock screen, a display change) closes the window with
-        // no request of ours, so it never opened a suppression window.
+        // before this branch clears the suppression. A reconciled external
+        // takeover has cleared it above on purpose: that close is the shell's.
         const bool closeInFlight =
             tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
         // An open that cancelled a close while the window still showed is owed
-        // only if that close still lands. The ticket is consumed here, by the
-        // landing, and by nothing else: the still-open poll below must not clear
-        // it, because between the cancel and the cloak transition the window is
-        // open for the whole window in which the dismiss can still land, and the
-        // suppression may already have expired by the time it does. A new close
-        // clears it in TakeCloseOwnership and an external takeover clears it in
-        // ApplyBridgeIntent; those are the explicit superseding actions.
-        const bool intentCancelLost = g_intentCancelPending;
-        g_intentCancelPending = false;
+        // only if that close still lands, and only for the menu the cancel named.
+        // The ticket is consumed here, by the landing, and by nothing else: the
+        // still-open poll below must not clear it, because between the cancel and
+        // the cloak transition the window is open for the whole window in which
+        // the dismiss can still land, and the suppression may already have expired
+        // by the time it does. A new close clears it in TakeCloseOwnership, an
+        // external takeover clears it in ApplyBridgeIntent, and a failed dismiss
+        // clears it in ApplyExecAck; those are the explicit superseding actions.
+        const bool intentCancelLost =
+            g_intentCancel.pending && g_intentCancel.openTick == g_ipcOpenTickLow;
+        if (g_intentCancel.pending) {
+            FileLog(L"intent recovery ticket open=%u now=%u seq=%lld served=%d",
+                    g_intentCancel.openTick, g_ipcOpenTickLow,
+                    static_cast<long long>(g_intentCancel.dismissSeq),
+                    intentCancelLost ? 1 : 0);
+        }
+        g_intentCancel = CloseCancelTicket{};
         // The close has landed, so its suppression no longer applies. Without
         // this a Win press right after the hide opened the window with Progress
         // still at 0, and the panel was invisible until the next open.
@@ -9009,6 +9215,13 @@ DWORD WINAPI HidInputThread(LPVOID) {
 
     MSG msg;
     bool running = true;
+    // The consumer is ready here: the window exists, both raw-input usages are
+    // registered, the timer and the event set are built, and this thread is about
+    // to wait on the intents. Availability is published from this point and never
+    // from init: an `alive` written earlier promises a service that does not exist
+    // yet, and the bridge would swallow a press for a consumer that has not begun
+    // to serve.
+    PublishPeerReady(L"consumer");
     while (running) {
         // Bounded, so the stop flag is observed even if the stop event were
         // missing from the set; the event itself is object 0 and wakes this at
@@ -9080,6 +9293,13 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
     UnregisterHidUsage(kUsageTouchScreen);
     UnregisterHidUsage(kUsagePen);
+
+    // Availability goes before anything this activation owns is reset, and it
+    // goes on every exit: the stop event, WM_QUIT and WAIT_FAILED all land here.
+    // The bridge must not read the last direction of a consumer that is gone,
+    // which is also why the shared direction and touch are cleared here rather
+    // than left for the next attach.
+    PublishPeerGone(L"consumer-exit");
 
     // One per-activation reset, the same function Wh_ModInit calls, so a clean
     // re-enable of this pinned image starts from the state the first activation
@@ -12483,7 +12703,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.42.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.43.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance
@@ -12663,6 +12883,15 @@ void Wh_ModBeforeUninit() {
     // shared state; its counted entry is what the drain below waits for.
     g_stopDismissCallback = true;
 
+    // Withdraw availability first, before anything is stopped or joined. This is
+    // the step that makes a shutdown press the shell's: the moment the input
+    // thread is told to stop it can no longer serve an intent, so the bridge must
+    // not intercept one. The same write resets the shared direction and touch, so
+    // a disable in the middle of a close cannot leave `closing` readable as the
+    // next activation's decision. It also happens before the poll-thread wait,
+    // which can be long, so the gate closes at once.
+    PublishPeerGone(L"unload");
+
     if (g_pollThread) {
         if (WaitForSingleObject(g_pollThread, kUnloadThreadWaitMs) ==
             WAIT_OBJECT_0) {
@@ -12684,6 +12913,7 @@ void Wh_ModBeforeUninit() {
     // 1. Stop the input thread. The event does not depend on the window: the
     //    thread may still be between CreateThread and publishing the HWND, and
     //    a WM_QUIT aimed at a window that does not exist yet reaches nobody.
+    //    Availability was already withdrawn above.
     if (g_hidStopEvent) {
         SetEvent(g_hidStopEvent);
     }
@@ -12734,9 +12964,10 @@ void Wh_ModUninit() {
 
     // The bridge's interception precondition fails here, before anything below
     // can return as a residual: from this point no intent is consumed, so no
-    // trigger may be swallowed for one. Publishing only the state leaves the
-    // tick as it was; the state alone is the answer.
-    PublishPeerGone();
+    // trigger may be swallowed for one. The withdrawal already ran in
+    // Wh_ModBeforeUninit, before the consumer was stopped; this repeat covers an
+    // uninit that skipped it, and writes only the two words.
+    PublishPeerGone(L"uninit");
 
     // A thread that BeforeUninit did not stop is a residual: every resource it
     // can touch stays alive, the handle stays open for a later join, and the log
