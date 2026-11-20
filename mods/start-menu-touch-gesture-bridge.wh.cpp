@@ -3605,9 +3605,14 @@ void ExecutePendingCommand() {
             FileLog(L"exec cancel seq=%lld target=%lld",
                     static_cast<long long>(command.seq),
                     static_cast<long long>(g_pendingDismissSeq));
+            // The cancel's own answer first, the target's last. The ACK slot is
+            // one record with an auto-reset event: two answers written before the
+            // reader wakes leave only the second readable. The Start side retires
+            // its recovery ticket on the *dismiss's* answer, so that answer has to
+            // be the one left behind; the cancel itself is fire-and-forget there.
+            AnswerExec(command.seq, kSwipeAckExecuted, S_OK, 0);
             AnswerExec(g_pendingDismissSeq, kSwipeAckSuperseded, S_OK,
                        kSwipeVisibilityUnknown);
-            AnswerExec(command.seq, kSwipeAckExecuted, S_OK, 0);
             g_pendingDismissSeq = 0;
             g_pendingDismissEpoch = 0;
         } else {
