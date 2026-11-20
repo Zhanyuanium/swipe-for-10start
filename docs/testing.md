@@ -209,9 +209,12 @@ What it does not cover, on purpose: the click-away step waits for the executor's
 (state 1/3) is swallowed; the open step uses the VK_LWIN tap because the
 auto-hidden bar cannot be opened through UIA; and the **HID dismiss** path
 (`close dismiss kind=...`) is unreachable from an injection, because every
-injected panel drag reaches the shell as a pointer-away click-away. Real-finger
-dismissal stays a manual check, together with the one-finger end-to-end, the two
-two-finger lift orders and a pen.
+injected panel drag reaches the shell as a pointer-away click-away, so that line
+is the only thing separating the two producers. A real finger's panel drag is the
+only thing that writes it: capture `close dismiss kind=...` with its matching
+`exec dismiss request ... method=1 open=<generation>` once by hand. A pen by hand
+is still owed; one finger end to end, two fingers in both lift orders and the
+auto-hide reveal after a fresh logon passed on the shipping build.
 
 
 ## Artifacts

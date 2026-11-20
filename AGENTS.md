@@ -10,6 +10,8 @@ docs/ - technical documentation (architecture, input, gesture, animation, geomet
 <config>
 README.md - user-facing quick start (English; README.zh-CN.md is the Chinese page)
 README.zh-CN.md - the Chinese page of the user-facing quick start
+CHANGELOG.md - release history: each tag with the Start/bridge versions and channel it shipped (CHANGELOG.zh-CN.md is the Chinese page)
+CHANGELOG.zh-CN.md - the Chinese page of the release history
 .gitignore - Windhawk/MSVC build outputs and local logs
 </config>
 

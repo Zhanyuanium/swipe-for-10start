@@ -76,14 +76,19 @@
   depend on the bar either way.
 - The bar's 48 DIP height and the 200 % scaling are measured, not assumed.
 
-## Hardware still owed
+## Hardware
 
-- One finger end to end on the real ELAN2513 through the final build (the
-  injector covers the logic; the hardware's report cadence is the remaining
-  difference).
-- Two fingers in both lift orders; a pen by hand.
-- The taskbar auto-hide reveal after a fresh logon (the stuck state above was
-  not reproduced after an explorer restart; the bar stayed hidden).
+- **Passed on the real ELAN2513 through the shipping build:** one finger end to
+  end (edge pull, follow, panel drag close, click-away), two fingers in both lift
+  orders, and the taskbar auto-hide reveal after a fresh logon (the stuck reveal
+  above did not reproduce after an explorer restart). The injector's sparser
+  report cadence is therefore no longer the difference between the test and the
+  hardware.
+- **Still owed:** a pen by hand. The one-finger pass also ran the HID dismiss
+  producer (`TakeCloseOwnership` → `RequestBridgeDismiss`), because a real
+  finger's panel drag is its only producer, but no `close dismiss kind=…` excerpt
+  was captured. Take one the next time the pair is touched: that line is the only
+  evidence separating the HID producer from the click-away one.
 
 ## Not attempted
 

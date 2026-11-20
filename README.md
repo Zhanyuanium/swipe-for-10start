@@ -118,3 +118,5 @@ when it is enabled, without an Explorer restart on this build.
 - The full technical documentation — what was measured, what was falsified,
   and every design decision — lives in [docs/](docs/README.md), including the
   complete [known-limits list](docs/limits.md).
+- [CHANGELOG.md](CHANGELOG.md) lists each release tag with the Start and bridge
+  versions it shipped.

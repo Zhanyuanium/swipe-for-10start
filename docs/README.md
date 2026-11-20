@@ -33,7 +33,7 @@ it.
 | [ipc.md](ipc.md) | The v7 shared-memory channel: names, 744-byte layout, seqlocks, the open generation, intents and acks, executor commands and acks with their expiry rules, the controller direction, peer liveness and activation identity (600 ms is a detection budget), and the init handshake. |
 | [lifecycle.md](lifecycle.md) | The image pin, the per-process instance guard, the counted module entries, the unload order and its residuals, re-initialisation, and the host's unload boundary. |
 | [testing.md](testing.md) | The PowerShell/Python probes and injectors, and the captured measurements in `artifacts/`. |
-| [limits.md](limits.md) | Known limits and risks, and the hardware checks still owed (one finger end to end, two fingers in both lift orders, pen by hand). |
+| [limits.md](limits.md) | Known limits and risks, what the real-machine pass covered, and what is still owed (a pen by hand, and the HID dismiss log excerpt). |
 
 ## The mods
 
