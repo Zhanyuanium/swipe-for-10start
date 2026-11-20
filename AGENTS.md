@@ -4,7 +4,7 @@ C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (8 sources + AGENTS.md: start-menu-legacy-swipe, touch-gesture-bridge, touch-gesture-consumer, touch-gesture-probe, msgprobe, inputprobe, start_gesture_shared.h, swipe_ipc_shared.h)
 tools/ - PowerShell probes, injectors and animation harnesses (15 scripts + AGENTS.md)
-artifacts/ - captured measurements (6 CSVs + inputprobe.dll + AGENTS.md)
+artifacts/ - captured measurements (6 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, README + AGENTS.md)
 </directory>
 <config>
@@ -38,9 +38,9 @@ state is only the resync for a panel the controller does not own. That direction
 cannot come from the shell: a gesture close retracts the panel with
 `InternalState` 5 and the cloak still open for the whole settle, until the
 executor's `Dismiss`; the controller publishes phase 2 in `TakeCloseOwnership`,
-before the settle's first frame. A close still settling (no executor dismiss
-armed) publishes open at once: the controller drops the tap and the pending
-dismiss and settles the panel back from its live position (`intent open cancel
+before the settle's first frame. A close still settling publishes open at once:
+the controller drops the local dismiss slot and cancels a pending executor
+command, then settles the panel back from its live position (`intent open cancel
 from=...`). A dismiss already inside the shell's `Dismiss` call cannot be
 recalled; the window hides, and the landing reissues that open once (`intent open
 recovered entry=...`). A shell hide in flight (`InternalState` 9/11), or an
@@ -84,9 +84,13 @@ The internal `0xA` value is **not** an acceptance criterion and is no longer
 quoted.
 
 Deleted in M3: the `VK_LWIN` tap, the close record and its publishes, the retract
-request/answer, the arbitration hold, the deferred candidate, `CloseInFlight` as
-panel owner, the `win open continued` ticket, the cancel answer and the reveal
-claim. M3.1 also removes the retired v2 close/retract slots from the header.
+request/answer and its cancel answer, the arbitration hold, the deferred
+candidate, and the reveal claim. `CloseInFlight` remains only as the
+suppression-window predicate: the settle owns the motion. The
+`win open continued` ticket went with them: its only stamp sat behind the same
+`CloseInFlight` early return that guards the follow, so it could never fire; the
+pull-reopen and the press latch are the reopen paths that remain. M3.1 also
+removes the retired v2 close/retract slots from the header.
 
 ## Channel
 

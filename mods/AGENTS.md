@@ -35,11 +35,11 @@ its lock; the close suppression.
   the contact while the shell uncloaks.
 - `ActivateRevealFollow` — the live takeover at `RevealEntryProgress`; the
   chase is `visible += clamp(mapped - visible, -rate*dt, +rate*dt)`.
-- `RunPendingCloseTap` — now sends `exec dismiss`; it is the schedule point, not
-  a Windows-key tap.
-- The pull cancel (`OnHidSampleStep`, a new contact while the tap is armed)
-  drops the tap and republishes phase 1, so a menu that stays open is an owned
-  open again.
+- `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
+  schedule point, not a Windows-key tap.
+- The pull cancel (`OnHidSampleStep`, a new contact while the dismiss is armed)
+  drops the armed dismiss and republishes phase 1, so a menu that stays open is
+  an owned open again.
 - `win close observed` — after the landing, a pull still down (or a release
   inside the 300 ms window) issues one fresh show and the open adopts it:
   `reveal reopen after close pull=1 late=0 entry=...`. The pull that was under
@@ -51,7 +51,9 @@ its lock; the close suppression.
 
 **Deleted here.** The `VK_LWIN` tap, the close record publishes, the retract
 request handler/answer, the reveal claim, the deferred candidate's close
-machinery. The remaining close scheduler is the one dismiss path.
+machinery, the `win open continued` ticket (its stamp sat behind the follow's
+own `CloseInFlight` guard, so it never fired) and the two-curve style switch.
+The remaining close scheduler is the one dismiss path.
 
 **Lifecycle.** Pinned image (`GetModuleHandleExW(...PIN)`), per-process instance
 mutex, counted module entries, stop-event-driven input thread, XAML revokes with
@@ -96,8 +98,8 @@ so a reinstall does not inherit the old WndProc.
   Dismiss. The controller publishes phase 2 in `TakeCloseOwnership` for exactly
   that.
 - **Press latch.** One dispatch. A close still settling publishes open now when
-  no executor dismiss is armed; the Start side cancels the tap and the close and
-  settles the panel back from its live position. A hide in flight
+  no executor dismiss is armed; the Start side cancels the armed dismiss and the
+  close and settles the panel back from its live position. A hide in flight
   (`InternalState` 9/11), or an executor dismiss already armed, latches the
   press (one slot, tick, trigger); the hidden event then arms a 50 ms timer and
   the timer serves the same open intent off the hidden event's stack. A show at

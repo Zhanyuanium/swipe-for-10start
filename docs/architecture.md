@@ -107,12 +107,13 @@ the executor's `Dismiss` runs. Reading the shell there made a press during the
 retract a second close, and the owner's press did nothing. No trigger has its
 own branch.
 
-**A press is never lost — cancel or latch.** A close still settling has no
-executor dismiss armed (a gesture close) or has one armed for a future deadline
-(an intent close). The gesture shape publishes open at once: the Start side
-drops the tap, cancels the pending dismiss, clears the suppression, takes the
-panel where the retract left it and settles it back to 1 (`intent open
-cancel from=...`). If the dismiss had already entered the shell's `Dismiss` call
+**A press is never lost — cancel or latch.** A close still settling has either a
+local dismiss slot not yet requested (a gesture close) or an executor dismiss
+armed for a future deadline (an intent close). Both publish open at once: the
+Start side clears the suppression, takes the panel where the retract left it and
+settles it back to 1 (`intent open cancel from=...`); it drops the local slot
+and, when one is pending, publishes `exec cancel` for the executor command. If
+the dismiss had already entered the shell's `Dismiss` call
 when the press landed, the window hides anyway; the landing reissues the open
 once (`intent open recovered entry=...`). A shell hide in flight
 (`InternalState` 9/11), or an executor dismiss already armed, is latched in one
@@ -209,11 +210,11 @@ release settle (160–520 ms) and no 30 ms lead: its dismiss is requested at the
 settle's end.
 
 A Win press during a close is an open because the controller's phase says so,
-not because the shell's state does. The open intent takes the live panel,
-cancels the tap and the pending dismiss and settles back to 1
+not because the shell's state does. The open intent takes the live panel, drops
+the local dismiss slot, cancels a pending `exec dismiss` and settles back to 1
 (`intent open cancel from=...`); the window never hides. The dismiss can already
-be inside the shell's `Dismiss` call when that press lands (a 1–15 ms window);
-the close then lands and the next poll reissues the open
+be inside the shell's `Dismiss` call when that press lands
+(a 1–15 ms window); the close then lands and the next poll reissues the open
 (`intent open recovered entry=...`), so no press is lost. A press during a
 shell hide (state 9/11) or with an armed executor dismiss is latched and served
 at the landing instead.
@@ -284,10 +285,13 @@ The M2 mechanisms that no longer exist in the shipping path:
 - the arbitration hold at `HideStartAndCortana` and the deferred candidate that
   existed to survive it (the touch show's own flag replaces only the idle
   suppression it needed);
-- `CloseInFlight` as the owner of the panel; the suppression window is now set
-  by the one close path and the close's dismiss is the owner;
-- the `win open continued` ticket and the cancel answer;
-- the reveal claim (`revealOpen`/`revealTick`) and the two-curve style switch.
+- `CloseInFlight` as the owner of the panel; the predicate now answers only
+  whether the suppression window is open, and the settle owns the motion;
+- the retract request's cancel answer;
+- the reveal claim (`revealOpen`/`revealTick`) and the two-curve style switch;
+- the `win open continued` ticket: its only stamp sat behind the same
+  `CloseInFlight` early return that guards the follow, so it could never fire;
+  the pull-reopen and the press latch are the reopen paths that remain.
 
 **v4** removes the retired M2 slots from the header: the section is 744 bytes
 and contains only the command, the open generation, the intent and its ack, the

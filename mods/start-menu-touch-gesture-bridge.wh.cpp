@@ -16,11 +16,13 @@
 Explorer-side half of the touch-swipe bridge for the ExplorerPatcher legacy
 Windows 10 Start menu.
 
-The mod owns the Start toggle on the explorer side. It keeps its own open
-boolean, re-reads the window's cloak (`IsStartWindowVisible`) before every
-decision, and calls the shell's own primitives — `XamlLauncher::ShowStartView`
-to open, `XamlLauncher::Dismiss` to close — so the shell keeps every visual and
-state transition. Nothing here writes the launcher's state.
+The mod owns the Start toggle on the explorer side. While the Start side's
+controller owns the panel, its published phase decides the direction; otherwise
+a cached open boolean is resynced from the window's cloak
+(`IsStartWindowVisible`) before every decision. It calls the shell's own
+primitives — `XamlLauncher::ShowStartView` to open, `XamlLauncher::Dismiss` to
+close — so the shell keeps every visual and state transition. Nothing here
+writes the launcher's state.
 
 The triggers and their entries:
 
@@ -28,14 +30,15 @@ The triggers and their entries:
   (RVA `0x14195C`): the launcher is `self + 0x18`. A bare press toggles through
   the decision. A press with Shift/Ctrl/Alt held is a combination: with the menu
   open it is forwarded as an external takeover and never animates, with the menu
-  closed it is swallowed and never opens Start. This is a hard gate; the Start
-  side's own gesture tap is recognised first from its `tapped` close record and
-  passed through.
+  closed it is swallowed and never opens Start. This is a hard gate; a press
+  during the controller's own close is an open by the published phase, not by
+  the shell's state.
 - The taskbar Start button does **not** call `XamlLauncher::OnStartButtonPressed`
   on this build, although that hook is installed and probed. It calls
-  `ShowStartView` / `Dismiss` directly (the open arrives with show method 16 or
-  11, the close with dismiss method 6). Those two primitives are hooked, and a
-  call this mod did not make is logged as `own decide trigger=foreign ...`.
+  `ShowStartView` / `Dismiss` directly: show method 11 is the Start button's
+  open, dismiss method 6 its close, and show method 16 is the shell's own edge
+  gesture. Any other call is swallowed while the controller owns the panel
+  (`exec swallow ... reason=owning`) or passed with a cloak resync.
 - A click outside enters `XamlLauncherState`'s dismiss handler
   (`0x24FC50` on this build) and calls `HideStartAndCortana(7)` directly; an
   older delegate (`0x4916D0`) does the same. Both are closes of ours and animate.
@@ -43,7 +46,7 @@ The triggers and their entries:
   this build does not recognise pass through at once, with only a cloak resync.
   A lock is never delayed. Win+Tab enters as method 5 and passes the same way.
 
-Every close executes in one place: the Start side plans the mirrored retract and
+Every close executes in one place: the Start side plans the mirrored close and
 publishes `exec dismiss` at the end of its settle plus 30 ms; the bridge's timer
 runs `XamlLauncher::Dismiss` on the launcher thread. A reveal contact that was
 driving the panel becomes a deferred pull in the Start mod: the menu closes, and
@@ -53,12 +56,12 @@ the same command, scheduled at the settle's end.
 A press during a close is a reopen, and the direction comes from the Start side's
 published controller state, never from the shell's. That controller publishes
 phase 2 before a close's first frame, so the bridge's one toggle rule reads the
-press as an open for the whole retract, including the window's last visible
-frame. A close still settling is cancelled: the Start side drops its tap and the
-executor's dismiss and settles the panel back from its live position. A dismiss
-that has already entered the shell's `Dismiss` call cannot be recalled; a press
-there is latched (one slot) and served as the same open intent when the hide
-lands (`own press served wait=...`). The serve is armed by the hidden event and
+press as an open for the whole close, including the window's last visible
+frame. A close still settling is cancelled: the Start side drops its local
+dismiss slot and cancels any executor command, and settles the panel back from
+its live position. A dismiss that has already entered the shell's `Dismiss` call
+cannot be recalled; a press there is latched (one slot) and served as the same
+open intent when the hide lands (`own press served wait=...`). The serve is armed by the hidden event and
 published 50 ms later, off that event's stack: a show at the hidden event's own
 tick was swallowed and the window stayed in state 3, while a show 16 ms after it
 opened normally. For the gesture path's own dismiss the landing instead reissues
@@ -87,10 +90,11 @@ flags, all in `Local\SwipeFor10Start_v4_*` (see `swipe_ipc_shared.h`).
 
 
 Hooked functions are forwarded unchanged except for the close decision above.
-The mod creates no windows, threads or COM objects. It refuses to initialize
-unless its own image can be pinned, and on unload it waits, with no deadline,
-until every close-hook frame that is inside has left, and closes the channel
-only then. A frame that does not return therefore holds the whole Windhawk
+The mod creates one hidden message-only window and one worker thread for the
+executor, and no COM objects. It refuses to initialize unless its own image can
+be pinned, and on unload it waits, with no deadline, until every close-hook
+frame that is inside has left, and closes the channel only then. A frame that
+does not return therefore holds the whole Windhawk
 reload until it does; that is the price of never handing the host a trampoline a
 live frame can still call.
 
@@ -123,13 +127,12 @@ Notes:
   write as the edge and the handle. There is no per-frame position sampling.
 - Each gesture state transition appends one line to `bridge.log` in the mod
   storage folder: `state=... edge=... src=... prov=... <reason>`. The channel to
-  the Start mod logs one `ipc open created=... close=...` at init, one
+  the Start mod logs one `ipc open created=...` at init, one
   `activation state reset` when a re-enable re-initialises the pinned image (a
   refused one logs `mod init refused: ...` and installs nothing instead), and
-  one `hide open generation unavailable err=...` for a close that found no
-  published open generation (0 is never a generation).
-- The two channels have two lifetimes. The v2 channel (the section mapping and
-  view, the mutex and the three events) is closed when the mod is disabled, and
+  one `intent kind=... trigger=... seq=... open=...` line per decision.
+- The two channels have two lifetimes. The v4 channel (the section mapping and
+  view, the mutex and the five events) is closed when the mod is disabled, and
   only then: the disable flag keeps new closes out of it, and the unload waits
   for every close that already entered to leave before it closes anything. That
   wait has no deadline, so its outcome is one of two. `drained`: the count
@@ -227,7 +230,8 @@ The decision and the executor:
   The shell cannot decide a controller close: a gesture close retracts the panel
   with the window still uncloaked and state 5 until the executor's `Dismiss`.
 - A press during a cancellable close publishes an open intent at once; the Start
-  side drops the close's tap and its pending dismiss and settles the panel back
+  side drops the close's local dismiss slot and its pending executor command and
+  settles the panel back
   from its live position. A press during a shell hide (state 9/11) or with an
   executor dismiss already armed is latched in one slot and served as the same
   open intent at the hide's landing (`own press served wait=...`). The Start
@@ -235,7 +239,7 @@ The decision and the executor:
   press lands; the landing then reissues the open the press cancelled.
 - Every close is one `exec dismiss` from the Start side: the launcher's
   `Dismiss` on the launcher thread. Nothing here holds the shell's
-  `HideStartAndCortana` and nothing asks the Start side for a retract duration.
+  `HideStartAndCortana` and nothing asks the Start side for a close duration.
 - `Hide` is `HRESULT (void* this, uint32_t reason)` on
   twinui.pcshell.dll 26100.9949. The prologue reads `rcx` (this) and `edx`
   (reason), compares `edx` with 7 and returns 0 on success or the negative
@@ -260,9 +264,10 @@ The decision and the executor:
  *   generation and controller flags, and on start_gesture_shared.h for the
  *   diagnostic animation ids.
  * [OUTPUT]: the hidden executor window WindhawkSwipeExecutor_<WndProc> on the
- *   launcher thread, fed by a worker on the Exec event; every command logs
- *   `exec show|dismiss|visible seq=... launcher=... state=0x... hr=... visible=...`,
- *   and the launcher read refuses `reason=not-ready` when `[+0x160] <= 0x10000`.
+ *   launcher thread, fed by a worker on the Exec event; every command logs an
+ *   `exec show`, `exec dismiss` or `exec visible` line with the sequence and the
+ *   launcher read it used, and the launcher read refuses `reason=not-ready`
+ *   when `[+0x160] <= 0x10000`.
  *   One decision per non-touch trigger: `own win decide`/`own button decide` and
  *   `intent kind=... trigger=... seq=...` for the Win key, the Start button
  *   (ShowStartView method 11 / Dismiss method 6) and the click-away
@@ -515,7 +520,7 @@ uint64_t g_pendingDismissOpen = 0;  // UI thread only
 LONG64 g_pendingShowSeq = 0;       // UI thread only
 // The confirmation probe: IsVisible right after Show returns is too early (the
 // window is cloaked until the shell's own show animation runs), so the answer is
-// read again 120 ms later on the same thread and logged with the command it
+// read again 300 ms later on the same thread and logged with the command it
 // belongs to.
 struct Point {
     float x;
@@ -542,7 +547,7 @@ std::atomic<bool> g_disabled{false};
 std::atomic<bool> g_closeHookEnabled{false};
 // Close-hook frames currently inside, entry to exit: the decision hook's
 // HideStartAndCortana and the observation hook's Hide. Wh_ModUninit closes the
-// v2 channel only when this is zero, and Wh_ModInit refuses to re-activate this
+// v4 channel only when this is zero, and Wh_ModInit refuses to re-activate this
 // image while it is not. It is a lifetime guard for that channel, not a barrier
 // between two closes: it answers "is a close still inside", never "this close
 // runs after that one".
@@ -1284,11 +1289,10 @@ HideStartAndCortana_t HideStartAndCortana_Original = nullptr;
 // - a press while the menu is open and settled closes it; a press while it is
 //   closing (state 9/11) asks for an open again, whose immediate call is latched
 //   in case the close's Hidden event lands last;
-// - the close itself is executed in one place: the HideStartAndCortana hook,
-//   where every shell close converges. The decision entries only call
-//   Dismiss/ShowStartView; the executor serves the retract and calls the
-//   original. Win+Tab, the lock/display sync dismiss and a forwarded modified
-//   press are external takeovers: they pass at once with only a resync.
+// - the close itself is executed in one place: the executor's `Dismiss` on the
+//   launcher thread, from the command the Start side schedules. The decision
+//   entries publish the intent; the HideStartAndCortana hook never holds a
+//   close, and an external takeover passes at once with only a resync.
 //
 // Nothing here writes InternalState and nothing caches a manager or a state
 // pointer across calls.
@@ -2109,10 +2113,10 @@ void OnStartHidden_Hook(void* self) {
 // button on this build does not call OnStartButtonPressed: it calls these
 // launcher methods directly (measured: the open arrives as the manager's Show
 // with no decision-hook frame; the close arrives as method 6 through
-// DismissStartAndCortana). These two hooks are the decision layer's observation
-// of such a caller: they log the same `own decide` line with trigger=foreign,
-// resync the truth, and then let the call run. Our own decision calls are
-// excluded by the thread-local guard, so they take the ordinary path.
+// DismissStartAndCortana). These two hooks are the decision layer for such a
+// caller: method 11 is the Start button's open and method 6 its close; any
+// other call is swallowed while the controller owns the panel, or passed with a
+// cloak resync. Our own decision calls are excluded by the thread-local guard.
 using DismissHook_t = HRESULT (*)(void*, uint32_t);
 DismissHook_t Dismiss_Original = nullptr;
 

@@ -68,9 +68,9 @@ launcher's thread. The panel is therefore never hidden mid-slide.
 `TakeProgressNow()` pins the live position and stops the animation. The new
 settle starts there: a close 172 ms into an open started at `from=0.542`; a Win
 press during a held touch started the close from `progress=1.000`; a press during
-a gesture close cancels the tap and the pending dismiss and settles the panel
-back from its live position (`intent open cancel from=...`). No path replays from
-the old target.
+a gesture close drops the local dismiss slot, cancels the pending executor
+command, and settles the panel back from its live position
+(`intent open cancel from=...`). No path replays from the old target.
 
 ## The coast
 

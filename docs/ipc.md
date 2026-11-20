@@ -101,13 +101,14 @@ Plain interlocked fields, read on every decision:
 | `controllerTouch` | 1 while the opening contact owns the panel |
 
 `controllerPhase` becomes 2 in `TakeCloseOwnership`, before the close's settle
-starts; it is not deferred to the tap. That is what lets the bridge's one toggle
-rule see the whole retract as a close while the shell still reports state 5 and
-the cloak still reports open. A pull that cancels a gesture close before its tap
-republishes phase 1 at the cancel. The bridge reads `controllerOwning` first:
-while it is set, phase 2 makes a press a reopen and any owned phase makes it a
-close. The shell's cloak and internal state are only the resync for a panel the
-controller does not own. A hide in flight (9/11) or an armed executor dismiss
+starts; it is not deferred to the dismiss. That is what lets the bridge's one
+toggle rule see the whole retract as a close while the shell still reports state
+5 and the cloak still reports open. A pull that cancels a gesture close before
+its dismiss is requested republishes phase 1 at the cancel. The bridge reads
+`controllerOwning` first: while it is set, phase 2 makes a press a reopen and
+any owned phase makes it a close. The shell's cloak and internal state are only
+the resync for a panel the controller does not own. A hide in flight (9/11) or
+an armed executor dismiss
 still latches the press instead of publishing into a no-op show.
 `controllerTouch` is the only reason a `HideStartAndCortana(7)` is not published
 as a close.

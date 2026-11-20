@@ -64,9 +64,9 @@ What it does:
   `Distance`, `DirX` and `DirY` are rewritten in place when the taskbar moves.
 - The scalar and its motion live in one `PanelController`: `progress`, `target`,
   `velocity`, `phase`, the settle record and the coast line. The touch path
-  emits `Begin`/`Move`/`End`/`Commit` intents; the keyboard and close paths
-  write the same controller through the existing helpers, so the position, the
-  seam speed and the phase have one owner.
+  emits `Begin`/`Move`/`End` intents; the mirrored close writes the same
+  controller with `Commit`; the position, the seam speed and the phase have one
+  owner.
 - `Wh_ModAfterInit` starts one input thread. The thread owns one window and
   registers `RAWINPUTDEVICE{0x0D, 0x04}` (touch) and `{0x0D, 0x02}` (pen) with
   `RIDEV_INPUTSINK`, so it still receives reports while the Start menu is in
@@ -227,10 +227,10 @@ What it does:
   target (a pull back before letting go) contributes 0 and
   the settle starts from rest instead of backwards. The unit is `Progress` per
   ms, so one estimator serves both families and the settle divides by the travel
-  in the same units. The tap that closes is armed for the end of that settle.
-  Every Progress animation inserts the target as the base value before
-  `StartAnimation`, which is why no interruption may read that value as a
-  position: `TakeProgressNow` answers where the panel is from the curve the
+  in the same units. The executor dismiss that closes the menu is armed for the
+  end of that settle. Every Progress animation inserts the target as the base
+  value before `StartAnimation`, which is why no interruption may read that value
+  as a position: `TakeProgressNow` answers where the panel is from the curve the
   compositor was handed, stops it and pins the answer.
 - A vertical dismiss competes with the scroll of whatever is under the press:
   dragging toward the taskbar is how a list scrolls back, and that drag used to
@@ -320,9 +320,10 @@ What it does:
     function is attached, because the samples are the curve.
 
   One settle-and-arm helper serves both gesture families: it plays the
-  animation, opens the suppression window, stamps the close channel and arms the
-  tap for the end of the settle, which is that settle's own duration. A close
-  whose settle did not start arms nothing. One line records each settle:
+  animation, opens the suppression window, publishes the close phase and arms
+  the executor dismiss for the end of the settle, which is that settle's own
+  duration. A close whose settle did not start publishes no phase and arms
+  nothing. One line records each settle:
   `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
   frames=... zeta=...`. The settle line's `vel` is the speed toward the target
   in DIP/ms, the same number the release line prints.
@@ -399,12 +400,11 @@ What it does:
   adopted (`reveal adopt ...`); a tap is not adopted because it has no travel.
   EP opens the menu by
   itself once the contact passes its own edge threshold. The open transition then
-  runs exactly one of four paths, in this order: a live takeover (a still-down,
+  runs exactly one of three paths, in this order: a live takeover (a still-down,
   moving finger — a candidate is promoted at the open instead of waiting for a
   report it might not get, and a contact without one is adopted), the late
-  release record (the pull already lifted), the contested continuation of a close
-  whose Hide already left (the settle starts where the pull had the panel), or
-  the keyboard settle (nothing preceded the open). The suppression test is that
+  release record (the pull already lifted), or the keyboard settle (nothing
+  preceded the open). The suppression test is that
   actual takeover, never the
   existence of an edge candidate: a contact that was refused (`reason=open`) or
   has not started following must not take the animation away, and the follow
@@ -545,7 +545,7 @@ What it does:
   same from any finger position. The settle itself starts at the gesture's end
   speed, measured over the same 8-30 ms window as the dismiss release and
   projected onto the settle's direction, so a pull that reversed before the lift
-  starts from rest. The Windows tap that closes the menu is armed
+  starts from rest. The executor dismiss that closes the menu is armed
   for the end of the settle, so the panel is already off screen when the shell
   hides it. `Progress`
   stays 0; a later
@@ -555,10 +555,10 @@ What it does:
   commit=... panel=... n=...` is written once per reveal: `progress` is the last
   chased value, `behind` the gap to the finger's mapped position still open at the
   release (progress units), `offset` the gap the takeover inherited, and
-  `travel`/`max` the finger's real motion. The cancel adds
-  `close tap kind=reveal delay=0`,
-  or `close tap dropped kind=reveal` when a new pull is already there at the tap.
-- A close owns `Progress` the same way from either family. A gesture close
+  `travel`/`max` the finger's real motion. A scheduled dismiss that runs logs
+  `close dismiss kind=reveal`; one a new pull cancels logs
+  `close dismiss cancelled kind=reveal`.
+- A close takes the panel the same way from either family. A gesture close
   arrives from its release; a keyboard close arrives through the bridge while the
   finger is still down, so it also ends the live dismiss session and the live
   reveal, mutes the rest of that contact until it lifts, opens the suppression
@@ -570,30 +570,34 @@ What it does:
   open. Without that state the next report
   of the same contact dragged the panel back and its release settled the menu
   open over a close that was already running. The helper is the same call for
-  both; the keyboard close additionally drops an armed tap, because the Hide it
-  serves would otherwise toggle the menu back open.
-- A close owns `Progress` from the moment its settle starts until the shell
+  both; the keyboard close path additionally cancels its executor command when
+  an open intent takes the panel back, because the Hide it serves would otherwise
+  close the menu again.
+- A close suppresses the panel from the moment its settle starts until the shell
   reports the window cloaked (`win close observed`), at most 600 ms.
-  `CloseInFlight` is that one answer; every admission, takeover, coast and settle
-  reads it. The reused root reports itself open until the shell has run the hide
-  behind the tap, and restoring `Progress = 1` in that gap flashed the fully open
-  panel while the close was in flight. One rule decides every pull that lands in
-  that window:
-  - A gesture close still has a `Hide` this mod can abort. Its Windows tap is
-    armed and runs at the end of the settle; the first report of a contact that
-    lands during it drops the tap, whatever its point (the band test only admits a
+  `CloseInFlight(tickMs)` answers only whether that suppression window is still
+  open; the settle owns the motion, and `CloseCancellableByPull()` answers whether
+  a pull may still abort the close. Every admission and takeover reads the
+  suppression. The reused root reports itself open until the shell has run the
+  hide behind the dismiss, and restoring `Progress = 1` in that gap flashed the
+  fully open panel while the close was in flight. One rule decides every pull
+  that lands in that window:
+  - A gesture close still has a dismiss this mod can abort. Its executor dismiss
+    is armed for the end of the settle; the first report of a contact that lands
+    during it drops the dismiss, whatever its point (the band test only admits a
     candidate, and a pull whose first point lands above the band would otherwise
-    let the tap fire). No Hide runs, the toggle is never advanced, the suppression
-    ends with the drop, and the panel comes back from the close's live position
-    (an open settle from where it is), because a menu that stays open at
-    `Progress` 0 has no pane. The admission names it
+    let the dismiss fire). No dismiss request reaches the bridge, the toggle is
+    never advanced, the suppression ends with the drop, and the panel comes back
+    from the close's live position (an open settle from where it is), because a
+    menu that stays open at `Progress` 0 has no pane. The admission names it
     (`reveal admit ... reason=cancelled`). This is the cancel path.
-  - Every other close already has its Hide in the shell's or the bridge's hand: a
-    keyboard close, a Start-button or click-away close (both arrive as the
-    bridge's retract request), or a gesture close whose tap already fired. A pull
-    that lands there is **deferred**: `reveal admit ... ok=1 reason=deferred`, no
-    `Progress` write, no pull generation, no cancel stamp, no mute, and
-    `startedOpen = 0` while the close is in flight, so a pull that starts above
+  - Every other close already has its dismiss in the shell's or the bridge's
+    hand: a keyboard close, a Start-button or click-away close (both arrive as
+    the bridge's close intent), or a gesture close whose dismiss already went
+    out. A pull that lands there is **deferred**: `reveal admit ... ok=1
+    reason=deferred`, no `Progress` write, no pull generation, no dismiss
+    cancel, no mute, and `startedOpen = 0` while the close is in flight, so a
+    pull that starts above
     the band is adopted from its own down point once it has travelled
     `kAdoptTravelDip` instead of staying inert. It is still measured — its down
     point, travel, end-speed window and, if it lifts first, one `RevealLateRelease`
@@ -630,39 +634,21 @@ What it does:
   retract's last frame is continued, never replayed. A close the shell performs
   by itself logs `win close observed`, leaves `Progress` where the close left it,
   and lets the next open animate from 0.
-  The Windows-key close is animated now: the explorer-side bridge asks this mod
-  for the retract through the shared channel and holds
-  `CStartExperienceManager::Hide` until the settle it starts has run. Only this
-  process can plan that settle, so it answers with the planned duration and the
-  bridge waits exactly that plus a 30 ms margin; the mod runs the selected
-  settle style from rest (520 ms at this layout's 1440 DIP travel, 409 ms for
-  the 900 DIP panel) and the panel slides out instead of vanishing. One line
-  per transition.
-- Every gesture close stamps the close channel at the release. The tap comes at
-  the end of the settle, so the Hide it causes needs no wait; the stamp, which
-  carries a sequence number, tells the bridge that this Hide is that tap's and
-  not a keyboard close. A stamp the bridge has already consumed, or one older
-  than its 800 ms window, means a keyboard close and takes the keyboard lead.
-- The cancel path above is the whole window in which the shell can still be
-  spared a close, and the only shape it can reopen from after that close's own
-  gesture. A pull that begins later is deferred, and the shell has to open the
-  menu for it: measured on this build, a Windows-key or Start-button press whose
-  release lands inside the held close decision (before the answered retract plus
-  the bridge's 30 ms margin, ~400 ms after the close starts here) is dropped:
-  no `show`, no uncloak, nothing this mod could react to. The same press at or
-  after that boundary opens the menu with one `win open dur=409` (press to first
-  visible frame 38-191 ms), and a pull that lifts before the landing gets a
-  `show` the shell cancels 17 ms later (`hide reason=7`), so the menu stays
-  closed. The mod cannot withdraw a Hide it does not own, and it never opens the
-  menu itself.
-- The close-contested ticket remains as the guard for an open whose panel the
-  close did not take to the hidden rest: `PollRootVisibility` consumes the
-  one-release, 300 ms ticket and settles from the panel's live position
-  (`win open continued from=... dur=...`) instead of starting the keyboard settle
-  from 0, so a panel that is already up is never rewound. With the deferral in
-  place no follow activates inside a close, so no ticket is stamped in the
-  measured shapes and the guard stays silent; a panel the close took to the
-  hidden rest settles from 0 exactly as before. The next close clears the ticket.
+  The Windows-key close is an intent this mod consumes and a command it
+  publishes: the close intent runs the mirrored close from the live position,
+  publishes phase 2 before the settle's first frame, and schedules
+  `exec dismiss` at the settle's end plus 30 ms; the bridge calls `Dismiss` on
+  the launcher thread and the shell's own duplicate Hide is swallowed while
+  `controllerOwning` is set. The panel slides out instead of vanishing. One
+  line per transition.
+- Every gesture close runs the same path with its own release settle: the
+  release arms the executor dismiss for that settle's end, and the pull
+  generation sampled at that arm decides whether the dismiss is dropped
+  (`close dismiss cancelled`) or runs (`close dismiss`).
+- The cancel path above is the only window in which the shell can still be
+  spared a close. A pull that begins later is deferred, and the shell has to
+  open the menu for it; the mod cannot withdraw a dismiss it does not own, and
+  it never opens the menu itself.
 - The uncloaked window and the hidden panel are one state, and no path may leave
   it standing. A close whose Hide landed, or a reopen whose settle never ran,
   leaves the window shown with `Progress` 0: nothing of the menu is on screen
@@ -677,18 +663,16 @@ What it does:
   pulls cannot all be muted. This poll reads the live position with
   `PeekProgressNow`, never `TakeProgressNow`: it is also where the late-release
   settle starts, and taking that settle at its first millisecond pinned the hidden
-  rest and was the dead state's cause (measured:
-  `progress take settle at=0.000 elapsed=0 caller=contested` right after
-  `reveal adopt late`).
-- The batch observer is optional; the close is not. A close arms its tap and
-  publishes its plan before the batch registration resolves, so a registration
+  rest and was the dead state's cause.
+- The batch observer is optional; the close is not. A close publishes its phase
+  and arms its dismiss before the batch registration resolves, so a registration
   that loses its serial (a reset or a take-over replaced the animation) or throws
-  leaves a running settle with an armed tap: that is `close observer lost
+  leaves a running settle with an armed dismiss: that is `close observer lost
   kind=dismiss`, and the close continues. Only a close that never started its
   settle may put the panel back (`AbandonClose`), and such a close published no
-  plan and armed no tap, so the restore is the whole operation: it logs
-  `close abandoned kind=dismiss|reveal` and no tap of a later close is touched. A
-  registration exception takes the same route as a lost serial.
+  phase and armed no dismiss, so the restore is the whole operation: it logs
+  `close abandoned kind=dismiss|reveal` and no dismiss of a later close is
+  touched. A registration exception takes the same route as a lost serial.
 
 What it does not do:
 
@@ -739,8 +723,7 @@ Unload:
   (`hid thread not started (stop event unavailable)`), because a gesture source
   that cannot be stopped is worse than none. Every wait on the input thread and
   on the module poll thread is bounded or watches that event, so the stop is
-  observed within one short wait; the Windows tap's 60 ms hold waits on the event
-  as well, and the key is released either way. `Wh_ModBeforeUninit` stops and
+  observed within one short wait. `Wh_ModBeforeUninit` stops and
   waits the module poll thread for 10 s, sets the stop event, posts the close
   message as a second signal for a queued message that wins the wait, and waits
   10 s for the input thread. `Wh_ModUninit` then revokes every XAML delegate on
@@ -819,9 +802,10 @@ Settings:
 
 Debug channel (kept in the build):
 
-- The channel is shared memory plus three events, described in
-  `swipe_ipc_shared.h`; no file is involved and nothing polls.
-  `tools/ipc.ps1` writes a command and reads the counters:
+- The channel is one shared section plus the command, intent/ack and exec/ack
+  events and the command mutex, described in `swipe_ipc_shared.h`; no file is
+  involved and nothing polls. `tools/ipc.ps1` writes a command and reads the
+  counters:
   - `pwsh -File tools\ipc.ps1 p=0.5` inserts `Progress`, clamped to 0..1.
   - `pwsh -File tools\ipc.ps1 t=-300,0,0` sets `UIElement.Translation` on the UI
     thread.
@@ -831,51 +815,29 @@ Debug channel (kept in the build):
     `anim=1` restores it. The default is `anim=1`, because suppression leaves
     the pane undrawn.
   - `pwsh -File tools\ipc.ps1 -State` prints the counters: the command sequence,
-    the close stamp, the retract request and the plan.
+    the open generation, the intent and its ack, the executor command and its
+    ack, and the controller flags.
   The command event wakes the raw input thread, so a command runs within
   milliseconds instead of waiting for a poll. The event is manual-reset and this
   side resets it, so a command published while one is running is not lost.
-- The `retract` request is its own event, not a command: the bridge publishes a
-  sequence number right before it holds the launcher's close decision
-  (`XamlLauncherState::HideStartAndCortana`), and this side plans the settle from
-  the current `Progress` and answers with its duration on the same channel. A
-  reveal contact that drives the panel is not a veto: the close happens, the
-  contact becomes a deferred pull, and the next open may adopt it. `retract=`
-  names the animation that just started; the "no settle" sentinel says that
-  nothing started, so the bridge closes at once. There is no cancel answer. The
-  answer echoes the request's sequence number, so an answer to an earlier close
-  can never satisfy a later one. The request carries the menu-open generation the
-  bridge saw and a deadline, so a request that outlived its close is answered with
-  the sentinel and starts nothing, and the bridge marks its request done when that
-  close is over. Open generation 0 is not a menu: `SwipeIpcReadOpen` reports
-  `ERROR_NOT_READY` instead of a snapshot, and this side refuses a request that
-  names 0 exactly like one whose generation is gone, so a keyboard close can
-  never start a settle for a menu that never published an open.
-- The reveal claim record is gone. It existed only to let a method-7 close be
-  refused without waiting; every close now closes, the lock path never waits, and
-  the Start side reads `g_reveal.active` only for its own deferral decision. The
-  layout is 664 bytes: the record and its reserved words were removed, not left
-  as a dead second mechanism.
+- The intent is its own event, not a command: the bridge publishes one
+  `intent(seq, kind, trigger, method, flags, open)` and this side answers on
+  `intentAck` with the state, the planned duration and the entry. An open sets
+  the entry and publishes `exec show`; a close runs the one close path and
+  publishes `exec dismiss`; a press that takes the panel back publishes
+  `exec cancel` for the dismiss sequence it supersedes, and the bridge kills its
+  timer. Open generation 0 is not a menu: `SwipeIpcReadOpen` reports
+  `ERROR_NOT_READY` instead of a snapshot, so an intent published before the
+  first open carries `open=0` and names no menu.
 - The section outlives either process, so both sides record the sequence numbers
-  at attach and act only on what is newer. That is what the one-second freshness
-  check on the old command file did: a request that predates this process
-  belongs to a menu this process never drew (`debug retract ignored (stale)`
-  names a request whose generation, deadline or done marker says its close is
-  over).
-- The `close record` is still three publishes of one seqlock record: the plan at
-  the release (`tapped=0`), the cancel the moment a new pull drops a gesture
-  close, and the tapped record with a fresh sequence immediately before the
-  Windows tap. Only the tapped one tells the bridge that a Hide needs no lead;
-  the cancelled kind only ever cancels the Start side's own armed tap, never a
-  bridge close. The open publisher is also a close-record writer: publishing a
-  new open generation publishes the cancelled kind in the same place, so an
-  unconsumed tapped record from the previous menu cannot survive into the next
-  one. The bridge's own rule — refuse a stamp older than the open tick — is a
-  second guard, not the binding this side relies on.
-- Every record is a seqlock, so the bridge never reads a half-written close
-  record, plan or open generation, and this side never reads half a command.
-  The command record is also serialised by a named mutex, because more than one
-  tool can publish into it.
+  at attach and act only on what is newer: an intent, a command or an open
+  generation from a previous process is ignored by its sequence, never served.
+- The v4 section is 744 bytes: the command, the open generation, the intent and
+  its ack, the executor command and its ack, and the controller flags. Every
+  record is a seqlock, so the bridge never reads a half-written intent, command
+  or open generation, and this side never reads half a command. The command
+  record is also serialised by a named mutex, because more than one tool can
+  publish into it.
 - The files this channel replaced (`debug.txt`, `close-mode.txt`,
   `retract-plan.txt`) are deleted at init; they are transport, not state, and a
   leftover would invite a reader that no longer exists.
@@ -905,24 +867,21 @@ Diagnostics:
   `frames` counts keyframes, so the segment count is one
   less),
   `win open dur=...`, `win open restore (no geometry)`,
-  `win open continued from=... dur=...` (the reopen of a close a pull contested:
-  the settle continues from the panel's live position, the close's own settle
-  value, and is not the keyboard settle from 0),
   `win open unhealed progress=...` (the visibility poll found the window shown
   with the panel off it and no motion; it is logged once per second while the
   pair stands, immediately before the settle that brings the panel back),
   `progress take settle at=... elapsed=... dur=... caller=...` (a settle taken
   below 5 %, naming the caller; the dead open's fingerprint),
   `win close observed`,
-  `close tap kind=dismiss|reveal delay=...`,
-  `close tap dropped kind=dismiss|reveal` (now written on the new contact's first
-  report during a close as well as at the tap's deadline),
-  `close tap skipped kind=... (already closed)`,
-  `close observer lost kind=dismiss` (the settle runs and its tap is armed; only
-  the batch observer is gone),
+  `close dismiss kind=dismiss|reveal` (the armed executor dismiss runs at the
+  settle's end),
+  `close dismiss cancelled kind=dismiss|reveal` (a new pull took the close back
+  before that dismiss was requested),
+  `close dismiss skipped kind=... (already closed)`,
+  `close observer lost kind=dismiss` (the settle runs and its dismiss is armed;
+  only the batch observer is gone),
   `close abandoned kind=dismiss|reveal` (no settle started, so the panel was put
   back and nothing was armed),
-  `close mode stamp failed kind=...`, `close mode cancel stamp failed`,
   `open follow travel=... max=... progress=... behind=... offset=... vel=...
   commit=... panel=... n=...` (`progress` is the last chased visible value,
   `behind` the gap to the finger's mapped position still open at the release in
@@ -954,9 +913,8 @@ Diagnostics:
   `attached root=...`, `dismiss axis=...` (with `src=appbar|bar|work` and what
   every source said), `dismiss axis=... kept, no source named an edge` (once per
   undecided episode; the last edge stays in force), `debug p=...`, `debug t=...`,
-  `debug e=...`, `debug anim=...`, `debug retract from=... dur=...`,
-  `debug retract failed`, `retract answer failed dur=...`,
-  `debug retract ignored (stale)`, `ipc open created=... cmd=... retract=...`,
+  `debug e=...`, `debug anim=...`,
+  `ipc open created=... cmd=...`,
   `ipc open failed err=...`, `ipc legacy files removed=...`,
   `gesture geometry updated axis=... dist=...` (or
   `gesture geometry axis=... dist=... (unchanged)` once per open),
@@ -1108,15 +1066,17 @@ Known risks:
   The shell hides the window; the next open is ready. With the explorer-side
   bridge disabled or its hooks refused the menu stays open at the retracted
   position, because the Start side never calls the launcher itself.
-- A pull that starts during the retract cancels the close before its tap runs,
-  so the shell is never touched and the menu stays open. That check runs once,
-  when the tap would run; a pull after the tap is a normal open of a closed menu.
+- A pull that starts during the retract cancels the close before its dismiss is
+  requested, so the shell is never touched and the menu stays open. That check
+  runs once, when the dismiss would be requested; a pull after it is a normal
+  open of a closed menu.
 - The controller publishes phase 2 before the close's first frame. A Win press
-  during the retract is therefore an open: it drops the tap and the pending
-  dismiss and settles the panel back from its live position. The shell's state
-  is only the resync, never the direction; it still reports state 5 and uncloaked
-  while the panel retracts, until the executor's `Dismiss` runs. A press after
-  the hide is latched (one slot) and served at the landing.
+  during the retract is therefore an open: it drops the armed dismiss and the
+  pending executor command and settles the panel back from its live position.
+  The shell's state is only the resync, never the direction; it still reports
+  state 5 and uncloaked while the panel retracts, until the executor's
+  `Dismiss` runs. A press after the hide is latched (one slot) and served at the
+  landing.
 - The suppression window is time based until `win close observed` clears it. A
   reopen that lands before the shell reports the close is not animated; the
   panel stays at the entry until the observed close clears the window and the
@@ -1200,8 +1160,9 @@ Known risks:
  *   resync. One close path: TakeCloseOwnership (publishes controllerOwning
  *   phase 2 before the settle's first frame) + BeginMirrorCloseSettle(
  *   TakeProgressNow()) + the dismiss scheduled at settle+30 ms. An open intent
- *   while the window still shows cancels that close: the tap and the pending
- *   dismiss are dropped and the panel settles back from its live position
+ *   while the window still shows cancels that close: its local dismiss slot is
+ *   dropped and a pending executor command is cancelled, and the panel settles
+ *   back from its live position
  *   (`intent open cancel from=...`); if the dismiss had already entered the
  *   shell and the window hides, the landing reissues the open
  *   (`intent open recovered entry=...`). A pull still
@@ -1216,7 +1177,7 @@ Known risks:
  *   and the panel's motion, and it is the only process that can plan the settle
  *   (the travel belongs to the panel). The bridge owns the launcher call and the
  *   non-touch triggers. The one shared rule is the suppression window: a close
- *   owns the retracted panel until the bridge's dismiss has landed.
+ *   suppresses the retracted panel until the bridge's dismiss has landed.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -1489,23 +1450,22 @@ constexpr int kGestureStartSpeedDefault = 100;
 constexpr int kGestureStartSpeedMin = 0;
 constexpr int kGestureStartSpeedMax = 300;
 
-// Every gesture close ends in one Windows tap at the end of its settle. The tap
-// is the shell's own Start toggle: the key handler performs Hide, so no
-// explorer-side request and no re-arm tap exist. The settle runs first, so the
-// panel is already off screen when the window hides; the close channel tells the
-// bridge that the Hide belongs to this tap and needs no further delay.
+// Every gesture close ends in one executor dismiss at the end of its settle. The
+// dismiss is the bridge's Dismiss on the launcher thread: no key handler, no
+// explorer-side request and no re-arm exist. The settle runs first, so the panel
+// is already off screen when the window hides.
 
 // A close this mod started hides the menu a moment later. Until then the shell
 // still reports the window open, so the reopen poll must not read that as a
 // fresh open and restore Progress while the close is in flight.
 constexpr uint64_t kRestoreSuppressMs = 600;
 
-// The tap has to run inside that window, or the poll reads the still-open window
-// as a fresh open and restores Progress while the close is in flight. Both
-// styles must land inside it, and the clamp is their upper bound.
+// The scheduled dismiss has to run inside that window, or the poll reads the
+// still-open window as a fresh open and restores Progress while the close is in
+// flight. Both styles must land inside it, and the clamp is their upper bound.
 static_assert(static_cast<uint64_t>(kSettleMaxDuration.count()) <=
                   kRestoreSuppressMs,
-              "the close tap must run inside the restore suppression");
+              "the close dismiss must run inside the restore suppression");
 
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
 constexpr float kCommitDistanceFraction = 0.20f;
@@ -2236,18 +2196,16 @@ std::atomic<uint64_t> g_suppressRestoreUntil{0};
 // ---------------------------------------------------------------------------
 // The gesture close
 //
-// Both close paths end in the same place: one Windows tap at the end of the
-// settle. The tap is the shell's own Start toggle, so the key handler runs
-// CStartExperienceManager::Hide exactly as it does for a keyboard close, and the
-// next Windows press opens the menu. The settle runs first, so the panel is off
-// screen when the window hides.
+// Both close paths end in the same place: one executor dismiss at the end of the
+// settle. The bridge runs the shell's Dismiss on the launcher thread, exactly as
+// it does for a keyboard close, and the next Windows press opens the menu. The
+// settle runs first, so the panel is off screen when the window hides.
 //
-// A new pull that starts during the settle cancels the close: the tap is
-// dropped before the shell is touched, so no Hide runs and the menu stays open.
-// The pull generation is sampled at the release and checked once when the tap
-// would run; the cancel is published the moment the pull begins, not at the
-// tap's deadline, so no Hide in between can be read as the tap's. This is one
-// scheduled tap, not a request file.
+// A new pull that starts during the settle cancels the close: the armed dismiss
+// is dropped before the bridge is asked, so no Dismiss runs and the menu stays
+// open. The pull generation is sampled at the release and checked once when the
+// dismiss would run; the cancel is published the moment the pull begins, not at
+// the dismiss deadline. This is one scheduled dismiss, not a request file.
 // ---------------------------------------------------------------------------
 enum class CloseKind {
     None,
@@ -2258,18 +2216,18 @@ enum class CloseKind {
 // A pull is a contact that starts in the taskbar edge band and becomes a reveal
 // candidate (BeginEdgeCandidate). The counter names the pull generation: a close
 // released under one generation is dropped when a later pull exists by the time
-// its tap would run.
+// its dismiss would run.
 uint32_t g_pullSerial = 0;  // input thread only
 
-// The one tap slot. `g_pendingTapPull` is the pull generation sampled when the
-// tap was armed: a newer pull replaces it, and the tap runner drops a slot whose
-// generation no longer matches. Zero in `g_pendingTapTick` means the slot is
-// empty, so no separate tap identity is needed.
+// The one dismiss slot. `g_pendingTapPull` is the pull generation sampled when
+// the dismiss was armed: a newer pull replaces it, and the runner drops a slot
+// whose generation no longer matches. Zero in `g_pendingTapTick` means the slot
+// is empty, so no separate dismiss identity is needed.
 uint64_t g_pendingTapTick = 0;  // input thread only, 0 = none
 CloseKind g_pendingTapKind = CloseKind::None;
 uint32_t g_pendingTapPull = 0;
 
-// Arms the tap for a close that has just started its settle. The deadline is
+// Arms the dismiss for a close that has just started its settle. The deadline is
 // the end of that settle.
 void ScheduleCloseTap(CloseKind kind, uint64_t delayMs) {
     g_pendingTapTick = GetTickCount64() + delayMs;
@@ -2441,7 +2399,8 @@ std::atomic<LONG64> g_pendingShowExec{0};
 std::atomic<uint64_t> g_pendingShowUntil{0};
 LONG64 g_lastIntentSeq = 0;  // input thread only
 // An open intent that cancelled a close whose window was still on screen. The
-// window keeps showing (the tap and the executor dismiss are dropped), but the
+// window keeps showing (the local dismiss slot and the executor command are
+// dropped), but the
 // dismiss can already be inside the shell's Dismiss call when the press lands.
 // That close still lands, so `win close observed` reissues the same open once.
 // Set by the open-intent cancel path, cleared by a new close or by a poll that
@@ -2681,17 +2640,16 @@ extern bool g_commitNeedsProgressReset;
 void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown);
 
 // The cross-process channel with the explorer-side bridge and the debug tools.
-// Defined with the channel helpers below; a gesture close publishes its plan,
-// its cancel and the moment its Windows tap goes down through it.
+// Defined with the channel helpers below; a close publishes its executor
+// command through it.
 SwipeIpcChannel g_ipc;
 
-// The close record goes through the shared channel below, on the input thread:
-// the plan when the tap is armed, the cancel when a new pull drops it, and the
-// tapped record immediately before the tap itself, so the bridge can tell the
-// tap's own Hide from a keyboard close.
+// The close's executor command goes through the shared channel below, on the
+// input thread: the intent is read and answered, and the dismiss is published
+// for the end of the settle. The bridge is the only launcher caller.
 
-// Defined with the input-thread gesture state below; the close tap needs the
-// kind for its log line.
+// Defined with the input-thread gesture state below; the scheduled dismiss
+// needs the kind for its log line.
 const wchar_t* CloseKindName(CloseKind kind);
 
 // Defined with the cloaked-window cache below; the debug `state` command reads
@@ -3297,7 +3255,7 @@ void PanelController::Commit(float to) {
 // at release, `to` is 0 for a close and 1 for an open, and `velocity` is the
 // release speed in Progress per millisecond, signed along the gesture axis, as
 // the end-velocity estimator reports it. `duration` is the animation's length,
-// which is also what the close tap is armed with.
+// which is also what the scheduled dismiss is armed with.
 //
 // One generator, two parameter sets. The style setting only picks the damping
 // ratio; everything below runs once for both:
@@ -3608,18 +3566,19 @@ bool ReleaseCommits(bool allowCommit, float travelDip, uint64_t elapsedMs,
 }
 
 // What a close attempt left behind: whether its settle runs. A close exists once
-// that settle started, and only then is a tap armed; there is no separate tap
-// identity to compare, because the pull generation already decides cancellation.
+// that settle started, and only then is a dismiss armed; there is no separate
+// dismiss identity to compare, because the pull generation already decides
+// cancellation.
 struct GestureClose {
     bool started = false;
 };
 
 // The close every gesture path runs, from the value the coast left. A close
-// exists only once its settle started: the suppression, the stamp and the tap
-// follow that animation, never a failed one. The tap is armed for the end of the
-// settle, so the panel is off screen when the shell hides the window. The
-// dismiss wraps this call in its settle batch; the reveal cancel calls it
-// directly.
+// exists only once its settle started: the suppression, the close phase and the
+// armed dismiss follow that animation, never a failed one. The dismiss is armed
+// for the end of the settle, so the panel is off screen when the shell hides the
+// window. The committed dismiss wraps this call in its settle batch; the reveal
+// cancel calls it directly.
 GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
                                uint32_t* serialOut = nullptr) {
     GestureClose close;
@@ -3634,10 +3593,11 @@ GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
 
 // Puts the panel back for a close that provably never started.
 //
-// A close exists only once its settle starts: ArmGestureClose publishes the plan
-// and arms the tap after BeginGestureSettle returned true. A close that never
-// started therefore published no plan and armed no tap, so there is nothing to
-// recall here; the restore is the whole operation. This is the only path that
+// A close exists only once its settle starts: ArmGestureClose publishes the
+// close phase and arms the dismiss after BeginGestureSettle returned true. A
+// close that never started therefore published no phase and armed no dismiss, so
+// there is nothing to recall here; the restore is the whole operation. This is
+// the only path that
 // may restore a panel after a failed close, and the log names the visible
 // outcome: the missing settle line already says the close never started, and
 // this line says what the panel did instead.
@@ -3667,7 +3627,7 @@ bool RevokeDismissBatch() {
 
 // What a dismiss close attempt left behind.
 enum class DismissClose {
-    NotStarted,         // no settle ran: nothing is stamped and no tap is armed
+    NotStarted,         // no settle ran: nothing is published and no dismiss is armed
     Started,            // the settle runs and its batch observer is registered
     StartedUnobserved,  // the settle runs; the observer was lost, the close goes on
 };
@@ -3676,19 +3636,19 @@ struct DismissCloseResult {
     DismissClose start = DismissClose::NotStarted;
 };
 
-// The close both gesture paths schedule. The settle runs first; the tap is
+// The close both gesture paths schedule. The settle runs first; the dismiss is
 // armed for its end, where RunPendingCloseTap checks the pull generation and
-// either taps or drops the close. No deferral file and no bridge request exist.
+// either asks for it or drops the close. No deferral file exists.
 //
-// Committed dismiss: the settle batch observes the settle, the shared close
-// tail arms the tap. The settle itself, the log line, the suppression window,
-// the close stamp and the tap all come from BeginGestureClose, so this path
-// and the reveal cancel cannot diverge.
+// Committed dismiss: the settle batch observes the settle, the shared close tail
+// arms the dismiss. The settle itself, the log line, the suppression window and
+// the close phase all come from BeginGestureClose, so this path and the reveal
+// cancel cannot diverge.
 //
 // The batch observer is optional; the close is not. When the registration loses
 // the animation (a reset or a takeover replaced it while the lock was free) or
-// the registration itself fails, the settle and its armed tap still run, so the
-// result says StartedUnobserved and the caller must not put the panel back. Only
+// the registration itself fails, the settle and its armed dismiss still run, so
+// the result says StartedUnobserved and the caller must not put the panel back. Only
 // a settle that failed to start leaves the panel in place.
 DismissCloseResult BeginDismissSettle(float from, float velocity) {
     DismissCloseResult result;
@@ -3723,7 +3683,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         if (!close.started) {
             // No animation, so the batch holds nothing and no handler may be
             // registered: a close that never settled must not clear a flag, and
-            // it armed neither a tap nor a stamp.
+            // it published no phase and armed no dismiss.
             {
                 std::lock_guard lock(g_compositionMutex);
                 InvalidateDismissBatchLocked();
@@ -3732,8 +3692,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
             return result;
         }
 
-        // From here on the close exists: its settle runs, its plan is published
-        // and its tap is scheduled. Nothing below may restore the panel.
+        // From here on the close exists: its settle runs, its close phase is
+        // published and its dismiss is scheduled. Nothing below may restore the
+        // panel.
         result.start = DismissClose::StartedUnobserved;
 
         // The counted entry is taken before the batch is ended, so a completion
@@ -3799,8 +3760,8 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
                     // reached its target. Leave Progress there: resetting it
                     // here flashes the fully open menu for the frames between
                     // this reset and the shell hiding the window. The next
-                    // session resets it instead. The hide itself is the Windows
-                    // tap's job, so this compositor callback only ends the
+                    // session resets it instead. The hide itself is the
+                    // executor's job, so this compositor callback only ends the
                     // settle, and its curve is no longer on screen.
                     if (g_state) {
                         g_state.StopAnimation(L"Progress");
@@ -3857,7 +3818,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         InvalidateDismissBatchLocked();
         // `result.start` is already the answer: the settle starts before any of
         // the batch work, and a throw after that leaves a close with an armed
-        // tap, which only a close that never started may abandon.
+        // dismiss, which only a close that never started may abandon.
         return result;
     } catch (...) {
         Wh_Log(L"Dismiss animation failed with an unknown exception");
@@ -3871,7 +3832,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         InvalidateDismissBatchLocked();
         // `result.start` is already the answer: the settle starts before any of
         // the batch work, and a throw after that leaves a close with an armed
-        // tap, which only a close that never started may abandon.
+        // dismiss, which only a close that never started may abandon.
         return result;
     }
 }
@@ -3881,25 +3842,23 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_v2_Cmd         p=, t=, e=, anim=   (tools -> here)
-//   Local\SwipeFor10Start_v2_RetractReq  "how long is the retract?"  (bridge)
-//   Local\SwipeFor10Start_v2_RetractPlan that many ms, or "none"     (here)
-//   ..._State.closeSeq                   "this Hide is my own tap"   (here)
-//   ..._State.openSeq                    "this is a new menu"        (here)
+//   Local\SwipeFor10Start_v4_Cmd     p=, t=, e=, anim=   (tools -> here)
+//   Local\SwipeFor10Start_v4_Intent  kind, trigger, method, flags, open (bridge)
+//   Local\SwipeFor10Start_v4_Exec    show, dismiss, cancel               (here)
+//   ..._State.openSeq                "this is a new menu"               (here)
 //
 // Every record is a seqlock: this side bumps the counter to odd, writes, and
-// bumps it to even, so the bridge can never accept a half-written close record,
-// plan or open generation, and this side never accepts half a command or a
-// half-written request. The command record is additionally serialised by a named
-// mutex, because more than one tool can publish into it.
+// bumps it to even, so the bridge can never accept a half-written intent, exec
+// command or open generation, and this side never accepts half a command. The
+// command record is additionally serialised by a named mutex, because more than
+// one tool can publish into it.
 //
 // The section outlives either process, so its sequence numbers start from
 // whatever the other side left. This mod records them at attach and acts only
 // on what is newer, which is what the one-second freshness check on the old
-// command file did: a command or request that predates this process belongs to
-// a menu this process never drew. A request is additionally bound to the menu
-// open it was written for: a request that predates this process belongs to a
-// menu this process never drew.
+// command file did: a command or intent that predates this process belongs to
+// a menu this process never drew. An intent carries the open generation the
+// bridge saw, so a close is tied to the menu it was read for.
 // ---------------------------------------------------------------------------
 
 // The highest sequence this process has acted on. Set from the section at
@@ -5002,7 +4961,7 @@ struct HidRevealSession {
     bool edgeCandidate = false;
     // The candidate arrived while a close owned the panel. It is measured (its
     // travel, its end-speed window and its release record) but it writes no
-    // Progress and leaves the close's tap armed, so the retract is the only
+    // Progress and leaves the close's dismiss armed, so the retract is the only
     // motion; the close's landing releases it and the open adopts it.
     bool deferred = false;
     bool active = false;
@@ -5185,21 +5144,12 @@ float g_screenDipHeight = 0.0f;  // input thread only
 // value of 0, so BeginHidSession restores the resting value first.
 bool g_commitNeedsProgressReset = false;  // input thread only
 bool g_rootWasOpen = false;              // input thread only
-// A reveal follow that took the panel back while a close was in flight. The
-// close's Hide is not cancellable (its tap already fired or the bridge already
-// holds it), so the menu can still go away under that follow. The reopen that
-// follows is then the same pull coming back: it must continue the panel the
-// pull reached instead of replaying the open from 0. `g_contestedReleaseQpc`
-// is the commit release that ended the follow (0 while the contact is down),
-// so the ticket covers one release and expires with kLateRevealWindowMs.
-bool g_closeContested = false;      // input thread only
-uint64_t g_contestedReleaseQpc = 0;  // input thread only, QPC
 uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
 // The edge line was a measurement instrument: it is off in the shipping build.
 constexpr bool g_debugEdge = false;
 
 // ---------------------------------------------------------------------------
-// A close owns Progress
+// A close suppresses the panel
 // ---------------------------------------------------------------------------
 //
 // A gesture close and a keyboard close must leave the mod in one state, or the
@@ -5220,25 +5170,25 @@ constexpr bool g_debugEdge = false;
 //   or the reveal owned it;
 // - the 1 ms timer period is released: no session is left that needs it.
 //
-// One helper, called by both families. It changes no tap and no close record: the
-// keyboard close drops the armed tap at its caller, the gesture close arms one.
-// A close owns `Progress` from the moment its settle starts until the window is
-// observed cloaked (or the suppression window runs out). This is the one answer
-// to "may a pull take the panel over?", and every admission, takeover and settle
-// path reads it: a pull that arrives while it is true is deferred, never a second
+// One helper, called by both families. It changes no dismiss slot: the
+// keyboard close drops the armed dismiss at its caller, the gesture close arms
+// one. The name answers only whether the close-suppression window is still open
+// (`tickMs < g_suppressRestoreUntil`); the settle owns Progress, and
+// CloseCancellableByPull() answers whether a pull may still abort the close. A
+// pull that arrives while the suppression is true is deferred, never a second
 // owner.
 bool CloseInFlight(uint64_t tickMs) {
     return tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
 }
 
 // Whether a pull may abort the close it lands in. Only a gesture close still has
-// a Hide that is this mod's own: its Windows tap is armed and runs at the end of
-// the settle, so dropping the tap aborts the close before the shell is touched.
-// That is the accepted cancel path, and it is one owner because the same call
-// clears the suppression and the follow takes the panel from its live position.
+// a close this mod can cancel: its executor command is armed for the end of the
+// settle, so dropping it aborts the close before the bridge is asked. That is
+// the accepted cancel path, and it is one owner because the same call clears
+// the suppression and the follow takes the panel from its live position.
 // Every other close — a keyboard close, a Start-button or click-away close
-// (both reach this mod as the bridge's retract request), or a gesture close
-// whose tap already fired — has its Hide in the shell's or the bridge's hand. A
+// (both arrive as the bridge's close intent), or a gesture close whose dismiss
+// already went out — has its dismiss in the shell's or the bridge's hand. A
 // pull cannot abort that, so it is deferred and the close lands first.
 bool CloseCancellableByPull() {
     return g_pendingTapTick != 0;
@@ -5254,7 +5204,7 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     // shell's state cannot answer that question: on this path the panel is
     // already retracting while the window still reports state 5 and the cloak
     // still reports open until the executor's Dismiss runs. Publishing the
-    // phase only at the tap (the settle's end) left the whole settle readable
+    // phase only at the settle's end left the whole settle readable
     // as "open", and a press in it restarted the close instead of taking the
     // menu back.
     SwipeIpcSetControllerOwning(&g_ipc, true, 0, 2);
@@ -5267,12 +5217,6 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     // that lands during *this* close is written after this line, so it is not
     // touched here.
     g_lateRelease = RevealLateRelease{};
-
-    // This close supersedes any earlier one, including a contested open that
-    // never arrived: its ticket names one reopen, and a new close decides the
-    // menu again.
-    g_closeContested = false;
-    g_contestedReleaseQpc = 0;
 
     // The mute belongs to the contact, not to the session that happened to own
     // it. Read the latch and both owners before either is cleared: a keyboard
@@ -5536,7 +5480,7 @@ float EndVelocityProgressPerMs(uint64_t releaseQpc) {
 // - both gesture sessions (the dismiss drag and the reveal follow);
 // - the close mute and the deferred-layout flag, plus the panel-ownership
 //   publication derived from the sessions;
-// - the pending tap and the pull generation it was armed under;
+// - the pending dismiss and the pull generation it was armed under;
 // - the coast and both velocity windows;
 // - the diagnostic latches that steer behaviour, and the `anim` debug override.
 //
@@ -5575,8 +5519,6 @@ void ResetActivationState() {
     g_commitNeedsProgressReset = false;
     g_intentCancelPending = false;
     g_rootWasOpen = false;
-    g_closeContested = false;
-    g_contestedReleaseQpc = 0;
     g_openCheckValid = false;
     g_openCheckOpen = false;
     g_lastOpenCheckTick = 0;
@@ -5969,14 +5911,15 @@ bool VerticalDismissAllowed(const GestureGeometry& geometry, int32_t axis,
 // Starts one reveal follow. Both entry points come through here — a contact
 // admitted on the down because it began inside the taskbar band, and a contact
 // adopted because the menu opened under it while it was already pulling — so the
-// clocks, the pull generation and the cancel stamp cannot diverge. `downX/downY`
+// clocks, the pull generation and the cancel tick cannot diverge. `downX/downY`
 // is the first positioned point of the contact and is what travel is measured
 // from, whatever moment the follow actually takes the panel over.
 //
 // `deferred` names a contact that arrived while a close owned the panel. It is
 // the pull that opens the *next* menu, so it changes nothing about this close:
 // it does not start a pull generation and it publishes no cancel, which is what
-// keeps the close's tap armed and its retract the only motion. `ActivateRevealFollow`
+// keeps the close's dismiss armed and its retract the only motion.
+// `ActivateRevealFollow`
 // refuses while the close is in flight, so the session stays a candidate that is
 // measured but never written.
 void StartRevealFollow(float downX, float downY, uint64_t downTick,
@@ -6019,8 +5962,8 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     }
 
     // The new pull owns the panel from this report on. It starts a new pull
-    // generation; a close tap checks it once and is skipped while this pull
-    // exists, so the shell never hides the menu the finger is pulling out.
+    // generation; a scheduled dismiss checks it once and is skipped while this
+    // pull exists, so the shell never hides the menu the finger is pulling out.
     g_pullSerial++;
     // A new pull supersedes the release record of the previous one: it owns
     // whatever opens next, and its own release will write its own record. The
@@ -6149,17 +6092,6 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // path: this finger owns the panel now.
     g_lateRelease = RevealLateRelease{};
 
-    // A follow that starts while a close is in flight is the pull that took the
-    // panel back from that close. The close's Hide is not cancellable (its tap
-    // may already have fired, or the bridge already holds it), so the menu can
-    // still go away under this follow; the reopen that follows is the same pull
-    // coming back and must continue this panel instead of replaying the open
-    // from 0. One flag per contest, one release of the contest.
-    if (tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
-        g_closeContested = true;
-        g_contestedReleaseQpc = 0;
-    }
-
     float panelTrail = 0.0f;
     const float mapped =
         RevealProgressDip(geometry, distance, x, y, panelTrail);
@@ -6169,9 +6101,9 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // A cancel or dismiss animation from a previous gesture may still own
     // Progress; the follow must drive the scalar from this sample on, and the
     // takeover pins the position the panel has now so no frame between the two
-    // writes shows the old animation's target. A close tap that is still ahead
-    // is not touched here: it re-checks the pull generation once, so a pull that
-    // began first drops the close.
+    // writes shows the old animation's target. A scheduled dismiss that is still
+    // ahead is not touched here: it re-checks the pull generation once, so a pull
+    // that began first drops the close.
     const float entry = RevealEntryProgress(geometry);
     const float live = TakeProgressNow(L"activate");
     // A hidden panel's visible value is the entry, never the recorded open rest
@@ -6225,11 +6157,12 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
 // a dismiss start, not a candidate, unless a close of this mod is still in
 // flight.
 //
-// An armed close tap that must not fire. The slot is cleared here, not left to
-// the deadline: a tap that already passed its due tick but has not run yet still
-// toggles the menu, and the caller has just proved that the user is on the glass
-// again. The cancelled record goes out so the bridge stops treating the close as
-// a tap; the slot's own pull generation is the record's, not the newer pull's.
+// An armed dismiss that must not fire. The slot is cleared here, not left to
+// the deadline: a dismiss that already passed its due tick but has not run yet
+// still closes the menu, and the caller has just proved that the user is on the
+// glass again. The pending executor command is cancelled so the bridge stops its
+// timer; the pull generation sampled when the dismiss was armed only decides
+// whether the runner still owns it.
 bool DropPendingCloseTap() {
     CancelPendingDismiss(L"pull");
     if (g_pendingTapTick == 0) {
@@ -6245,8 +6178,8 @@ bool DropPendingCloseTap() {
 
 // A dismiss that is still settling does not block a candidate: the edge contact
 // during its retract is the pull that can still cancel the close if it began
-// before the tap, and refusing it would let the tap take the menu away under the
-// finger.
+// before the dismiss, and refusing it would let the dismiss take the menu away
+// under the finger.
 bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
                         uint64_t tickMs) {
     float low = 0.0f;
@@ -6730,13 +6663,6 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     if (commit) {
         // Let go past the commit point: the menu stays open and the follow
         // finishes the slide instead of snapping.
-        // A commit is the ticket the reopen reads: if this pull took the panel
-        // back from a close, the settle this starts is the one motion up, and
-        // the open that follows the close must continue it instead of replaying
-        // from 0 (PollRootVisibility). The ticket is one release wide.
-        if (g_closeContested) {
-            g_contestedReleaseQpc = releaseQpc;
-        }
         const bool started = BeginGestureOpen(from, endVelocity);
         FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
                 L"offset=%.3f vel=%.2f commit=%d panel=%.0f n=%d",
@@ -6749,15 +6675,10 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
         return;
     }
 
-    // Short reveal: the same settle, the same log line, the same close
-    // stamp, the same suppression window and the same armed tap as the
-    // committed dismiss, from the same release speed. Both close paths read
-    // identically from any finger position.
-    //
-    // This pull chose the close, so its earlier contest of another close does
-    // not name a reopen: the ticket dies with the decision.
-    g_closeContested = false;
-    g_contestedReleaseQpc = 0;
+    // Short reveal: the same settle, the same log line, the same close phase,
+    // the same suppression window and the same armed dismiss as the committed
+    // dismiss, from the same release speed. Both close paths read identically
+    // from any finger position.
     //
     // Progress stays at 0 afterwards and is not restored here: the hide takes a
     // moment, and restoring now would flash the fully open menu while the close
@@ -6774,9 +6695,9 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
         return;
     }
 
-    // No settle ran, so no close is owed and no tap may be armed under a panel
-    // that is still on screen. The committed dismiss puts its panel back in the
-    // same case; this one leaves the menu open, fully in.
+    // No settle ran, so no close is owed and no dismiss may be armed under a
+    // panel that is still on screen. The committed dismiss puts its panel back
+    // in the same case; this one leaves the menu open, fully in.
     AbandonClose(CloseKind::RevealCancel);
 }
 
@@ -6956,7 +6877,7 @@ void ReleaseHidSession(const GestureGeometry& geometry, bool allowCommit,
             g_commitNeedsProgressReset = true;
         } else {
             // The settle never started, so there is no close to wait for and no
-            // tap was armed by it. The helper puts the panel back and says so.
+            // dismiss was armed by it. The helper puts the panel back and says so.
             AbandonClose(CloseKind::Dismiss);
         }
         session.active = false;
@@ -7099,7 +7020,7 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
         // a pull from its own down point once it has travelled
         // kAdoptTravelDip, exactly as it does with the menu closed. Reading the
         // shown-but-leaving window as open refused that pull: it stayed inert,
-        // the armed tap hid the menu under it, and the reopen replayed the open.
+        // the armed dismiss hid the menu under it, and the reopen replayed the open.
         const bool closeInFlight =
             tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
         const bool windowOpen =
@@ -7136,10 +7057,10 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     // A contact that lands while a close is in flight is the user changing their
     // mind about that close. Two shapes, one owner each:
     //
-    // - The close is still this mod's own (a gesture close whose Windows tap has
-    //   not run): dropping the tap aborts it before the shell is touched, so no
-    //   Hide runs and the panel comes back from where the close had it. The
-    //   suppression goes with it: there is no close to wait for.
+    // - The close is still this mod's own (a gesture close whose dismiss has not
+    //   been requested): dropping the dismiss aborts it before the shell is
+    //   touched, so no Dismiss runs and the panel comes back from where the close
+    //   had it. The suppression goes with it: there is no close to wait for.
     // - The Hide is already in the shell's or the bridge's hand: nothing here can
     //   abort it. The contact is the pull that opens the next menu; the band test
     //   below defers it and the close's landing releases it.
@@ -7486,10 +7407,10 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     PublishPanelOwnership();
 }
 
-// The tap both close paths arm. It runs on the input thread at the end of the
-// retract. A pull that started after the release owns the menu again, so the tap
-// is dropped and no Hide ever reaches the shell. The close record then names the
-// cancel with tapped = 0, so a later keyboard close takes its own lead.
+// The dismiss both close paths arm. It runs on the input thread at the end of
+// the settle. A pull that started after the release owns the menu again, so the
+// dismiss is dropped and no Dismiss request reaches the bridge; the pull
+// generation sampled at the arm decides the drop.
 void RunPendingCloseTap(uint64_t tickMs) {
     if (g_pendingTapTick == 0 || tickMs < g_pendingTapTick) {
         return;
@@ -7508,8 +7429,8 @@ void RunPendingCloseTap(uint64_t tickMs) {
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
 
-    // A Win press during the retract cancels this tap (the open intent drops the
-    // slot), so a window already closed here was hidden by something else: an
+    // A Win press during the retract cancels this dismiss (the open intent drops
+    // the slot), so a window already closed here was hidden by something else: an
     // external takeover or the shell's own close. The dismiss would only ask the
     // shell to close a window that is already closed.
     if (!StartWindowIsOpen()) {
@@ -7873,8 +7794,9 @@ void ApplyBridgeIntent() {
         const GestureGeometry geometry = ReadGestureGeometry();
         if (StartWindowIsOpen()) {
             // The close this press answers has not hidden the window yet, so the
-            // press cancels it. The tap is dropped before it can dismiss and the
-            // executor's dismiss is cancelled above; the panel is taken where the
+            // press cancels it. The local dismiss slot is dropped before the
+            // executor command can fire, and that command is cancelled above;
+            // the panel is taken where the
             // retract left it and settles back up with the pull-cancel's own
             // curve. The window never hides, so no show is requested and no entry
             // is applied: the menu is on screen at its live position.
@@ -7993,7 +7915,7 @@ void PollRootVisibility(uint64_t tickMs) {
     const bool open = StartWindowIsOpen();
     const bool justOpened = open && !g_rootWasOpen;
     // A close this mod started reports the window open until the shell has run
-    // the Hide its tap caused. Reading that as a reopen restored Progress 1
+    // the Hide its dismiss caused. Reading that as a reopen restored Progress 1
     // while the close was still in flight, so a follow that began in that window
     // flashed the panel fully open and the window then vanished.
     const bool closeInFlight = CloseInFlight(tickMs);
@@ -8010,15 +7932,12 @@ void PollRootVisibility(uint64_t tickMs) {
             g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
             g_reveal.deferred = false;
         }
-        // A fresh menu, so every retract request written for the previous one is
+        // A fresh menu, so every executor command written for the previous one is
         // void from this point on, whatever its own deadline says. The
         // generation goes out before any close of this open can be answered; the
         // 20 ms poll below is the only delay, and no user closes a menu they have
         // not seen yet.
         SwipeIpcPublishOpen(&g_ipc, tickMs);
-        // The reveal claim is bound to this open: a claim published for the
-        // previous menu can never cancel a close of this one. The claim's own
-        // refresh happens on this tick's report/idle path, after any adoption.
         g_ipcOpenTickLow = static_cast<uint32_t>(tickMs);
         // A new open is also a new geometry epoch: every measurement recorded for
         // the previous one is stale from this point on, and a request that was
@@ -8036,7 +7955,7 @@ void PollRootVisibility(uint64_t tickMs) {
         const GestureGeometry geometry = ReadGestureGeometry();
         PromoteRevealContact(geometry, tickMs);
 
-        // Exactly one of the four open paths runs, in this order:
+        // Exactly one of the three open paths runs, in this order:
         //
         // 1. the live takeover above — a still-down, moving finger that started
         //    while the menu was closed, promoted from its candidate or adopted
@@ -8046,11 +7965,7 @@ void PollRootVisibility(uint64_t tickMs) {
         //    even when a new contact is already down, because that contact cannot
         //    be the one that opened the menu and may be refused on its next
         //    report;
-        // 3. the contested continuation — this open follows a close whose Hide
-        //    already left under a pull that took the panel back. Its commit
-        //    release is the ticket, and the settle starts where that panel is,
-        //    not at 0, so the one motion up is not replayed;
-        // 4. the keyboard settle — nothing preceded the open.
+        // 3. the keyboard settle — nothing preceded the open.
         //
         // The suppression test is that actual takeover, never the existence of an
         // edge candidate: a candidate that is down but not following (the open
@@ -8069,51 +7984,12 @@ void PollRootVisibility(uint64_t tickMs) {
         const bool lateAdopted =
             !gestureOwnsProgress && ConsumeLateRevealRelease(geometry);
 
-        // The reopen of a close that a pull contested is that pull coming back.
-        // The close's Hide is not cancellable, so the menu went away under the
-        // follow; the release already started the one settle up, and Progress is
-        // the position the panel had. Starting the keyboard settle here would
-        // rewind it to 0 and replay the open — the flash the user sees. So the
-        // reopen continues the panel instead: a settle from the live position
-        // (the close's own settle value), planned from the travel still left, so
-        // one pull produces one motion up and lands on 1. The ticket is one
-        // release old (kLateRevealWindowMs) and only counts while the panel is
-        // above the hidden rest: a close that took it all the way to 0 left
-        // nothing to continue, and the settle from 0 is its first animation.
-        // The live position is read, never taken here: this poll also starts the
-        // late-release settle, and taking that settle at its first millisecond
-        // pins the hidden rest and leaves the window shown with the panel off it
-        // (the dead state this check exists for). A peek answers the same value
-        // and lets the animation that owns Progress keep running; the branches
-        // below replace it only when they actually start a settle.
-        const uint64_t nowQpc = QpcMsNow();
-        const float liveNow = PeekProgressNow();
-        const bool contestedOpen =
-            !gestureOwnsProgress && !lateAdopted && g_closeContested &&
-            g_contestedReleaseQpc != 0 &&
-            nowQpc >= g_contestedReleaseQpc &&
-            nowQpc - g_contestedReleaseQpc <= kLateRevealWindowMs &&
-            liveNow > 0.0f;
-        g_closeContested = false;
-        g_contestedReleaseQpc = 0;
-        if (contestedOpen) {
-            std::chrono::milliseconds duration{0};
-            if (BeginGestureSettle(liveNow, 1.0f, 0.0f, duration)) {
-                g_commitNeedsProgressReset = false;
-                FileLog(L"win open continued from=%.3f dur=%llu", liveNow,
-                        static_cast<unsigned long long>(duration.count()));
-            } else {
-                ShowAtRest();
-                FileLog(L"win open continued from=%.3f (no settle)", liveNow);
-            }
-        }
-
         // The keyboard open is the gesture open from rest: one curve for every
         // open, so a Windows press and an edge pull cannot look different, and
         // the travel plans the duration exactly as it does there. An open that
         // overlapped a close still on its way out starts from where the panel is:
         // starting it at 0 would rewind the retract it just superseded.
-        if (!gestureOwnsProgress && !lateAdopted && !contestedOpen) {
+        if (!gestureOwnsProgress && !lateAdopted) {
             // The settle needs the measured travel, from the snapshot the follow
             // reads. The measurement request below runs after this poll, so an
             // open that lands before the first publish still has Distance 0: a
@@ -8199,7 +8075,7 @@ void PollRootVisibility(uint64_t tickMs) {
             // A close this mod did not start: an external takeover owns the
             // screen. The pull is dropped, not deferred — the takeover's window
             // is not a menu to reopen — and the rest of the contact stays inert
-            // until it lifts. No close record, no tap, no Progress write: the
+            // until it lifts. No dismiss command, no Progress write: the
             // shell did all of it.
             const bool contactLive =
                 g_contactDown || g_hidSession.active || g_reveal.active ||
@@ -8900,8 +8776,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
 
     // Object 0 is the stop event, then the idle tick when the waitable timer
-    // exists, then the debug command event and the bridge's retract request,
-    // then the message queue. The stop event does not depend on the window: the
+    // exists, then the debug command, intent and exec-ack events, then the
+    // message queue. The stop event does not depend on the window: the
     // unload sets it even if this thread has not published the HWND yet, and it
     // is checked again after every message batch, because a queued message can
     // win the wait over a just-signalled event.
@@ -9000,9 +8876,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // One per-activation reset, the same function Wh_ModInit calls, so a clean
     // re-enable of this pinned image starts from the state the first activation
     // did. Nothing a gesture left behind survives: the tracked identity, the
-    // latch, the sessions, the close mute, the contested close's ticket, the
-    // deferred layout, the tap, the
-    // coast and the debug switches.
+    // latch, the sessions, the close mute, the deferred layout, the dismiss
+    // slot, the coast and the debug switches.
     ResetActivationState();
     // No measurement of this thread's opens is left to run.
     CancelMeasureRequest();
@@ -12436,9 +12311,9 @@ BOOL Wh_ModInit() {
         FileLog(L"hid stop event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
-    // The cross-process channel: without it a gesture close still closes (the
-    // Windows tap is local) but the bridge cannot tell that Hide from a keyboard
-    // close, and a keyboard close cannot be answered with its retract.
+    // The cross-process channel: without it a gesture close still runs its
+    // settle, but the dismiss command never reaches the bridge and the window
+    // stays shown over the retracted panel.
     OpenIpcChannel();
     RemoveLegacyChannelFiles();
     FileLog(L"settle plan speed=%.2f dip/ms dur=%llu..%llu segment=%.1f ms "

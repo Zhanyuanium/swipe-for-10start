@@ -95,8 +95,9 @@ is scheduled, not immediate, so the panel is never hidden mid-slide.
 A press while the close runs is never lost. `IntentShouldClose` reads the
 controller's phase, so a press during the retract is an open:
 - a gesture close still settling publishes open at once; the Start side drops
-  the tap, cancels the pending dismiss, clears the suppression and settles the
-  panel back from its live position (`intent open cancel from=...`). If the
+  the local dismiss slot, cancels the pending executor command, clears the
+  suppression and settles the panel back from its live position
+  (`intent open cancel from=...`). If the
   dismiss already entered the shell's `Dismiss` call, the hide lands and the
   landing reissues the open (`intent open recovered entry=...`);
 - an intent close has its dismiss armed for a future deadline, so the bridge
