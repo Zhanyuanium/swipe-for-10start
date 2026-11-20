@@ -190,6 +190,29 @@ could act, or before its confirmation could land).
   open), the log shows `exec dismiss unconfirmed ... visible=visible at_call=...`
   and the Start side follows with a released direction; the next press opens.
 
+## The one-pass smoke
+
+`tools/smoke.ps1` drives the four triggers through their real paths and judges
+each step by `start_menu.ps1`'s state plus the lines the pair wrote in that step:
+a VK_LWIN tap opens (`kind=open`, `exec show`) and closes (`kind=close`,
+`exec dismiss`), an injected edge pull opens (`reveal admit|takeover`), an
+injected panel drag closes, and a desktop click closes (`trigger=clickaway`,
+`method=7`). The last step fails on any error-shaped line in the run — a non-zero
+`hr=`, `timeout`, `refused`, a lost press or a dropped latch. Run it before
+handing the tree to a review: two of the defects fixed during the M3.3 review
+rounds were caught by it and by nothing else (a dismiss whose identity guard
+compared a generation with a tick, so every close was refused, and an ACK
+ordering that hid the answer Start needed).
+
+What it does not cover, on purpose: the click-away step waits for the executor's
+`exec visible ... visible=1` because a click inside the window's presentation
+(state 1/3) is swallowed; the open step uses the VK_LWIN tap because the
+auto-hidden bar cannot be opened through UIA; and the **HID dismiss** path
+(`close dismiss kind=...`) is unreachable from an injection, because every
+injected panel drag reaches the shell as a pointer-away click-away. Real-finger
+dismissal stays a manual check, together with the one-finger end-to-end, the two
+two-finger lift orders and a pen.
+
 
 ## Artifacts
 
