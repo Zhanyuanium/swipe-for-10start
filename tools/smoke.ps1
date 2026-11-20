@@ -26,6 +26,10 @@ Three details it encodes, each learned the hard way:
 - An injected contact is occasionally decoded as a hover rather than a touch; the
   pull and the drag are therefore retried before a step is called failed.
 
+.PARAMETER Log
+The Start mod's `renderer.log`. Default: the standard Windhawk data root under
+`%ProgramData%`; pass this when Windhawk keeps its data elsewhere.
+
 .PARAMETER SkipClickAway
 Do not click the desktop. Use it when the desktop is covered by a window that
 should not lose focus.
@@ -35,11 +39,18 @@ pwsh -File tools/smoke.ps1
 #>
 [CmdletBinding()]
 param(
-    [string]$Log = 'C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\renderer.log',
+    [string]$Log = (Join-Path $env:ProgramData 'Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\renderer.log'),
     [switch]$SkipClickAway
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not (Test-Path -LiteralPath $Log)) {
+    throw ("no renderer log at '$Log'. Windhawk may keep its data outside " +
+        "%ProgramData%; pass -Log with the Start mod's storage path, then run the " +
+        "smoke again.")
+}
+
 $startMenu = Join-Path $PSScriptRoot 'start_menu.ps1'
 $inject = Join-Path $PSScriptRoot 'inject_swipe.ps1'
 $rows = New-Object System.Collections.Generic.List[object]

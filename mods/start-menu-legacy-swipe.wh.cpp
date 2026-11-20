@@ -6,7 +6,7 @@
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -lshell32 -Wall -Wextra -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -lshell32 -Wall -Wextra
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==

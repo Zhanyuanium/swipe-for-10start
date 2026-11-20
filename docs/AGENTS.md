@@ -63,9 +63,10 @@ auto-hide state, and the hardware still owed.
 README.md: the map and the shipping pair.
 
 store.md: how the pair reaches `ramensoftware/windhawk-mods` — the one-file-per-PR
-rule that forces `tools/make_store_mods.ps1` to inline the shared headers, the
-exact edits that generator makes and why (the quoted `-I`, `-Wall`/`-Wextra`, the
-required `@github`/`@license`/`@homepage`, the companion-mod note), why it is two
+rule that forces `tools/make_store_mods.ps1` to inline the shared headers, what
+the `store` and `local` profiles each change (no `-I` in either; the store also
+drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage` plus the
+companion-mod note), the local install flow that consumes `local`, why it is two
 PRs, and the four checks to run before opening one.
 
 ## Laws

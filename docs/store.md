@@ -15,12 +15,31 @@ hand-edited (`dist/` is ignored), and changes only what the collection requires:
 | Change | Why |
 |---|---|
 | Each `#include "<local>.h"` replaced by the header body, inside `#pragma clang diagnostic push/ignored "-Wunused-const-variable"/pop` | One file per PR; the contract's constants are used by one side, so the unused half would warn, and the 2.0 compatibility check fails on any warning |
-| `-I"<repo>"`, `-Wall`, `-Wextra` removed from `@compilerOptions` | A quoted option breaks the compile job outright; `-Wall`/`-Wextra` are not among the options the collection accepts, and its CI compiles without them |
+| `-I` (if a source ever carries one), `-Wall`, `-Wextra` removed from `@compilerOptions` in the store profile | A machine path must not survive and a quoted option breaks the compile job outright; `-Wall`/`-Wextra` are not among the options the collection accepts, and its CI compiles without them |
 | `@github https://github.com/Zhanyuanium`, `@license MIT`, `@homepage <repo>` added | `@github` is required and must equal the PR author's profile exactly; the collection treats a missing licence as MIT |
 | A "one half of a pair" note under the README heading, naming the companion mod's `windhawk.net/mods/<id>` page | The two mods only work together; the pair precedent is `audioswap`/`microswap` |
 
 Everything else — code, README body, version, `@include`, `@architecture` — is the
 repo source verbatim, so the submitted file and `mods/` cannot drift apart.
+
+## Local install
+
+The same generator has a `local` profile, because an installed mod is also
+compiled from a single file: Windhawk reads a mod's source from stdin and has no
+repository beside it. `pwsh -File tools/install_mods.ps1` builds that profile into
+`dist/local/` — headers inlined, `-I` removed, `-Wall -Wextra` kept, no store
+metadata and no companion note — then installs and enables
+`local@start-menu-legacy-swipe` and `local@start-menu-touch-gesture-bridge` and
+restarts `StartMenuExperienceHost.exe`. `-All` adds the four diagnostics (the
+consumer from `dist/local/` because it includes a local header, the three probes
+from `mods/`); `-SkipRestart` leaves the menu host running. The CLI comes from
+`-CliPath`/`-Compiler`, then `windhawk-cli` on `PATH`, then
+`%ProgramFiles%\Windhawk\windhawk-cli.exe`, and the failure message names both
+locations.
+
+This flow is why `mods/` no longer carries an `-I`: the repository source is built
+with `-I mods` on the compiler command line, and the installed source is always
+the generated one.
 
 ## Two pull requests, never one
 
@@ -33,10 +52,11 @@ through path rather than a half-driven menu.
 
 ## Checks before opening the PR
 
-1. `pwsh -File tools/make_store_mods.ps1` — regenerates both files and runs
+1. `pwsh -File tools/make_store_mods.ps1` — regenerates both store files and runs
    `windhawk-cli source meta --strict` on each.
-2. Compile each generated file with `-Wall -Wextra -fsyntax-only`; both must be
-   silent (the inlined-header pragma exists for exactly this).
+2. `pwsh -File tools/make_store_mods.ps1 -Profile local`, then compile each
+   generated local file with `-Wall -Wextra -fsyntax-only` and no `-I`; all of
+   them must be silent (the inlined-header pragma exists for exactly this).
 3. Run the collection's own validator against each file, from a clone of
    `windhawk-mods`:
    `python .github/pr_validation.py mods/<id>.wh.cpp Zhanyuanium 92024923`

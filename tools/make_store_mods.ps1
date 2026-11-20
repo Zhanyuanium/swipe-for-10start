@@ -1,58 +1,116 @@
 #requires -Version 7.0
 <#
 .SYNOPSIS
-Build the single-file Windhawk store submission from the repo's two mod sources.
+Build self-contained Windhawk mod sources from the repo's mod sources, for the
+store submission or for a local install.
 
 .DESCRIPTION
-The mods here share `mods/swipe_ipc_shared.h` (and the bridge also includes
-`mods/start_gesture_shared.h`), which the store cannot accept: a pull request adds
-exactly one self-contained `mods/<id>.wh.cpp`, and `@compilerOptions` may not
-contain a quoted `-I`. This script produces that one file per mod and changes
-nothing else:
+The mods here share `mods/swipe_ipc_shared.h` (and the bridge and the consumer
+also include `mods/start_gesture_shared.h`), which neither the store nor a
+Windhawk install can resolve: a pull request adds exactly one self-contained
+`mods/<id>.wh.cpp`, and Windhawk compiles the installed file from stdin with no
+repository beside it. This script produces that one file per mod and changes
+nothing else. Two profiles:
 
-- each `#include "..."` of a local header is replaced by the header body, inside a
+- `store` (the default) is the `ramensoftware/windhawk-mods` submission. Each
+  `#include "..."` of a local header is replaced by the header body, inside a
   `#pragma clang diagnostic push/ignored/pop` pair, because the contract's
-  constants are used by one side or the other and the unused half would otherwise
-  warn (the store's 2.0 compatibility check fails on any warning);
-- the local `-I` path and `-Wall -Wextra` are dropped from `@compilerOptions`
-  (neither is among the options the collection accepts, and its CI compiles
-  without them);
-- `@github`, `@license` and `@homepage` are added, and a companion-mod note is put
-  under the README heading, because the two mods only work as a pair.
+  constants are used by one side or the other and the unused half would
+  otherwise warn (the store's 2.0 compatibility check fails on any warning).
+  `-I`, `-Wall` and `-Wextra` are dropped from `@compilerOptions` (a quoted
+  option breaks the collection's compile job, and the warning flags are not
+  among the options it accepts), `@github`, `@license` and `@homepage` are added,
+  a companion-mod note is put under the README heading (the two shipping mods
+  only work as a pair), and each output is checked with
+  `windhawk-cli source meta --strict`.
+- `local` is the file `tools/install_mods.ps1` installs. It inlines the same
+  headers, removes the `-I` option, and changes nothing else: `-Wall -Wextra`
+  stay so a local build is warning-clean, and no store metadata or companion
+  note is added. It also builds `start-menu-touch-gesture-consumer.wh.cpp`, the
+  diagnostic that includes a local header; the other probes install from `mods/`
+  directly.
 
-The output is generated, never hand-edited: `dist/` is ignored, and a diff against
-the repo source is only the inlined headers and those metadata lines.
+The output is generated, never hand-edited: `dist/` is ignored, and a diff
+against the repo source is only the inlined headers and the metadata the store
+profile requires.
+
+.PARAMETER Profile
+`store` or `local`. Default `store`.
+
+.PARAMETER CliPath
+The `windhawk-cli` executable used for `source meta --strict`. Default: a
+`windhawk-cli` on PATH, then `%ProgramFiles%\Windhawk\windhawk-cli.exe`. Only the
+`store` profile needs it.
 
 .PARAMETER OutDir
-Where the two `.wh.cpp` files are written. Default `dist/store`.
+Where the generated `.wh.cpp` files are written. Default `dist/<profile>`.
 
 .EXAMPLE
 pwsh -File tools/make_store_mods.ps1
+
+.EXAMPLE
+pwsh -File tools/make_store_mods.ps1 -Profile local
 #>
 [CmdletBinding()]
 param(
-    [string]$OutDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist\store')
+    [ValidateSet('store', 'local')]
+    [string]$Profile = 'store',
+    [string]$CliPath,
+    [string]$OutDir
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $mods = Join-Path $repo 'mods'
 $repoUrl = 'https://github.com/Zhanyuanium/swipe-for-10start'
+$isStore = $Profile -eq 'store'
 
-$modsToBuild = @(
-    @{
+if (-not $OutDir) { $OutDir = Join-Path $repo "dist\$Profile" }
+
+# Explicit path, then PATH, then Windhawk's own install folder. Never a guess:
+# the fallback stays a test, not an assumption about where Windhawk lives.
+function Resolve-WindhawkCli {
+    if ($CliPath) {
+        if (-not (Test-Path -LiteralPath $CliPath)) {
+            throw "-CliPath does not name a file: $CliPath"
+        }
+        return (Resolve-Path -LiteralPath $CliPath).Path
+    }
+
+    $command = Get-Command windhawk-cli -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
+
+    $fallback = Join-Path $env:ProgramFiles 'Windhawk\windhawk-cli.exe'
+    if (Test-Path -LiteralPath $fallback) { return $fallback }
+
+    throw ("windhawk-cli was not found. Pass -CliPath, or put Windhawk's install " +
+        "folder (the one holding windhawk-cli.exe) on PATH, or install it to the " +
+        "default '$fallback'. To add it to PATH: Settings > System > About > " +
+        "Advanced system settings > Environment Variables, edit Path, then reopen " +
+        "the shell.")
+}
+
+$modsToBuild = New-Object System.Collections.Generic.List[hashtable]
+$modsToBuild.Add(@{
         File = 'start-menu-legacy-swipe.wh.cpp'
         CompanionId = 'start-menu-touch-gesture-bridge'
         CompanionName = 'Start Menu Touch Gesture Bridge'
         CompanionWhere = 'explorer.exe'
-    },
-    @{
+    })
+$modsToBuild.Add(@{
         File = 'start-menu-touch-gesture-bridge.wh.cpp'
         CompanionId = 'start-menu-legacy-swipe'
         CompanionName = 'Legacy Start Edge Swipe'
         CompanionWhere = 'StartMenuExperienceHost.exe'
-    }
-)
+    })
+if (-not $isStore) {
+    # The only diagnostic that includes a local header; the others install from
+    # mods/ as they are.
+    $modsToBuild.Add(@{ File = 'start-menu-touch-gesture-consumer.wh.cpp' })
+}
+
+$cli = $null
+if ($isStore) { $cli = Resolve-WindhawkCli }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
@@ -82,27 +140,33 @@ $($body.TrimEnd())
     }
     for ($i = 0; $i -lt $inlined.Count; $i++) { $text = $text.Replace("@@INLINE_$i@@", $inlined[$i]) }
 
-    # -- metadata the collection requires and this repo does not need locally
-    $extra = foreach ($pair in @(
-            @('@github', 'https://github.com/Zhanyuanium'),
-            @('@license', 'MIT'),
-            @('@homepage', $repoUrl))) {
-        '// ' + $pair[0].PadRight(16) + ' ' + $pair[1]
-    }
-    $text = [regex]::Replace($text, '(?m)^(//\s+@author\s+.*)$', {
-        param($m) $m.Groups[1].Value.TrimEnd() + "`r`n" + ($extra -join "`r`n")
-    }.GetNewClosure())
-
+    # -- @compilerOptions: no machine path in either profile. The store also
+    #    drops the warning flags it does not accept; a local build keeps them.
     $text = [regex]::Replace($text, '(?m)^(//\s+@compilerOptions\s+)(.*)$', {
-        param($m)
-        $opts = ($m.Groups[2].Value -split '\s+' | Where-Object {
-            $_ -and $_ -ne '-Wall' -and $_ -ne '-Wextra' -and $_ -notmatch '^-I'
-        }) -join ' '
-        $m.Groups[1].Value + $opts + "`r"
-    })
+            param($m)
+            $drop = if ($isStore) { @('-Wall', '-Wextra') } else { @() }
+            $opts = ($m.Groups[2].Value -split '\s+' | Where-Object {
+                    $_ -and $_ -notmatch '^-I' -and $drop -notcontains $_
+                }) -join ' '
+            if ($opts -match '"') { throw "quoted compiler option left in $($mod.File): $opts" }
+            if (-not $opts) { return '' }
+            $m.Groups[1].Value + $opts + "`r"
+        }.GetNewClosure())
 
-    # -- the pair note, under the README heading
-    $note = @"
+    if ($isStore) {
+        # -- metadata the collection requires and this repo does not need locally
+        $extra = foreach ($pair in @(
+                @('@github', 'https://github.com/Zhanyuanium'),
+                @('@license', 'MIT'),
+                @('@homepage', $repoUrl))) {
+            '// ' + $pair[0].PadRight(16) + ' ' + $pair[1]
+        }
+        $text = [regex]::Replace($text, '(?m)^(//\s+@author\s+.*)$', {
+                param($m) $m.Groups[1].Value.TrimEnd() + "`r`n" + ($extra -join "`r`n")
+            }.GetNewClosure())
+
+        # -- the pair note, under the README heading
+        $note = @"
 > **This is one half of a pair.** The gesture is decided in
 > [$($mod.CompanionName)](https://windhawk.net/mods/$($mod.CompanionId)) (``$($mod.CompanionWhere)``);
 > install both mods, or the menu opens without the swipe following the finger and
@@ -110,15 +174,20 @@ $($body.TrimEnd())
 >
 > Requires ExplorerPatcher's legacy Windows 10 Start menu (``Start_ShowClassicMode=1``).
 "@
-    $text = [regex]::Replace($text,
-        '(?m)^(// ==WindhawkModReadme==\r?\n/\*\r?\n)(#[^\r\n]*\r?\n)',
-        { param($m) $m.Groups[1].Value + $m.Groups[2].Value + $note + "`n" })
+        $text = [regex]::Replace($text,
+            '(?m)^(// ==WindhawkModReadme==\r?\n/\*\r?\n)(#[^\r\n]*\r?\n)',
+            { param($m) $m.Groups[1].Value + $m.Groups[2].Value + $note + "`n" })
+    }
 
     $out = Join-Path $OutDir $mod.File
     Set-Content -LiteralPath $out -Value $text -NoNewline -Encoding utf8
 
-    $meta = & 'C:\Program Files\Windhawk\windhawk-cli.exe' source meta --strict --json $out 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "source meta rejected $($mod.File): $meta" }
-    "{0}: {1} lines, {2} header(s) inlined, meta strict ok" -f `
+    $summary = "{0}: {1} lines, {2} header(s) inlined" -f `
         $mod.File, (Get-Content -LiteralPath $out | Measure-Object -Line).Lines, $inlined.Count
+    if ($isStore) {
+        $meta = & $cli source meta --strict --json $out 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "source meta rejected $($mod.File): $meta" }
+        $summary += ', meta strict ok'
+    }
+    $summary
 }

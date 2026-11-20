@@ -290,10 +290,14 @@ release position there for the probe mods.
   unload: the probe refuses new hook installation from `Wh_ModBeforeUninit` and
   keeps the log/handles when the scan thread does not join; the consumer wakes its
   reader, joins it, and keeps the mapping when the join times out.
-- `msgprobe.wh.cpp` — pointer messages and `GetPointerInfo` ownership. Its poller
+- `msgprobe.wh.cpp` — pointer messages and `GetPointerInfo` ownership; writes
+  `msgprobe.log` into the folder `Wh_GetModStoragePath` returns and mirrors each
+  line to the Windhawk log. Its poller
   and summary thread are woken, joined, and released only after the join; a join
   timeout keeps the handle so a later attempt can still join.
-- `inputprobe.wh.cpp` — the Raw Input dump. It must not be enabled beside the
+- `inputprobe.wh.cpp` — the Raw Input dump; it writes `inputprobe.log` into the
+  folder `Wh_GetModStoragePath` returns (both probes use the API, never a
+  ProgramData literal). It must not be enabled beside the
   shipping mod: Raw Input allows one sink per usage per process and the probe
   takes the stream. Its window subclasses are detached on their owner threads
   (`kProbeDetachMessage`), never from the unload thread, and a chain with a later

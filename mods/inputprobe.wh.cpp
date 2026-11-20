@@ -54,7 +54,8 @@ it. A device without contact collections decodes collection 0 and logs
 The raw input listener stops after 900 s (15 min) or on `Wh_ModBeforeUninit`.
 The log is truncated on `Wh_ModInit`, so every run starts clean.
 
-The log is `...\mod-storage\local@inputprobe\inputprobe.log`.
+The log is `inputprobe.log` in the mod's storage folder (shown by Windhawk;
+`local@inputprobe` in the standard install).
 */
 // ==/WindhawkModReadme==
 
@@ -63,8 +64,10 @@ The log is `...\mod-storage\local@inputprobe\inputprobe.log`.
  *   SetWindowLongPtrW, GetPointerInfo, RegisterRawInputDevices,
  *   GetRawInputData, GetRawInputDeviceList and GetRawInputDeviceInfoW from
  *   user32; on HidP_GetCaps, HidP_GetLinkCollectionNodes and
- *   HidP_GetUsageValue from hid.dll.
- * [OUTPUT]: writes inputprobe.log; exports no symbols.
+ *   HidP_GetUsageValue from hid.dll; on Wh_GetModStoragePath from
+ *   windhawk_api.h for the log's folder.
+ * [OUTPUT]: writes inputprobe.log in the mod's storage folder; exports no
+ *   symbols.
  * [POS]: isolated diagnostic probe for StartMenuExperienceHost.exe. It is a
  *   sibling of msgprobe (message queue) and start-menu-touch-gesture-probe
  *   (callbacks): it observes the window procedure and the raw HID stream,
@@ -77,6 +80,8 @@ The log is `...\mod-storage\local@inputprobe\inputprobe.log`.
 
 #include <hidusage.h>
 #include <hidpi.h>
+
+#include <windhawk_api.h>
 
 #include <atomic>
 #include <cstdarg>
@@ -91,12 +96,19 @@ namespace {
 // Log
 // ---------------------------------------------------------------------------
 
-constexpr wchar_t kLogDir[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@inputprobe";
-constexpr wchar_t kLogPath[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@inputprobe\\inputprobe.log";
+// The mod's own storage folder is the only correct source for this path: it
+// exists from the moment the mod is installed, it is removed with the mod, and
+// a Windhawk installed anywhere still answers with the right folder. A zero
+// answer means no log, exactly like a failed CreateFileW below.
+bool BuildLogPath(WCHAR (&path)[MAX_PATH]) {
+    WCHAR storage[MAX_PATH] = {};
+    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
+        return false;
+    }
+    swprintf_s(path, L"%s\\inputprobe.log", storage);
+    return true;
+}
+
 constexpr int kMaxTotalLines = 12000;
 
 SRWLOCK g_logLock = SRWLOCK_INIT;
@@ -108,7 +120,11 @@ thread_local bool t_logging = false;
 // Caller holds g_logLock.
 void AppendToFileLocked(const char* data, int length) {
     if (g_logFile == INVALID_HANDLE_VALUE) {
-        g_logFile = CreateFileW(kLogPath, FILE_APPEND_DATA,
+        WCHAR path[MAX_PATH] = {};
+        if (!BuildLogPath(path)) {
+            return;
+        }
+        g_logFile = CreateFileW(path, FILE_APPEND_DATA,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     }
@@ -1164,17 +1180,21 @@ DWORD WINAPI RawInputThread(LPVOID) {
 }  // namespace
 
 BOOL Wh_ModInit() {
-    CreateDirectoryW(kLogDir, nullptr);
-
-    // Truncate once per process so a stale run never mixes with this one.
-    HANDLE file = CreateFileW(kLogPath, GENERIC_WRITE,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        CloseHandle(file);
-    } else {
-        LogFormat("log truncate fail err=%u",
-                  static_cast<unsigned>(GetLastError()));
+    // Truncate once per process so a stale run never mixes with this one. The
+    // storage folder exists whenever the API answers, so there is nothing to
+    // create; no path means no log, the same as a failed CreateFileW.
+    WCHAR logPath[MAX_PATH] = {};
+    if (BuildLogPath(logPath)) {
+        HANDLE file = CreateFileW(logPath, GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                  nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+        } else {
+            LogFormat("log truncate fail err=%u",
+                      static_cast<unsigned>(GetLastError()));
+        }
     }
 
     LogFormat("inputprobe init pid=%u",

@@ -3,7 +3,7 @@
 C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (8 sources + AGENTS.md: start-menu-legacy-swipe, touch-gesture-bridge, touch-gesture-consumer, touch-gesture-probe, msgprobe, inputprobe, start_gesture_shared.h, swipe_ipc_shared.h)
-tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke and the store packager (17 scripts + AGENTS.md)
+tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke, the store packager and the local installer (18 scripts + AGENTS.md)
 artifacts/ - captured measurements (6 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>

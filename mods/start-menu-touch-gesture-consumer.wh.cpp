@@ -6,7 +6,6 @@
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
-// @compilerOptions -I"C:\Users\doubao\source\repos\swipe-for-10start\mods"
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==

@@ -41,20 +41,27 @@ Two mods ship together, and both are needed for the full experience:
 
 ## Install
 
-Install both mods from the Windhawk UI, or from an elevated PowerShell:
+Install both mods from the Windhawk UI, or from an elevated PowerShell in this
+repository:
 
 ```powershell
-& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-legacy-swipe.wh.cpp
-& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-touch-gesture-bridge.wh.cpp
-& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod enable local@start-menu-touch-gesture-bridge
+pwsh -File .\tools\install_mods.ps1
 ```
 
-Then restart `StartMenuExperienceHost.exe` (Task Manager → details →
-`StartMenuExperienceHost.exe` → end task; it restarts itself) or sign out and
-back in — the mod can only attach when the menu process creates its window.
-`mod install` leaves a previously disabled mod disabled, so the `enable` line
-is required for the Windows-key close animation; the bridge hooks Explorer
-when it is enabled, without an Explorer restart on this build.
+The script runs `tools/make_store_mods.ps1 -Profile local` first: that writes the
+single-file builds to `dist\local\`, with the shared headers inlined and no `-I`
+in `@compilerOptions`, because an installed mod is compiled from stdin with no
+repository beside it. It then installs and enables both mods. Windhawk's install
+folder must be on `PATH`; `-Compiler` names `windhawk-cli` explicitly, `-All`
+also installs the diagnostic probes, and `-SkipRestart` leaves the menu host
+alone.
+
+The script restarts `StartMenuExperienceHost.exe` when it finishes; do it by hand
+(Task Manager → details → `StartMenuExperienceHost.exe` → end task; it restarts
+itself) or sign out and back in — the mod can only attach when the menu process
+creates its window. `mod install` leaves a previously disabled mod disabled, so
+the script enables both; the bridge hooks Explorer when it is enabled, without an
+Explorer restart on this build.
 
 ## Settings
 
@@ -104,9 +111,9 @@ when it is enabled, without an Explorer restart on this build.
 
 ## If something looks wrong
 
-- The mods log to their Windhawk storage folders:
-  `C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\renderer.log`
-  and `...\local@start-menu-touch-gesture-bridge\bridge.log`.
+- Each mod logs into its own Windhawk storage folder, which Windhawk shows on the
+  mod's page: `renderer.log` for `local@start-menu-legacy-swipe` and
+  `bridge.log` for `local@start-menu-touch-gesture-bridge`.
 - After disabling and re-enabling the mod, restart
   `StartMenuExperienceHost.exe` — gestures cannot attach to the already-open
   menu window.

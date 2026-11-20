@@ -20,16 +20,16 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 
 ## 安装
 
-在 Windhawk 界面中安装两个模组，或在以管理员身份运行的 PowerShell 中执行：
+在 Windhawk 界面中安装两个模组，或者在仓库目录下以管理员身份运行 PowerShell：
 
 ```powershell
-& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-legacy-swipe.wh.cpp
-& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod install --file .\mods\start-menu-touch-gesture-bridge.wh.cpp
-& 'C:\Program Files\Windhawk\windhawk-cli.exe' mod enable local@start-menu-touch-gesture-bridge
+pwsh -File .\tools\install_mods.ps1
 ```
 
-然后重启 `StartMenuExperienceHost.exe`（任务管理器 → 详细信息 →
-`StartMenuExperienceHost.exe` → 结束任务，它会自动重启），或者注销并重新登录——模组只能在菜单进程创建窗口时挂载。`mod install` 不会启用先前被禁用的模组，所以上面那条 `enable` 命令是 Windows 键关闭动画所必需的；bridge 启用时会挂钩 Explorer，在当前系统版本上不必重启它。
+脚本先运行 `tools/make_store_mods.ps1 -Profile local`，把共享头文件内联后的单文件构建写到 `dist\local\`（`@compilerOptions` 中不再有 `-I`，因为安装后的模组由 Windhawk 从标准输入编译，旁边没有仓库）；随后安装并启用两个模组。Windhawk 的安装目录必须在 `PATH` 上；`-Compiler` 可直接指定 `windhawk-cli`，`-All` 会一并安装诊断探针，`-SkipRestart` 则不重启菜单宿主。
+
+脚本结束时重启 `StartMenuExperienceHost.exe`；手动操作时在任务管理器 → 详细信息 →
+`StartMenuExperienceHost.exe` → 结束任务，它会自动重启，或者注销并重新登录——模组只能在菜单进程创建窗口时挂载。`mod install` 不会启用先前被禁用的模组，所以脚本会显式启用两者；bridge 启用时会挂钩 Explorer，在当前系统版本上不必重启它。
 
 ## 设置项
 
@@ -54,8 +54,7 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 
 ## 如果看起来不对
 
-- 模组日志写在各自的 Windhawk 存储目录：`C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@start-menu-legacy-swipe\renderer.log`
-  和 `...\local@start-menu-touch-gesture-bridge\bridge.log`。
+- 每个模组的日志写进它自己的 Windhawk 存储目录（Windhawk 在模组页面上显示该路径）：`local@start-menu-legacy-swipe` 的 `renderer.log`、`local@start-menu-touch-gesture-bridge` 的 `bridge.log`。
 - 禁用再启用模组后要重启 `StartMenuExperienceHost.exe`——手势无法挂到已经存在的菜单窗口上。
 - 本模组要求 `StartUI_.dll` 的版本正好是 `10.0.22621.3733`；版本不符则不启动任何手势，日志里会看到 `startui root hook skipped ...`。
 - 拖动菜单期间，菜单内容仍在原位置接收触摸——这是已知限制；另一条已知限制：本模组假设触摸面板覆盖主显示器。

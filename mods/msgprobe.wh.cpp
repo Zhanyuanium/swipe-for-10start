@@ -41,14 +41,31 @@ owning-thread samples at the top of `PeekMessageW`/`GetMessageW`, before the
 next message is retrieved. Those lines use the `uipoll`, `uipollsum` and
 `uihist` prefixes.
 
-The log is appended to
-`C:\ProgramData\Windhawk\Engine\ModsWritable\mod-storage\local@msgprobe\msgprobe.log`
-and mirrored to the Windhawk log. Writing stops after 3000 lines.
+The log is appended to `msgprobe.log` in the mod's storage folder (shown by
+Windhawk; `local@msgprobe` in the standard install) and mirrored to the Windhawk
+log. Writing stops after 3000 lines.
 */
 // ==/WindhawkModReadme==
 
+/*
+ * [INPUT]: depends on PeekMessageW and GetMessageW from user32 (hooked);
+ *   GetPointerInfo, GetPointerFrameInfoHistory and GetPointerFrameTouchInfo
+ *   from user32, resolved at runtime; CreateThread and WaitForSingleObject
+ *   from kernel32; Wh_GetModStoragePath from windhawk_api.h for the log's
+ *   folder.
+ * [OUTPUT]: writes msgprobe.log in the mod's storage folder and mirrors every
+ *   line to the Windhawk log; exports no symbols.
+ * [POS]: isolated diagnostic probe for StartMenuExperienceHost.exe. It is a
+ *   sibling of inputprobe (window procedure and raw HID) and
+ *   start-menu-touch-gesture-probe (callbacks): it observes the message queue,
+ *   the one path both of those cannot see.
+ * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ */
+
 #include <windows.h>
 #include <windowsx.h>
+
+#include <windhawk_api.h>
 
 #include <atomic>
 #include <climits>
@@ -59,12 +76,19 @@ and mirrored to the Windhawk log. Writing stops after 3000 lines.
 
 namespace {
 
-constexpr wchar_t kLogDir[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@msgprobe";
-constexpr wchar_t kLogPath[] =
-    L"C:\\ProgramData\\Windhawk\\Engine\\ModsWritable\\mod-storage\\"
-    L"local@msgprobe\\msgprobe.log";
+// The mod's own storage folder is the only correct source for this path: it
+// exists from the moment the mod is installed, it is removed with the mod, and
+// a Windhawk installed anywhere still answers with the right folder. A zero
+// answer means no log, exactly like a failed CreateFileW below.
+bool BuildLogPath(WCHAR (&path)[MAX_PATH]) {
+    WCHAR storage[MAX_PATH] = {};
+    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
+        return false;
+    }
+    swprintf_s(path, L"%s\\msgprobe.log", storage);
+    return true;
+}
+
 constexpr int kMaxLines = 3000;
 
 // Pointer message range: WM_POINTERUPDATE .. WM_POINTERHWHEEL.
@@ -90,7 +114,11 @@ HANDLE g_summaryThread = nullptr;
 // Caller holds g_logLock.
 void AppendToFileLocked(const char* data, int length) {
     if (g_logFile == INVALID_HANDLE_VALUE) {
-        g_logFile = CreateFileW(kLogPath, FILE_APPEND_DATA,
+        WCHAR path[MAX_PATH] = {};
+        if (!BuildLogPath(path)) {
+            return;
+        }
+        g_logFile = CreateFileW(path, FILE_APPEND_DATA,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     }
@@ -832,7 +860,8 @@ BOOL WINAPI GetMessageW_Hook(LPMSG msg, HWND hwnd, UINT filterMin,
 }  // namespace
 
 BOOL Wh_ModInit() {
-    CreateDirectoryW(kLogDir, nullptr);
+    // The storage folder exists whenever Wh_GetModStoragePath answers, so the
+    // probe creates nothing; a missing path means no log, not a failed init.
     LogFormat("msgprobe init pid=%u",
               static_cast<unsigned>(GetCurrentProcessId()));
 

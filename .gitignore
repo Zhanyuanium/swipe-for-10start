@@ -26,5 +26,5 @@ __pycache__/
 desktop.ini
 Thumbs.db
 
-# Generated store submission files
+# Generated mod sources (store and local profiles)
 dist/

@@ -6,7 +6,7 @@
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -I"C:\Users\doubao\source\repos\swipe-for-10start\mods" -Wall -Wextra -luser32
+// @compilerOptions -Wall -Wextra -luser32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -137,9 +137,11 @@ until that exact join or destruction has completed (`exec reinit refused: ...`);
 worker that exits later is reaped and the enable then proceeds.
 
 Notes:
-- Windhawk compiles the mod from stdin, so the repository `mods` folder is
-  passed via `@compilerOptions -I...` to resolve `start_gesture_shared.h` and
-  `swipe_ipc_shared.h`. Update that path if the repository is moved.
+- Windhawk compiles the mod from stdin, so `start_gesture_shared.h` and
+  `swipe_ipc_shared.h` are not beside the compiled file. A repo build resolves
+  them with `-I mods` on the compiler command line; the installed mod is always
+  the generated file (`tools/make_store_mods.ps1` inlines both headers), because
+  no machine path is kept in the metadata.
 - RVAs are specific to `twinui.pcshell.dll` 26100.9949 (x86-64). Before any
   hook is installed, the loaded module must report that exact file version
   (and, when readable, the PE timestamp of the loaded image must match the file
