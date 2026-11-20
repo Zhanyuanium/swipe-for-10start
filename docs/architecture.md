@@ -232,14 +232,14 @@ the window anyway; the landing reissues the open once
 command that was published: still queued or armed when the cancel ran, or already
 executed but not yet confirmed. A local-only cancel arms no ticket,
 because no dismiss is inside the shell and a later hide of the same menu is not
-that press's close. It is bound to that menu's open generation, to the sequence it
+that press's close. It is bound to that menu's open tick, to the sequence it
 revoked, and to a deadline (the revoked command's own deadline plus the ack budget
 and the confirmation probe); past it, the command cannot still be inside the
 shell, so a later landing is not served. A refused, expired or superseded answer
-for **that sequence** retires it; the landing, a new close and an external
-takeover retire it explicitly. It is not cleared merely because one poll still
-sees the window open — that is the window in which an entered `Dismiss` may still
-land. Before a landing
+for **that sequence** retires it before the pending-slot gate, which the open
+that cancelled the close has already cleared; the landing, a new close and an
+external takeover retire it explicitly. A still-open poll does not clear it: an
+entered `Dismiss` may land at any point while the window is up. Before a landing
 may recover it reconciles an already-published `external` intent
 (`intent reconcile ... (before landing recovery)`) and applies the record it
 examined, not a second read, because the idle timer is

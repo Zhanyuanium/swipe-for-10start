@@ -84,8 +84,10 @@ instead of spinning it.
 `openSeq` (seqlock), `openTick` (uint64). Published when the Start side first
 sees the window shown. The even `openSeq` is the generation; generation 0 is not
 a menu and `SwipeIpcReadOpen` returns `ERROR_NOT_READY`. Every intent carries the
-generation the bridge read, and the Start side's recovery ticket is bound to the
-same identity, so a landing can only serve an open for the menu it belongs to.
+generation the bridge read. The Start side's recovery ticket is bound to the open
+tick (the tick the open record published), not to the generation; the landing
+compares that tick, while an executor record that names a menu takes the
+generation.
 
 ### Intent — bridge -> Start
 
@@ -136,18 +138,22 @@ the timeout is a repair, not a cancel, and no scheme can recall a call already
 inside the shell. What the bridge can still do is refuse a record whose publisher
 activation changed: it reads `peerEpoch` when it accepts the record and again
 immediately before the call, and answers `kSwipeAckSuperseded` on a mismatch. A
-record that names a menu (`execOpen`; a dismiss carries the menu's open tick when
-it is known, a show has no menu yet) is also refused when the section has already
-moved to a later open generation (`exec dismiss ... superseded menu=... now=...`).
+record that names a menu (`execOpen`: a dismiss carries the open generation from
+`SwipeIpcReadOpen` when a menu is known; a show and a cancel carry 0) is also
+refused when the section has already moved to a later open generation
+(`exec dismiss ... superseded menu=... now=...`).
 The Start side publishes a `cancel(target=0)` at attach for the same reason: a record
 from the previous activation must not act on the menu the new one opens.
 
 The bridge answers on `execAckSeq` with `(command, state, hr, visible)`, where
 `visible` is the visibility probe, now three-valued: `kSwipeVisibilityHidden` (0),
 `kSwipeVisibilityVisible` (1), and `kSwipeVisibilityUnknown` (-1) when there is no
-launcher or `IsVisible` failed. A dismiss is answered in two steps: `executed`
-means the primitive returned; then the 300 ms probe answers `confirmed` (hidden),
-`unconfirmed` (visible), or `unknown` (probe or timer failed). A record replaced by
+launcher or `IsVisible` failed. The mailbox holds one answer: a later answer can
+replace an earlier one before the Start side reads it, so the reader matches
+`command` and never reads one command's state under another's sequence. A dismiss
+is answered in two steps: `executed` means the primitive returned; then the
+300 ms probe answers `confirmed` (hidden), `unconfirmed` (visible), or `unknown`
+(probe or timer failed). A record replaced by
 a newer one is answered `superseded`, which is distinct from `expired`. The log
 prints the probe's real elapsed time (`after=<n> ms`), not the requested delay.
 `unconfirmed` and `unknown` are terminal repairs for the Start side, which releases

@@ -66,6 +66,26 @@
   `-State` prints `peerEpoch` beside `peerTick`/`peerState`, which is how a
   re-enable is told from a still-running activation.
 
+## Touch producers: real digitizer vs injected contact
+
+`tools/inject_swipe.ps1` calls `InjectTouchInput`, but the contact reaches the
+shell as a pointer, and a press that dismisses the open panel is served by the
+shell's own click-away (`HideStartAndCortana`, method 7), which the bridge logs
+as `intent close trigger=clickaway method=7 state=...`. The mod's own gesture
+dismiss (`close dismiss kind=...`, the `RequestBridgeDismiss` at the close's end)
+is therefore exercised only by a real finger on the digitizer.
+
+A four-trigger smoke that checks only "the menu closed and an `exec dismiss` ran"
+cannot tell the two producers apart: both paths end in the same command. The
+producer is the line before it. On a real panel the HID close logs `close dismiss
+kind=<...>` and then `exec dismiss request ... method=1 open=<generation>`; no
+`intent close` belongs to it, and the bridge must not answer it `superseded
+menu=...` (the `open=` is the generation read by `SwipeIpcReadOpen`, not a tick).
+On the injected path the bridge logs `intent close trigger=clickaway method=7
+state=...` and the Start side logs `intent recv seq=... kind=close
+trigger=clickaway ...`, and no `close dismiss kind=` line appears. The manual
+check is that pair of lines, not only the close's outcome.
+
 ## Round-2 runtime checks
 
 Each line is what a run must show for one review item; the code half is in
@@ -111,11 +131,16 @@ could act, or before its confirmation could land).
   dismiss produces `exec dismiss unconfirmed|failed command=...` on the Start
   side and a released direction. With the channel closed, `exec show request
   skipped ... reason=no-channel` and `intent open refused ... reason=no-executor`
-  replace a claimed open. **A cancelled show produces no expiry line**: the
-  cancel supersedes the record, so `exec cancel request target=0
-  reason=show-expired` is the only line and no `exec ack timeout ... kind=show`
-  follows. **A superseded dismiss produces no confirmation**: the replacement's
-  probe answers, and the old sequence is answered `superseded` by the bridge.
+  replace a claimed open. **The show timeout emits both lines**: when 400 ms pass
+  with no ack, the Start side publishes `exec cancel request target=0
+  reason=show-expired` (unless a pending dismiss already owns the executor record)
+  and logs `exec ack timeout seq=... kind=show open=... (resync from cloak)`. The
+  cancel repairs the executor's record; it does not suppress the publisher's own
+  timeout line. A show the bridge answers `superseded` before its deadline clears
+  its slot in `ApplyExecAck`, so that one logs `exec show superseded command=...`
+  and no timeout. **A superseded dismiss produces no confirmation**: the
+  replacement's probe answers, and the old sequence is answered `superseded` by
+  the bridge.
 - **F — latch supersession.** The test needs a **pre-existing latch**: press to
   close, press again while the hide is in flight to create the slot, then press a
   third time after the landing but before the 50 ms serve. The third press sees
@@ -148,7 +173,8 @@ could act, or before its confirmation could land).
   arms one (`ticket_seq` = that sequence), because its call returned but its hide
   may still land. A refused/expired/superseded answer for the
   **ticket's** sequence retires it even though the pending slot was already
-  cleared by the open.
+  cleared by the open (`intent recovery ticket retired seq=... reason=
+  superseded|refused|expired`).
 - **Publisher epoch.** Restart the Start host immediately after a close request:
   the old dismiss must log `exec dismiss seq=... superseded epoch=... now=...`
   (or `exec show ... superseded`) instead of calling the launcher, and the new

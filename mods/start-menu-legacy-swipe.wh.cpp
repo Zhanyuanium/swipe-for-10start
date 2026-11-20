@@ -1189,9 +1189,10 @@ Known risks:
  *   dropped and a pending executor command is cancelled, and the panel settles
  *   back from its live position
  *   (`intent open cancel from=...`); the recovery ticket is bound to that close
- *   (open generation and executor sequence) and stays set until a landing for the
+ *   (open tick and executor sequence) and stays set until a landing for the
  *   same menu proves the dismiss was already inside the shell (then
- *   `intent open recovered entry=...`) or an explicit action supersedes it. A
+ *   `intent open recovered entry=...`); a refused/expired/superseded answer for
+ *   its sequence retires it, as does an explicit action. A
  *   landing reconciles an already-published `external` intent before it may
  *   recover, because the idle timer is waited on before the intent event. A
  *   pull still
@@ -2461,10 +2462,11 @@ LONG64 g_lastIntentSeq = 0;  // input thread only; seeded by OpenIpcChannel
 // same open once.
 //
 // The ticket is bound to the close it belongs to, not to "a landing": openTick is
-// the open generation the cancel was issued under and dismissSeq is the executor
-// command it revoked (0 when the close had none yet). A landing for a different
-// menu can therefore never serve it. Set by the open-intent cancel path, cleared
-// by a new close, an external takeover, or the landing that consumes it.
+// the low 32 bits of the tick the menu's open record published, captured when the
+// cancel ran; dismissSeq is the executor command it revoked (0 when the close had
+// none yet). A landing for a different menu can therefore never serve it. Set by
+// the open-intent cancel path, cleared by a new close, an external takeover, a
+// terminal answer for its sequence, or the landing that consumes it.
 struct CloseCancelTicket {
     bool pending = false;
     uint32_t openTick = 0;
@@ -3951,8 +3953,11 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 // attach, advanced by the input thread only.
 LONG64 g_ipcCommandSeq = 0;
 
-// The low 32 bits of the open tick this process last published: input thread
-// only. It names the menu a later open record belongs to; it is not a claim.
+// The low 32 bits of the tick at which this process last observed a fresh open:
+// input thread only. The cancel-recovery ticket compares it at the landing to
+// prove that the hide belongs to the menu the cancel named. It is a tick, not
+// the open generation: an executor record or an intent that names a menu takes
+// SwipeIpcReadOpen's first out-parameter.
 uint32_t g_ipcOpenTickLow = 0;
 
 // The last peer tick this side published, as GetTickCount64's low 32 bits. Set
@@ -8341,6 +8346,27 @@ void ApplyExecAck() {
         ack.command == g_pendingDismissExec.load(std::memory_order_relaxed);
     const bool dismissConfirming =
         ack.command != 0 && ack.command == g_pendingDismissConfirm;
+    // The recovery ticket can outlive both pending slots: the open intent that
+    // cancelled the close clears them before the bridge's answer arrives. The
+    // ticket is bound to the command it revoked, so that sequence is the whole
+    // test; a terminal answer for it is the same proof the slot path uses — the
+    // command cannot still hide the window. `executed` is not terminal (the call
+    // returned and the hide may still land), `confirmed` belongs to the landing,
+    // and `unknown` may still hide the window, so none of them retires it.
+    const bool dismissTicket =
+        g_intentCancel.pending && ack.command != 0 &&
+        g_intentCancel.dismissSeq == ack.command;
+    if (dismissTicket &&
+        (failed || ack.state == kSwipeAckSuperseded)) {
+        const wchar_t* reason = ack.state == kSwipeAckSuperseded
+                                    ? L"superseded"
+                                    : (ack.state == kSwipeAckRefused
+                                           ? L"refused"
+                                           : L"expired");
+        FileLog(L"intent recovery ticket retired seq=%lld reason=%s",
+                static_cast<long long>(ack.command), reason);
+        g_intentCancel = CloseCancelTicket{};
+    }
     if (dismissPending || dismissConfirming) {
         // One dismiss has up to three answers: the primitive's (`Executed` or a
         // terminal failure), the visibility probe's (`Confirmed`), and the
@@ -8372,10 +8398,10 @@ void ApplyExecAck() {
             // A dismiss that did not hide the window — refused, expired, still
             // visible at the probe, or unanswerable — is terminal: the panel is
             // retracted, the controller stops owning it, and the next poll reads
-            // the cloak. The cancel-recovery ticket dies with it, by the ticket's
-            // own sequence: the pending slot may already have been cleared by the
-            // open that cancelled this other command.
-            if (g_intentCancel.pending &&
+            // the cloak. A refused/expired ticket for this sequence was retired
+            // above, before this gate; `unconfirmed`/`unknown` retires one here,
+            // because the pending slot still names the command.
+            if (unconfirmed && g_intentCancel.pending &&
                 g_intentCancel.dismissSeq == ack.command) {
                 g_intentCancel = CloseCancelTicket{};
             }
@@ -8391,13 +8417,6 @@ void ApplyExecAck() {
         // activation) already owns the window. It is reported so the two cases
         // are distinguishable in the log.
         if (ack.state == kSwipeAckSuperseded) {
-            if (g_intentCancel.pending &&
-                g_intentCancel.dismissSeq == ack.command) {
-                FileLog(L"intent recovery ticket retired seq=%lld "
-                        L"reason=superseded",
-                        static_cast<long long>(ack.command));
-                g_intentCancel = CloseCancelTicket{};
-            }
             if (dismissConfirming) {
                 g_pendingDismissConfirm = 0;
             }
