@@ -19,9 +19,10 @@ The duration is planned from the travel, not a time:
 T = clamp(|target - start| * distance / 2.2 DIP/ms, 160 ms, 520 ms)
 ```
 
-A 900 DIP panel takes 409 ms (docked). The historical auto-hidden geometry
-measured 852 DIP and 387 ms; the current docked layout uses 900 and 409. The curve is generated as samples (`BuildSpringSamples`),
-scaled by its own value at `T`, so it lands exactly on the target with no step.
+A 852 DIP panel takes 387 ms (auto-hidden; the docked 900 DIP panel takes 409 ms;
+the earlier auto-hidden variant also measured 852 DIP and 387 ms). The curve is
+generated as samples (`BuildSpringSamples`), scaled by its own value at `T`, so
+it lands exactly on the target with no step.
 The first keyframe, up to 4 ms in, shows the first segment's average speed
 instead of the analytic seam.
 
@@ -40,7 +41,7 @@ initial slope, which is why the seam factor is a computed value, not a constant.
 - keyboard/Start-button open: the settle from rest (`vel=0.00`) to 1, `dur=409`
   on the full travel;
 - intent open: the Start side holds the entry (`RevealEntryProgress`, warm
-  0.348 docked, 0.186 historical auto-hidden, cold 0.000) and starts the same
+  0.255 auto-hidden, 0.348 docked, cold 0.000) and starts the same
   settle from there when the shell's
   shown event arrives (`win open intent from=... dur=...`);
 - touch: the reveal takeover starts at the entry and chases the mapped finger at
@@ -58,16 +59,18 @@ The gesture close keeps its own release spring (`BeginGestureSettle`) and uses
 the mirror only for the shell-triggered family.
 
 At the end of the close the Start side publishes `exec dismiss` at
-`settle + 30 ms`; the bridge arms a timer and calls `Dismiss` on the launcher's
-thread. The panel is therefore never hidden mid-slide.
+`settle + 30 ms` for an intent close, or at the settle's end for a gesture close;
+the bridge arms a timer (or calls it at once) and calls `Dismiss` on the
+launcher's thread. The panel is therefore never hidden mid-slide.
 
 ## Interruption
 
 `TakeProgressNow()` pins the live position and stops the animation. The new
 settle starts there: a close 172 ms into an open started at `from=0.542`; a Win
-press during a held touch started the close from `progress=1.000`; a second Win
-79 ms after a close canceled the scheduled dismiss and left the menu open. No
-path replays from the old target.
+press during a held touch started the close from `progress=1.000`; a press during
+a gesture close cancels the tap and the pending dismiss and settles the panel
+back from its live position (`intent open cancel from=...`). No path replays from
+the old target.
 
 ## The coast
 

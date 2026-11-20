@@ -2,7 +2,7 @@
 // @id              start-menu-legacy-swipe
 // @name            Legacy Start Edge Swipe
 // @description     Touch or pen swipe from the taskbar edge opens and dismisses the legacy Start menu
-// @version         0.39.0
+// @version         0.40.0
 // @author          Zhanyuanium
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
@@ -369,16 +369,13 @@ What it does:
   with `timeEndPeriod` for the time a contact is down). Without the waitable
   timer the release measured `relms=31`; the 1 ms request alone left it at 32.
 - A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
-  the legacy menu ignores an injected `VK_ESCAPE`. Both closes are one Windows
-  tap. A keyboard close already is one; a gesture close taps `VK_LWIN` at the
-  end of its retract, after the panel has left the screen. That tap is the
-  shell's own Start toggle: the key handler performs
-  `CStartExperienceManager::Hide` and leaves the toggle ready for the next
-  Windows press, so no re-arm tap and no explorer-side hide request exist. The
-  transfer is one key press, down 60 ms and up, on whichever window has the
-  foreground. A Win press during the retract hides the menu early (the stamp is
-  already fresh), and the armed tap is then skipped; no press desyncs the
-  toggle.
+  the legacy menu ignores an injected `VK_ESCAPE`. Every close is the
+  controller's one path: the panel retracts with its mirrored settle, the
+  controller publishes its close phase at the settle's start, and the bridge
+  calls `XamlLauncher::Dismiss` at the settle's end. A Win press during the
+  retract is a reopen: it cancels the close and the panel settles back from its
+  live position. A press after the hide is latched and served at the landing,
+  so no press desyncs the toggle.
 - A down that arrives while the previous commit is still settling is ignored.
   The menu reuses one XAML root, so a commit sets a flag that makes the next
   down stop the animation and restore `Progress = 1` before the drag starts.
@@ -1105,37 +1102,30 @@ Known risks:
   33 Hz has no pair in the window, and the settle then starts from rest rather
   than from a speed the data cannot support. The panel reports at ~170 Hz, so
   this only affects a coarsely injected gesture.
-- A committed dismiss taps the Windows key at the end of its retract. That tap is
-  the close: with the explorer-side bridge disabled or its hooks refused, the
-  menu still hides, and the panel has already slid out. The tap is global: it
-  lands on whichever window has the foreground, and a lone Windows tap opens
-  Start if the menu is already gone.
-- A pull that starts during the retract cancels the tap before it is sent, so
-  the shell is never touched and the menu stays open. That check runs once, when
-  the tap would run; a pull after the tap is a normal open of a closed menu.
-- A Win press during the retract hides the menu early (the close stamp is
-  already fresh), and the armed tap is skipped because the window is closed.
-  A press just after that hide lands in the shell's own settle and is ignored;
-  the toggle is not advanced, and the next press opens the menu.
+- A committed close retracts the panel with the mirrored settle and then asks
+  the bridge for the shell's `Dismiss`: 30 ms after the settle for a keyboard,
+  Start-button or click-away close, at the settle's end for a gesture close.
+  The shell hides the window; the next open is ready. With the explorer-side
+  bridge disabled or its hooks refused the menu stays open at the retracted
+  position, because the Start side never calls the launcher itself.
+- A pull that starts during the retract cancels the close before its tap runs,
+  so the shell is never touched and the menu stays open. That check runs once,
+  when the tap would run; a pull after the tap is a normal open of a closed menu.
+- The controller publishes phase 2 before the close's first frame. A Win press
+  during the retract is therefore an open: it drops the tap and the pending
+  dismiss and settles the panel back from its live position. The shell's state
+  is only the resync, never the direction; it still reports state 5 and uncloaked
+  while the panel retracts, until the executor's `Dismiss` runs. A press after
+  the hide is latched (one slot) and served at the landing.
 - The suppression window is time based until `win close observed` clears it. A
   reopen that lands before the shell reports the close is not animated; the
-  panel stays at 0 until the observed close clears the window and the next open
-  animates it. In practice the window is the hide delay, not the full 600 ms.
-- The tap holds the input thread for 60 ms. It runs after the retract, on the
-  input thread, and is global; a new contact's reports queue behind it.
-- The close stamp is read only inside its 800 ms window. A gesture close stamps
-  it at its release; the tap's Hide arrives at the end of the settle
-  (409 ms for a full 900 DIP panel at the planned 2.2 DIP/ms) and runs
-  at once. A dropped close stamps the cancelled kind, which the bridge treats as
-  a keyboard close, so a Win press within the window still takes the keyboard lead.
-- A keyboard close's lead is the answer this mod publishes on the channel,
-  plus the bridge's 30 ms margin. The answer can only be sent after the
-  bridge's request has reached this thread, so the shell hides one margin after
-  the settle has run to its end, never while it is still moving. When the answer
-  never arrives (the mod is disabled, the settle did not start, the request is
-  stale) the bridge closes at once instead of waiting for an animation nobody
-  planned; when the answer is `cancel` it does not close at all, because a
-  reveal contact owns the panel.
+  panel stays at the entry until the observed close clears the window and the
+  next open animates it. In practice the window is the hide delay, not the full
+  600 ms.
+- A keyboard, Start-button or click-away close is a mirrored settle and then a
+  bridge `exec dismiss` 30 ms after it, because the Start side never calls the
+  launcher. A command the bridge refuses or never answers releases
+  `controllerOwning` and the shell's own path serves the next press.
 - `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
   is missing, no gesture starts.
 - The `PrepareRootElement` and `OnGlobalAnimationRequested` RVAs are specific to
@@ -1207,8 +1197,14 @@ Known risks:
  *   The M3 consumer: `intent recv`/`intent open|close|external` decides open or
  *   close; `exec show request`/`exec dismiss request`/`exec cancel request`
  *   publish the bridge command; `exec ack` and `exec ack timeout` release or
- *   resync. One close path: TakeCloseOwnership + BeginMirrorCloseSettle(
- *   TakeProgressNow()) + the dismiss scheduled at settle+30 ms. A pull still
+ *   resync. One close path: TakeCloseOwnership (publishes controllerOwning
+ *   phase 2 before the settle's first frame) + BeginMirrorCloseSettle(
+ *   TakeProgressNow()) + the dismiss scheduled at settle+30 ms. An open intent
+ *   while the window still shows cancels that close: the tap and the pending
+ *   dismiss are dropped and the panel settles back from its live position
+ *   (`intent open cancel from=...`); if the dismiss had already entered the
+ *   shell and the window hides, the landing reissues the open
+ *   (`intent open recovered entry=...`). A pull still
  *   down at `win close observed` (or lifted inside the 300 ms late window)
  *   issues one fresh show (`reveal reopen after close pull=1 late=0 entry=...`)
  *   and the open adopts it; the 18 ms idle is held through a show and a close
@@ -2444,6 +2440,13 @@ std::atomic<uint64_t> g_pendingDismissExecAt{0};
 std::atomic<LONG64> g_pendingShowExec{0};
 std::atomic<uint64_t> g_pendingShowUntil{0};
 LONG64 g_lastIntentSeq = 0;  // input thread only
+// An open intent that cancelled a close whose window was still on screen. The
+// window keeps showing (the tap and the executor dismiss are dropped), but the
+// dismiss can already be inside the shell's Dismiss call when the press lands.
+// That close still lands, so `win close observed` reissues the same open once.
+// Set by the open-intent cancel path, cleared by a new close or by a poll that
+// sees the menu stay open.
+bool g_intentCancelPending = false;  // input thread only
 
 float TrailEdge(int32_t axis, float left, float top, float right, float bottom);
 float GeometryTrailDip(const GestureGeometry& geometry);
@@ -5245,6 +5248,19 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     g_suppressRestoreUntil.store(tickMs + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
     SwipeIpcSetControllerTouch(&g_ipc, false);
+    // The controller publishes the close before its first frame. The bridge's
+    // one toggle rule reads this phase for a Win, Start-button or click-away
+    // press, so a press during the settle is a reopen, not a second close. The
+    // shell's state cannot answer that question: on this path the panel is
+    // already retracting while the window still reports state 5 and the cloak
+    // still reports open until the executor's Dismiss runs. Publishing the
+    // phase only at the tap (the settle's end) left the whole settle readable
+    // as "open", and a press in it restarted the close instead of taking the
+    // menu back.
+    SwipeIpcSetControllerOwning(&g_ipc, true, 0, 2);
+    // A new close decides the menu: an earlier open that cancelled a close is
+    // no longer owed.
+    g_intentCancelPending = false;
 
     // A new close decides the menu, so a release record left by an earlier pull
     // is moot: its open either already came or never will. The record of a pull
@@ -5557,6 +5573,7 @@ void ResetActivationState() {
     ResetEndVelocity();
 
     g_commitNeedsProgressReset = false;
+    g_intentCancelPending = false;
     g_rootWasOpen = false;
     g_closeContested = false;
     g_contestedReleaseQpc = 0;
@@ -7130,6 +7147,10 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
         if (DropPendingCloseTap()) {
             g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
             g_closeCancelledTick = tickMs;
+            // The close is gone and the menu stays open, so the controller owns
+            // an open again. The phase must follow: phase 2 with a shown menu
+            // would turn the next press into a second reopen.
+            SwipeIpcSetControllerOwning(&g_ipc, true, 0, 1);
             const float live = TakeProgressNow(L"new-contact");
             const float distance = ReadGestureGeometry().distance();
             if (distance > 0.0f &&
@@ -7487,8 +7508,10 @@ void RunPendingCloseTap(uint64_t tickMs) {
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
 
-    // A Win press during the retract has already hidden the menu. The dismiss
-    // would only ask the shell to close a window that is already closed.
+    // A Win press during the retract cancels this tap (the open intent drops the
+    // slot), so a window already closed here was hidden by something else: an
+    // external takeover or the shell's own close. The dismiss would only ask the
+    // shell to close a window that is already closed.
     if (!StartWindowIsOpen()) {
         FileLog(L"close dismiss skipped kind=%s (already closed)",
                 CloseKindName(kind));
@@ -7844,16 +7867,41 @@ void ApplyBridgeIntent() {
         FileLog(L"intent external drop trigger=%s", trigger);
     } else if (intent.kind == kSwipeIntentOpen) {
         CancelPendingDismiss(L"open-intent");
-        const GestureGeometry geometry = ReadGestureGeometry();
-        const float entry =
-            std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
-        g_intentOpenEntry.store(entry, std::memory_order_relaxed);
-        g_intentOpenActive.store(true, std::memory_order_relaxed);
-        g_panel.Begin(&entry);
+        // The controller owns an open from this line, whichever shape the press
+        // has; the bridge reads this phase for the next toggle.
         SwipeIpcSetControllerOwning(&g_ipc, true, intent.open, 1);
-        RequestBridgeShow(intent.method ? intent.method : 1, intent.flags);
-        ackEntry = static_cast<int32_t>(std::llround(entry * 1000.0f));
-        FileLog(L"intent open entry=%.3f", entry);
+        const GestureGeometry geometry = ReadGestureGeometry();
+        if (StartWindowIsOpen()) {
+            // The close this press answers has not hidden the window yet, so the
+            // press cancels it. The tap is dropped before it can dismiss and the
+            // executor's dismiss is cancelled above; the panel is taken where the
+            // retract left it and settles back up with the pull-cancel's own
+            // curve. The window never hides, so no show is requested and no entry
+            // is applied: the menu is on screen at its live position.
+            DropPendingCloseTap();
+            g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+            g_commitNeedsProgressReset = false;
+            g_intentOpenActive.store(false, std::memory_order_relaxed);
+            // A dismiss that already entered the shell's Dismiss call cannot be
+            // recalled by the cancel above; if it still hides the window, the
+            // close's landing reissues this open once.
+            g_intentCancelPending = true;
+            const float live = TakeProgressNow(L"intent-open-cancel");
+            std::chrono::milliseconds duration{0};
+            if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
+                ShowAtRest();
+            }
+            FileLog(L"intent open cancel from=%.3f", live);
+        } else {
+            const float entry =
+                std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
+            g_intentOpenEntry.store(entry, std::memory_order_relaxed);
+            g_intentOpenActive.store(true, std::memory_order_relaxed);
+            g_panel.Begin(&entry);
+            RequestBridgeShow(intent.method ? intent.method : 1, intent.flags);
+            ackEntry = static_cast<int32_t>(std::llround(entry * 1000.0f));
+            FileLog(L"intent open entry=%.3f", entry);
+        }
     } else if (intent.kind == kSwipeIntentClose) {
         CancelPendingDismiss(L"close-intent");
         // The close owns the panel now: one close mechanism, the same ownership
@@ -7866,6 +7914,7 @@ void ApplyBridgeIntent() {
         std::chrono::milliseconds duration{0};
         if (!BeginMirrorCloseSettle(from, duration)) {
             ShowAtRest();
+            SwipeIpcSetControllerOwning(&g_ipc, false, 0, 0);
             ackState = kSwipeAckRefused;
             ackHr = E_FAIL;
         } else {
@@ -8117,6 +8166,11 @@ void PollRootVisibility(uint64_t tickMs) {
         // no request of ours, so it never opened a suppression window.
         const bool closeInFlight =
             tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+        // An open that cancelled a close while the window still showed is owed
+        // only if that close still lands. The flag is consumed here whichever
+        // way the landing went; a new close already cleared it at its start.
+        const bool intentCancelLost = g_intentCancelPending;
+        g_intentCancelPending = false;
         // The close has landed, so its suppression no longer applies. Without
         // this a Win press right after the hide opened the window with Progress
         // still at 0, and the panel was invisible until the next open.
@@ -8213,7 +8267,28 @@ void PollRootVisibility(uint64_t tickMs) {
             FileLog(L"reveal reopen after close pull=%d late=%d entry=%.3f",
                     pullDown ? 1 : 0, lateFresh ? 1 : 0, entry);
         }
+
+        // The press cancelled a close while the window still showed, but the
+        // dismiss had already entered the shell's Dismiss call and the close
+        // landed. The open it asked for is served now, from the closed state,
+        // exactly like the pull reopen above; the next poll's just-opened path
+        // runs the one open settle.
+        if (intentCancelLost && RendererReady() && !StartWindowIsOpen() &&
+            !g_intentOpenActive.load(std::memory_order_relaxed)) {
+            const GestureGeometry geometry = ReadGestureGeometry();
+            const float entry =
+                std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
+            InsertProgress(entry);
+            g_intentOpenActive.store(true, std::memory_order_relaxed);
+            g_intentOpenEntry.store(entry, std::memory_order_relaxed);
+            SwipeIpcSetControllerOwning(&g_ipc, true, 0, 1);
+            RequestBridgeShow(1, 0);
+            FileLog(L"intent open recovered entry=%.3f", entry);
+        }
     } else if (open) {
+        // The window stayed uncloaked, so an open that cancelled a close needed
+        // no recovery.
+        g_intentCancelPending = false;
         // The window has stayed uncloaked across polls. That is the healthy state
         // for an open menu, but a close that hid the menu and a reopen whose
         // settle never ran leave the same window shown with the panel at the
@@ -12325,7 +12400,7 @@ void ResetReinitState() {
 
 BOOL Wh_ModInit() {
     FileLog(L"mod init");
-    Wh_Log(L"Legacy Start Edge Swipe 0.39.0 initializing");
+    Wh_Log(L"Legacy Start Edge Swipe 0.40.0 initializing");
 
     // Both acquisitions are prerequisites, and both run before any thread: the
     // pin keeps a late worker's code mapped, the guard keeps a second instance

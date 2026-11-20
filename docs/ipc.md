@@ -1,6 +1,6 @@
 # IPC — the v4 channel
 
-> Start 0.39.0 / bridge 0.20.0. One session-local section, seven named objects,
+> Start 0.40.0 / bridge 0.21.0. One session-local section, seven named objects,
 > every record a seqlock. There is no file and no polling on either side.
 
 ## Names and layout
@@ -97,12 +97,18 @@ Plain interlocked fields, read on every decision:
 |---|---|
 | `controllerOwning` | 1 from an intent/touch show until the close's hide is observed |
 | `controllerOpen` | the open generation the controller owns |
-| `controllerPhase` | 1 opening, 2 closing, 0 idle |
+| `controllerPhase` | 1 while the controller owns an open, 2 from the close's first frame, 0 idle |
 | `controllerTouch` | 1 while the opening contact owns the panel |
 
-The bridge reads `phase` in `IntentShouldClose` and in the press latch: phase 1
-makes a press a close, phase 2 a reopen, and a hide in flight (9/11) or an armed
-dismiss latches the press instead of publishing into a no-op show.
+`controllerPhase` becomes 2 in `TakeCloseOwnership`, before the close's settle
+starts; it is not deferred to the tap. That is what lets the bridge's one toggle
+rule see the whole retract as a close while the shell still reports state 5 and
+the cloak still reports open. A pull that cancels a gesture close before its tap
+republishes phase 1 at the cancel. The bridge reads `controllerOwning` first:
+while it is set, phase 2 makes a press a reopen and any owned phase makes it a
+close. The shell's cloak and internal state are only the resync for a panel the
+controller does not own. A hide in flight (9/11) or an armed executor dismiss
+still latches the press instead of publishing into a no-op show.
 `controllerTouch` is the only reason a `HideStartAndCortana(7)` is not published
 as a close.
 

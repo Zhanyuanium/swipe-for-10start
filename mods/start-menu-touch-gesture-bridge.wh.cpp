@@ -2,7 +2,7 @@
 // @id              start-menu-touch-gesture-bridge
 // @name            Start Menu Touch Gesture Bridge
 // @description     Decides the shell's Start close from explorer and publishes the live Win10 Start edge-gesture handle and state
-// @version         0.20.0
+// @version         0.21.0
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @architecture    x86-64
@@ -43,25 +43,32 @@ The triggers and their entries:
   this build does not recognise pass through at once, with only a cloak resync.
   A lock is never delayed. Win+Tab enters as method 5 and passes the same way.
 
-Every close executes in one place: `XamlLauncherState::HideStartAndCortana`
-(RVA `0x24BCB0`), one frame above `CStartExperienceManager::Hide`. The mod asks
-the Start side for the retract duration over the v2 channel, holds the original
-for that duration plus 30 ms (`own close animated ... retract=... lead=...`),
-and calls it. The answer is a duration or the no-settle sentinel; there is no
-cancel answer and no reveal claim any more, because every close closes. A reveal
-contact that was driving the panel becomes a deferred pull in the Start mod: the
-menu closes, and the pull may open the next one. A close the Start side's own
-Windows tap causes is passed at once (`reason=gesture`).
+Every close executes in one place: the Start side plans the mirrored retract and
+publishes `exec dismiss` at the end of its settle plus 30 ms; the bridge's timer
+runs `XamlLauncher::Dismiss` on the launcher thread. A reveal contact that was
+driving the panel becomes a deferred pull in the Start mod: the menu closes, and
+the pull may open the next one. A close the Start side's own gesture causes runs
+the same command, scheduled at the settle's end.
 
-A press during a close is a reopen. The decision entry sets a latch and the
-`OnStartHidden` event serves it from the settled closed state
-(`own reopen served after close`). The immediate `ShowStartView` was measured to
-wedge the UI thread when the shell delivered the press inside its own Hide, so
-the latch is the whole action there; the owner accepted that wait.
+A press during a close is a reopen, and the direction comes from the Start side's
+published controller state, never from the shell's. That controller publishes
+phase 2 before a close's first frame, so the bridge's one toggle rule reads the
+press as an open for the whole retract, including the window's last visible
+frame. A close still settling is cancelled: the Start side drops its tap and the
+executor's dismiss and settles the panel back from its live position. A dismiss
+that has already entered the shell's `Dismiss` call cannot be recalled; a press
+there is latched (one slot) and served as the same open intent when the hide
+lands (`own press served wait=...`). The serve is armed by the hidden event and
+published 50 ms later, off that event's stack: a show at the hidden event's own
+tick was swallowed and the window stayed in state 3, while a show 16 ms after it
+opened normally. For the gesture path's own dismiss the landing instead reissues
+the cancelled open (`intent open recovered`). The immediate `ShowStartView`
+inside the shell's own Hide was measured to wedge the UI thread, so the latch is
+the action for that shape.
 
 External takeovers (`Win+Tab`, the lock/display method-7 path, and a modified
 Windows press the Win hook can recognise) pass through immediately: no close
-record, no retract plan, no hold, no animation. Their only reaction is the cloak
+intent, no settle, no hold, no animation. Their only reaction is the cloak
 resync. The Start side drops a pull at the window close such a takeover causes
 (`reveal dropped (window closed by shell)`) instead of reopening it.
 
@@ -74,9 +81,9 @@ edge, the start point and the gesture state to shared memory:
 
 A StartMenuExperienceHost-side consumer could read the mapping and bind a
 Composition animation with `InputAnimationTarget::GetInputAnimationObject`; the
-shipping Start mod does not read it. Its live couplings are the close stamp, the
-retract request/answer pair and the open generation, all in
-`Local\SwipeFor10Start_v2_*` (see `swipe_ipc_shared.h`).
+shipping Start mod does not read it. Its live couplings are the intent and its
+ack, the executor command and its ack, the open generation and the controller
+flags, all in `Local\SwipeFor10Start_v4_*` (see `swipe_ipc_shared.h`).
 
 
 Hooked functions are forwarded unchanged except for the close decision above.
@@ -210,30 +217,25 @@ Notes:
   mapping, and the init logs `activation state reset`; a ready mapping and a
   channel an earlier activation left open are reused rather than rebuilt.
 
-The close record and the retract pair:
+The decision and the executor:
 
-- A gesture close publishes its plan at its release and a fresh record marked
-  `tapped` immediately before it sends the Windows key. Only the tapped record
-  names the tap's own close, so the decision hook passes it at once
-  (`close passed ... reason=gesture`). A plan or a cancel never passes: the tap
-  is the record that carries `tapped`, and the plan stays current for the whole
-  settle. A Hide that arrives while only the plan is current is the user's own
-  Windows press during the settle and takes the request path, exactly as before.
-- A gesture close that a new edge pull cancels before its tap publishes the
-  cancelled kind at once, so no close in between is ever mistaken for the tap's.
-- The close record names no menu, so a tapped record is accepted only when it is
-  newer than the sequence this process seeded at attach and was stamped at or
-  after the newest open generation it has seen. That alone keeps a tap whose Hide
-  never came from passing an unrelated close under the next menu; the channel also
-  asks the Start side to cancel its stamp when it publishes a new open. Both
-  ticks come from one clock, so only a tap and an open inside the same ~16 ms
-  tick cannot be ordered: an unconsumed fresh stamp is evidence of correlation,
-  not proof of cause, and the plan-versus-tapped distinction is what carries the
-  correctness.
-- Any other close publishes the `retract` request and then waits for the Start
-  mod's answer, as described above. Every waited close marks its request done
-  before it returns, so a request whose close is over cannot start a settle
-  under the next menu.
+- The bridge decides the direction from the Start side's published controller
+  flags. While `controllerOwning` is set, `controllerPhase` 2 means a close is in
+  flight, so a Win, Start-button or click-away press is a reopen; an owned phase
+  1 is the open the controller owns, so a press is a close. The shell's cloak and
+  `InternalState` are the resync only for a panel the controller does not own.
+  The shell cannot decide a controller close: a gesture close retracts the panel
+  with the window still uncloaked and state 5 until the executor's `Dismiss`.
+- A press during a cancellable close publishes an open intent at once; the Start
+  side drops the close's tap and its pending dismiss and settles the panel back
+  from its live position. A press during a shell hide (state 9/11) or with an
+  executor dismiss already armed is latched in one slot and served as the same
+  open intent at the hide's landing (`own press served wait=...`). The Start
+  side's own gesture dismiss can be inside the shell's `Dismiss` call when a
+  press lands; the landing then reissues the open the press cancelled.
+- Every close is one `exec dismiss` from the Start side: the launcher's
+  `Dismiss` on the launcher thread. Nothing here holds the shell's
+  `HideStartAndCortana` and nothing asks the Start side for a retract duration.
 - `Hide` is `HRESULT (void* this, uint32_t reason)` on
   twinui.pcshell.dll 26100.9949. The prologue reads `rcx` (this) and `edx`
   (reason), compares `edx` with 7 and returns 0 on success or the negative
@@ -254,7 +256,7 @@ The close record and the retract pair:
  *   Show/Hide for the observation lines. The launcher thread is the thread that
  *   runs OnHotkeyInvoke (measured tid=7108); the taskbar thread is a different
  *   thread and a show there fail-fasts explorer (measured). Also depends on
- *   swipe_ipc_shared.h v3 for the intent/ack, executor command/ack, open
+ *   swipe_ipc_shared.h v4 for the intent/ack, executor command/ack, open
  *   generation and controller flags, and on start_gesture_shared.h for the
  *   diagnostic animation ids.
  * [OUTPUT]: the hidden executor window WindhawkSwipeExecutor_<WndProc> on the
@@ -265,11 +267,18 @@ The close record and the retract pair:
  *   `intent kind=... trigger=... seq=...` for the Win key, the Start button
  *   (ShowStartView method 11 / Dismiss method 6) and the click-away
  *   (HideStartAndCortana method 7); IntentShouldClose is the only toggle rule
- *   (controller phase 1 -> close, phase 2 -> reopen, else the cloak and the
- *   internal state). A press is never lost: a hide in flight (state 9/11) or a
- *   dismiss already armed is latched (one slot, tick) and served as the same
- *   open intent at `own state event=hidden` (`own press served wait=...`,
- *   31-110 ms); a second press replaces the slot. The click-away the shell
+ *   (the controller owns the panel -> phase 2 is a reopen, phase 1 is a close;
+ *   otherwise the cloak and the internal state are the shell resync). The
+ *   direction is never read from the shell while the controller owns: a gesture
+ *   close retracts the panel with the cloak still open and the state still 5
+ *   until the executor's Dismiss, which is why the controller publishes phase 2
+ *   at the close's start. A press is never lost: a hide in flight (state 9/11)
+ *   or a dismiss already armed is latched (one slot, tick) and served as the
+ *   same open intent 50 ms after the hidden event (`own press served wait=...`);
+ *   the deferral keeps the show off the hidden event's stack (a show at its own
+ *   tick was swallowed, state 3, no Shown). A close still cancellable publishes
+ *   open at once and the Start side settles the panel back from its live
+ *   position; a second press replaces the slot. The click-away the shell
  *   issues while the window is appearing (state 1/3) and the Hide(7) inside our
  *   own ShowStartView in state 1/3 are the pointer-away check and are swallowed
  *   (`reason=opening`/`reason=own-show`). The shell's own show/dismiss is
@@ -487,6 +496,14 @@ constexpr UINT_PTR kExecProbeTimer = 0x5359;
 constexpr UINT_PTR kPressLatchTimer = 0x535A;
 constexpr uint64_t kPressLatchTimeoutMs = 400;
 constexpr uint64_t kPressLatchRetryMs = 100;
+// The hidden event does not publish the latched open from its own stack. A show
+// that ran at the hidden event's own tick was swallowed by the completing hide
+// (measured on the auto-hidden layout: `own state event=hidden`, show and
+// `exec show` in the same millisecond, `exec visible ... visible=0`, state
+// stuck at 3, no Shown); a show 16 ms after the event opened normally. The
+// timer fires in the message loop after the event has unwound; 50 ms keeps a
+// margin over the measured 16 ms.
+constexpr uint64_t kPressServeDelayMs = 50;
 constexpr uintptr_t kLauncherSingletonRva = 0x948E80;
 constexpr uintptr_t kLauncherStateOffset = 0x160;
 constexpr uintptr_t kLauncherIsVisibleRva = 0x1F9B40;
@@ -1784,17 +1801,21 @@ HRESULT Hide_Hook(void* self, uint32_t reason) {
 // The decision hooks: Windows key, Start button, and the two state events
 // ---------------------------------------------------------------------------
 
-// One toggle decision for every trigger. While the controller owns a transition
-// its phase decides: an open in flight is closed, a close in flight is reopened.
-// Otherwise the shell's own state and the cloak decide, and a shell close
-// (9/11) is a reopen. No trigger has its own rule.
+// One toggle decision for every trigger. The controller's published state is
+// the whole answer while it owns the panel: phase 2 is a close in flight, so a
+// press reopens; any owned phase is the open it owns, so a press closes. The
+// launcher's state is only the resync for a panel the controller does not own
+// (the shell's own open or close), never the direction for a controller close.
+//
+// The shell cannot answer this: a gesture close retracts the panel while the
+// window still reports InternalState 5 and the cloak still reports open, and
+// only the executor's Dismiss ends that. Reading the shell there classified a
+// press during the retract as a second close, and the owner's press did nothing.
+// The controller publishes phase 2 before the close's first frame precisely so
+// this rule has the direction while the shell still looks open.
 bool IntentShouldClose(const OwnSnapshot& own) {
-    const int32_t phase = SwipeIpcControllerPhase(&g_ipc);
-    if (phase == 1) {
-        return true;
-    }
-    if (phase == 2) {
-        return false;
+    if (SwipeIpcControllerOwning(&g_ipc)) {
+        return SwipeIpcControllerPhase(&g_ipc) != 2;
     }
     if (own.open) {
         return true;
@@ -1824,6 +1845,12 @@ struct PressLatch {
 };
 
 PressLatch g_pressLatch;  // launcher thread only
+// Why the timer that will serve g_pressLatch was armed: the hidden event's
+// deferral ("hidden") or the 400 ms fallback ("timeout"). The serve line names
+// it. Launcher thread only, like the latch.
+const wchar_t* g_pressServeReason = L"timeout";
+
+bool ServeLatchedPress(const wchar_t* reason);
 
 const wchar_t* PressTriggerName(int32_t trigger) {
     switch (trigger) {
@@ -1866,9 +1893,26 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
             own.state, PressTriggerName(trigger),
             static_cast<unsigned long long>(now));
     if (g_execWindow.load(std::memory_order_relaxed)) {
+        g_pressServeReason = L"timeout";
         SetTimer(g_execWindow.load(std::memory_order_relaxed), kPressLatchTimer,
                  kPressLatchTimeoutMs, nullptr);
     }
+}
+
+// The latch waits for the hide's own event; the event then arms this deferral
+// instead of publishing from its stack. See kPressServeDelayMs.
+void ArmLatchedServe() {
+    if (!g_pressLatch.pending) {
+        return;
+    }
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (!window) {
+        ServeLatchedPress(L"hidden");
+        return;
+    }
+    g_pressServeReason = L"hidden";
+    SetTimer(window, kPressLatchTimer, static_cast<UINT>(kPressServeDelayMs),
+             nullptr);
 }
 
 // Serves the latched press once the hide has landed. The hidden event is the
@@ -2054,9 +2098,11 @@ void OnStartHidden_Hook(void* self) {
         return;
     }
     OwnEventHidden();
-    // The landing the latch exists for. If the cloak has already flipped, the
-    // press becomes the same open intent a normal press would have published.
-    ServeLatchedPress(L"hidden");
+    // The landing the latch exists for. The serve is deferred off this event's
+    // stack: a show requested at the hidden event's own tick was swallowed
+    // (kPressServeDelayMs). If the cloak has already flipped, the press becomes
+    // the same open intent a normal press would have published.
+    ArmLatchedServe();
 }
 
 // XamlLauncher::Dismiss / XamlLauncher::ShowStartView. The taskbar's Start
@@ -3051,9 +3097,10 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
     }
     if (message == WM_TIMER && wParam == kPressLatchTimer) {
         KillTimer(window, kPressLatchTimer);
-        if (!ServeLatchedPress(L"timeout") && g_pressLatch.pending) {
+        if (!ServeLatchedPress(g_pressServeReason) && g_pressLatch.pending) {
             // The hide has not landed yet. Retry; the hidden event is the normal
             // serve point, this only covers a landing it missed.
+            g_pressServeReason = L"timeout";
             SetTimer(window, kPressLatchTimer,
                      static_cast<UINT>(kPressLatchRetryMs), nullptr);
         }
@@ -3261,7 +3308,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Start Menu Touch Gesture Bridge 0.20.0 initializing");
+    Wh_Log(L"Start Menu Touch Gesture Bridge 0.21.0 initializing");
 
     // A disable/enable cycle re-initialises this same image, because the pin
     // keeps it mapped. Nothing in it was re-initialised by the loader, so the
