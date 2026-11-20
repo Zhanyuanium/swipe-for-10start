@@ -46,10 +46,10 @@ geometry.md: the `GestureGeometry` snapshot and its lock, the panel-trail
 measurement and band, the taskbar axis probe, the deferred measurement, the
 scroll survey, and the measured layouts.
 
-ipc.md: the v7 channel — names, 744-byte layout, seqlocks, open generation,
-intent/ack, executor command/ack (expiry and the dismiss confirmation), controller
-direction, peer liveness/identity (epoch, tick, state, the 600 ms detection
-budget), init handshake.
+ipc.md: the merged mod's channel — names, 216-byte layout, seqlocks, open
+generation, intent/ack, executor command/ack (admission vocabulary, expiry and
+the dismiss confirmation), controller direction, peer liveness/identity (epoch,
+tick, state, the 600 ms detection budget), init handshake.
 
 lifecycle.md: the pin, the instance guard, the counted entries, the unload
 order and residuals, the re-initialisation and the host's unload boundary.

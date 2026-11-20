@@ -3871,10 +3871,6 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 // answers. See "Peer liveness" in swipe_ipc_shared.h.
 // ---------------------------------------------------------------------------
 
-// The highest sequence this process has acted on. Set from the section at
-// attach, advanced by the input thread only.
-LONG64 g_ipcCommandSeq = 0;
-
 // The low 32 bits of the tick at which this process last observed a fresh open:
 // input thread only. The cancel-recovery ticket compares it at the landing to
 // prove that the hide belongs to the menu the cancel named. It is a tick, not
@@ -4054,12 +4050,10 @@ void OpenIpcChannel() {
     SetPeerGone(L"attach", false);
 
     // Everything published before this attach belongs to an earlier menu. The
-    // raw counters are enough for a seed: the first record this process accepts
-    // must be newer than anything the previous one could have written.
-    g_ipcCommandSeq = SwipeIpcLoad64(&g_ipc.state->cmdSeq);
-    // An intent published while no consumer was listening belongs to no menu of
-    // this activation: the seed is the boundary, and only a record newer than it
-    // is consumed.
+    // raw counter is enough for a seed: the first record this process accepts
+    // must be newer than anything the previous one could have written. An intent
+    // published while no consumer was listening belongs to no menu of this
+    // activation, so only a record newer than this boundary is consumed.
     g_lastIntentSeq = SwipeIpcLoad64(&g_ipc.state->intentSeq);
     g_ipcOpenTickLow = 0;
     // The activation identity goes before anything this activation publishes. A
@@ -4081,219 +4075,8 @@ void OpenIpcChannel() {
                 g_peerEpoch);
     }
 
-    FileLog(L"ipc open created=%d cmd=%lld intent=%lld epoch=%u",
-            created ? 1 : 0, static_cast<long long>(g_ipcCommandSeq),
+    FileLog(L"ipc open created=%d intent=%lld epoch=%u", created ? 1 : 0,
             static_cast<long long>(g_lastIntentSeq), g_peerEpoch);
-}
-
-// Deletes the files this channel used before it moved to shared memory. They
-// carry no state worth keeping, and a leftover retract-plan.txt invites a
-// reader that no longer exists.
-void RemoveLegacyChannelFiles() {
-    WCHAR storage[MAX_PATH] = {};
-    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
-        return;
-    }
-
-    const wchar_t* names[] = {L"debug.txt", L"close-mode.txt",
-                              L"retract-plan.txt"};
-    int removed = 0;
-    for (const wchar_t* name : names) {
-        WCHAR path[MAX_PATH] = {};
-        if (swprintf_s(path, ARRAYSIZE(path), L"%s\\%s", storage, name) > 0 &&
-            DeleteFileW(path)) {
-            ++removed;
-        }
-    }
-    if (removed > 0) {
-        FileLog(L"ipc legacy files removed=%d", removed);
-    }
-}
-
-// Parses "v[,v...]" up to maxCount values. A missing, partial or trailing
-// token rejects the whole line.
-bool ParseFloatList(const char* text, int maxCount, float* values,
-                    int& count) {
-    count = 0;
-    const char* cursor = text;
-
-    while (count < maxCount) {
-        while (*cursor == ' ' || *cursor == '\t') {
-            ++cursor;
-        }
-
-        char* end = nullptr;
-        const float value = std::strtof(cursor, &end);
-        if (end == cursor || !std::isfinite(value)) {
-            return false;
-        }
-        values[count++] = value;
-        cursor = end;
-
-        while (*cursor == ' ' || *cursor == '\t') {
-            ++cursor;
-        }
-        if (*cursor == ',') {
-            ++cursor;
-            continue;
-        }
-        break;
-    }
-
-    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' ||
-           *cursor == '\n') {
-        ++cursor;
-    }
-    return *cursor == '\0';
-}
-
-// The alternative to the expression: write the visual Offset directly. Both
-// the property set entry and the visual property are written, because the
-// probe must cover both forms the visual may read.
-bool SetVisualOffset(float x, float y) {
-    std::lock_guard lock(g_compositionMutex);
-    if (!g_visual) {
-        return false;
-    }
-
-    try {
-        g_visual.Properties().InsertVector3(L"Offset", float3{x, y, 0.0f});
-        g_visual.Offset(float3{x, y, 0.0f});
-    } catch (winrt::hresult_error const& e) {
-        Wh_Log(L"Visual offset failed: %08X %s",
-               static_cast<unsigned>(e.code()), e.message().c_str());
-        return false;
-    } catch (...) {
-        Wh_Log(L"Visual offset failed with an unknown exception");
-        return false;
-    }
-
-    return true;
-}
-
-// The other alternative: the XAML framework translation property, which must be
-// set on the UI thread. The call is asynchronous, so the applied line is logged
-// from the callback and never claims a change the dispatcher refused. The turn is
-// a counted module entry: it reads g_root, and the unload waits for it before it
-// drops the root.
-void RequestTranslation(float x, float y, float z) {
-    wucore::CoreDispatcher dispatcher = CopyDispatcher();
-    if (!dispatcher || g_unloading.load(std::memory_order_relaxed)) {
-        return;
-    }
-
-    try {
-        PostCountedUiTurn(dispatcher, [x, y, z]() {
-            try {
-                wux::FrameworkElement root = g_root;
-                if (!root) {
-                    return;
-                }
-                wuxh::ElementCompositionPreview::SetIsTranslationEnabled(
-                    root, true);
-                root.Translation(float3{x, y, z});
-                FileLog(L"debug t=%.1f,%.1f,%.1f", x, y, z);
-            } catch (winrt::hresult_error const& e) {
-                FileLog(L"debug t fail err=%08X",
-                        static_cast<unsigned>(e.code()));
-            } catch (...) {
-                FileLog(L"debug t fail err=unknown");
-            }
-        });
-    } catch (winrt::hresult_error const& e) {
-        FileLog(L"debug t queue err=%08X", static_cast<unsigned>(e.code()));
-    } catch (...) {
-        FileLog(L"debug t queue err=unknown");
-    }
-}
-
-void ApplyDebugLine(const char* line) {
-    while (*line == ' ' || *line == '\t' || *line == '\r') {
-        ++line;
-    }
-    if (line[0] == '\0') {
-        return;
-    }
-
-    // A one-shot state line for a measurement harness: the window's cloak state,
-    // the live Progress, whether a settle or coast is moving it, and the restore
-    // the state owes. It only reads (PeekProgressNow never stops an animation),
-    // so a probe cannot change what it measures.
-    if (std::strncmp(line, "state", 5) == 0) {
-        const char* rest = line + 5;
-        while (*rest == ' ' || *rest == '\t' || *rest == '\r') {
-            ++rest;
-        }
-        if (*rest == '\0') {
-            const bool motion = ProgressMotionActive();
-            PanelPhase phase = PanelPhase::Idle;
-            {
-                std::lock_guard lock(g_compositionMutex);
-                phase = g_panel.phase;
-            }
-            FileLog(L"state open=%d progress=%.3f motion=%d restore=%d phase=%s",
-                    StartWindowIsOpen() ? 1 : 0, PeekProgressNow(),
-                    motion ? 1 : 0,
-                    g_commitNeedsProgressReset ? 1 : 0,
-                    PanelPhaseName(phase));
-            return;
-        }
-    }
-
-    if (line[1] != '=') {
-        return;
-    }
-
-    float values[3] = {};
-    int count = 0;
-
-    switch (line[0]) {
-        case 'p':
-            if (!ParseFloatList(line + 2, 1, values, count) || count != 1) {
-                return;
-            }
-            {
-                const float progress = std::clamp(values[0], 0.0f, 1.0f);
-                if (InsertProgress(progress)) {
-                    FileLog(L"debug p=%.3f", progress);
-                }
-            }
-            return;
-        case 't':
-            if (!ParseFloatList(line + 2, 3, values, count) || count != 3) {
-                return;
-            }
-            RequestTranslation(values[0], values[1], values[2]);
-            return;
-        case 'e':
-            if (!ParseFloatList(line + 2, 2, values, count) || count < 1) {
-                return;
-            }
-            {
-                const float y = count > 1 ? values[1] : 0.0f;
-                if (SetVisualOffset(values[0], y)) {
-                    FileLog(L"debug e=%.1f,%.1f", values[0], y);
-                }
-            }
-            return;
-        default:
-            return;
-    }
-}
-
-void ApplyDebugCommands(char* text) {
-    char* cursor = text;
-    while (*cursor != '\0') {
-        char* newline = std::strchr(cursor, '\n');
-        if (newline) {
-            *newline = '\0';
-        }
-        ApplyDebugLine(cursor);
-        if (!newline) {
-            return;
-        }
-        cursor = newline + 1;
-    }
 }
 
 // M3 executor requests. The bridge owns ShowStartView/Dismiss; these publish the
@@ -4332,6 +4115,23 @@ bool RequestBridgeShow(uint32_t method, uint32_t flags) {
     FileLog(L"exec show request seq=%lld method=%u flags=%u",
             static_cast<long long>(sequence), method, flags);
     return true;
+}
+
+// Maps a close intent's observed shell method to the executor's dismiss
+// vocabulary. A click-away's intent carries the Hide method 7, which is
+// evidence about the shell path, not a dismiss value this mod sends: the
+// executor calls XamlLauncher::Dismiss with 1 (Win) or 6 (Start button). A
+// controller-owned click-away executes as 6, the pointer-driven close the Start
+// button's own dismiss uses, so the close still animates exactly once. The
+// intent record keeps 7 for the decision log.
+constexpr int32_t kClickAwayShellMethod = 7;
+constexpr uint32_t kClickAwayExecMethod = 6;
+
+uint32_t ExecDismissMethodForIntent(int32_t intentMethod) {
+    if (intentMethod == kClickAwayShellMethod) {
+        return kClickAwayExecMethod;
+    }
+    return static_cast<uint32_t>(intentMethod);
 }
 
 bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
@@ -4386,26 +4186,6 @@ LONG64 CancelPendingDismiss(const wchar_t* reason) {
 // for a panel the controller no longer drives. Declared here because the open
 // and close paths above use it; defined with the ack handling.
 void ReleaseExecutorOwnership();
-
-// Applies the newest debug command, if one arrived. The command event is
-// manual-reset, so a command published while this runs is not lost: the next
-// pass takes it. Nothing runs before the renderer exists, because before the
-// first Setup neither mechanism has an object to act on; a command that arrives
-// then stays in the section and is replaced by the next one.
-void ApplyPendingCommand() {
-    ResetEvent(g_ipc.commandEvent);
-    if (g_unloading.load(std::memory_order_relaxed) ||
-        !RendererReady()) {
-        return;
-    }
-
-    char text[kSwipeIpcCommandMaxBytes] = {};
-    if (!SwipeIpcTakeCommand(&g_ipc, text, sizeof(text), &g_ipcCommandSeq)) {
-        return;
-    }
-    ApplyDebugCommands(text);
-}
-
 
 // ---------------------------------------------------------------------------
 // Raw HID input
@@ -8204,7 +7984,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             const uint64_t executeAt =
                 GetTickCount64() + static_cast<uint64_t>(duration.count()) +
                 kBridgeDismissLeadMs;
-            if (RequestBridgeDismiss(intent.method ? intent.method : 1,
+            if (RequestBridgeDismiss(ExecDismissMethodForIntent(intent.method),
                                      executeAt, intent.open)) {
                 ackDuration = static_cast<int32_t>(duration.count());
                 FileLog(L"intent close from=%.3f dur=%lld", from,
@@ -9417,21 +9197,18 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
 
     // Object 0 is the stop event, then the idle tick when the waitable timer
-    // exists, then the debug command, intent and exec-ack events, then the
-    // message queue. The stop event does not depend on the window: the
-    // unload sets it even if this thread has not published the HWND yet, and it
-    // is checked again after every message batch, because a queued message can
-    // win the wait over a just-signalled event.
-    HANDLE waits[6] = {};
+    // exists, then the intent and exec-ack events, then the message queue. The
+    // stop event does not depend on the window: the unload sets it even if this
+    // thread has not published the HWND yet, and it is checked again after every
+    // message batch, because a queued message can win the wait over a
+    // just-signalled event.
+    HANDLE waits[5] = {};
     DWORD waitCount = 0;
     if (g_hidStopEvent) {
         waits[waitCount++] = g_hidStopEvent;
     }
     if (idleTimer) {
         waits[waitCount++] = idleTimer;
-    }
-    if (g_ipc.commandEvent) {
-        waits[waitCount++] = g_ipc.commandEvent;
     }
     if (g_ipc.intentEvent) {
         waits[waitCount++] = g_ipc.intentEvent;
@@ -9524,10 +9301,6 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 CheckHidIdleRelease(now);
                 CheckExecAckTimeout(now);
                 PollRootVisibility(now);
-                continue;
-            }
-            if (signalled == g_ipc.commandEvent) {
-                ApplyPendingCommand();
                 continue;
             }
             if (signalled == g_ipc.intentEvent) {
@@ -12725,7 +12498,6 @@ BOOL RoleInit() {
     // settle, but the dismiss command never reaches the bridge and the window
     // stays shown over the retracted panel.
     OpenIpcChannel();
-    RemoveLegacyChannelFiles();
     FileLog(L"settle plan speed=%.2f dip/ms dur=%llu..%llu segment=%.1f ms "
             L"frames=%d..%d",
             static_cast<double>(kSettleSpeedDipPerMs),
@@ -13107,6 +12879,21 @@ constexpr uint32_t kDismissMethodWin = 1;
 constexpr uint32_t kDismissMethodWinTab = 5;
 constexpr uint32_t kDismissMethodStartButton = 6;
 constexpr uint32_t kDismissMethodClickAway = 7;
+
+// The executor's allowlist. A show carries the keyboard/touch method 1, the
+// Start button's 11, or the touch/edge method 16; its flags are the mask the
+// shell's ShowStartView actually reads (0x8 relaxes the foreground/context-menu
+// check and 0x4 tolerates an open context menu). A dismiss carries the Win close
+// 1 or the Start button's 6; 7 is the click-away's Hide method, kept as intent
+// evidence, and the Start side maps it to 6 before publishing the command.
+// Dismiss records carry no flags. A cancel names only its target. Anything else
+// is refused, never clamped into a legitimate shell action.
+constexpr uint32_t kExecShowMethodKeyboard = 1;
+constexpr uint32_t kExecShowMethodStartButton = 11;
+constexpr uint32_t kExecShowMethodTouch = 16;
+constexpr uint32_t kExecShowFlagMask = 0x8 | 0x4;
+constexpr uint32_t kExecDismissMethodWin = 1;
+constexpr uint32_t kExecDismissMethodStartButton = 6;
 
 // The M2 retract wait and its tapped-close stamp are retired. The M3 executor
 // schedules the dismiss from the duration the Start side plans, and the Start
@@ -15061,6 +14848,31 @@ bool ExecCommandForCurrentMenu(const SwipeIpcExecCommand& command,
     return false;
 }
 
+// Validates a command before anything arms a timer or touches the launcher. The
+// vocabulary is the one this mod's own producers use, not a numeric range: a
+// method the shell does not receive from us is refused, and no flag word is
+// forwarded that a command of that kind does not carry.
+bool ValidExecCommand(const SwipeIpcExecCommand& command) {
+    switch (command.kind) {
+        case kSwipeExecShow:
+            return command.executeAt == 0 && command.target == 0 &&
+                   (command.method == kExecShowMethodKeyboard ||
+                    command.method == kExecShowMethodStartButton ||
+                    command.method == kExecShowMethodTouch) &&
+                   (static_cast<uint32_t>(command.flags) &
+                    ~kExecShowFlagMask) == 0;
+        case kSwipeExecDismiss:
+            return command.flags == 0 && command.target == 0 &&
+                   (command.method == kExecDismissMethodWin ||
+                    command.method == kExecDismissMethodStartButton);
+        case kSwipeExecCancel:
+            return command.method == 0 && command.flags == 0 &&
+                   command.executeAt == 0;
+        default:
+            return false;
+    }
+}
+
 void ExecuteShow(const SwipeIpcExecCommand& command) {
     const uint64_t now = GetTickCount64();
     if (ExecCommandExpired(command, now)) {
@@ -15114,7 +14926,7 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
     }
     ++t_execCall;
     const HRESULT hr = g_showStartView
-                           ? g_showStartView(launcher, command.method ? command.method : 1,
+                           ? g_showStartView(launcher, command.method,
                                              command.flags)
                            : E_FAIL;
     // IsVisible right after the call is honest but early: the shell's show is
@@ -15194,7 +15006,7 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
     }
     ++t_execCall;
     const HRESULT hr =
-        g_dismiss ? g_dismiss(launcher, command.method ? command.method : 1)
+        g_dismiss ? g_dismiss(launcher, command.method)
                   : E_FAIL;
     // `hr` is the primitive's answer, and the visibility right after it is
     // checked again by the confirmation probe: success is not yet a hide.
@@ -15295,6 +15107,16 @@ void ExecutePendingCommand() {
     // again immediately before the shell call, because a Start restart inside
     // that budget must not let the old record act on a new menu.
     g_dispatchEpoch = PeerEpochNow();
+    if (!ValidExecCommand(command)) {
+        FileLog(L"exec refused seq=%lld kind=%d method=%u flags=%u target=%lld "
+                L"reason=invalid",
+                static_cast<long long>(command.seq),
+                static_cast<int>(command.kind), command.method, command.flags,
+                static_cast<long long>(command.target));
+        AnswerExec(command.seq, kSwipeAckRefused, E_INVALIDARG,
+                   kSwipeVisibilityUnknown);
+        return;
+    }
     if (command.kind == kSwipeExecCancel) {
         if (g_pendingDismissSeq != 0 &&
             (command.target == 0 || command.target == g_pendingDismissSeq)) {

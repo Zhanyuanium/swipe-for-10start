@@ -59,10 +59,10 @@
   the panel's bottom edge for 500 ms; its release time comes from `End-Contact`,
   so `t=0` is the UP and not the end of the preceding capture. Its start point
   and scan band are the top-taskbar geometry.
-- `tools/ipc.ps1` — the debug channel's only command publisher; see
-  [ipc.md](ipc.md) for the protocol, the v7 records and the commands it takes.
-  `-State` prints `peerEpoch` beside `peerTick`/`peerState`, which is how a
-  re-enable is told from a still-running activation.
+- `tools/ipc.ps1` — the read-only view of the channel; see
+  [ipc.md](ipc.md) for the protocol and the records. `-State` prints `peerEpoch`
+  beside `peerTick`/`peerState`, which is how a re-enable is told from a
+  still-running activation. There is no command publisher any more.
 
 ## Touch producers: real digitizer vs injected contact
 

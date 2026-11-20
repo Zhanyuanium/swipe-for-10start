@@ -2,29 +2,29 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <windows.h>
 
 
 // Shared-memory contract between the StartMenuExperienceHost-side controller and
 // the explorer-side bridge.
 //
-// Two processes, one session-local section, four auto-reset events, one
-// manual-reset command event and one mutex. There is no file and no polling:
-// every record carries its own sequence number, and a reader accepts a record
-// only when that number did not move while the record was being copied.
+// Two processes, one session-local section and four auto-reset events. There is
+// no file, no mutex and no polling: every record carries its own sequence
+// number, and a reader accepts a record only when that number did not move
+// while the record was being copied.
 //
-//   Local\SwipeFor10Start_v7_State        SwipeIpcState
-//   Local\SwipeFor10Start_v7_Cmd          manual-reset, tools -> Start
-//   Local\SwipeFor10Start_v7_CmdWrite     mutex,         one command writer
-//   Local\SwipeFor10Start_v7_Intent       auto-reset,   bridge -> Start
-//   Local\SwipeFor10Start_v7_IntentAck    auto-reset,   Start -> bridge
-//   Local\SwipeFor10Start_v7_Exec         auto-reset,   Start -> bridge
-//   Local\SwipeFor10Start_v7_ExecAck      auto-reset,   bridge -> Start
+//   Local\SwipeFor10Start_SingleMod_State      SwipeIpcState
+//   Local\SwipeFor10Start_SingleMod_Intent     auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod_IntentAck  auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod_Exec       auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod_ExecAck    auto-reset, bridge -> Start
 //
 // The names are session-local because both processes run as the same user in the
-// same session. The version is part of every name, so a layout change is a new
-// channel instead of a silent mismatch.
+// same session. There is no product version word: the ABI namespace *is* the
+// layout identity. A future incompatible layout changes the prefix, so an old
+// pinned development image can never join this channel and a same-size change is
+// never reinterpreted across a staggered update. Only a single shipping mod
+// uses these names.
 //
 // ---------------------------------------------------------------------------
 // Publishing: one seqlock per record
@@ -37,9 +37,9 @@
 // copy is therefore impossible to accept.
 //
 // One counter for the whole section would not work: the records are written by
-// different processes (the tools the command, the Start side the open generation
-// and the executor command, the bridge the intent), and a shared counter would
-// invalidate a record another side is reading.
+// different processes (the Start side the open generation and the executor
+// command, the bridge the intent), and a shared counter would invalidate a
+// record another side is reading.
 //
 // A counter left odd means its writer died between the two bumps. The next
 // writer takes the record at the next odd value, so no reader can accept the
@@ -56,8 +56,8 @@
 //
 //   1. A process claims the section by an interlocked exchange of initState from
 //      blank (0) or abandoned (3) to initialising (1). It writes initTick first.
-//   2. The claimer writes magic, version and layoutBytes, then publishes
-//      initState = ready (2).
+//   2. The claimer writes magic and layoutBytes, then publishes initState =
+//      ready (2).
 //   3. A process that finds initState = initialising waits and re-checks, in one
 //      millisecond steps, for kSwipeIpcOpenBudgetMs: kSwipeIpcInitAbandonMs plus
 //      one kSwipeIpcInitWaitMs window, so a dead claim becomes abandonable while
@@ -74,7 +74,7 @@
 //   ERROR_NOT_READY    no section was handed over: the section is not ready yet
 //                      or the budget expired. Nothing was changed.
 //   ERROR_INVALID_DATA initState is not one of the four values, or it says ready
-//                      while magic, version or layoutBytes disagrees.
+//                      while magic or layoutBytes disagrees.
 //
 // Neither side ever destroys a section the other side may hold: SwipeIpcClose
 // closes this process's handles only.
@@ -83,10 +83,6 @@
 // The records
 // ---------------------------------------------------------------------------
 //
-// Command (tools -> Start): one line in the syntax `docs/ipc.md` documents. The
-// command event is manual-reset. Only one writer may publish at a time:
-// `tools/ipc.ps1` takes kSwipeIpcCommandMutexName.
-//
 // Open generation (Start -> bridge): a counter the Start side publishes when it
 // sees a fresh menu open. The even value is the identity of that menu. A counter
 // of 0 is not a generation; SwipeIpcReadOpen reports ERROR_NOT_READY.
@@ -94,17 +90,22 @@
 // Intent (bridge -> Start): the one decision record. kind is open/close/external,
 // trigger names the adapter (win, startbutton, clickaway, touch, override), and
 // method/flags are the shell call's own. `open` is the generation the bridge saw.
-// The Start side answers with intentAck (state, duration, entry, hr), echoing the
-// intent's sequence.
+// A close intent's method is evidence about the shell path that produced it; the
+// Start side chooses the executor's execution method separately. The Start side
+// answers with intentAck (state, duration, entry, hr), echoing the intent's
+// sequence.
 //
-// Executor command (Start -> bridge): show, dismiss or cancel. dismiss carries
-// the GetTickCount64 deadline at which the bridge must call the launcher; cancel
-// names the dismiss sequence it supersedes. `execTick` is the publish tick and is
-// the deadline of a show and a cancel. A command older than the publisher's
-// budget past its deadline is stale: the publisher has already cleared its
-// sequence and released ownership, so the bridge answers it as expired instead of
-// calling the launcher. The bridge answers with execAck (state, hr, visible),
-// where visible is the IsVisible result and is advisory for a dismiss.
+// Executor command (Start -> bridge): show, dismiss or cancel. The bridge
+// validates the record before it calls the launcher: a show names a show method
+// (1, 11 or 16) and a flag word from the verified mask; a dismiss names a
+// dismiss method (1 or 6) and no flags; a cancel names the dismiss sequence it
+// supersedes. A dismiss carries the GetTickCount64 deadline at which the bridge
+// must call the launcher; `execTick` is the publish tick and is the deadline of a
+// show and a cancel. A command older than the publisher's budget past its
+// deadline is stale: the publisher has already cleared its sequence and released
+// ownership, so the bridge answers it as expired instead of calling the launcher.
+// The bridge answers with execAck (state, hr, visible), where visible is the
+// IsVisible result and is advisory for a dismiss.
 //
 // Controller state (Start -> bridge): one direction word and one touch flag.
 // controllerDirection is the whole decision: the bridge reads that single word,
@@ -125,36 +126,17 @@
 // stale. That window is a detection budget, not a delivery guarantee.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_v7_State";
-constexpr wchar_t kSwipeIpcCommandEventName[] =
-    L"Local\\SwipeFor10Start_v7_Cmd";
-constexpr wchar_t kSwipeIpcCommandMutexName[] =
-    L"Local\\SwipeFor10Start_v7_CmdWrite";
+    L"Local\\SwipeFor10Start_SingleMod_State";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_v7_Intent";
+    L"Local\\SwipeFor10Start_SingleMod_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_v7_IntentAck";
+    L"Local\\SwipeFor10Start_SingleMod_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_v7_Exec";
+    L"Local\\SwipeFor10Start_SingleMod_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_v7_ExecAck";
+    L"Local\\SwipeFor10Start_SingleMod_ExecAck";
 
 constexpr uint32_t kSwipeIpcMagic = 0x53313053;  // 'S' '0' '1' 'S', LE
-// v7 adds the Start side's activation identity (`peerEpoch`) beside the liveness
-// pair. The section keeps its 744-byte size: `peerEpoch` fills the four bytes
-// after `peerState` that alignment had left, so the size alone no longer names
-// the layout and the version word, in every object name and in the section, is
-// what separates v6 from v7.
-// v6 added the liveness pair at the tail. v5 replaced v4's `controllerOwning` +
-// `controllerPhase` pair with one direction word and dropped `controllerOpen`,
-// which no reader used. Each change moves the section size or its meaning, so the
-// version is bumped deliberately and stays part of every object name: a v6
-// section left by an older build is a different channel, and `layoutBytes` (or
-// `version`, for the same-size v7) refuses it if one is ever handed over anyway.
-constexpr uint32_t kSwipeIpcVersion = 7;
-
-// One command per line, in the same syntax `docs/ipc.md` documents.
-constexpr size_t kSwipeIpcCommandMaxBytes = 512;
 
 // M3 intents, executor commands and acknowledgements.
 constexpr int32_t kSwipeIntentOpen = 0;
@@ -233,12 +215,6 @@ constexpr int32_t kSwipePeerAlive = 1;
 // a copy in each source would drift. The asserts below pin every field.
 struct SwipeIpcState {
     uint32_t magic;
-    uint32_t version;
-
-    // Tools -> Start. cmdSeq is the record's seqlock counter.
-    volatile LONG64 cmdSeq;
-    char cmdText[kSwipeIpcCommandMaxBytes];
-    volatile LONG64 cmdTick;
 
     // Start -> bridge. openSeq is the record's counter and its even value is
     // the open generation.
@@ -252,7 +228,8 @@ struct SwipeIpcState {
 
     // M3: bridge -> Start intent (seqlock). `intentOpen` is the open generation
     // the bridge saw; `intentKind` is open/close/external and `intentTrigger`
-    // names the adapter.
+    // names the adapter. `intentMethod` is the shell method that produced the
+    // trigger (7 for a click-away) and is evidence, not an execution method.
     volatile LONG64 intentSeq;
     volatile LONG64 intentTick;
     volatile LONG intentKind;
@@ -300,16 +277,14 @@ struct SwipeIpcState {
 
     // M3/v5: the Start-side session. One authoritative direction word, so the
     // bridge's toggle rule reads a single atomic value and can never see new
-    // ownership beside the previous phase. The v4 section published owning and
-    // phase as separate words; a reader could see owning=1 with the old phase,
-    // and the bridge read the still-open window as a close during a retract.
+    // ownership beside the previous phase.
     volatile LONG controllerDirection;  // kSwipeDirection*
     // 1 while a touch contact owns the opening panel. The bridge swallows the
     // shell's click-away from that same opening contact; it is the finger that
     // pulled the menu out, not a press outside it.
     volatile LONG controllerTouch;
-    // v6/v7: the Start side's liveness and identity. peerTick is the low 32 bits
-    // of GetTickCount64, so the reader compares by unsigned difference and a wrap
+    // The Start side's liveness and identity. peerTick is the low 32 bits of
+    // GetTickCount64, so the reader compares by unsigned difference and a wrap
     // after 49.7 days is not a discontinuity. peerState is kSwipePeer*.
     // peerEpoch counts attachments: it is incremented before the tick and alive,
     // so an epoch read beside `alive` names the activation that published them.
@@ -319,53 +294,47 @@ struct SwipeIpcState {
 };
 
 static_assert(offsetof(SwipeIpcState, magic) == 0, "layout");
-static_assert(offsetof(SwipeIpcState, version) == 4, "layout");
-static_assert(offsetof(SwipeIpcState, cmdSeq) == 8, "layout");
-static_assert(offsetof(SwipeIpcState, cmdText) == 16, "layout");
-static_assert(offsetof(SwipeIpcState, cmdTick) == 528, "layout");
-static_assert(offsetof(SwipeIpcState, openSeq) == 536, "layout");
-static_assert(offsetof(SwipeIpcState, openTick) == 544, "layout");
-static_assert(offsetof(SwipeIpcState, initState) == 552, "layout");
-static_assert(offsetof(SwipeIpcState, layoutBytes) == 556, "layout");
-static_assert(offsetof(SwipeIpcState, initTick) == 560, "layout");
-static_assert(offsetof(SwipeIpcState, intentSeq) == 568, "layout");
-static_assert(offsetof(SwipeIpcState, intentTick) == 576, "layout");
-static_assert(offsetof(SwipeIpcState, intentKind) == 584, "layout");
-static_assert(offsetof(SwipeIpcState, intentTrigger) == 588, "layout");
-static_assert(offsetof(SwipeIpcState, intentMethod) == 592, "layout");
-static_assert(offsetof(SwipeIpcState, intentFlags) == 596, "layout");
-static_assert(offsetof(SwipeIpcState, intentOpen) == 600, "layout");
-static_assert(offsetof(SwipeIpcState, intentAckSeq) == 608, "layout");
-static_assert(offsetof(SwipeIpcState, intentAckFor) == 616, "layout");
-static_assert(offsetof(SwipeIpcState, intentAckState) == 624, "layout");
-static_assert(offsetof(SwipeIpcState, intentAckDuration) == 628, "layout");
-static_assert(offsetof(SwipeIpcState, intentAckEntry) == 632, "layout");
-static_assert(offsetof(SwipeIpcState, intentAckHr) == 636, "layout");
-static_assert(offsetof(SwipeIpcState, execSeq) == 640, "layout");
-static_assert(offsetof(SwipeIpcState, execTick) == 648, "layout");
-static_assert(offsetof(SwipeIpcState, execKind) == 656, "layout");
-static_assert(offsetof(SwipeIpcState, execMethod) == 660, "layout");
-static_assert(offsetof(SwipeIpcState, execFlags) == 664, "layout");
-static_assert(offsetof(SwipeIpcState, execExecuteAt) == 672, "layout");
-static_assert(offsetof(SwipeIpcState, execOpen) == 680, "layout");
-static_assert(offsetof(SwipeIpcState, execTarget) == 688, "layout");
-static_assert(offsetof(SwipeIpcState, execAckSeq) == 696, "layout");
-static_assert(offsetof(SwipeIpcState, execAckFor) == 704, "layout");
-static_assert(offsetof(SwipeIpcState, execAckState) == 712, "layout");
-static_assert(offsetof(SwipeIpcState, execAckHr) == 716, "layout");
-static_assert(offsetof(SwipeIpcState, execAckVisible) == 720, "layout");
-static_assert(offsetof(SwipeIpcState, controllerDirection) == 724, "layout");
-static_assert(offsetof(SwipeIpcState, controllerTouch) == 728, "layout");
-static_assert(offsetof(SwipeIpcState, peerTick) == 732, "layout");
-static_assert(offsetof(SwipeIpcState, peerState) == 736, "layout");
-static_assert(offsetof(SwipeIpcState, peerEpoch) == 740, "layout");
-static_assert(sizeof(SwipeIpcState) == 744, "layout");
+static_assert(offsetof(SwipeIpcState, openSeq) == 8, "layout");
+static_assert(offsetof(SwipeIpcState, openTick) == 16, "layout");
+static_assert(offsetof(SwipeIpcState, initState) == 24, "layout");
+static_assert(offsetof(SwipeIpcState, layoutBytes) == 28, "layout");
+static_assert(offsetof(SwipeIpcState, initTick) == 32, "layout");
+static_assert(offsetof(SwipeIpcState, intentSeq) == 40, "layout");
+static_assert(offsetof(SwipeIpcState, intentTick) == 48, "layout");
+static_assert(offsetof(SwipeIpcState, intentKind) == 56, "layout");
+static_assert(offsetof(SwipeIpcState, intentTrigger) == 60, "layout");
+static_assert(offsetof(SwipeIpcState, intentMethod) == 64, "layout");
+static_assert(offsetof(SwipeIpcState, intentFlags) == 68, "layout");
+static_assert(offsetof(SwipeIpcState, intentOpen) == 72, "layout");
+static_assert(offsetof(SwipeIpcState, intentAckSeq) == 80, "layout");
+static_assert(offsetof(SwipeIpcState, intentAckFor) == 88, "layout");
+static_assert(offsetof(SwipeIpcState, intentAckState) == 96, "layout");
+static_assert(offsetof(SwipeIpcState, intentAckDuration) == 100, "layout");
+static_assert(offsetof(SwipeIpcState, intentAckEntry) == 104, "layout");
+static_assert(offsetof(SwipeIpcState, intentAckHr) == 108, "layout");
+static_assert(offsetof(SwipeIpcState, execSeq) == 112, "layout");
+static_assert(offsetof(SwipeIpcState, execTick) == 120, "layout");
+static_assert(offsetof(SwipeIpcState, execKind) == 128, "layout");
+static_assert(offsetof(SwipeIpcState, execMethod) == 132, "layout");
+static_assert(offsetof(SwipeIpcState, execFlags) == 136, "layout");
+static_assert(offsetof(SwipeIpcState, execExecuteAt) == 144, "layout");
+static_assert(offsetof(SwipeIpcState, execOpen) == 152, "layout");
+static_assert(offsetof(SwipeIpcState, execTarget) == 160, "layout");
+static_assert(offsetof(SwipeIpcState, execAckSeq) == 168, "layout");
+static_assert(offsetof(SwipeIpcState, execAckFor) == 176, "layout");
+static_assert(offsetof(SwipeIpcState, execAckState) == 184, "layout");
+static_assert(offsetof(SwipeIpcState, execAckHr) == 188, "layout");
+static_assert(offsetof(SwipeIpcState, execAckVisible) == 192, "layout");
+static_assert(offsetof(SwipeIpcState, controllerDirection) == 196, "layout");
+static_assert(offsetof(SwipeIpcState, controllerTouch) == 200, "layout");
+static_assert(offsetof(SwipeIpcState, peerTick) == 204, "layout");
+static_assert(offsetof(SwipeIpcState, peerState) == 208, "layout");
+static_assert(offsetof(SwipeIpcState, peerEpoch) == 212, "layout");
+static_assert(sizeof(SwipeIpcState) == 216, "layout");
 
 struct SwipeIpcChannel {
     SwipeIpcState* state;
     HANDLE mapping;
-    HANDLE commandEvent;
-    HANDLE commandMutex;
     HANDLE intentEvent;
     HANDLE intentAckEvent;
     HANDLE execEvent;
@@ -421,9 +390,9 @@ inline bool SwipeIpcSnapshot(volatile LONG64* sequence, LONG64* outSequence,
 // Creates the channel when the other side has not, initialises it when neither
 // side has, then validates it. `created` reports that this call performed the
 // initialisation. Every member is optional except the section itself: a missing
-// event disables only the direction it carries, a missing mutex serialises
-// nothing. On failure `*error` is ERROR_NOT_READY or ERROR_INVALID_DATA as
-// described above, or the failing Win32 code.
+// event disables only the direction it carries. On failure `*error` is
+// ERROR_NOT_READY or ERROR_INVALID_DATA as described above, or the failing Win32
+// code.
 //
 // This call may sleep for kSwipeIpcOpenBudgetMs while another process finishes
 // its claim, so it belongs at mod init. A hook must not call it: a hook that
@@ -521,7 +490,6 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
 
     if (owner) {
         state->magic = kSwipeIpcMagic;
-        state->version = kSwipeIpcVersion;
         state->layoutBytes = static_cast<LONG>(sizeof(SwipeIpcState));
         MemoryBarrier();
         InterlockedExchange(&state->initState, kSwipeIpcReady);
@@ -529,7 +497,7 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
     }
 
     if (state->initState != kSwipeIpcReady ||
-        state->magic != kSwipeIpcMagic || state->version != kSwipeIpcVersion ||
+        state->magic != kSwipeIpcMagic ||
         state->layoutBytes != static_cast<LONG>(sizeof(SwipeIpcState))) {
         // Broken, or written by another layout. Nothing here is repaired: the
         // other side may be live on it.
@@ -539,12 +507,6 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
         return false;
     }
 
-    // Auto-reset except for the command event: a command that arrived while the
-    // reader was busy must not be forgotten by a second reset.
-    HANDLE commandEvent =
-        CreateEventW(nullptr, TRUE, FALSE, kSwipeIpcCommandEventName);
-    HANDLE commandMutex =
-        CreateMutexW(nullptr, FALSE, kSwipeIpcCommandMutexName);
     HANDLE intentEvent =
         CreateEventW(nullptr, FALSE, FALSE, kSwipeIpcIntentEventName);
     HANDLE intentAckEvent =
@@ -557,8 +519,6 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
     *error = 0;
     channel->state = state;
     channel->mapping = mapping;
-    channel->commandEvent = commandEvent;
-    channel->commandMutex = commandMutex;
     channel->intentEvent = intentEvent;
     channel->intentAckEvent = intentAckEvent;
     channel->execEvent = execEvent;
@@ -566,9 +526,9 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
     return true;
 }
 
-// Drops this process's handles. The section, its events and its mutex stay alive
-// while the other side holds them, so a restarted side reopens the same channel
-// and finds the other side's records where it left them.
+// Drops this process's handles. The section and its events stay alive while the
+// other side holds them, so a restarted side reopens the same channel and finds
+// the other side's records where it left them.
 inline void SwipeIpcClose(SwipeIpcChannel* channel) {
     if (channel->state) {
         UnmapViewOfFile(channel->state);
@@ -576,14 +536,6 @@ inline void SwipeIpcClose(SwipeIpcChannel* channel) {
     if (channel->mapping) {
         CloseHandle(channel->mapping);
     }
-    if (channel->commandEvent) {
-        CloseHandle(channel->commandEvent);
-    }
-    if (channel->commandMutex) {
-        CloseHandle(channel->commandMutex);
-    }
-    // Every event this side opened, the intent event included: it was the one
-    // handle SwipeIpcClose used to leak, so a re-enable opened a second one.
     if (channel->intentEvent) {
         CloseHandle(channel->intentEvent);
     }
@@ -597,33 +549,6 @@ inline void SwipeIpcClose(SwipeIpcChannel* channel) {
         CloseHandle(channel->execAckEvent);
     }
     *channel = SwipeIpcChannel{};
-}
-
-// Copies the newest command when it is newer than `consumed`, and advances it.
-// A torn share of the record is retried inside SwipeIpcSnapshot; a record that
-// never settles inside the attempt budget is reported as "no command" and is
-// taken by the next event, or replaced by the next command.
-inline bool SwipeIpcTakeCommand(SwipeIpcChannel* channel, char* buffer,
-                                size_t count, LONG64* consumed) {
-    if (!channel->state || count < 2) {
-        return false;
-    }
-
-    char text[kSwipeIpcCommandMaxBytes] = {};
-    LONG64 sequence = 0;
-    if (!SwipeIpcSnapshot(&channel->state->cmdSeq, &sequence, [&]() {
-            std::memcpy(text, channel->state->cmdText, sizeof(text));
-        })) {
-        return false;
-    }
-    if (sequence == 0 || sequence == *consumed) {
-        return false;
-    }
-
-    std::strncpy(buffer, text, count - 1);
-    buffer[count - 1] = '\0';
-    *consumed = sequence;
-    return true;
 }
 
 // Publishes a fresh menu open and returns its generation (the even value of the
@@ -1013,4 +938,3 @@ inline bool SwipeIpcPeerAlive(SwipeIpcChannel* channel, uint32_t staleMs) {
     }
     return now - tick < staleMs;
 }
-

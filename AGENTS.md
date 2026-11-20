@@ -169,16 +169,18 @@ removes the retired v2 close/retract slots from the header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h` **v7**: one session-local section (744 bytes), seven
-named objects (State/Cmd/CmdWrite, Intent/IntentAck, Exec/ExecAck), every record a
-seqlock with its own counter and an `offsetof` assert. The M2 close/retract slots
-are gone; the records are the command, the open generation, the intent and its
-ack, the executor command and its ack, one controller direction word plus the
-touch flag, and the liveness triple `peerTick` (732) / `peerState` (736) /
-`peerEpoch` (740, the activation identity). The size did not move from v6, so the
-**version word** is what refuses a v6 section.
-`tools/ipc.ps1` is the only command publisher and takes the mutex; `-State` reads
-v7/744 and prints the peer epoch.
+`mods/swipe_ipc_shared.h`: one session-local section (216 bytes) and four named
+events (`State/Intent/IntentAck/Exec/ExecAck` — five objects), every record a
+seqlock with its own counter and an `offsetof` assert. The names carry the merged
+mod's own prefix (`SwipeFor10Start_SingleMod_`) and there is **no product version
+word**: the namespace is the ABI identity, so an older development image cannot
+join, and a future layout changes the prefix. The records are the open
+generation, the intent and its ack, the executor command and its ack, one
+controller direction word plus the touch flag, and the liveness triple
+`peerTick` (204) / `peerState` (208) / `peerEpoch` (212). The debug command
+record (`cmdText`, `Cmd`, `CmdWrite`, the parser) is **gone**.
+`tools/ipc.ps1` is read-only: `-State` reads 216 bytes and prints the records and
+the peer epoch.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
 `initState` are refused, never waited on. Each role opens the channel at its
 `RoleInit`, never in a hook.

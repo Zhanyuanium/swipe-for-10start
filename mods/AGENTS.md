@@ -333,23 +333,21 @@ HWND, and never clears the reservation itself; a creator that outlives the drain
 makes it refuse. See `docs/lifecycle.md` for the test-build hold that stages the
 creator/reaper interleaving.
 
-### swipe_ipc_shared.h (v7, 744 bytes)
-The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**
-from v3 on; the records that ship are the open generation, the intent and its
-ack, the executor command and its ack, one controller direction word, the touch
-flag, and the peer liveness triple `peerTick` (732, GetTickCount64 low bits) /
-`peerState` (736, alive/gone) / `peerEpoch` (740, the activation identity). Every
-offset is asserted; the magic is `0x53313053` and the version is 7. v5 replaced
-v4's owning/phase pair with that one direction word (the bridge reads one atomic
-value, never a pair) and dropped `controllerOpen`, which no reader used. v6 added
-the liveness pair and took the section from 736 to 744 bytes. v7 adds `peerEpoch`
-at 740, which the 8-byte alignment had already paid for, so the size stays 744 and
-the **version word** is what refuses a v6 section handed over by an older build.
-0.44.0/0.25.0, the last pair versions before the 0.7.0 merge, add no field: the
-ack's outcome word gained values (`confirmed`,
-`unconfirmed`, `unknown`, `superseded`) and the visible word gained
-`unknown = -1`, both inside the existing `LONG` slots, so the version stays 7 and
-`tools/ipc.ps1`/`docs/ipc.md` only document the new names.
+### swipe_ipc_shared.h (merged mod, 216 bytes)
+The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**,
+and so is the debug command record (0.7.0): no `cmdText`/`cmdSeq`/`cmdTick`, no
+`Cmd`/`CmdWrite`, no parser. The records that ship are the open generation, the
+intent and its ack, the executor command and its ack, one controller direction
+word, the touch flag, and the peer liveness triple `peerTick` (204,
+GetTickCount64 low bits) / `peerState` (208, alive/gone) / `peerEpoch` (212, the
+activation identity). Every offset is asserted; the magic is `0x53313053`. There
+is **no version word**: the object namespace
+(`Local\SwipeFor10Start_SingleMod_*`) is the ABI identity, so an old development
+image cannot join and a future layout changes the prefix. The executor validates
+each command before any launcher call: show method 1/11/16 with flags under the
+`0x8|0x4` mask, dismiss method 1/6 with no flags, cancel method/flags 0; anything
+else is refused, never clamped. A click-away intent keeps method 7 as evidence;
+the Start side maps it to executor method 6.
 
 ## Diagnosis (not needed at runtime)
 
