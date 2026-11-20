@@ -475,6 +475,14 @@ false result while the fetch runs is pending with a 120 s deadline, and only the
 deadline logs `unresolved`, installs no root hook and withholds the controller
 service. The shell keeps pumping for the whole fetch.
 
+The controller advertises that service only once the root is attached
+(`PublishPeerReady` requires `g_rendererReady`, not just the hook). A session
+that missed `PrepareRootElement` during the cold fetch has no geometry, so a
+press admitted there would be swallowed for a controller that can only pass it
+through (`win open restore (no geometry)` was measured); with the gate, the peer
+stays unpublished and every press is native until the next host session attaches
+a root.
+
 **v7** adds the Start side's activation identity at the tail: `peerEpoch` at 740,
 which the struct's alignment had already paid for, so the section stays 744 bytes
 and the **version word** — in the object names and in the section — is what

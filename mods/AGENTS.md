@@ -126,8 +126,11 @@ the first call starts Windhawk's PDB fetch and blocking the shell's loader
 thread makes the menu host look hung. A false result while the fetch runs is
 pending (logged with its attempt, elapsed time and the 120 s deadline) and is
 retried; only the deadline produces `unresolved`, no root hook and no peer
-service. The reference address `module+0xAD730` is logged as evidence, not
-required. A disable/enable
+service. The peer is published only once the root is attached: `PublishPeerReady`
+requires `g_rendererReady` as well as the hook, so a session that missed
+`PrepareRootElement` (the cold fetch) advertises nothing and every press stays
+native until the host restarts. The reference address `module+0xAD730` is
+logged as evidence, not required. A disable/enable
 without a host restart reuses the XAML root and has no renderer until the host
 restarts (a measured limit, not a bug to paper over).
 

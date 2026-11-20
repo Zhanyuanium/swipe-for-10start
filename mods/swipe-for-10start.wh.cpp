@@ -1110,7 +1110,9 @@ Known risks:
   one reason after the 120 s pending deadline,
   `startui root symbol unresolved name=...`; without the root there is no
   renderer, so no gesture starts and the controller advertises no service (the
-  shell handles every press natively).
+  shell handles every press natively). The peer is published only once a root is
+  attached: a session that missed `PrepareRootElement` during the cold symbol
+  fetch stays native until the host restarts.
 - The instance guard's name is process local:
   `Local\WindhawkLegacyStartSwipe.instance.<pid>`. A residual instance holds it
   for the life of the process, so re-enabling the mod there is refused with one
@@ -3983,12 +3985,15 @@ void PublishPeerGone(const wchar_t* why) {
 // activation's tick as this one's. This write is not throttled.
 //
 // "Availability" here is intent-consumer readiness: this thread's window, its
-// message loop and the intent event exist. A refused raw-input registration is
+// message loop and the intent event exist, the root hook is installed, and a
+// root is attached (`g_rendererReady`). A refused raw-input registration is
 // logged by RegisterHidUsage and does not withdraw it — the touch half degrades,
 // the intent half that the bridge's interception depends on still runs.
-void PublishPeerReady(const wchar_t* why) {
+//
+// Returns true when this call published `alive`.
+bool PublishPeerReady(const wchar_t* why) {
     if (!g_ipc.state) {
-        return;
+        return false;
     }
     // A controller that could not resolve its root hook cannot drive the panel:
     // it must not advertise an interception service, or the bridge would
@@ -3997,20 +4002,29 @@ void PublishPeerReady(const wchar_t* why) {
     if (!g_rootHookReady.load(std::memory_order_acquire)) {
         FileLog(L"ipc peer not published reason=no-root-hook refused=%d",
                 g_rootHookRefused.load(std::memory_order_acquire) ? 1 : 0);
-        return;
+        return false;
+    }
+    // A root hook without an attached root has no geometry: the controller
+    // cannot plan a settle or follow a finger, and a press admitted in that
+    // window is swallowed for a service that can only pass it through. The cold
+    // session's Win close produced `win open restore (no geometry)` and left the
+    // menu open. The peer is announced when the root is.
+    if (!g_rendererReady.load(std::memory_order_acquire)) {
+        FileLog(L"ipc peer not published reason=no-renderer");
+        return false;
     }
     if (!g_ipc.intentEvent) {
         // Without the intent event the bridge can publish a decision nobody
         // wakes for. That is not a consumer, so it is not announced.
         FileLog(L"ipc peer not published reason=no-intent-event");
-        return;
+        return false;
     }
     bool published = false;
     AcquireSRWLockExclusive(&g_peerLock);
     if (g_peerTerminal) {
         ReleaseSRWLockExclusive(&g_peerLock);
         FileLog(L"ipc peer not published reason=terminal-withdrawal");
-        return;
+        return false;
     }
     const uint64_t now = GetTickCount64();
     g_peerTickLast = static_cast<uint32_t>(now);
@@ -4024,6 +4038,7 @@ void PublishPeerReady(const wchar_t* why) {
                 g_peerEpoch, g_touchRegistered ? 1 : 0,
                 g_penRegistered ? 1 : 0);
     }
+    return published;
 }
 
 void OpenIpcChannel() {
@@ -9442,18 +9457,20 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // `alive` written earlier promises a service that does not exist yet, and the
     // bridge would swallow a press for a consumer that has not begun to serve.
     //
-    // The root hook is the second condition. It is normally installed before
-    // this thread exists; a StartUI_ that loads later is picked up by the
-    // LoadLibraryExW notification, and this thread publishes on the next tick —
-    // still from the consumer itself, never from the loading thread.
+    // The root hook and an attached root are the second condition. The hook is
+    // normally installed before this thread exists; a StartUI_ that loads later
+    // is picked up by the LoadLibraryExW notification, and this thread publishes
+    // once Setup attaches the root — still from the consumer itself, never from
+    // the loading thread.
     bool peerAnnounced = false;
+    bool rendererWaitLogged = false;
     // The root hook is resolved here and not by the LoadLibraryExW notification:
     // the first symbol load blocks for Windhawk's PDB fetch, and this thread is
     // the mod's own. A pending result leaves the peer unpublished.
     ProbeRootSymbolFromInputThread();
-    if (g_rootHookReady.load(std::memory_order_acquire)) {
-        PublishPeerReady(L"consumer");
-        peerAnnounced = true;
+    if (g_rootHookReady.load(std::memory_order_acquire) &&
+        g_rendererReady.load(std::memory_order_acquire)) {
+        peerAnnounced = PublishPeerReady(L"consumer");
     }
     while (running) {
         // The module appears after this thread starts in the measured host, so
@@ -9461,9 +9478,18 @@ DWORD WINAPI HidInputThread(LPVOID) {
         // the result is pending and stops as soon as ready or refused is set.
         ProbeRootSymbolFromInputThread();
         if (!peerAnnounced &&
-            g_rootHookReady.load(std::memory_order_acquire)) {
-            PublishPeerReady(L"consumer");
-            peerAnnounced = true;
+            g_rootHookReady.load(std::memory_order_acquire) &&
+            g_rendererReady.load(std::memory_order_acquire)) {
+            peerAnnounced = PublishPeerReady(L"consumer");
+        }
+        if (!peerAnnounced && !rendererWaitLogged &&
+            g_rootHookReady.load(std::memory_order_acquire) &&
+            !g_rendererReady.load(std::memory_order_acquire)) {
+            // One line per activation: the hook is ready, the root is not. The
+            // service waits for Setup; a session that never attaches advertises
+            // nothing and every press stays native.
+            rendererWaitLogged = true;
+            FileLog(L"ipc peer withheld reason=no-renderer");
         }
         // Bounded, so the stop flag is observed even if the stop event were
         // missing from the set; the event itself is object 0 and wakes this at
