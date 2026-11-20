@@ -90,9 +90,9 @@ Triggers and their decision lines:
 
 | Trigger | Hook | Decision |
 |---|---|---|
-| Windows key | `XamlLauncher::OnHotkeyInvoke` (`+0x14195C`) | `own win decide state=… kind=open|close` |
-| Start button open | `ShowStartView` method 11 | `intent open trigger=startbutton` |
-| Start button close | `Dismiss` method 6 | `intent close trigger=startbutton` |
+| Windows key | `XamlLauncher::OnHotkeyInvoke` (`+0x14195C`) | `own toggle decide trigger=win … kind=open|close` |
+| Start button open | `ShowStartView` method 11 | `own toggle decide trigger=startbutton …` |
+| Start button close | `Dismiss` method 6 | `own toggle decide trigger=startbutton …` |
 | click-away | `HideStartAndCortana` method 7 | `intent close trigger=clickaway` |
 | touch | the Start side's band admission | `reveal show request` |
 
