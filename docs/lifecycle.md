@@ -100,12 +100,22 @@ reduced, not eliminated.
 A re-enable re-initialises the same image without the loader resetting
 anything, and refuses while a close from the previous activation is still inside
 (`mod init refused: a close from the previous activation is still inside;
-...`); otherwise `ResetReinitState()` clears `g_disabled`, `g_afterInit`,
-`g_explorerHooked`, `g_closeHookEnabled` and `g_startPointTick`, retries a
+...`) or while the previous activation's executor worker is still running
+(`... executor worker is still running; ...`, a join timeout that kept its
+handles instead of closing one under the live thread); otherwise
+`ResetReinitState()` clears `g_disabled`, `g_afterInit`,
+`g_explorerHooked`, `g_closeHookEnabled`, `g_startPointTick` and the executor's
+pending command, press latch, accepted sequence and thread ids, retries a
 failed gesture mapping, leaves `g_closeCalls` alone, and logs `activation state
 reset`; a drained unload closes the channel before it returns, so a re-enable
 opens a fresh one. `Wh_ModInit` still reuses a channel `g_ipc` already holds
 instead of mapping a second one over it.
+
+The unload order on the bridge is the executor first, then the drain: the ready
+flag clears, the worker is joined, and the launcher thread destroys the window
+and its three timers with an acknowledged `WM_CLOSE`. Every executor dispatch
+holds a `CloseCallLease`, so the count that gates the channel close covers
+commands as well as close hooks.
 
 ## The host's unload boundary
 
@@ -114,6 +124,7 @@ The host order was established from the installed engine's upstream tag
 hooks, `Wh_ModUninit`, `ThreadsCallStackWaitForRegions(..., 200, 400)`, remove
 hooks, `FreeLibrary`, with that wait's result discarded. "The scan found the
 frame" and "the frame exited before removal" are therefore two different
-claims, and only the first is the host's. The bridge's counted-`Hide` drain is
-the mod-side half of that boundary; its measured behaviour is in
-[ipc.md](ipc.md#the-bridges-unload-drain).
+claims, and only the first is the host's. The bridge's counted close-hook and
+executor-dispatch drain is the mod-side half of that boundary; the executor's
+thread rule and its unload acknowledgement are in
+[architecture.md](architecture.md#the-executor-thread).
