@@ -3351,13 +3351,16 @@ bool ExecCommandForCurrentMenu(const SwipeIpcExecCommand& command,
     uint64_t open = 0;
     uint64_t openTick = 0;
     SwipeIpcReadOpen(&g_ipc, &open, &openTick);
-    if (command.open == 0 || openTick == 0 || command.open == openTick) {
+    // `open` is the generation and `openTick` the tick it was published at. The
+    // record carries the generation, so the two generations are what must be
+    // compared; comparing a generation against a tick refused every command.
+    if (command.open == 0 || open == 0 || command.open == open) {
         return true;
     }
     FileLog(L"exec %s seq=%lld superseded menu=%llu now=%llu", kind,
             static_cast<long long>(command.seq),
             static_cast<unsigned long long>(command.open),
-            static_cast<unsigned long long>(openTick));
+            static_cast<unsigned long long>(open));
     return false;
 }
 
