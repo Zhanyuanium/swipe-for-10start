@@ -337,14 +337,16 @@ The decision and the executor:
  *   window and primitive the decision needs exist; otherwise every trigger passes
  *   to the shell (`own pass trigger=... reason=no-peer|no-executor|wrong-thread|
  *   no-window`, and `exec pass hide ... reason=no-primitive` for the close
- *   intent). A press is never lost: a hide in flight (state 9/11) or a dismiss
- *   already armed is latched (one slot, tick, activation epoch) and served as the
- *   same open intent 50 ms after the
+ *   intent). A press is normally recovered: a hide in flight (state 9/11) or a
+ *   dismiss already armed is latched (one slot, tick, activation epoch) and
+ *   served as the same open intent 50 ms after the
  *   hidden event (`own press served wait=...`); the deferral keeps the show off
  *   the hidden event's stack (a show at its own tick was swallowed, state 3, no
  *   Shown). A close still cancellable publishes open at once and the Start side
- *   settles the panel back from its live position; a second press replaces the
- *   slot. The click-away the shell
+ *   settles the panel back from its live position; a newer press supersedes the
+ *   slot; a serve re-reads the peer and the epoch; a refused or expired dismiss
+ *   invalidates it; and a press lost to the 600 ms detection budget is served by
+ *   the shell. The click-away the shell
  *   issues while the window is appearing (state 1/3) and the Hide(7) inside our
  *   own ShowStartView in state 1/3 are the pointer-away check and are swallowed
  *   (`reason=opening`/`reason=own-show`). The shell's own show/dismiss is
@@ -1427,15 +1429,6 @@ HideStartAndCortana_t HideStartAndCortana_Original = nullptr;
 // Nothing here writes InternalState and nothing caches a manager or a state
 // pointer across calls.
 
-enum class OwnTrigger : int {
-    None = 0,
-    Win,
-    StartButton,
-    ClickAway,
-    Foreign,
-    Shell,
-};
-
 enum class OwnCaller : int {
     Ordinary = 0,  // DismissStartAndCortana: Win, Start button, our Dismiss
     ClickAway,     // the delegate sub_4916D0
@@ -1470,9 +1463,6 @@ uintptr_t g_twinuiBase = 0;
 // LauncherNow, which is the one checked reader.
 SRWLOCK g_ownLock = SRWLOCK_INIT;
 bool g_ownOpen = false;
-// The trigger of the close this thread's Dismiss call is executing, for the
-// executor's log only. Set around the Dismiss call, cleared after it returns.
-OwnTrigger g_ownCloseTrigger = OwnTrigger::None;
 
 std::atomic<bool> g_ownWinEnabled{false};
 std::atomic<bool> g_ownButtonEnabled{false};
@@ -1491,47 +1481,6 @@ std::atomic<bool> g_callersVerified{false};
 // matching executor frame and restored by the guard, so a later or unrelated
 // call on the same thread cannot inherit it. See OnHotkeyInvoke_Hook.
 thread_local uint32_t t_ownExternalMethod = 0;
-
-// Set while this thread is inside a call this mod's own decision made. The
-// Dismiss/ShowStartView observation hooks use it to tell their own call from a
-// foreign caller (the taskbar's Start button on this build calls the launcher's
-// Dismiss/ShowStartView directly, not OnStartButtonPressed).
-thread_local int t_ownDecisionCall = 0;
-
-// Set by the Dismiss observation hook around a foreign close, so the executor
-// names the trigger it is serving. Thread-local and scoped; it cannot outlive
-// the synchronous original call it marks.
-thread_local bool t_ownForeignClose = false;
-
-// Non-zero while this thread is anywhere inside the close executor, the wait
-// and the original call included. A press delivered by the message pump inside
-// the shell Hide is nested here; its reopen must be latched, not presented,
-// because ShowStartView from under the Hide does not return (measured).
-thread_local int t_ownCloseExecutor = 0;
-
-struct OwnCloseExecutorGuard {
-    OwnCloseExecutorGuard() { ++t_ownCloseExecutor; }
-    ~OwnCloseExecutorGuard() { --t_ownCloseExecutor; }
-    OwnCloseExecutorGuard(const OwnCloseExecutorGuard&) = delete;
-    OwnCloseExecutorGuard& operator=(const OwnCloseExecutorGuard&) = delete;
-};
-
-struct OwnDecisionCallGuard {
-    OwnDecisionCallGuard() { ++t_ownDecisionCall; }
-    ~OwnDecisionCallGuard() { --t_ownDecisionCall; }
-    OwnDecisionCallGuard(const OwnDecisionCallGuard&) = delete;
-    OwnDecisionCallGuard& operator=(const OwnDecisionCallGuard&) = delete;
-};
-
-struct OwnForeignCloseGuard {
-    bool previous;
-    OwnForeignCloseGuard() : previous(t_ownForeignClose) {
-        t_ownForeignClose = true;
-    }
-    ~OwnForeignCloseGuard() { t_ownForeignClose = previous; }
-    OwnForeignCloseGuard(const OwnForeignCloseGuard&) = delete;
-    OwnForeignCloseGuard& operator=(const OwnForeignCloseGuard&) = delete;
-};
 
 struct OwnExternalForwardGuard {
     uint32_t previous;
@@ -2146,13 +2095,12 @@ bool ServeLatchedPress(const wchar_t* reason) {
         return false;
     }
     if (own.open || ShellHideInFlight(own)) {
-        // The landing has not happened. A panel that is settled open with no
-        // armed dismiss is the other shape: the hide this latch waited for was
-        // refused or never ran, so the reopen can never be served. Drop it there
-        // rather than retrying until the deadline.
-        if (own.open && own.state == 5 && g_pendingDismissSeq == 0) {
-            DropPressLatch(L"dismiss-refused", reason);
-        }
+        // The landing has not happened. A definitely failed hide is dropped at
+        // its own observation instead of here: a refused or expired dismiss in
+        // ExecuteDismiss/ExecuteDueDismiss, and a still-visible window at the
+        // 300 ms confirmation (`dismiss-unconfirmed`). The settled-open state is
+        // not used as that test, because the retract-before-dismiss and the
+        // dismiss-returned-before-cloak windows both read as a shown panel too.
         return false;
     }
     const PressLatch latch = g_pressLatch;
@@ -2373,8 +2321,7 @@ DismissHook_t Dismiss_Original = nullptr;
 HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
     const CloseCallLease closeCall;
     if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
-        g_disabled.load(std::memory_order_relaxed) || t_execCall > 0 ||
-        t_ownDecisionCall > 0) {
+        g_disabled.load(std::memory_order_relaxed) || t_execCall > 0) {
         return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
     }
     if (!BridgeCanServeOnLauncherThread(L"dismiss")) {
@@ -2409,8 +2356,7 @@ ShowStartViewHook_t ShowStartView_Original = nullptr;
 HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
     const CloseCallLease closeCall;
     if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
-        g_disabled.load(std::memory_order_relaxed) || t_execCall > 0 ||
-        t_ownDecisionCall > 0) {
+        g_disabled.load(std::memory_order_relaxed) || t_execCall > 0) {
         return ShowStartView_Original
                    ? ShowStartView_Original(launcher, method, flags)
                    : E_FAIL;
@@ -3109,9 +3055,6 @@ void ResetReinitState() {
     g_pressLatch = PressLatch{};
     g_pressServeReason = L"timeout";
     t_ownExternalMethod = 0;
-    t_ownDecisionCall = 0;
-    t_ownForeignClose = false;
-    t_ownCloseExecutor = 0;
     // The executor's lifetime protocol, which the refusal checks above have
     // proved complete: no worker, no identified window, no creator. Only now is
     // admission reopened; a stop that did not complete left it closed and the
@@ -3122,7 +3065,6 @@ void ResetReinitState() {
     g_execWorkerId = 0;
     AcquireSRWLockExclusive(&g_ownLock);
     g_ownOpen = false;
-    g_ownCloseTrigger = OwnTrigger::None;
     ReleaseSRWLockExclusive(&g_ownLock);
     // A failed gesture mapping is retried by the next activation, as it was
     // when every activation loaded a fresh image. A ready one is kept: the
@@ -3539,11 +3481,16 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
             const bool visible = LauncherVisibleNow(launcher);
             // The bounded confirmation: `hr=0` said the primitive returned, and
             // this says whether the window actually went away. A still-visible
-            // window is recorded, not reported as a hide.
+            // window is recorded, not reported as a hide, and the press latch
+            // that was waiting for this hide is dropped: its reopen has no
+            // landing to be served at.
             FileLog(L"exec dismiss %s seq=%lld visible=%d at_call=%d after=%u ms",
                     visible ? L"unconfirmed" : L"confirmed",
                     static_cast<long long>(sequence), visible ? 1 : 0, atCall,
                     static_cast<unsigned>(kExecDismissConfirmMs));
+            if (visible) {
+                DropPressLatch(L"dismiss-unconfirmed", L"confirmation");
+            }
         }
         return 0;
     }

@@ -62,7 +62,46 @@
   so `t=0` is the UP and not the end of the preceding capture. Its start point
   and scan band are the top-taskbar geometry.
 - `tools/ipc.ps1` — the debug channel's only command publisher; see
-  [ipc.md](ipc.md#the-v2-channel) for the protocol and the commands it takes.
+  [ipc.md](ipc.md) for the protocol, the v7 records and the commands it takes.
+  `-State` prints `peerEpoch` beside `peerTick`/`peerState`, which is how a
+  re-enable is told from a still-running activation.
+
+## Round-2 runtime checks
+
+Each line is what a run must show for one review item; the code half is in
+`mods/` and the static limits are named in the item's notes.
+
+- **A — unload acknowledgement.** Enable the bridge, disable it, enable it again.
+  `bridge.log` shows `exec window destroyed` (or `destroyed directly`) and
+  `ipc close` on the first cycle, then `activation state reset` and a fresh
+  `exec window hwnd=...` on the second. A forced timeout must instead show
+  `ipc close deferred` and the next enable `exec reinit refused: ...`, never a
+  second `exec window hwnd` while the old one lives.
+- **B — activation identity and availability.** Disable the Start mod while a
+  close is running; `bridge.log` must show `own pass trigger=... reason=no-peer`
+  (or `exec pass hide method=... reason=no-peer`) from the moment of the disable,
+  and the next `ipc peer alive reason=consumer` must carry a **new** `epoch`. A
+  press during the gap opens or closes natively once.
+- **C — detection budget.** With the Start mod disabled, `own pass trigger=...
+  reason=no-peer` appears at the first press; `own press latch dropped
+  reason=peer-gone` appears when a latched press outlives its peer.
+- **D — capability.** On the shipping build, a click-away close logs
+  `intent close trigger=clickaway ...` only after the executor exists; with the
+  worker refused, `exec pass hide method=7 reason=no-executor` (or
+  `no-window`/`wrong-thread`/`no-primitive`) and the shell's own close runs.
+- **E — expiry and confirmation.** A `dismiss` whose dispatch is delayed past
+  `executeAt + 400 ms` logs `exec dismiss seq=... expired` and no
+  `exec dismiss ... hr=`; every successful close is followed by `exec dismiss
+  confirmed seq=... visible=0` (or `unconfirmed`). With the channel closed,
+  `exec show request skipped ... reason=no-channel` and `intent open refused
+  ... reason=no-executor` replace a claimed open.
+- **F — latch supersession.** Press Win to close, then press the Start button
+  before the landing: `own press latch dropped reason=superseded newer-press
+  wait=...` (no serve of the older slot). A latch whose dismiss failed logs
+  `reason=dismiss-refused` and stops retrying.
+- **G — landing order.** With Win+Tab immediately after a Win press, the landing
+  logs `intent reconcile seq=... kind=external (before landing recovery)` and no
+  `intent open recovered`.
 
 ## Artifacts
 

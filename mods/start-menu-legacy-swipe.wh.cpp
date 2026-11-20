@@ -4006,6 +4006,12 @@ void PublishPeerReady(const wchar_t* why) {
     if (!g_ipc.state) {
         return;
     }
+    if (!g_ipc.intentEvent) {
+        // Without the intent event the bridge can publish a decision nobody
+        // wakes for. That is not a consumer, so it is not announced.
+        FileLog(L"ipc peer not published reason=no-intent-event");
+        return;
+    }
     const uint64_t now = GetTickCount64();
     g_peerTickLast = static_cast<uint32_t>(now);
     SwipeIpcPublishPeerTick(&g_ipc, now);
@@ -4275,11 +4281,6 @@ void ApplyDebugCommands(char* text) {
     }
 }
 
-// Applies the newest debug command, if one arrived. The command event is
-// manual-reset, so a command published while this runs is not lost: the next
-// pass takes it. Nothing runs before the renderer exists, because before the
-// first Setup neither mechanism has an object to act on; a command that arrives
-// then stays in the section and is replaced by the next one.
 // M3 executor requests. The bridge owns ShowStartView/Dismiss; these publish the
 // command and its sequence. Each returns whether a consumer can actually run it:
 // no section, or no Exec event to wake the worker, means nothing will execute the
@@ -4361,6 +4362,11 @@ LONG64 CancelPendingDismiss(const wchar_t* reason) {
 // and close paths above use it; defined with the ack handling.
 void ReleaseExecutorOwnership();
 
+// Applies the newest debug command, if one arrived. The command event is
+// manual-reset, so a command published while this runs is not lost: the next
+// pass takes it. Nothing runs before the renderer exists, because before the
+// first Setup neither mechanism has an object to act on; a command that arrives
+// then stays in the section and is replaced by the next one.
 void ApplyPendingCommand() {
     ResetEvent(g_ipc.commandEvent);
     if (g_unloading.load(std::memory_order_relaxed) ||
@@ -5675,6 +5681,10 @@ float EndVelocityProgressPerMs(uint64_t releaseQpc) {
 // - the close mute and the deferred-layout flag, plus the panel-ownership
 //   publication derived from the sessions;
 // - the pending dismiss and the pull generation it was armed under;
+// - the executor sequences and deadlines (show, dismiss), the pending open entry
+//   and the last consumed intent sequence;
+// - the recovery ticket of an open that cancelled a close, and the activation's
+//   peer epoch (the next attach claims a new one);
 // - the coast and both velocity windows;
 // - the diagnostic latches that steer behaviour, and the `anim` debug override.
 //
@@ -5715,6 +5725,8 @@ void ResetActivationState() {
     // acted on nothing, and OpenIpcChannel overwrites it before the thread runs.
     g_lastIntentSeq = 0;
     g_intentCancel = CloseCancelTicket{};
+    // The next attach claims a new identity; until then this activation has none.
+    g_peerEpoch = 0;
 
     g_panel.coasting.store(false, std::memory_order_relaxed);
     g_panel.coastStartQpc = 0;
@@ -5724,7 +5736,6 @@ void ResetActivationState() {
     ResetEndVelocity();
 
     g_commitNeedsProgressReset = false;
-    g_intentCancel = CloseCancelTicket{};
     g_rootWasOpen = false;
     g_openCheckValid = false;
     g_openCheckOpen = false;
@@ -6117,6 +6128,33 @@ bool VerticalDismissAllowed(const GestureGeometry& geometry, int32_t axis,
     return false;
 }
 
+// The stores both own-opens write: the entry, its insertion, the pending open and
+// its entry, the controller's direction and touch, and the show request. The two
+// callers keep their own preconditions and their own log line — the band admits a
+// contact, a landing serves a close — and this function owns exactly the writes
+// they share. The closed keyboard intent's `g_panel.Begin` is deliberately not
+// here: that path starts the controller at the entry, while these two replace a
+// panel that is being pulled or restored from a settled position.
+//
+// False means the show could not be requested. Nothing may claim an open that no
+// executor can present, so the claim is withdrawn in one step and the caller
+// leaves the panel to the path that can still open it.
+bool PublishOpenClaim(const GestureGeometry& geometry, bool touch,
+                      float& entryOut) {
+    const float entry = std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
+    InsertProgress(entry);
+    g_intentOpenActive.store(true, std::memory_order_relaxed);
+    g_intentOpenEntry.store(entry, std::memory_order_relaxed);
+    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
+    SwipeIpcSetControllerTouch(&g_ipc, touch);
+    entryOut = entry;
+    if (!RequestBridgeShow(1, 0)) {
+        ReleaseExecutorOwnership();
+        return false;
+    }
+    return true;
+}
+
 // Starts one reveal follow. Both entry points come through here — a contact
 // admitted on the down because it began inside the taskbar band, and a contact
 // adopted because the menu opened under it while it was already pulling — so the
@@ -6159,24 +6197,16 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     if (!StartWindowIsOpen() &&
         !g_intentOpenActive.load(std::memory_order_relaxed)) {
         const GestureGeometry geometry = ReadGestureGeometry();
-        const float entry =
-            std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
-        InsertProgress(entry);
-        g_intentOpenActive.store(true, std::memory_order_relaxed);
-        g_intentOpenEntry.store(entry, std::memory_order_relaxed);
-        SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
-        SwipeIpcSetControllerTouch(&g_ipc, true);
-        if (!RequestBridgeShow(1, 0)) {
-            // No executor can present this open, so the controller must not claim
-            // it: the direction, the touch mark and the pending entry go back in
-            // one step, and the shell's own band gesture remains the owner of the
+        float entry = 0.0f;
+        if (PublishOpenClaim(geometry, true, entry)) {
+            FileLog(L"reveal show request entry=%.3f", entry);
+        } else {
+            // No executor can present this open: the claim is withdrawn by the
+            // helper and the shell's own band gesture remains the owner of the
             // open. The pull keeps its candidate and its release history, so an
             // open the shell performs anyway is adopted at the next poll.
-            ReleaseExecutorOwnership();
             FileLog(L"reveal show request failed entry=%.3f reason=no-executor",
                     entry);
-        } else {
-            FileLog(L"reveal show request entry=%.3f", entry);
         }
     }
 
@@ -7959,10 +7989,6 @@ void PostUiOpenWatchRelease(uint32_t closedGeneration,
     }
 }
 
-// The one repair every terminal executor failure performs; defined with the ack
-// handling below, used by the close path above.
-void ReleaseExecutorOwnership();
-
 // The open/close transitions the poll below observes, including why a close that
 // is not this mod's own is not fought, are documented at PollRootVisibility.
 
@@ -8203,13 +8229,18 @@ void CheckExecAckTimeout(uint64_t now) {
     if (show != 0 && now >= g_pendingShowUntil.load(std::memory_order_relaxed)) {
         g_pendingShowExec.store(0, std::memory_order_relaxed);
         g_pendingShowUntil.store(0, std::memory_order_relaxed);
-        if (g_ipc.state) {
+        // A pending close has already written its own record over this show's
+        // slot, so a cancel now would replace the dismiss that is about to run.
+        // Only a timeout with no close behind it supersedes the record.
+        const bool dismissPending =
+            g_pendingDismissExec.load(std::memory_order_relaxed) != 0;
+        if (!dismissPending && g_ipc.state) {
             SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, 0);
             FileLog(L"exec cancel request target=0 reason=show-expired");
         }
         // Same rule as a refused show: a pending close owns the panel and its
         // state is not this silence's to clear.
-        if (g_pendingDismissExec.load(std::memory_order_relaxed) == 0) {
+        if (!dismissPending) {
             ReleaseExecutorOwnership();
         }
         FileLog(L"exec ack timeout seq=%lld kind=show open=%d (resync from "
@@ -8238,27 +8269,6 @@ void CheckExecAckTimeout(uint64_t now) {
             static_cast<long long>(dismiss), StartWindowIsOpen() ? 1 : 0);
 }
 
-// Two things happen here. A closed-to-open transition that no reveal owns is a
-// keyboard, Start-button or tray open: the shell slides its own storyboard and
-// the mod makes `Progress` follow from 0, so the same root slides the same way a
-// gesture open does. The settle needs the measured travel, so an open that lands
-// before the first geometry publish restores the resting value and lets the
-// shell's storyboard run instead. A close that is not this mod's own (an
-// external takeover: Win+Tab, the lock screen, a display change) is not fought:
-// nothing is inserted, the pull is dropped, and the next open starts from 0
-// again.
-//
-// The poll runs on the 5 ms idle tick but accepts one cloaked answer per 20 ms;
-// it used 100 ms for the restore check alone. Measured against the uncloak, a
-// 100 ms throttle started the open slide up to 94 ms late, so the panel sat at
-// rest first and then jumped out and slid back in. 20 ms keeps the start within
-// one compositor frame of the shell's own open, which is what makes the two read
-// as one animation.
-//
-// The open transition is also the one place the gesture geometry is refreshed
-// without a system event: the XAML root is reused between opens, so
-// PrepareRootElement does not fire again and the axis, Distance and DirX/DirY
-// captured by Setup can belong to a taskbar that has moved since.
 // A superseding intent that arrived with the landing. See PollRootVisibility: the
 // idle timer is waited on before the intent event, so the landing can be served
 // first. Only `external` is reconciled here — an open or close intent is the user
@@ -8292,19 +8302,11 @@ bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
         return false;
     }
     const GestureGeometry geometry = ReadGestureGeometry();
-    const float entry = std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
-    InsertProgress(entry);
-    g_intentOpenActive.store(true, std::memory_order_relaxed);
-    g_intentOpenEntry.store(entry, std::memory_order_relaxed);
-    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
-    if (pullReopen) {
-        SwipeIpcSetControllerTouch(&g_ipc, true);
-    }
-    if (!RequestBridgeShow(1, 0)) {
+    float entry = 0.0f;
+    if (!PublishOpenClaim(geometry, pullReopen, entry)) {
         // The landing cannot present anything: the panel stays retracted with the
         // window hidden, and the controller claims nothing. The next open
         // (the shell's own or a later pull) starts from the entry again.
-        ReleaseExecutorOwnership();
         FileLog(L"landing open failed entry=%.3f pull=%d reason=no-executor",
                 entry, pullReopen ? 1 : 0);
         return false;
@@ -8318,6 +8320,32 @@ bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
     return true;
 }
 
+// Two things happen here. A closed-to-open transition that no reveal owns is a
+// keyboard, Start-button or tray open: the shell slides its own storyboard and
+// the mod makes `Progress` follow from 0, so the same root slides the same way a
+// gesture open does. The settle needs the measured travel, so an open that lands
+// before the first geometry publish restores the resting value and lets the
+// shell's storyboard run instead. A close that is not this mod's own (an
+// external takeover: Win+Tab, the lock screen, a display change) is not fought:
+// nothing is inserted, the pull is dropped, and the next open starts from 0
+// again.
+//
+// The poll runs on the 5 ms idle tick but accepts one cloaked answer per 20 ms;
+// it used 100 ms for the restore check alone. Measured against the uncloak, a
+// 100 ms throttle started the open slide up to 94 ms late, so the panel sat at
+// rest first and then jumped out and slid back in. 20 ms keeps the start within
+// one compositor frame of the shell's own open, which is what makes the two read
+// as one animation.
+//
+// The open transition is also the one place the gesture geometry is refreshed
+// without a system event: the XAML root is reused between opens, so
+// PrepareRootElement does not fire again and the axis, Distance and DirX/DirY
+// captured by Setup can belong to a taskbar that has moved since.
+//
+// The landing runs on this thread's idle timer, which is waited on before the
+// intent event: a superseding intent that arrived with the landing is reconciled
+// before the landing may serve a recovery (ReconcileSupersedingIntentBeforeLanding),
+// or the now-external close would reissue an open the takeover had just revoked.
 void PollRootVisibility(uint64_t tickMs) {
     static uint64_t lastPollTick = 0;
     if (tickMs - lastPollTick < kOpenCheckIntervalMs) {
@@ -9215,12 +9243,13 @@ DWORD WINAPI HidInputThread(LPVOID) {
 
     MSG msg;
     bool running = true;
-    // The consumer is ready here: the window exists, both raw-input usages are
-    // registered, the timer and the event set are built, and this thread is about
-    // to wait on the intents. Availability is published from this point and never
-    // from init: an `alive` written earlier promises a service that does not exist
-    // yet, and the bridge would swallow a press for a consumer that has not begun
-    // to serve.
+    // The consumer is ready here: the window exists, both raw-input usages have
+    // been registered (a refused registration is logged and leaves the intent
+    // half of this thread working, so it does not withdraw availability), the
+    // timer and the event set are built, and this thread is about to wait on the
+    // intents. Availability is published from this point and never from init: an
+    // `alive` written earlier promises a service that does not exist yet, and the
+    // bridge would swallow a press for a consumer that has not begun to serve.
     PublishPeerReady(L"consumer");
     while (running) {
         // Bounded, so the stop flag is observed even if the stop event were

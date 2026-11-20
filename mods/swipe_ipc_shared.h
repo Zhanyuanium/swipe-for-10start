@@ -557,6 +557,11 @@ inline void SwipeIpcClose(SwipeIpcChannel* channel) {
     if (channel->commandMutex) {
         CloseHandle(channel->commandMutex);
     }
+    // Every event this side opened, the intent event included: it was the one
+    // handle SwipeIpcClose used to leak, so a re-enable opened a second one.
+    if (channel->intentEvent) {
+        CloseHandle(channel->intentEvent);
+    }
     if (channel->intentAckEvent) {
         CloseHandle(channel->intentAckEvent);
     }

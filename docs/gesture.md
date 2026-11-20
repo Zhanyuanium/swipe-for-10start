@@ -25,7 +25,11 @@ contact lifts.
 1. **Band admission** — the first positioned report inside the band while the
    window is closed. `StartRevealFollow` records the down point, starts the
    timing, and requests `exec show` **once per open** (`g_intentOpenActive`).
-   It sets `controllerDirection` to `1` (open) and `controllerTouch`.
+   It sets `controllerDirection` to `1` (open) and `controllerTouch`, through the
+   same `PublishOpenClaim` a landing open uses. A show request that cannot be
+   published withdraws the claim instead of leaving a controller waiting for a
+   command nobody will run (`reveal show request failed ... reason=no-executor`),
+   and the shell's own band gesture remains the opener.
 2. **Shell open** — the bridge's executor calls `ShowStartView`; the shell
    uncloaks (245–268 ms worst case; the current auto-hidden Win open showed its
    first panel pixel at +82–187 ms from the key, median +115 over three runs; the
@@ -92,20 +96,32 @@ travel (387 ms at the current 852 DIP; 409 at the docked 900), no seam speed,
 from the live position. The dismiss
 is scheduled, not immediate, so the panel is never hidden mid-slide.
 
-A press while the close runs is never lost. `IntentShouldClose` reads the
-controller's phase, so a press during the retract is an open:
+A press while the close runs is recovered, not guaranteed. `IntentShouldClose`
+reads the controller's phase, so a press during the retract is an open:
 - a gesture close still settling publishes open at once; the Start side drops
   the local dismiss slot, cancels the pending executor command, clears the
   suppression and settles the panel back from its live position
   (`intent open cancel from=...`). If the
   dismiss already entered the shell's `Dismiss` call, the hide lands and the
-  landing reissues the open (`intent open recovered entry=...`);
+  landing reissues the open (`intent open recovered entry=...`), provided the
+  landing is for the same menu the cancel named and no external takeover
+  arrived with it (`intent reconcile ... (before landing recovery)`);
 - an intent close has its dismiss armed for a future deadline, so the bridge
-  latches the press (one slot, tick); the hidden event arms a 50 ms timer and
-  the timer serves the open after the event's stack has unwound (`own press
-  served wait=...`). A show at the hidden event's own tick was swallowed (state
-  stuck at 3), which is why the serve is deferred. A shell hide in flight (state
-  9/11) is latched the same way.
+  latches the press (one slot, tick, activation epoch); the hidden event arms a
+  50 ms timer and the timer serves the open after the event's stack has unwound
+  (`own press served wait=...`). A show at the hidden event's own tick was
+  swallowed (state stuck at 3), which is why the serve is deferred. A shell hide
+  in flight (state 9/11) is latched the same way.
+
+The recoveries are bounded obligations, not a theorem: a newer press supersedes
+the slot, a dismissed command the shell refused or that expired invalidates it, a
+serve whose peer is gone or replaced by a new activation is dropped, and a latch
+older than 1200 ms expires. The windows this cannot cover are the ones where
+there is no consumer left — a press after the 600 ms liveness gate closed, or a
+latch armed before a kill and served after it. There the shell's own toggle
+serves the press, which is the intended fallback: one interception may be lost, a
+wedged menu never is.
+
 A press while the open runs is a close: the `open` direction makes it a close, and
 the settle starts from the live position (`from=0.542` measured 172 ms into an
 open).

@@ -45,20 +45,25 @@ know the revocation ran before it frees the objects that turn holds.
 
 ## Unload order and residuals
 
-Unload stops the module-scan thread (10 s wait), sets the event, waits 10 s for
-the input thread, revokes every XAML delegate on the UI thread and waits for
-that turn, detaches the settle batch's `Completed` handler, and drains every
-counted entry into module code (2 s bound), then frees the composition state
-and the IPC view. Before any of those steps can return as a residual,
-`Wh_ModUninit` publishes `ipc peer gone` (`peerState=0`): the bridge stops
-intercepting at once, and it does so even when a leaked thread keeps the view
-and the section alive. A thread or callback that misses its wait leaves every
-resource in place and logs `unload residual=...; process must restart to finish
-unloading`; the timed-out thread's handle stays open so a later attempt can
-join it, a joined thread's handle is closed, and the hid-thread case also logs
+Unload withdraws availability first, then stops the module-scan thread (10 s
+wait), sets the event, waits 10 s for the input thread, revokes every XAML
+delegate on the UI thread and waits for that turn, detaches the settle batch's
+`Completed` handler, and drains every counted entry into module code (2 s bound),
+then frees the composition state and the IPC view. The withdrawal is
+`PublishPeerGone`: `peerState=0` plus `controllerDirection=0` plus
+`controllerTouch=0`, written **before** the input thread is told to stop and
+therefore before any residual can return. A few presses during the stop are served
+by the shell, which is the intended trade: the alternative is an `alive` word over
+a consumer that is already leaving. A thread or callback that misses its wait
+leaves every resource in place and logs `unload residual=...; process must restart
+to finish unloading`; the timed-out thread's handle stays open so a later attempt
+can join it, a joined thread's handle is closed, and the hid-thread case also logs
 `unload hid thread still running; ipc view leaked` instead of unmapping a
 section the running thread still touches. A counted entry that does not drain
-logs `unload entries outstanding=%d`.
+logs `unload entries outstanding=%d`. The input thread's own exit withdraws
+availability again (`reason=consumer-exit`), so an exit that no `Wh_ModBeforeUninit`
+preceded — a failed wait, a `WM_QUIT` — cannot leave the direction of a stopped
+consumer readable by the bridge.
 
 A XAML delegate that could not be revoked keeps its token and its owner,
 because that token is the only handle on a handler that can still fire, and a
@@ -83,8 +88,13 @@ lifecycle state (`ResetReinitState`) and then runs one per-activation reset
 (`ResetActivationState`, logged `activation state reset`), which the input
 thread's exit runs too: the tracked contact, the contact latch, both sessions,
 the close mute, the deferred flag, the pending dismiss and the pull generation it
-was armed under, the pull serial, the coast, both velocity windows, the
-diagnostic latches and the `anim` override all start over.
+was armed under, the pull serial, the coast, both velocity windows, the diagnostic
+latches, the `anim` override, the executor's pending show and dismiss sequences
+with their deadlines, the pending open entry, the last consumed intent sequence
+and the recovery ticket all start over. The attach then withdraws the peer's
+`alive` word, resets the shared direction and touch, seeds the intent boundary
+from the section and claims a fresh `peerEpoch`; `alive` is published only when
+the input thread is ready to serve.
 
 ## The bridge's side
 
@@ -103,22 +113,36 @@ reduced, not eliminated.
 A re-enable re-initialises the same image without the loader resetting
 anything, and refuses while a close from the previous activation is still inside
 (`mod init refused: a close from the previous activation is still inside;
-...`) or while the previous activation's executor worker is still running
-(`... executor worker is still running; ...`, a join timeout that kept its
-handles instead of closing one under the live thread); otherwise
-`ResetReinitState()` clears `g_disabled`, `g_afterInit`,
-`g_explorerHooked`, `g_closeHookEnabled`, `g_startPointTick` and the executor's
-pending command, press latch, accepted sequence and thread ids, retries a
-failed gesture mapping, leaves `g_closeCalls` alone, and logs `activation state
-reset`; a drained unload closes the channel before it returns, so a re-enable
-opens a fresh one. `Wh_ModInit` still reuses a channel `g_ipc` already holds
-instead of mapping a second one over it.
+...`) or while the previous activation's executor teardown is still outstanding
+(`... the previous activation's executor has not finished stopping; ...`).
+"Outstanding" is exact: the worker has not been joined, the identified window has
+not been destroyed, or a creator is still inside `CreateWindowExW`. A worker that
+has exited since is joined and its handles closed when the enable asks, and a
+window destroyed since clears the stop target then, so the refusal is not
+permanent. Otherwise `ResetReinitState()` clears `g_disabled`, `g_afterInit`,
+`g_explorerHooked`, `g_closeHookEnabled`, `g_startPointTick`, the executor's
+pending command, press latch, confirmation sequence, accepted sequence, thread
+ids and stop target, reopens window admission, retries a failed gesture mapping,
+leaves `g_closeCalls` alone, and logs `activation state reset`; a drained unload
+closes the channel before it returns, so a re-enable opens a fresh one.
+`Wh_ModInit` still reuses a channel `g_ipc` already holds instead of mapping a
+second one over it — and that reuse is exactly why the refusal above exists: a
+surviving worker still waits on that channel's `Exec` event.
 
-The unload order on the bridge is the executor first, then the drain: the ready
-flag clears, the worker is joined, and the launcher thread destroys the window
-and its three timers with an acknowledged `WM_CLOSE`. Every executor dispatch
-holds a `CloseCallLease`, so the count that gates the channel close covers
-commands as well as close hooks.
+The unload order on the bridge is the executor first, then the drain: readiness
+clears, admission to window creation closes, a creator is drained, the worker is
+joined, and the identified window and its four timers are destroyed — directly
+when the unload already runs on its owner thread, otherwise through a `WM_CLOSE`
+the owner acknowledges from `WM_NCDESTROY`, where only that HWND signals.
+**Acknowledged destruction is conditional.** A join timeout, a close-post
+failure, an unacknowledged `WM_CLOSE` or a creator that does not leave in 500 ms
+leaves the window, the worker or both alive; the unload then keeps the handles
+**and the channel** and logs `ipc close deferred: ...` instead of pretending to
+have closed it. That is the path a re-enable must refuse, and the unacknowledged
+window is why the acknowledgement is bound to one HWND: a second window's
+destruction must not stand in for the first one's. Every executor dispatch holds
+a `CloseCallLease`, so the count that gates the channel close covers commands as
+well as close hooks.
 
 ## The host's unload boundary
 

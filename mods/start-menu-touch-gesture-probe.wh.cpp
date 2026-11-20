@@ -53,6 +53,12 @@ std::atomic<bool> g_startUIHooked{false};
 std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_stopPolling{false};
 std::atomic<uint32_t> g_continueCount{0};
+// The module-scan thread and the event it waits on. The thread is kept so the
+// unload can join it before the log it writes to is released: this mod is a
+// diagnostic, but a worker still appending after Wh_ModUninit returned would be
+// writing through a closed mutex handle.
+HANDLE g_pollThread = nullptr;
+HANDLE g_stopEvent = nullptr;
 HANDLE g_logMutex = nullptr;
 WCHAR g_logPath[MAX_PATH] = {};
 const char* g_procTag = "?";
@@ -544,12 +550,6 @@ void HookStartUI(HMODULE module) {
                 "StartUI::StartSizingFrame::OnWindowSizeChanged");
 }
 
-void ApplyPendingHooks() {
-    if (g_afterInit.load()) {
-        Wh_ApplyHookOperations();
-    }
-}
-
 using LoadLibraryExW_t = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
 LoadLibraryExW_t LoadLibraryExW_Original = nullptr;
 
@@ -595,13 +595,20 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
 }
 
 DWORD WINAPI PollModulesThread(LPVOID) {
+    // The wait is the stop event, so a disable is observed at once; the 50 ms
+    // timeout keeps the scan cadence when nothing signals it. The handle is
+    // joined by Wh_ModUninit before the log is released.
     for (int i = 0; i < 400 && !g_stopPolling.load(); i++) {
         TryInstallFromLoadedModules(true);
         if (g_isStartProcess ? g_startUIHooked.load()
                              : g_explorerHooked.load()) {
             break;
         }
-        Sleep(50);
+        if (g_stopEvent) {
+            WaitForSingleObject(g_stopEvent, 50);
+        } else {
+            Sleep(50);
+        }
     }
     return 0;
 }
@@ -611,6 +618,11 @@ DWORD WINAPI PollModulesThread(LPVOID) {
 BOOL Wh_ModInit() {
     InitLog();
     Log("Wh_ModInit");
+
+    g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_stopEvent) {
+        Log("stop event failed err=%lu", GetLastError());
+    }
 
     HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
     auto loadLibraryExW = reinterpret_cast<LoadLibraryExW_t>(
@@ -622,7 +634,11 @@ BOOL Wh_ModInit() {
 
     TryInstallFromLoadedModules(false);
 
-    CreateThread(nullptr, 0, PollModulesThread, nullptr, 0, nullptr);
+    g_pollThread =
+        CreateThread(nullptr, 0, PollModulesThread, nullptr, 0, nullptr);
+    if (!g_pollThread) {
+        Log("poll thread failed err=%lu", GetLastError());
+    }
 
     return TRUE;
 }
@@ -636,9 +652,34 @@ void Wh_ModAfterInit() {
 
 void Wh_ModUninit() {
     Log("Wh_ModUninit");
+    // The fourth unload path: the scan thread is woken, joined, and only then are
+    // its handles and the log released. Closing the mutex first (as this used to)
+    // let a poll iteration that was still inside Log() release a handle that had
+    // been closed under it.
     g_stopPolling = true;
+    if (g_stopEvent) {
+        SetEvent(g_stopEvent);
+    }
+    if (g_pollThread) {
+        const DWORD waited = WaitForSingleObject(g_pollThread, 5000);
+        Log("poll thread join=%s", waited == WAIT_OBJECT_0 ? "ok" : "timeout");
+        if (waited == WAIT_OBJECT_0) {
+            CloseHandle(g_pollThread);
+        }
+        // A timeout keeps the handle and the log alive: the thread may still be
+        // inside Log, and closing either under it is worse than one leaked pair.
+        if (waited != WAIT_OBJECT_0) {
+            return;
+        }
+        g_pollThread = nullptr;
+    }
+    if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+    }
     if (g_logMutex) {
         CloseHandle(g_logMutex);
         g_logMutex = nullptr;
     }
+    g_logPath[0] = L'\0';
 }
