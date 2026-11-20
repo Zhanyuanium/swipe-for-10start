@@ -223,8 +223,10 @@ if ($SkipClickAway) {
     if (-not (Wait-For $true 3000)) {
         Add-Row 'click-away' $false 'menu did not open'
     } else {
-        [void](Wait-Log $m 'exec visible .*visible=1' 2500)
-        Start-Sleep -Milliseconds 250
+        # The window's presentation is ~300 ms and a click inside it is swallowed on
+        # purpose. The executor's `visible=1` line is in the bridge's log, not the
+        # Start log this script reads, so the wait is time-based.
+        Start-Sleep -Milliseconds 900
         [Smoke.Native]::Click([int]([Smoke.Native]::GetSystemMetrics(0) * 0.85), [int]([Smoke.Native]::GetSystemMetrics(1) * 0.15))
         $closed = Wait-For $false 3000
         Start-Sleep -Milliseconds 400
