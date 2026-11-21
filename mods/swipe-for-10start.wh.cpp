@@ -119,7 +119,11 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   executor window on explorer's launcher thread that runs the one shell call
  *   per command; one decision line and one executor line per trigger. Every
  *   line goes through `TraceLog`: `Wh_Log` always, and the role's file only
- *   while the `DiagnosticTrace` setting is on. Wh_ModInit
+ *   while the `DiagnosticTrace` setting is on. The two interruption dates are
+ *   `motion sample` — the position and slope `TakeProgressNow` reads, once per
+ *   call under the composition lock — and `exec dismiss enter`, the QPC instant
+ *   taken immediately before the launcher call and written after it returned.
+ *   Wh_ModInit
  *   selects exactly one role table from the host executable name
  *   (start::Role or bridge::Role), and the four Windhawk entry points forward
  *   to that table.
@@ -2256,14 +2260,23 @@ bool AnimateProgressTo(float to, std::chrono::milliseconds duration,
 
 // Where the linear coast is at qpcNow: from + (to - from) * elapsed / duration.
 // Exact, because the animation has no easing and its start time is known here.
-float CoastValueAt(uint64_t qpcNow) {
+// `slopeOut`, when given, is the line's signed speed in Progress per ms; it is 0
+// once the line has run out. Caller holds g_compositionMutex.
+float CoastValueAt(uint64_t qpcNow, float* slopeOut = nullptr) {
+    const uint64_t duration = static_cast<uint64_t>(kCoastDuration.count());
+    if (slopeOut) {
+        *slopeOut = (g_panel.coastTo - g_panel.coastFrom) /
+                    static_cast<float>(duration);
+    }
     if (qpcNow <= g_panel.coastStartQpc) {
         return g_panel.coastFrom;
     }
 
-    const uint64_t duration = static_cast<uint64_t>(kCoastDuration.count());
     const uint64_t elapsed = qpcNow - g_panel.coastStartQpc;
     if (elapsed >= duration) {
+        if (slopeOut) {
+            *slopeOut = 0.0f;
+        }
         return g_panel.coastTo;
     }
 
@@ -2275,17 +2288,20 @@ float CoastValueAt(uint64_t qpcNow) {
 // g_panel.samples, equally spaced and linear, so the value is one interpolation
 // between two of them. Once the duration has passed the answer is the last
 // sample, which is the target the animation was handed and where the panel
-// actually is. Caller holds g_compositionMutex.
-float SettleValueAt(uint64_t qpcNow) {
+// actually is. `slopeOut`, when given, is the slope of that interpolation in
+// Progress per ms — the two samples' difference over their spacing — and 0 once
+// the curve has reached its end. Caller holds g_compositionMutex.
+float SettleValueAt(uint64_t qpcNow, float* slopeOut = nullptr) {
+    if (slopeOut) {
+        *slopeOut = 0.0f;
+    }
     if (g_panel.frames < 2 || g_panel.durationMs == 0) {
         return std::clamp(g_panel.progress.load(std::memory_order_relaxed), 0.0f,
                           1.0f);
     }
-    if (qpcNow <= g_panel.startQpc) {
-        return std::clamp(g_panel.samples[0], 0.0f, 1.0f);
-    }
 
-    const uint64_t elapsed = qpcNow - g_panel.startQpc;
+    const uint64_t elapsed =
+        qpcNow > g_panel.startQpc ? qpcNow - g_panel.startQpc : 0;
     if (elapsed >= g_panel.durationMs) {
         return std::clamp(g_panel.samples[g_panel.frames - 1], 0.0f, 1.0f);
     }
@@ -2298,6 +2314,12 @@ float SettleValueAt(uint64_t qpcNow) {
     const float value =
         g_panel.samples[index] +
         (g_panel.samples[index + 1] - g_panel.samples[index]) * fraction;
+    if (slopeOut) {
+        const double spacing =
+            static_cast<double>(g_panel.durationMs) / (g_panel.frames - 1);
+        *slopeOut = static_cast<float>(
+            (g_panel.samples[index + 1] - g_panel.samples[index]) / spacing);
+    }
     return std::clamp(value, 0.0f, 1.0f);
 }
 
@@ -2327,6 +2349,9 @@ float TakeProgressNow(const wchar_t* caller) {
     if (!g_state) {
         // No renderer, so no animation can be on screen and the resting value is
         // the only answer that cannot be a stale target.
+        TraceLog(L"motion sample caller=%s phase=%s p=%.3f v=%.3f qpc=%llu",
+                caller, L"none", kProgressRest, 0.0f,
+                static_cast<unsigned long long>(qpcNow));
         return kProgressRest;
     }
 
@@ -2339,13 +2364,26 @@ float TakeProgressNow(const wchar_t* caller) {
         // behind (ShowAtRest, StopCoast, the take itself and every direct insert
         // write the value first). With no renderer there is no recording at all,
         // and the resting value 1 is the only answer that cannot be a target.
-        return std::clamp(g_panel.progress.load(std::memory_order_relaxed), 0.0f,
-                          1.0f);
+        const float resting =
+            std::clamp(g_panel.progress.load(std::memory_order_relaxed), 0.0f,
+                       1.0f);
+        TraceLog(L"motion sample caller=%s phase=%s p=%.3f v=%.3f qpc=%llu",
+                caller, L"rest", resting, 0.0f,
+                static_cast<unsigned long long>(qpcNow));
+        return resting;
     }
 
+    float slope = 0.0f;
     const float value =
-        std::clamp(coasting ? CoastValueAt(qpcNow) : SettleValueAt(qpcNow),
+        std::clamp(coasting ? CoastValueAt(qpcNow, &slope)
+                            : SettleValueAt(qpcNow, &slope),
                    0.0f, 1.0f);
+    // What the takeover read, at the instant it read it: `p` is the value pinned
+    // below, `v` the signed slope in Progress per ms, `qpc` the one clock read the
+    // value came from. One line per call, under the same lock as the take.
+    TraceLog(L"motion sample caller=%s phase=%s p=%.3f v=%.3f qpc=%llu", caller,
+            coasting ? L"coast" : L"settle", value, slope,
+            static_cast<unsigned long long>(qpcNow));
     // A settle taken over at its very start is the shape of a dead open: the
     // animation that should lift the panel is stopped a few milliseconds in and
     // the hidden rest is pinned as the base. Rare and diagnostic.
@@ -14995,6 +15033,7 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
         return;
     }
     ++t_execCall;
+    const uint64_t enterAt = start::QpcMsNow();
     const HRESULT hr =
         g_dismiss ? g_dismiss(launcher, command.method)
                   : E_FAIL;
@@ -15002,6 +15041,15 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
     // checked again by the confirmation probe: success is not yet a hide.
     const ProbeVisibility visible = LauncherVisibleNow(launcher);
     --t_execCall;
+    // Written here, after the call returned, because log I/O must not delay the
+    // entry; `at` is the one timestamp taken immediately before it. The `hr=`
+    // line below cannot date the entry against the Start side's `motion sample`;
+    // this line can.
+    TraceLog(L"exec dismiss enter seq=%llu gen=%llu epoch=%llu at=%llu",
+            static_cast<unsigned long long>(command.seq),
+            static_cast<unsigned long long>(command.open),
+            static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(enterAt));
     TraceLog(L"exec dismiss seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
             L"visible=%s",
             static_cast<long long>(command.seq), outer, launcher,

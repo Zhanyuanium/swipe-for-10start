@@ -105,7 +105,21 @@ settle style=win11 dir=close vel=0.00 dur=409 remaining=900 frames=104 zeta=1.72
 settle style=win11 dir=open  vel=1.19 dur=333 remaining=733 frames=85  zeta=1.72
 open follow travel=475 max=475 progress=0.91 behind=0.000 offset=-0.127 vel=0.00 commit=1
 exec dismiss seq=4 armed in=439 ms
+motion sample caller=intent-open-cancel phase=settle p=0.542 v=-0.006 qpc=184223117
+exec dismiss enter seq=7 gen=18 epoch=1 at=184223189
 ```
 
 The `remaining` in the close line is the full travel by design (the mirrored
 curve), not `(1 - start) * distance`.
+
+Two lines date an interruption on its two sides, one in each process.
+`exec dismiss enter` is written after the launcher call returned, like the
+`hr=` line beside it, so it can carry the QPC instant taken immediately before
+`Dismiss` was entered (`at`, the same millisecond clock as `qpc`): `hr=` says
+only that the primitive returned, never when it entered, so it cannot show
+whether a cancel or a fresh press reached the panel before or after the hide
+began. `motion sample` is the position and slope `TakeProgressNow` reads at the
+takeover, taken once under `g_compositionMutex` with the one `qpcNow` it uses.
+`phase` names the motion the value came from — `settle`, `coast`, `rest` with
+nothing recorded, `none` without a renderer — and `v` is the signed slope in
+Progress per ms, `0.000` once the curve has landed.

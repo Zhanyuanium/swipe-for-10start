@@ -145,7 +145,10 @@ probe that cannot answer (no launcher, a failed call, an unarmed timer) is
 `unknown`. The Start side treats `unconfirmed` and `unknown` as a terminal
 repair — release the direction, drop the ticket, read the cloak on the next
 transition — because a dismiss that is not observed to hide the window is not a
-hide.
+hide. The `hr=` line is written after the call returned, so
+`exec dismiss enter seq=... gen=... epoch=... at=...` carries the QPC timestamp
+taken immediately before the launcher was entered: that is the point an
+interruption on the Start side is dated against.
 
 A command is not run late. The controller gives each one 400 ms from its
 scheduled time (the dismiss's `executeAt`, or the publication tick of a show);
