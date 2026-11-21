@@ -59,6 +59,19 @@
   the panel's bottom edge for 500 ms; its release time comes from `End-Contact`,
   so `t=0` is the UP and not the end of the preceding capture. Its start point
   and scan band are the top-taskbar geometry.
+- `tools/panel_edge_track.ps1` — sample the panel's trailing edge (the side away
+  from the taskbar) in physical pixels while the menu opens or closes: one 96 px
+  band inside the panel, one reused DIB, every frame diffed against a
+  closed-menu baseline, each `t` stamped before its `BitBlt`. The axis, panel
+  rectangle, band and work area come from the run's own `reveal panelTrail`
+  line, `Distance` from `gesture geometry axis=... dist=`, and the scale from the
+  `dismiss` bar thickness over half the band; a missing field refuses the run.
+  Progress uses the mod's own `1 - (edge - trail) / (dir * distance)`. `-WinTap`
+  opens and closes with the Win key, `-Observe` leaves the trigger to the caller,
+  and `-TriggerAtMs`/`-Trigger` fire a qualified 25 DIP band pull or another tap
+  at an offset (from the close tap in win-tap mode). On the live left bar it reads
+  2105 px with the menu fully open (trail 1053 DIP × 2) and follows the retract
+  down to the entry edge (~98-175 px) before the window hides.
 - `tools/ipc.ps1` — the read-only view of the channel; see
   [ipc.md](ipc.md) for the protocol and the records. `-State` prints `peerEpoch`
   beside `peerTick`/`peerState`, which is how a re-enable is told from a
@@ -250,6 +263,53 @@ is still owed; one finger end to end, two fingers in both lift orders and the
 auto-hide reveal after a fresh logon passed on the shipping build.
 
 
+## The panel's trailing edge
+
+A `win close observed` line says the window hid; it does not say whether the
+panel turned around on the way. `tools/panel_edge_track.ps1` answers that from
+pixels: it places one 96 px band inside the panel from the run's own
+`reveal panelTrail` rectangle, diffs every frame against the closed-menu
+baseline, and reads the extreme changed coordinate along the trailing axis. On
+the live left docked bar the edge is vertical and the scan runs along x, which
+`settle_track.ps1` does not do (its y band and bottom-edge read are the
+top-taskbar layout).
+
+Baseline runs on the installed 0.7.0 build, 2026-11-21, left docked bar. The mod's own
+numbers give trail 1053 DIP, `distance` 1392 DIP, scale 2.000, so a fully open
+panel's edge is 2106 px; every run measured 2105 px (`at-close=2105`,
+`measured-max=2105`). Two runs of each of two sequences, `tc` in ms after the
+close tap:
+
+| `tc` of the first sample at or below | 2000 px | 1500 px | 1000 px | 500 px | 200 px | last visible | hidden |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| plain Win close, run 1 | 274 | 440 | 511 | 551 | 567 | 127 px @ 567 | 575 |
+| plain Win close, run 2 | 261 | 442 | 508 | 550 | 564 | 98 px @ 564 | 573 |
+| pull at `tc` 150, run 1 | 264 | 438 | 503 | 545 | 561 | 175 px @ 561 | 567 |
+| pull at `tc` 150, run 2 | 275 | 443 | 492 | 540 | 556 | 175 px @ 556 | 564 |
+
+Each run held 110-119 samples at a mean 14.0-15.2 ms period (3.6-5.0 ms minimum
+while the panel is hidden, 51-59 ms worst stall when the close lands), and the
+edge first leaves 2105 px 79-84 ms after the tap — the settle's first frames are
+the slow ones. The visible series ends at 98-175 px, progress 0.279-0.306: the
+window is cloaked before the panel slides the last 48 DIP behind the bar, so no
+frame exists for the end of the travel. Those samples are `edge=-1`, never
+progress 0.
+
+The second row pair is the interruption baseline. The pull is admitted while the
+close is in flight (`reveal admit ... reason=deferred`), qualifies at 25 DIP and
+is released inside the close. Every retract landmark of the pull runs stays within
+14 ms of the plain runs — the two plain runs alone differ by up to 13 ms from each
+other at the same landmarks — and no sample shows a plateau or a reversal. That is
+what says the pull does not interrupt the Win close: an interruption would be a
+reversal of hundreds of pixels, not a 10 ms shift. What it leaves behind is a
+reopen: the panel is visible again at `tc` 710 and 736, after the landing, which
+the mod logs as `reveal reopen after close pull=0 late=1` — the release record,
+not a live contact, takes the menu back.
+
+Frames were captured at 200 % DPI with the tool's own DIB; `t` is the capture
+start, so a frame can lag its stamp by one compositor interval, and the CSV's
+`edge_dip` is the measured edge divided by the derived scale.
+
 ## Artifacts
 
 The raw tables behind the Windows 11 fit are in `artifacts/`:
@@ -265,4 +325,8 @@ minus the UP call's own time, with no fixed sign — the current tool stamps bef
 its `BitBlt` and takes t=0 from the UP timestamp. Then
 `cursor-follow.csv`, `start-window.csv` and
 `gesture-shared.csv` are the cursor, window-rect and bridge-state dumps behind
-the data-sources table. `artifacts/AGENTS.md` lists each file with its bias.
+the data-sources table. `panel-edge-wintap-1.csv`/`-2.csv` and
+`panel-edge-wintap-pull-1.csv`/`-2.csv` are the four trailing-edge baselines
+above (`t,tc,edge_px,edge_dip,progress`; `t` stamped before the `BitBlt`, `tc`
+empty when the run has no close anchor). `artifacts/AGENTS.md` lists each file
+with its bias.
