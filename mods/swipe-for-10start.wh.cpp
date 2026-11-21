@@ -235,20 +235,33 @@ void SetTraceFileName(const wchar_t* name) {
     g_traceFileName = name;
 }
 
-// Counts the lines already in the file. The cap bounds the read. Called with
+// Counts the complete lines already in the file into g_traceLines. Returns true
+// when the count is complete: a file that does not exist yet counts as empty
+// (the first append creates it), while an existing file that cannot be opened or
+// read is *not* seeded, so the next write retries instead of making the cap
+// believe the file is empty and growing it past kTraceMaxLines. A read that
+// fails midway discards the partial count for the same reason. Called with
 // g_traceLock held.
-void SeedTraceLines(const wchar_t* path) {
+bool SeedTraceLines(const wchar_t* path) {
     g_traceLines = 0;
-    g_traceSeeded = true;
     HANDLE file = CreateFileW(path, GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
-        return;
+        const DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
     }
     char buffer[8192];
     DWORD read = 0;
-    while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+    bool complete = true;
+    for (;;) {
+        if (!ReadFile(file, buffer, sizeof(buffer), &read, nullptr)) {
+            complete = false;
+            break;
+        }
+        if (read == 0) {
+            break;  // end of file
+        }
         for (DWORD i = 0; i < read; ++i) {
             if (buffer[i] == '\n') {
                 ++g_traceLines;
@@ -256,6 +269,10 @@ void SeedTraceLines(const wchar_t* path) {
         }
     }
     CloseHandle(file);
+    if (!complete) {
+        g_traceLines = 0;
+    }
+    return complete;
 }
 
 // Reads the setting and gives the next write a fresh line count. Called from
@@ -315,7 +332,7 @@ void TraceLog(const wchar_t* format, ...) {
 
     AcquireSRWLockExclusive(&g_traceLock);
     if (!g_traceSeeded) {
-        SeedTraceLines(path);
+        g_traceSeeded = SeedTraceLines(path);
     }
     // The cap is cut on its own handle: SetEndOfFile needs FILE_WRITE_DATA, and
     // a handle that carries FILE_WRITE_DATA does not append — measured on this
@@ -353,8 +370,13 @@ void TraceLog(const wchar_t* format, ...) {
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
-        WriteFile(file, utf8, lineBytes, &written, nullptr);
-        ++g_traceLines;
+        const BOOL ok = WriteFile(file, utf8, lineBytes, &written, nullptr);
+        // Only a complete line counts. A partial or failed append leaves a torn
+        // line the next seed re-counts from the file itself; counting it here
+        // would drift the cap by a line the file does not have.
+        if (ok && written == lineBytes && g_traceSeeded) {
+            ++g_traceLines;
+        }
         CloseHandle(file);
     }
     ReleaseSRWLockExclusive(&g_traceLock);

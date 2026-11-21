@@ -27,7 +27,11 @@ line to `<mod storage>\renderer.log` or `\bridge.log` only while
 tools read. The cap is `kTraceMaxLines` (20,000 lines): the line count is seeded
 from the existing file and the next write truncates it; the counter resets only
 when the truncation succeeded, and a failure stops the file half for the session
-with one `Wh_Log` line naming the error. The cut has its own `FILE_WRITE_DATA`
+with one `Wh_Log` line naming the error. A file that does not exist yet seeds as
+empty, while an existing file that cannot be opened or read is **not** seeded:
+the next write retries, so a transient share cannot make the cap believe the file
+is empty. Only a complete `WriteFile` increments the count; a partial append is
+left to the next seed, which re-counts the file itself. The cut has its own `FILE_WRITE_DATA`
 handle and the line is written through a `FILE_APPEND_DATA` handle: a handle
 with both bits does not append (measured: writes at offset 0). The CRLF is in
 the same buffer, so one line is one `WriteFile` and two activations cannot tear
