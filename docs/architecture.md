@@ -603,7 +603,9 @@ of clamping it. The producer checks the same vocabulary (`SwipeShowAllowed`,
 combination is passed to the shell's original at admission (`own pass ...
 reason=unsupported`), so the executor's refusal is defence in depth, never the
 first time the press is validated. A click-away intent's method 7 is evidence
-and is mapped to 6 at the producer; the executor sees 1 or 6 only.
+and is mapped to 6 at the producer, but only for the click-away trigger: an
+ordinary caller's method-7 Hide is passed to the shell, never converted. The
+executor sees 1 or 6 only.
 
 **A note on the retired versions.** v7 added `peerEpoch` at 740 inside v6's
 744-byte section; v6 added the liveness pair at 732/736; v5 removed the M2 slots

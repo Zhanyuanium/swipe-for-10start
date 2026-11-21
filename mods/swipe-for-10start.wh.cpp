@@ -385,8 +385,10 @@ bool SwipeDismissAllowed(uint32_t method) {
 }
 
 // The intent carries the shell's observed close method. 7 is the click-away's
-// evidence and is mapped to 6 at the producer; 1 and 6 are the executor's own
-// dismiss values. 5 (Win+Tab) is an external takeover, never a close intent.
+// evidence and is mapped to 6 at the producer, but only from the caller scope
+// that proves the source (`OwnCaller::ClickAway`); 1 and 6 are the executor's own
+// dismiss values. 5 (Win+Tab) is an external takeover, never a close intent. A
+// method-7 Hide from an ordinary caller is the shell's own close and passes.
 bool SwipeCloseIntentAllowed(uint32_t method) {
     return method == kSwipeDismissMethodWin ||
            method == kSwipeDismissMethodStartButton ||
@@ -3410,11 +3412,17 @@ bool RequestBridgeShow(uint32_t method, uint32_t flags) {
 // controller-owned click-away executes as 6, the pointer-driven close the Start
 // button's own dismiss uses, so the close still animates exactly once. The
 // intent record keeps 7 for the decision log.
+//
+// The number alone is not the evidence: the conversion needs the click-away
+// *trigger* too. A method-7 intent from the Win trigger is not something this
+// bridge publishes; if one arrives, it is forwarded as the number it carries and
+// the executor refuses it, rather than being laundered into a dismiss.
 constexpr int32_t kClickAwayShellMethod = 7;
 constexpr uint32_t kClickAwayExecMethod = 6;
 
-uint32_t ExecDismissMethodForIntent(int32_t intentMethod) {
-    if (intentMethod == kClickAwayShellMethod) {
+uint32_t ExecDismissMethodForIntent(int32_t intentMethod, int32_t intentTrigger) {
+    if (intentTrigger == kSwipeTriggerClickAway &&
+        intentMethod == kClickAwayShellMethod) {
         return kClickAwayExecMethod;
     }
     return static_cast<uint32_t>(intentMethod);
@@ -7399,8 +7407,9 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             const uint64_t executeAt =
                 GetTickCount64() + static_cast<uint64_t>(duration.count()) +
                 kBridgeDismissLeadMs;
-            if (RequestBridgeDismiss(ExecDismissMethodForIntent(intent.method),
-                                     executeAt, intent.open)) {
+            if (RequestBridgeDismiss(
+                    ExecDismissMethodForIntent(intent.method, intent.trigger),
+                    executeAt, intent.open)) {
                 ackDuration = static_cast<int32_t>(duration.count());
                 TraceLog(L"intent close from=%.3f dur=%lld", from,
                         static_cast<long long>(duration.count()));
@@ -13377,13 +13386,18 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     const int32_t trigger = caller == OwnCaller::ClickAway
                                 ? kSwipeTriggerClickAway
                                 : kSwipeTriggerWin;
-    // The close intent's method is forwarded to the executor. A method outside
-    // the shared vocabulary is the shell's own close, not one this mod can run:
-    // pass it now instead of swallowing it for a command that would be refused.
-    if (!SwipeCloseIntentAllowed(method)) {
+    // The close intent's method is forwarded to the executor. 7 is click-away
+    // *evidence*, so only the caller scope that proves the source may carry it;
+    // an ordinary caller's method-7 Hide is the shell's own close and passes.
+    // Anything else outside the shared vocabulary passes too, instead of being
+    // swallowed for a command that would be refused.
+    const bool methodFitsCaller =
+        method != kDismissMethodClickAway || caller == OwnCaller::ClickAway;
+    if (!methodFitsCaller || !SwipeCloseIntentAllowed(method)) {
         TraceLog(L"intent pass close trigger=%s caller=%s method=%u reason=%s",
                 trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win",
-                OwnCallerName(caller), method, L"unsupported");
+                OwnCallerName(caller), method,
+                methodFitsCaller ? L"unsupported" : L"caller-scope");
         callOriginal();
         OwnResyncFromState(self);
         return;

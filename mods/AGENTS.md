@@ -345,7 +345,12 @@ probe or timer failure is answered `unknown`.
   modified press publish `intent=external` and pass. A close intent is a close
   only from the click-away caller or the Win/button caller; the click-away's
   opening suppression (state 1/3, `reason=opening`) and the `controllerTouch`
-  suppression require `caller=clickaway`, not the number 7 alone. The own-show
+  suppression require `caller=clickaway`, not the number 7 alone. The same rule
+  gates admission: method 7 is click-away evidence, so an **ordinary** caller's
+  method-7 Hide passes to the shell (`reason=caller-scope`) instead of becoming a
+  close intent — the number alone never makes a close ours, and the 7→6 mapping
+  on the Start side needs the click-away trigger as well as the method. The
+  own-show
   exception requires the executor's own stack, an unattributed caller and state
   1/3 (`caller=unknown method=7 state=1|3 depth>0 reason=own-show`). Every
   decision line prints caller, method, internal state and executor depth
