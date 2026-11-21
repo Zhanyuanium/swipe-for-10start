@@ -175,24 +175,43 @@ function Test-ExecutedDismiss { param([string]$text, [int]$method)
 # The geometry the mod itself last published: axis (0 left, 1 top, 2 right,
 # 3 bottom), band in DIP, panel rectangle in DIP. Physical pixels are DIP times
 # the primary screen's scale, which is what InjectTouchInput expects.
+#
+# Only lines from this run count: `-Since` is the run's tick mark, so a rotated
+# trace or a previous session cannot supply historical coordinates. Every field
+# is reported separately, and the caller refuses to inject unless all four were
+# measured; the defaults below are a safe shape for the table, not a layout.
 function Get-Layout {
+    param([long]$Since = 0)
     $lines = @()
-    if (Test-Path -LiteralPath $Log) { $lines = @(Get-Content -LiteralPath $Log) }
-    $layout = [pscustomobject]@{ Axis = 3; Low = 804; High = 900; Left = 236; Top = 265; Right = 1229; Bottom = 840; Scale = 2 }
+    if (Test-Path -LiteralPath $Log) {
+        $lines = @(Get-Content -LiteralPath $Log | Where-Object {
+            $_ -match '^t=(\d+) ' -and [long]$Matches[1] -ge $Since
+        })
+    }
+    $layout = [pscustomobject]@{
+        Axis = 3; Low = 804; High = 900; Left = 236; Top = 265; Right = 1229; Bottom = 840
+        Scale = 2
+        AxisKnown = $false; BandKnown = $false; RectKnown = $false; ScaleKnown = $false
+        Complete = $false
+    }
     # The axis survives even when the panel rectangle was rejected (a left or
     # right bar can put the panel off the edge the trail expects): the fallback
     # line has the axis, the dismissal line has it too, and the rejected line
     # still carries the measured rectangle the drag needs.
     $axisLine = $lines | Select-String 'panelTrail=.*axis=\d|dismiss axis=\d' | Select-Object -Last 1
-    if ($axisLine -and $axisLine.Line -match 'axis=(\d)') { $layout.Axis = [int]$Matches[1] }
+    if ($axisLine -and $axisLine.Line -match 'axis=(\d)') {
+        $layout.Axis = [int]$Matches[1]; $layout.AxisKnown = $true
+    }
     $bandLine = $lines | Select-String 'band=(-?\d+),(-?\d+)' | Select-Object -Last 1
     if ($bandLine -and $bandLine.Line -match 'band=(-?\d+),(-?\d+)') {
         $layout.Low = [int]$Matches[1]; $layout.High = [int]$Matches[2]
+        $layout.BandKnown = $true
     }
     $rectLine = $lines | Select-String 'reveal .*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)' | Select-Object -Last 1
     if ($rectLine -and $rectLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
         $layout.Left = [int]$Matches[1]; $layout.Top = [int]$Matches[2]
         $layout.Right = [int]$Matches[3]; $layout.Bottom = [int]$Matches[4]
+        $layout.RectKnown = $true
     }
     # The scale from the taskbar's own rect: the `dismiss` line prints it in
     # physical pixels, and the band is twice the bar in DIP. Their ratio is the
@@ -207,11 +226,26 @@ function Get-Layout {
         $bandDip = $layout.High - $layout.Low
         if ($bandDip -gt 0) {
             $barPhysical = if ($layout.Axis -eq 0 -or $layout.Axis -eq 2) { $barWidth } else { $barHeight }
-            if ($barPhysical -gt 0) { $layout.Scale = $barPhysical / ($bandDip / 2.0) }
+            if ($barPhysical -gt 0) {
+                $layout.Scale = $barPhysical / ($bandDip / 2.0)
+                $layout.ScaleKnown = $true
+            }
         }
     }
     if ($layout.Scale -lt 1) { $layout.Scale = 1 }
+    $layout.Complete = $layout.AxisKnown -and $layout.BandKnown -and
+        $layout.RectKnown -and $layout.ScaleKnown
     return $layout
+}
+
+# The fields a refused layout is missing, for the row detail.
+function Get-LayoutGap { param($layout)
+    $missing = @()
+    if (-not $layout.AxisKnown) { $missing += 'axis' }
+    if (-not $layout.BandKnown) { $missing += 'band' }
+    if (-not $layout.RectKnown) { $missing += 'rect' }
+    if (-not $layout.ScaleKnown) { $missing += 'scale' }
+    return ($missing -join ',')
 }
 
 # The pull: from just inside the band toward the desktop, ~450 DIP of travel.
@@ -239,21 +273,31 @@ function Get-DragPoints { param($layout)
     }
 }
 
-$layout = Get-Layout
 $runMark = Mark
 
 # 0. clean start
 if (State) { [Smoke.Native]::WinTap(); Start-Sleep -Milliseconds 900 }
-Add-Row 'starts closed' (Wait-For $false 3000) "state=$(State) axis=$($layout.Axis)"
+Add-Row 'starts closed' (Wait-For $false 3000) "state=$(State)"
 
-# 1. the keyboard path opens
+# 1. the keyboard path opens. This warm-up open is also what refreshes the mod's
+# geometry, so the layout is read *after* it: the geometry snapshot a run starts
+# with can belong to a rotated trace or a bar that moved since.
 $m = Mark
 [Smoke.Native]::WinTap()
 $opened = Wait-For $true 3000
 Assert-TraceReady
 Start-Sleep -Milliseconds 400
 $l = (New-Lines $m) -join "`n"
-Add-Row 'win open' ($opened -and ($l -match 'kind=open') -and ($l -match 'exec show')) ''
+$winOpen = ($l -match 'intent recv seq=\d+ kind=open trigger=win\b') -and
+    (Test-ExecutedShow $l)
+Add-Row 'win open' ($opened -and $winOpen) ''
+
+# The layout the injected steps will use, from this run's own lines only.
+$layout = Get-Layout -Since $runMark
+$layoutGap = Get-LayoutGap $layout
+if (-not $layout.Complete) {
+    Write-Host "layout incomplete for this run (missing: $layoutGap); injecting nothing"
+}
 
 # 2. and closes
 $m = Mark
@@ -261,13 +305,18 @@ $m = Mark
 $closed = Wait-For $false 3000
 Start-Sleep -Milliseconds 400
 $l = (New-Lines $m) -join "`n"
-Add-Row 'win close' ($closed -and ($l -match 'kind=close') -and ($l -match 'exec dismiss')) ''
+$winClose = ($l -match 'intent recv seq=\d+ kind=close trigger=win\b') -and
+    (Test-ExecutedDismiss $l 1)
+Add-Row 'win close' ($closed -and $winClose) ''
 
 # 3. an injected edge pull opens it (admission, takeover, show); retried because
 # an injected contact is occasionally decoded as a hover. The wait is deliberate:
 # a pull that starts inside the previous close's settle is tracked as the reopen
 # that close owes, not as a fresh admission, and its log lines differ.
 Start-Sleep -Milliseconds 1200
+if (-not $layout.Complete) {
+    Add-Row 'touch open' $false "layout incomplete: $layoutGap"
+} else {
 $pull = Get-PullPoints $layout
 $opened = $false; $detail = ''
 for ($i = 1; $i -le 3 -and -not $opened; $i++) {
@@ -281,8 +330,12 @@ for ($i = 1; $i -le 3 -and -not $opened; $i++) {
     if (-not $opened) { $detail = "attempt $i"; Start-Sleep -Milliseconds 400 }
 }
 Add-Row 'touch open' $opened $detail
+}
 
 # 4. an injected panel drag closes it
+if (-not $layout.Complete) {
+    Add-Row 'touch close' $false "layout incomplete: $layoutGap"
+} else {
 $drag = Get-DragPoints $layout
 $closed = $false; $detail = ''
 for ($i = 1; $i -le 3 -and -not $closed; $i++) {
@@ -304,6 +357,7 @@ for ($i = 1; $i -le 3 -and -not $closed; $i++) {
     if (-not $closed) { $detail = "attempt $i"; Start-Sleep -Milliseconds 400 }
 }
 Add-Row 'touch close' $closed $detail
+}
 
 # 5. a click on the desktop closes it, once the window is past its presentation
 if ($SkipClickAway) {
@@ -334,9 +388,13 @@ if ($SkipClickAway) {
     }
 }
 
-# 6. nothing error-shaped was written during this run
-$bad = New-Lines $runMark | Where-Object {
-    $_ -match 'hr=(?!0{8}\b)|timeout|refused|press .* lost|exec .* failed|executor not ready|latch replaced'
+# 6. nothing error-shaped was written during this run, in either log: a failed
+# command or a refused trigger is reported by the side that answered it.
+$bad = @()
+foreach ($path in @($Log, $BridgeLog)) {
+    $bad += New-Lines $runMark $path | Where-Object {
+        $_ -match 'hr=(?!0{8}\b)|timeout|refused|press .* lost|exec .* failed|executor not ready|latch replaced'
+    }
 }
 Add-Row 'no error lines' ($bad.Count -eq 0) (($bad | Select-Object -First 2) -join ' | ')
 
