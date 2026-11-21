@@ -142,7 +142,10 @@ core (see [../docs/limits.md](../docs/limits.md)).
   answer for the recovery ticket's own sequence retires it **before the
   pending-slot gate**, because the open that cancelled the close already cleared
   the slot that gate reads. An `executed` dismiss clears the pending slot
-  but keeps the command in `g_pendingDismissConfirm`; `confirmed` closes it,
+  but keeps the command in `g_pendingDismissConfirm`; `confirmed` closes it —
+  by the landing itself when the cloak reads hidden and no transition carried
+  the hide (`win close observed reason=confirmed-without-transition`), otherwise
+  by retiring the answer for the transition still to come — while
   `unconfirmed`/`unknown` is the same terminal repair, and `superseded` needs no
   repair. A 400 ms silence does the same from `g_pendingShowUntil` for a
   show and from `g_pendingDismissExecAt + 400 ms` for a dismiss (the deadline the
@@ -172,7 +175,15 @@ core (see [../docs/limits.md](../docs/limits.md)).
   drops both schedules and republishes the open direction once the contact has
   crossed 24 DIP inward. Contact-down no longer cancels anything; a tap leaves
   the close alone.
-- `win close observed` — after the landing, a pull still down (or a release
+- `win close observed` — the landing body (`LandClosedMenu`). The cloak
+  transition is its usual caller; the executor's confirmation is the second:
+  when the probe reads hidden and the cloak agrees, and the dismiss slot still
+  names that command, no
+  transition carried the hide (the window was already hidden when `Dismiss` ran,
+  a native hide won the race, or the transition was lost), so the same landing
+  runs with `win close observed reason=confirmed-without-transition`. The
+  command is the identity there too, and nothing pretends a transition happened.
+  After the landing, a pull still down (or a release
   inside its readiness window: the release on a closed menu, the landing for a
   deferred record) issues one fresh show and the open adopts it:
   `reveal reopen after close pull=1 late=0 entry=...`. The pull that was under

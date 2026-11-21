@@ -202,6 +202,16 @@ qualified release and an independently owed Win/button recovery are unaffected.
 Touch ownership follows the finger: a release record reopens as `pull=0 late=1`
 with `controllerTouch=0`, so the next real click away from the menu closes it;
 only a contact still down at the landing keeps the click-away protection.
+
+A close can also land without a transition: when the executor's confirmation
+probe reads hidden and no cloak event carried the hide (the window was already
+hidden when `Dismiss` ran, a native hide won the race, or the transition was
+lost), the same landing body finishes the close and logs
+`win close observed reason=confirmed-without-transition`. A held pull is released
+and a still-down qualified contact reopens exactly as it does after a transition;
+the command that owns the pending dismiss is the identity, never the suppression
+window.
+
 The idle is held through the close so the digitizer's pause during the key/hide
 does not drop the pull. Measured on the bottom docked layout: held pull at 350
 DIP, Win close, landing reopened with `reveal takeover from=0.348 offset=0.558`,

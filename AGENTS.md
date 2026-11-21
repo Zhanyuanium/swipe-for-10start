@@ -160,7 +160,11 @@ service from healing the retracted panel before the dismiss lands.
 The close is judged by behaviour: the shell's hidden event (`own state
 event=hidden open=0`), the executor's `confirmed` (hidden) at its bounded 300 ms
 confirmation — `unconfirmed`/`unknown` is a repair, not a hide — and the next open
-working.
+working. A confirmed dismiss on a window the cloak already read hidden, with no
+transition left to arrive, finishes through the same landing
+(`win close observed reason=confirmed-without-transition`), so the controller
+cannot keep publishing `closing` into the next press; the transition is not
+invented, only the close is completed.
 The internal `0xA` value is **not** an acceptance criterion and is no longer
 quoted.
 
@@ -170,8 +174,9 @@ candidate **as an arbitration mechanism**, and the reveal claim. The deferred
 candidate still has one live use, and it is not arbitration:
 `BeginEdgeCandidate` (the touch show's band admission) calls `StartRevealFollow`
 with `deferred=true` while `CloseInFlight`, so a contact that lands during a
-close is tracked without writing `Progress`; the landing (`ServiceRootVisibility`)
-releases it. `CloseInFlight` remains only as the
+close is tracked without writing `Progress`; the landing (`LandClosedMenu`, run
+by the visibility service and by the executor's confirmation) releases it.
+`CloseInFlight` remains only as the
 suppression-window predicate: the settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
 `CloseInFlight` early return that guards the follow, so it could never fire; the

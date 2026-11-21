@@ -134,6 +134,15 @@ reopened (`reveal reopen after close pull=1 late=0`). A landing with no command
 of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
 for) and the pull is dropped by design.
 
+**No transition is not a stuck close.** A dismiss can be confirmed on a window
+the shell had already hidden (a native hide won the race, the hide arrived
+before the close was observed, or its transition was lost). The executor's 300 ms
+confirmation is then the bound: with the cloak reading hidden and the dismiss
+slot still naming that command, the Start side runs the same landing and logs
+`win close observed reason=confirmed-without-transition`. The direction returns
+to unowned (open-capable) without another press, and the next Win press opens
+exactly once; the transition itself is never synthesized.
+
 ## The touch show
 
 - **The digitizer may go quiet during the uncloak and during a close.** The

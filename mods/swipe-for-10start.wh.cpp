@@ -128,7 +128,10 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   a touch-first open can reach the launcher before any Win or Start-button
  *   hook ran. The controller decides; the executor performs. The one shared rule
  *   is the suppression window: a close suppresses the retracted panel until the
- *   executor's dismiss has landed. Nothing in either half runs on a period: the
+ *   executor's dismiss has landed. A landing the cloak never reports — the
+ *   window was already hidden when `Dismiss` ran — is finished by the executor's
+ *   own confirmation (`win close observed reason=confirmed-without-transition`),
+ *   never by inventing a transition. Nothing in either half runs on a period: the
  *   controller arms one high-resolution one-shot for the soonest deadline it has
  *   and waits on its events otherwise (the open/close state is a WinEvent with a
  *   bounded fallback poll), and the executor's worker blocks on its events once
@@ -1957,6 +1960,11 @@ extern bool g_commitNeedsProgressReset;
 // ownership state (no session drives Progress, and the suppression window is
 // open) through this one helper.
 void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown);
+
+// Defined with the visibility service below: the one close-landing body, run by a
+// cloak transition and by the executor's confirmation when the window is already
+// hidden. `reason` is null for the transition and names the probe otherwise.
+void LandClosedMenu(uint64_t tickMs, const wchar_t* reason);
 
 // The cross-process channel with the explorer-side bridge and the debug tools.
 // Defined with the channel helpers below; a close publishes its executor
@@ -7532,13 +7540,13 @@ void ApplyExecAck() {
         // terminal failure), the visibility probe's (`Confirmed`), and the
         // repair a probe that could not confirm performs. All are handled here,
         // and the pending slot is cleared only by the outcome that ends it.
-        if (dismissPending) {
-            g_pendingDismissExec.store(0, std::memory_order_relaxed);
-            g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
-        }
         if (executed) {
             // Returned is not hidden. The command stays identified until the
             // confirmation probe (or the landing) says what happened.
+            if (dismissPending) {
+                g_pendingDismissExec.store(0, std::memory_order_relaxed);
+                g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+            }
             g_pendingDismissConfirm = ack.command;
             TraceLog(L"exec dismiss executed command=%lld visible=%d "
                     L"(awaiting confirmation)",
@@ -7546,13 +7554,33 @@ void ApplyExecAck() {
             return;
         }
         if (confirmed) {
-            const bool wasConfirming = dismissConfirming;
-            if (wasConfirming) {
-                g_pendingDismissConfirm = 0;
-            }
             TraceLog(L"exec dismiss confirmed command=%lld visible=%d",
                     static_cast<long long>(ack.command), ack.visible);
+            // The probe said the window is hidden. If a cloak transition had
+            // carried this hide, it would have landed the close and cleared the
+            // slot that still names this command; the slot surviving means no
+            // transition arrived inside the probe's own bound (the dismiss ran
+            // on a window something else had already hidden, a native hide won
+            // the race, or the transition was lost). The close is still this
+            // command's, so it finishes through the same landing, and the log
+            // names the probe as the cause. The cloak is read again here because
+            // it, not the probe, is the state: a window it still reports open
+            // has a transition still to come, and that landing keeps the close.
+            if (ack.visible == 0 && !StartWindowIsOpen()) {
+                LandClosedMenu(GetTickCount64(),
+                               L"confirmed-without-transition");
+            }
+            // The landing consumed both slots. A confirmation the cloak did not
+            // agree with retires only the answer: its transition (or the watch)
+            // still owns the close, and the old code left nothing for it either.
+            g_pendingDismissExec.store(0, std::memory_order_relaxed);
+            g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+            g_pendingDismissConfirm = 0;
             return;
+        }
+        if (dismissPending) {
+            g_pendingDismissExec.store(0, std::memory_order_relaxed);
+            g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
         }
         if (unconfirmed || failed) {
             // A dismiss that did not hide the window — refused, expired, still
@@ -7744,6 +7772,182 @@ bool RevealPullQualified(const GestureGeometry& geometry) {
                            g_contactOrigin.y) >= kAdoptTravelDip;
 }
 
+// The close-landing body. Its usual caller is the cloak transition: the window
+// went from shown to hidden and this classifies the close, releases a pull that
+// waited for it, and resets the controller. The executor's confirmation probe is
+// the second caller: it can find the window already hidden with no transition
+// left to arrive (the dismiss ran on a window something else had hidden, a
+// native hide won the race, or the transition was lost). The body is shared on
+// purpose — one landing, one set of generation and ticket rules — but the log
+// names the cause, because only the first one is a transition the shell
+// performed. The command identity is the same in both: a pending dismiss slot (or
+// the answer that names it) must still call this close its own.
+void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
+    // A landing must not outrun a takeover that arrived with it. The idle
+    // timer and the intent event are two wait objects of this thread, and the
+    // timer has the lower index: the landing can be served before the
+    // `external` intent that came with it is processed, and processing it
+    // afterwards does not revoke a Show this branch already issued. The
+    // already-published superseding intent is reconciled first, and it clears
+    // the suppression and the recovery ticket as any external takeover does.
+    ReconcileSupersedingIntentBeforeLanding();
+    // Whether the hide that just landed belongs to a close this mod
+    // started. The suppression *window* is not the evidence: it is 600 ms,
+    // and a maximum-duration close (520 ms settle + the 30 ms lead +
+    // launcher dispatch + cloak delivery) measured 579-594 ms, so a busy
+    // launcher can pass it and a genuine pull held through that close would
+    // be dropped as an external takeover. The command is the identity: a
+    // dismiss of ours is queued/armed, or executed and awaiting its
+    // confirmation, for exactly the menu this landing closes. Every path
+    // that revokes it (a cancel, a failure, an external intent) clears those
+    // slots first, so this cannot claim someone else's close. A close whose
+    // command an open intent revoked is added below through its ticket.
+    const bool closeCommand =
+        g_pendingDismissExec.load(std::memory_order_relaxed) != 0 ||
+        g_pendingDismissConfirm != 0;
+    // An open that cancelled a close while the window still showed is owed
+    // only if that close still lands, and only for the menu the cancel named.
+    // The ticket is consumed here, by the landing, and by nothing else: the
+    // still-open read below must not clear it, because between the cancel and
+    // the cloak transition the window is open for the whole window in which
+    // the dismiss can still land, and the suppression may already have expired
+    // by the time it does. A new close clears it in TakeCloseOwnership, an
+    // external takeover clears it in ApplyBridgeIntent, and a failed dismiss
+    // clears it in ApplyExecAck; those are the explicit superseding actions.
+    //
+    // The ticket also has a deadline: after the revoked command's own
+    // deadline plus the ack budget and the confirmation probe, the dismiss can
+    // no longer be inside the shell, so a landing after that is some other
+    // close of the same menu, not this press's.
+    const bool ticketCurrent =
+        g_intentCancel.pending && g_intentCancel.openTick == g_ipcOpenTickLow;
+    const bool ticketLive =
+        ticketCurrent &&
+        (g_intentCancel.expireAt == 0 || tickMs <= g_intentCancel.expireAt);
+    const bool intentCancelLost = ticketLive;
+    if (g_intentCancel.pending) {
+        TraceLog(L"intent recovery ticket open=%u now=%u seq=%lld served=%d "
+                L"expired=%d",
+                g_intentCancel.openTick, g_ipcOpenTickLow,
+                static_cast<long long>(g_intentCancel.dismissSeq),
+                intentCancelLost ? 1 : 0,
+                ticketCurrent && !ticketLive ? 1 : 0);
+    }
+    g_intentCancel = CloseCancelTicket{};
+    // A close whose command an open intent revoked can still land. The
+    // ticket names that command and the menu it belongs to, so the landing
+    // is still this mod's close and its pull is released, not dropped.
+    const bool closeOurs = closeCommand || intentCancelLost;
+    // The close has landed, so its suppression no longer applies. Without
+    // this a Win press right after the hide opened the window with Progress
+    // still at 0, and the panel was invisible until the next open.
+    g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+    if (closeOurs) {
+        // A pull that arrived during the close is the pull that opens the
+        // menu this hide made room for. The landing is the one moment its
+        // deferral can end: the retract is over, nothing else writes
+        // Progress, and the open's own poll either promotes the contact from
+        // its down point (still down) or consumes the release record it left
+        // (already lifted).
+        if (g_reveal.deferred) {
+            g_reveal.deferred = false;
+            TraceLog(L"reveal defer released candidate=%d down=%d",
+                    g_reveal.edgeCandidate ? 1 : 0,
+                    g_contactOrigin.valid ? 1 : 0);
+        }
+        // The release record of a pull that lifted during this close becomes
+        // consumable now: its end speed was measured at the lift, and the
+        // window it must arrive in starts at the landing, not at the lift.
+        if (g_lateRelease.valid && g_lateRelease.deferred) {
+            g_lateRelease.deferred = false;
+            g_lateRelease.readyQpc = QpcMsNow();
+        }
+    } else {
+        // A close this mod did not start: an external takeover owns the
+        // screen. The pull is dropped, not deferred — the takeover's window
+        // is not a menu to reopen — and the rest of the contact stays inert
+        // until it lifts. No dismiss command, no Progress write: the
+        // shell did all of it.
+        const bool contactLive =
+            g_contactDown || g_hidSession.active || g_reveal.active ||
+            g_reveal.edgeCandidate;
+        if (g_reveal.active || g_reveal.edgeCandidate ||
+            g_reveal.deferred) {
+            g_reveal = HidRevealSession{};
+            TraceLog(L"reveal dropped (window closed by shell)");
+        }
+        if (g_hidSession.active) {
+            g_hidSession.active = false;
+            EndContactTiming();
+            TraceLog(L"hid dropped (window closed by shell)");
+        }
+        if (contactLive) {
+            g_hidSession.suppress = true;
+            g_contactOrigin = HidContactOrigin{};
+        }
+        g_lateRelease = RevealLateRelease{};
+    }
+    // The closed menu shows no panel, and the layout of the next open is a
+    // new epoch: a measurement still in flight belongs to the menu that just
+    // went away. The request id is captured before the epoch moves, so the
+    // deferred release cancels exactly the request of this open.
+    const uint32_t closedGeneration =
+        g_openGeneration.load(std::memory_order_relaxed);
+    const SettledMeasureRequest closing = SnapshotMeasureRequest();
+    AdvanceOpenGeneration();
+    if (reason) {
+        // A close the confirmation probe had to finish: no cloak event carried
+        // it, so the cause is named. The word `observed` stays, because the
+        // close is as real as any the transition reports.
+        TraceLog(L"win close observed reason=%s", reason);
+    } else {
+        TraceLog(L"win close observed");
+    }
+    SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
+    SwipeIpcSetControllerTouch(&g_ipc, false);
+    g_intentOpenActive.store(false, std::memory_order_relaxed);
+    g_pendingDismissExec.store(0, std::memory_order_relaxed);
+    g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+    g_pendingDismissConfirm = 0;
+    // The measurement request and the cached scroller belong to the open that
+    // just ended; the UI thread releases them.
+    PostUiOpenWatchRelease(closedGeneration, closing);
+
+    // A pull that was down when this close landed is the pull that takes the
+    // menu back — but only a qualified one. A finger merely resting in the
+    // band during the retract is not a pull, and the retract is not
+    // permission to reopen the menu it just closed. The qualification is the
+    // same signed inward travel the open claim uses; a release record left
+    // by a real pull (lateFresh) stays valid on its own.
+    const uint64_t closeQpc = QpcMsNow();
+    const bool pullDown =
+        g_contactDown && RevealPullQualified(ReadGestureGeometry());
+    // The window starts when the record became consumable: readyQpc for a
+    // pull that waited for this landing, releaseQpc for one that lifted on
+    // the closed menu. The release time stays the age the adopt line
+    // reports, never the deadline of a record that became usable late.
+    const uint64_t readyQpc =
+        g_lateRelease.readyQpc != 0 ? g_lateRelease.readyQpc
+                                    : g_lateRelease.releaseQpc;
+    const bool lateFresh =
+        g_lateRelease.valid && !g_lateRelease.deferred &&
+        readyQpc != 0 && closeQpc >= readyQpc &&
+        closeQpc - readyQpc <= kLateRevealWindowMs;
+    // The reason is computed first, then one transaction runs: the pull keeps
+    // its precedence over the cancel-recovery, and only the pull marks the
+    // contact as the panel's owner.
+    const bool pullReopen = pullDown || lateFresh;
+    if (pullReopen) {
+        BeginLandingOpen(true, pullDown, lateFresh);
+    } else if (intentCancelLost) {
+        BeginLandingOpen(false, false, false);
+    }
+    // The window is hidden from this point on. A cloak wake that was already
+    // queued for the same hide reads this and finds no transition to run, so
+    // the landing is served once whatever completed it.
+    g_rootWasOpen = false;
+}
+
 // Two things happen here. A closed-to-open transition that no reveal owns is a
 // keyboard, Start-button or tray open: the shell slides its own storyboard and
 // the mod makes `Progress` follow from 0, so the same root slides the same way a
@@ -7924,158 +8128,7 @@ void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
             !g_hidSession.active && !g_reveal.edgeCandidate);
         PostGeometryMeasurement(request, false);
     } else if (!open && g_rootWasOpen) {
-        // A landing must not outrun a takeover that arrived with it. The idle
-        // timer and the intent event are two wait objects of this thread, and the
-        // timer has the lower index: the landing can be served before the
-        // `external` intent that came with it is processed, and processing it
-        // afterwards does not revoke a Show this branch already issued. The
-        // already-published superseding intent is reconciled first, and it clears
-        // the suppression and the recovery ticket as any external takeover does.
-        ReconcileSupersedingIntentBeforeLanding();
-        // Whether the hide that just landed belongs to a close this mod
-        // started. The suppression *window* is not the evidence: it is 600 ms,
-        // and a maximum-duration close (520 ms settle + the 30 ms lead +
-        // launcher dispatch + cloak delivery) measured 579-594 ms, so a busy
-        // launcher can pass it and a genuine pull held through that close would
-        // be dropped as an external takeover. The command is the identity: a
-        // dismiss of ours is queued/armed, or executed and awaiting its
-        // confirmation, for exactly the menu this landing closes. Every path
-        // that revokes it (a cancel, a failure, an external intent) clears those
-        // slots first, so this cannot claim someone else's close. A close whose
-        // command an open intent revoked is added below through its ticket.
-        const bool closeCommand =
-            g_pendingDismissExec.load(std::memory_order_relaxed) != 0 ||
-            g_pendingDismissConfirm != 0;
-        // An open that cancelled a close while the window still showed is owed
-        // only if that close still lands, and only for the menu the cancel named.
-        // The ticket is consumed here, by the landing, and by nothing else: the
-        // still-open read below must not clear it, because between the cancel and
-        // the cloak transition the window is open for the whole window in which
-        // the dismiss can still land, and the suppression may already have expired
-        // by the time it does. A new close clears it in TakeCloseOwnership, an
-        // external takeover clears it in ApplyBridgeIntent, and a failed dismiss
-        // clears it in ApplyExecAck; those are the explicit superseding actions.
-        //
-        // The ticket also has a deadline: after the revoked command's own
-        // deadline plus the ack budget and the confirmation probe, the dismiss can
-        // no longer be inside the shell, so a landing after that is some other
-        // close of the same menu, not this press's.
-        const bool ticketCurrent =
-            g_intentCancel.pending && g_intentCancel.openTick == g_ipcOpenTickLow;
-        const bool ticketLive =
-            ticketCurrent &&
-            (g_intentCancel.expireAt == 0 || tickMs <= g_intentCancel.expireAt);
-        const bool intentCancelLost = ticketLive;
-        if (g_intentCancel.pending) {
-            TraceLog(L"intent recovery ticket open=%u now=%u seq=%lld served=%d "
-                    L"expired=%d",
-                    g_intentCancel.openTick, g_ipcOpenTickLow,
-                    static_cast<long long>(g_intentCancel.dismissSeq),
-                    intentCancelLost ? 1 : 0,
-                    ticketCurrent && !ticketLive ? 1 : 0);
-        }
-        g_intentCancel = CloseCancelTicket{};
-        // A close whose command an open intent revoked can still land. The
-        // ticket names that command and the menu it belongs to, so the landing
-        // is still this mod's close and its pull is released, not dropped.
-        const bool closeOurs = closeCommand || intentCancelLost;
-        // The close has landed, so its suppression no longer applies. Without
-        // this a Win press right after the hide opened the window with Progress
-        // still at 0, and the panel was invisible until the next open.
-        g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
-        if (closeOurs) {
-            // A pull that arrived during the close is the pull that opens the
-            // menu this hide made room for. The landing is the one moment its
-            // deferral can end: the retract is over, nothing else writes
-            // Progress, and the open's own poll either promotes the contact from
-            // its down point (still down) or consumes the release record it left
-            // (already lifted).
-            if (g_reveal.deferred) {
-                g_reveal.deferred = false;
-                TraceLog(L"reveal defer released candidate=%d down=%d",
-                        g_reveal.edgeCandidate ? 1 : 0,
-                        g_contactOrigin.valid ? 1 : 0);
-            }
-            // The release record of a pull that lifted during this close becomes
-            // consumable now: its end speed was measured at the lift, and the
-            // window it must arrive in starts at the landing, not at the lift.
-            if (g_lateRelease.valid && g_lateRelease.deferred) {
-                g_lateRelease.deferred = false;
-                g_lateRelease.readyQpc = QpcMsNow();
-            }
-        } else {
-            // A close this mod did not start: an external takeover owns the
-            // screen. The pull is dropped, not deferred — the takeover's window
-            // is not a menu to reopen — and the rest of the contact stays inert
-            // until it lifts. No dismiss command, no Progress write: the
-            // shell did all of it.
-            const bool contactLive =
-                g_contactDown || g_hidSession.active || g_reveal.active ||
-                g_reveal.edgeCandidate;
-            if (g_reveal.active || g_reveal.edgeCandidate ||
-                g_reveal.deferred) {
-                g_reveal = HidRevealSession{};
-                TraceLog(L"reveal dropped (window closed by shell)");
-            }
-            if (g_hidSession.active) {
-                g_hidSession.active = false;
-                EndContactTiming();
-                TraceLog(L"hid dropped (window closed by shell)");
-            }
-            if (contactLive) {
-                g_hidSession.suppress = true;
-                g_contactOrigin = HidContactOrigin{};
-            }
-            g_lateRelease = RevealLateRelease{};
-        }
-        // The closed menu shows no panel, and the layout of the next open is a
-        // new epoch: a measurement still in flight belongs to the menu that just
-        // went away. The request id is captured before the epoch moves, so the
-        // deferred release cancels exactly the request of this open.
-        const uint32_t closedGeneration =
-            g_openGeneration.load(std::memory_order_relaxed);
-        const SettledMeasureRequest closing = SnapshotMeasureRequest();
-        AdvanceOpenGeneration();
-        TraceLog(L"win close observed");
-        SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
-        SwipeIpcSetControllerTouch(&g_ipc, false);
-        g_intentOpenActive.store(false, std::memory_order_relaxed);
-        g_pendingDismissExec.store(0, std::memory_order_relaxed);
-        g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
-        g_pendingDismissConfirm = 0;
-        // The measurement request and the cached scroller belong to the open that
-        // just ended; the UI thread releases them.
-        PostUiOpenWatchRelease(closedGeneration, closing);
-
-        // A pull that was down when this close landed is the pull that takes the
-        // menu back — but only a qualified one. A finger merely resting in the
-        // band during the retract is not a pull, and the retract is not
-        // permission to reopen the menu it just closed. The qualification is the
-        // same signed inward travel the open claim uses; a release record left
-        // by a real pull (lateFresh) stays valid on its own.
-        const uint64_t closeQpc = QpcMsNow();
-        const bool pullDown =
-            g_contactDown && RevealPullQualified(ReadGestureGeometry());
-        // The window starts when the record became consumable: readyQpc for a
-        // pull that waited for this landing, releaseQpc for one that lifted on
-        // the closed menu. The release time stays the age the adopt line
-        // reports, never the deadline of a record that became usable late.
-        const uint64_t readyQpc =
-            g_lateRelease.readyQpc != 0 ? g_lateRelease.readyQpc
-                                        : g_lateRelease.releaseQpc;
-        const bool lateFresh =
-            g_lateRelease.valid && !g_lateRelease.deferred &&
-            readyQpc != 0 && closeQpc >= readyQpc &&
-            closeQpc - readyQpc <= kLateRevealWindowMs;
-        // The reason is computed first, then one transaction runs: the pull keeps
-        // its precedence over the cancel-recovery, and only the pull marks the
-        // contact as the panel's owner.
-        const bool pullReopen = pullDown || lateFresh;
-        if (pullReopen) {
-            BeginLandingOpen(true, pullDown, lateFresh);
-        } else if (intentCancelLost) {
-            BeginLandingOpen(false, false, false);
-        }
+        LandClosedMenu(tickMs, nullptr);
     } else if (open) {
         // The window stayed uncloaked. The cancel-recovery ticket is deliberately
         // not cleared merely because this poll sees the window open: this poll can
