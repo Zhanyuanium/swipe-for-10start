@@ -115,7 +115,8 @@ the consumer withdraws before it unregisters its devices.
   crossed 24 DIP inward. Contact-down no longer cancels anything; a tap leaves
   the close alone.
 - `win close observed` — after the landing, a pull still down (or a release
-  inside the 300 ms window) issues one fresh show and the open adopts it:
+  inside its readiness window: the release on a closed menu, the landing for a
+  deferred record) issues one fresh show and the open adopts it:
   `reveal reopen after close pull=1 late=0 entry=...`. The pull that was under
   the close is the pull that takes the menu back, and it must be qualified:
   `RevealPullQualified` applies the same 24 DIP signed inward travel at the

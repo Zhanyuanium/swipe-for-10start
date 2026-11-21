@@ -66,7 +66,11 @@ contact lifts.
    commits on travel (half the travel) or on the session average, and the release
    speed is measured over the last 8–30 ms window (freshness 30 ms).
 6. **Late release** — a pull that lifts before the open keeps its travel, mapped
-   position and end speed in one `RevealLateRelease` record for 300 ms. The open
+   position and end speed in one `RevealLateRelease` record. The window it may be
+   consumed in is 300 ms measured from its readiness: the release time when the
+   menu was closed, or `readyQpc` (the landing) when the pull waited for a close.
+   The idle-tick expiry uses that same clock and skips a record that is still
+   deferred. The open
    reads it and settles from the panel's live position with that end speed. A
    live takeover, an admitted newer pull, the consumption and the window
    invalidate it; a new down does not.
@@ -171,7 +175,8 @@ the settle starts from the live position (`from=0.542` measured 172 ms into an
 open).
 
 A pull that is still down and qualified when the close lands (or a qualified
-release inside the 300 ms late window) takes the menu back: after `win close
+release inside its readiness window — the release on a closed menu, the landing
+for a deferred record) takes the menu back: after `win close
 observed` the controller issues one fresh show (`reveal reopen after close
 pull=1 late=0 entry=...`), and the open adopts the live contact or consumes the
 release record. "Qualified" is the same signed inward travel, 24 DIP, measured

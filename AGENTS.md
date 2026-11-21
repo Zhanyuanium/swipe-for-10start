@@ -144,7 +144,8 @@ takeover chases the mapped finger at 2.2 DIP/ms, then follows (`behind=0.000`).
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
 pull that is still down and qualified when a close lands (or that lifted within
-the 300 ms late window) is the pull that takes the menu back: after `win close
+its readiness window: the release on a closed menu, the landing for a deferred
+record) is the pull that takes the menu back: after `win close
 observed` the controller issues the same show the qualified pull would, and the
 open adopts the live contact or the release record (`reveal reopen after close
 pull=1 late=0`). "Qualified" is the same 24 DIP at the contact's last positioned

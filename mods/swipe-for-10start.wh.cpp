@@ -6471,10 +6471,17 @@ void CheckHidIdleRelease(uint64_t tickMs) {
 
     // A release record that no open consumed inside its window is dead: drop it
     // here so it cannot be read long after the gesture, and so the next keyboard
-    // open finds none.
-    if (g_lateRelease.valid &&
-        (qpcNow < g_lateRelease.releaseQpc ||
-         qpcNow - g_lateRelease.releaseQpc > kLateRevealWindowMs)) {
+    // open finds none. The deadline is the record's readiness, not its release:
+    // a pull that lifted while a close owned the panel is not consumable until
+    // that close lands, so starting the window at the release would kill it
+    // before the landing it waits for. While it is still deferred, the landing
+    // (or the qualified pull that cancels the close) owns its fate.
+    const uint64_t recordQpc =
+        g_lateRelease.readyQpc != 0 ? g_lateRelease.readyQpc
+                                    : g_lateRelease.releaseQpc;
+    if (g_lateRelease.valid && !g_lateRelease.deferred &&
+        (qpcNow < recordQpc ||
+         qpcNow - recordQpc > kLateRevealWindowMs)) {
         g_lateRelease = RevealLateRelease{};
     }
 
@@ -7676,11 +7683,17 @@ void PollRootVisibility(uint64_t tickMs) {
         const uint64_t closeQpc = QpcMsNow();
         const bool pullDown =
             g_contactDown && RevealPullQualified(ReadGestureGeometry());
+        // The window starts when the record became consumable: readyQpc for a
+        // pull that waited for this landing, releaseQpc for one that lifted on
+        // the closed menu. The release time stays the age the adopt line
+        // reports, never the deadline of a record that became usable late.
+        const uint64_t readyQpc =
+            g_lateRelease.readyQpc != 0 ? g_lateRelease.readyQpc
+                                        : g_lateRelease.releaseQpc;
         const bool lateFresh =
             g_lateRelease.valid && !g_lateRelease.deferred &&
-            g_lateRelease.releaseQpc != 0 &&
-            closeQpc >= g_lateRelease.releaseQpc &&
-            closeQpc - g_lateRelease.releaseQpc <= kLateRevealWindowMs;
+            readyQpc != 0 && closeQpc >= readyQpc &&
+            closeQpc - readyQpc <= kLateRevealWindowMs;
         // The reason is computed first, then one transaction runs: the pull keeps
         // its precedence over the cancel-recovery, and only the pull marks the
         // contact as the panel's owner.
