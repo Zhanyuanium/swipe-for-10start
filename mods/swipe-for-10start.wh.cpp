@@ -12728,18 +12728,22 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     }
     if (t_execCall > 0) {
         const uint32_t execState = OwnInternalState(self);
+        const OwnCaller execCaller = OwnCallerNow();
+        // The pointer-away of our own Show enters HideStartAndCortana(7)
+        // directly, with no wrapper scope (Unknown). A lock or a real click-away
+        // on this same executor stack is not that source and must not be
+        // swallowed; the caller and the depth are logged with the decision.
         if (method == kDismissMethodClickAway &&
-            (execState == 1 || execState == 3)) {
-            // Our own Show is still on the stack and the shell is closing the
-            // window it is just presenting because the pointer is outside it.
-            // That is the pointer-away check, not a user click; swallowing it is
-            // what lets the requested open land.
-            TraceLog(L"exec swallow hide method=7 state=%u reason=own-show",
-                    execState);
+            (execState == 1 || execState == 3) &&
+            execCaller == OwnCaller::Unknown) {
+            TraceLog(L"exec swallow hide caller=%s method=%u state=%u depth=%d "
+                    L"reason=own-show",
+                    OwnCallerName(execCaller), method, execState, t_execCall);
             return;
         }
-        TraceLog(L"exec pass hide method=%u state=%u reason=executor", method,
-                execState);
+        TraceLog(L"exec pass hide caller=%s method=%u state=%u depth=%d "
+                L"reason=executor",
+                OwnCallerName(execCaller), method, execState, t_execCall);
         callOriginal();
         OwnResyncFromState(self);
         return;
@@ -12772,9 +12776,12 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         OwnResyncFromState(self);
         return;
     }
+    // External and lock precedence, before any opening or touch-owner
+    // suppression: a lock, an unattributed caller, Win+Tab's method 5 and a
+    // forwarded Win press are takeovers, not this mod's close, and they pass.
     if (caller == OwnCaller::Lock || caller == OwnCaller::Unknown ||
         method == kDismissMethodWinTab || OwnTakeExternalForward(method)) {
-        TraceLog(L"intent external trigger=hide caller=%s method=%u", 
+        TraceLog(L"intent external trigger=hide caller=%s method=%u",
                 OwnCallerName(caller), method);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                             method, 0);
@@ -12801,17 +12808,23 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     // asked for. Swallow it only in the opening states; a click-away on the
     // settled panel (state 5) is a real trigger.
     const uint32_t currentState = OwnInternalState(self);
-    if (method == kDismissMethodClickAway &&
+    // Only the observed click-away source is the opening pointer-away. A
+    // method-7 number alone is not: the lock and unattributed callers already
+    // passed above as external, and an ordinary caller's 7 is not a click-away.
+    if (caller == OwnCaller::ClickAway &&
+        method == kDismissMethodClickAway &&
         (currentState == 1 || currentState == 3)) {
-        TraceLog(L"intent ignore trigger=clickaway method=%u state=%u "
-                L"reason=opening",
-                method, currentState);
+        TraceLog(L"intent ignore trigger=clickaway caller=%s method=%u state=%u "
+                L"depth=%d reason=opening",
+                OwnCallerName(caller), method, currentState, t_execCall);
         return;
     }
-    if (method == kDismissMethodClickAway &&
+    if (caller == OwnCaller::ClickAway &&
+        method == kDismissMethodClickAway &&
         SwipeIpcControllerTouch(&g_ipc)) {
-        TraceLog(L"intent ignore trigger=clickaway method=%u reason=touch-owner",
-                method);
+        TraceLog(L"intent ignore trigger=clickaway caller=%s method=%u state=%u "
+                L"depth=%d reason=touch-owner",
+                OwnCallerName(caller), method, currentState, t_execCall);
         return;
     }
 
@@ -12822,17 +12835,17 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     // the shared vocabulary is the shell's own close, not one this mod can run:
     // pass it now instead of swallowing it for a command that would be refused.
     if (!SwipeCloseIntentAllowed(method)) {
-        TraceLog(L"intent pass close trigger=%s method=%u reason=unsupported",
+        TraceLog(L"intent pass close trigger=%s caller=%s method=%u reason=%s",
                 trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win",
-                method);
+                OwnCallerName(caller), method, L"unsupported");
         callOriginal();
         OwnResyncFromState(self);
         return;
     }
     PublishBridgeIntent(kSwipeIntentClose, trigger, method, 0);
-    TraceLog(L"intent close trigger=%s method=%u state=%u",
-            trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win", method,
-            OwnInternalState(self));
+    TraceLog(L"intent close trigger=%s caller=%s method=%u state=%u depth=%d",
+            trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win",
+            OwnCallerName(caller), method, currentState, t_execCall);
 }
 // ---------------------------------------------------------------------------
 // The decision hooks: Windows key, Start button, and the two state events

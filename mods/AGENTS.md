@@ -275,10 +275,15 @@ probe or timer failure is answered `unknown`.
   methods go through the same dispatcher as the Win key, so a press during a
   retract is a reopen whatever primitive it entered through.
 - `HideStartAndCortana_Hook` (0x24BCB0): lock/unknown/Win+Tab and a forwarded
-  modified press publish `intent=external` and pass; method 7 is a close intent
-  unless `controllerTouch` is set (the opening contact's shell click-away is
-  swallowed); every other Hide is a close intent. Its capability gate is one
-  function (`HideCanServeClose`): peer, caller wrappers verified, started worker,
+  modified press publish `intent=external` and pass. A close intent is a close
+  only from the click-away caller or the Win/button caller; the click-away's
+  opening suppression (state 1/3, `reason=opening`) and the `controllerTouch`
+  suppression require `caller=clickaway`, not the number 7 alone. The own-show
+  exception requires the executor's own stack, an unattributed caller and state
+  1/3 (`caller=unknown method=7 state=1|3 depth>0 reason=own-show`). Every
+  decision line prints caller, method, internal state and executor depth
+  together, so a method-7 number cannot stand in for its source. Its capability
+  gate is one function (`HideCanServeClose`): peer, caller wrappers verified, started worker,
   recorded launcher thread (never adopted by a Hide), a window on this thread and
   a callable `Dismiss`. Any missing piece passes with
   `exec pass hide method=... reason=no-peer|callers-unverified|no-executor|
@@ -342,9 +347,11 @@ probe or timer failure is answered `unknown`.
   or whose hide never landed, and expires after 1200 ms. Timer-arming failures are
   handled, never papered over: a latch whose **initial** timer cannot be armed is
   dropped, and one that cannot be deferred is dropped rather than shown on the
-  hidden event's stack. A click-away in state 1/3, or a Hide(7)
-  inside our own `ShowStartView` in state 1/3, is the pointer-away check and is
-  swallowed (`reason=opening`/`reason=own-show`); otherwise the served open is
+  hidden event's stack. A click-away in state 1/3 from the ActiveZBand caller,
+  or a Hide(7) inside our own `ShowStartView` in state 1/3 from the executor's
+  call stack with an unattributed caller, is the pointer-away check and is
+  swallowed (`caller=clickaway reason=opening`, or
+  `caller=unknown depth>0 reason=own-show`); otherwise the served open is
   hidden the instant it appears. The latch is a best-effort obligation, not a
   guarantee: a press can still be lost when the peer dies inside the detection
   window, and a swallowed press has no shell fallback.

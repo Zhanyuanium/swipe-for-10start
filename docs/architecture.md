@@ -274,10 +274,14 @@ examined, not a second read, because the idle timer is
 waited on before the intent event and processing the takeover afterwards would
 not revoke a Show the landing had already issued.
 The
-click-away that the shell issues while the window is appearing (state 1/3), and
-the Hide(7) it issues inside our own `ShowStartView` in state 1/3, are the
-pointer-away check, not a user click, and are swallowed
-(`reason=opening`/`reason=own-show`). Without that, the served open came back
+click-away that the shell issues while the window is appearing (state 1/3) is
+swallowed only from the `ActiveZBand` caller (`caller=clickaway`,
+`reason=opening`); the Hide(7) inside our own `ShowStartView` is swallowed only
+on the executor's own call stack with an unattributed caller
+(`caller=unknown state=1|3 depth>0`, `reason=own-show`). A lock, an unattributed
+Hide outside that stack, or any other caller takes the external path first and
+passes. Each line prints caller, method, internal state and executor depth
+together. Without the guards, the served open came back
 and was hidden in the same millisecond.
 
 **Executed is not hidden.** A successful `Dismiss` answers `executed`; the hide is
