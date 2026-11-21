@@ -15,7 +15,8 @@ decision/one executor per trigger, the controller-direction toggle rule (closing
 published at the close's start), the close cancel/recovery for a press during a
 retract (the ticket only for a published command, bounded by its deadline), the
 bounded press latch for a hide in flight, the click-away guards of an
-opening window, the qualified pull-reopen at a close's landing, the command-expiry rule
+opening window, the grab's one transfer attempt and the press obligation a
+landing still serves, the command-expiry rule
 (one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
 auto-hidden timing/interruption chains (the bottom docked numbers are named as
 historical; the live left docked layout is a separate set), the
@@ -41,9 +42,9 @@ gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admissio
 and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry
 and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
 from the panel's position), the one close path (`TakeProgressNow` → mirrored
-settle → scheduled `exec dismiss`), the qualified pull-cancel of any close whose
-dismiss is still revocable, the qualified pull-reopen on a closing panel,
-the gates and settle ownership.
+settle → scheduled `exec dismiss`), the grab's down hit-test and its one
+transfer attempt (a refusal consumes the contact and the landing adopts no
+finger), the gates and settle ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
 start-speed seam, the mirrored close, the coast, and the measured lines.

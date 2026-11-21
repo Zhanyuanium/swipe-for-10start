@@ -4,7 +4,7 @@ C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
 tools/ - PowerShell probes, injectors, animation harnesses, the panel-edge tracker, the regression smoke, the store packager and the local installer (16 scripts + AGENTS.md)
-artifacts/ - captured measurements (12 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
+artifacts/ - captured measurements (14 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
 <config>
@@ -139,34 +139,37 @@ already inside the shell; an entered dismiss is handled by the landing rules.
 The open runs from the band contact, but only after travel: admission records the
 contact and its down point, and the one `exec show` of that contact is requested
 on the first positioned report whose signed inward travel reaches 24 DIP
-(`reveal pull qualified ...` then `reveal show request ...`). A tap anywhere in
-the band — twice the taskbar's thickness — requests nothing and stays a native
-press; the shell's own edge gesture (from about 20 DIP) remains the fallback and
-an open it performs is adopted. One attempt per contact: a refused request is
-not retried. The content settle starts at `RevealEntryProgress`, and the reveal
-takeover chases the mapped finger at 2.2 DIP/ms, then follows (`behind=0.000`).
+(`reveal pull qualified ... grab=none` then `reveal show request ...`). A tap
+anywhere in the band — twice the taskbar's thickness — requests nothing and stays
+a native press; the shell's own edge gesture (from about 20 DIP) remains the
+fallback and an open it performs is adopted. One attempt per contact: a refused
+request is not retried. The content settle starts at `RevealEntryProgress`, and
+the reveal takeover chases the mapped finger at 2.2 DIP/ms, then follows
+(`behind=0.000`).
 A pull that takes a live retract over does not start at the entry: it continues
 from the panel's position, keeps the finger-to-panel offset it took over
-(`reveal takeover ... live=1`) and begins its chase at that sample. The pull that
-does it aborts the close at its 24 DIP report: `CancelCloseForQualifiedPull`
-revokes both schedules (the local slot and the armed `exec dismiss`), arms the
-same recovery ticket a press arms, and takes the retract over there. Two closes it
-cannot abort: a dismiss whose call already returned with its hide unconfirmed
-(`g_pendingDismissConfirm`), whose hide can land at any moment, and a retract
-already at or below the entry, where no panel is on screen — cancelling there
-would open the menu from an invisible start, so that pull keeps the landing reopen
-and its open begins at the entry. Both stay deferred and their
-landing reopens.
+(`reveal takeover ... live=1`) and begins its chase at that sample. That pull is
+a grab, and while a close owns the panel a down is admitted only when it lands in
+the band or on the surface the retract still shows — its mapped progress at or
+below the panel's live one, because the panel's trail edge is then at or beyond
+the point. A point in the area the retract has left is refused
+(`reveal admit ... reason=offsurface`) and muted for its contact. The grab spends
+its one opportunity at its 24 DIP report: `CancelCloseForQualifiedPull` revokes
+both schedules (the local slot and the armed `exec dismiss`), arms the same
+recovery ticket a press arms, and takes the retract over there (`grab=taken`). A
+refused transfer — the retract already at or below the entry, the dismiss already
+inside the shell, no distance, or nothing left to cancel — consumes the contact
+(`grab=refused reason=...`): it keeps no open right until it lifts, every later
+report is inert, and its release leaves no record. A close also consumes every
+contact that was already on the glass when it started.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
-pull that is still down and qualified when a close it could not abort lands (or
-that lifted within
-its readiness window: the release on a closed menu, the landing for a deferred
-record) is the pull that takes the menu back: after `win close
-observed` the controller issues the same show the qualified pull would, and the
-open adopts the live contact or the release record (`reveal reopen after close
-pull=1 late=0`). "Qualified" is the same 24 DIP at the contact's last positioned
-report; a finger merely resting in the band through the retract is not reopened.
+landing adopts no finger: after `win close observed` the controller issues no
+touch show, and no hover, carried travel or release record turns a landed close
+into a Show; a contact still down is inert until it lifts (`win close observed
+... muted=1`). The only open a landing still serves is the explicit, independently
+owed press obligation (`intent open recovered ...`) with its epoch and close
+identity, unchanged.
 An intent close is
 `TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
@@ -195,16 +198,16 @@ Deleted in M3: the `VK_LWIN` tap, the close record and its publishes, the retrac
 request/answer and its cancel answer, the arbitration hold, the deferred
 candidate **as an arbitration mechanism**, and the reveal claim. The deferred
 candidate still has one live use, and it is not arbitration:
-`BeginEdgeCandidate` (the touch show's band admission) calls `StartRevealFollow`
-with `deferred=true` while `CloseInFlight`, so a contact that lands during a
-close is tracked without writing `Progress`; the landing (`LandClosedMenu`, run
-by the visibility service and by the executor's confirmation) releases it.
-`CloseInFlight` remains only as the
-suppression-window predicate: the settle owns the motion. The
+`BeginEdgeCandidate` (the down's admission) calls `StartRevealFollow`
+with `deferred=true` while `CloseInFlight`, so a grab is tracked without writing
+`Progress`; its one transfer attempt is the pull cancel, and a refused transfer
+consumes it — the landing no longer releases it. `CloseInFlight` remains only as
+the suppression-window predicate: the settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
 `CloseInFlight` early return that guards the follow, so it could never fire; the
-pull-reopen and the press latch are the reopen paths that remain. M3.1 also
-removes the retired v2 close/retract slots from the header.
+press cancel, the press latch and the landing's press recovery are the reopen
+paths that remain. M3.1 also removes the retired v2 close/retract slots from the
+header.
 
 ## Channel
 

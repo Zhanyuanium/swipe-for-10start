@@ -250,8 +250,13 @@ no `reveal show request` and no `exec show`, and leave the menu cloaked; the
 Start button must log one shell open (`exec show ... method=11`) and no band
 claim. Then pull 23 DIP and 25 DIP and lift: the first requests nothing from this
 mod (the shell's own gesture may open it), the second requests one show. Finally
-hold a contact still through a Win close's landing: it must not reopen
-(`reveal defer released candidate=1 down=1`, no `reveal reopen`).
+hold a contact still in the band through a Win close: its down is admitted as a
+grab (`reveal admit ... reason=deferred`), it never reaches 24 DIP, and the
+landing consumes it (`win close observed ... muted=1`) with no `exec show`. A
+grab that does reach 24 DIP after the retract has passed the entry logs
+`reveal pull qualified ... grab=refused reason=offsurface` and opens nothing; the
+same pull held on the visible panel *before* the crossing cancels the close
+(`grab=taken`).
 
 What it does not cover, on purpose: the click-away step waits for the executor's
 `exec visible ... visible=visible` because a click inside the window's presentation
@@ -307,11 +312,14 @@ other at the same landmarks — and no sample shows a plateau or a reversal. Tha
 was the old rule: the pull did not interrupt the Win close, because only a local
 gesture-close slot was cancellable. What it leaves behind is a
 reopen: the panel is visible again at `tc` 710 and 736, after the landing, which
-the mod logs as `reveal reopen after close pull=0 late=1` — the release record,
-not a live contact, takes the menu back. These four CSV pairs stay as the
+that build logged as `reveal reopen after close pull=0 late=1` — the release
+record, not a live contact, took the menu back. These four CSV pairs stay as the
 deferred-path reference; a pull that interrupts a Win close now logs
 `reveal takeover ... live=1` in the same millisecond as the qualifying report,
-and the retract reverses there instead of reaching the landing.
+and the retract reverses there instead of reaching the landing. The delayed
+reopen itself is gone: under the current rule a grab that the close outruns is
+refused and consumed, so the same capture would end with the menu closed and
+`win close observed ... muted=1`.
 
 ### The interruption, measured
 
@@ -350,12 +358,40 @@ different depths of the same 387 ms close:
 | after the settle ended (~437 ms) | at or below the entry | no cancel; `reveal defer released candidate=1 down=1`, `win close observed`, `reveal reopen after close pull=1 late=0 entry=0.310` |
 
 The second row is why a cancel needs a panel on screen: a takeover at or below the
-entry would open the menu from an invisible start, so the close lands and the
-landing's reopen begins at the entry instead.
+entry would open the menu from an invisible start, so the close lands. That run
+predates the current rule, which serves no touch open at a landing: the grab is
+refused (`reason=offsurface`) and consumed, the landing logs
+`win close observed ... muted=1`, and the menu stays closed. The table cell keeps
+that build's own line as the measurement it is.
 
 Frames were captured at 200 % DPI with the tool's own DIB; `t` is the capture
 start, so a frame can lag its stamp by one compositor interval, and the CSV's
 `edge_dip` is the measured edge divided by the derived scale.
+
+### The ownership change, measured (P1)
+
+A close now owns the panel to its landing: a down during the retract is a grab
+only when it lands in the band or on the surface the retract still shows, the
+grab's one transfer attempt is spent either way, and a landing adopts no finger.
+Four probes on the bottom auto-hidden bar, 2026-11-22, with the installed build
+(`axis=3`, open edge 558 px, entry edge 1704 px, entry progress 0.363, work-area
+entry 0.310):
+
+| probe | result |
+| --- | --- |
+| band grab at `tc` 150 | `reveal admit ... reason=deferred`, `reveal pull qualified ... grab=taken`, `reveal takeover from=0.931 ... live=1`; the edge reverses at 692 px and ends at 558 with the menu open (`panel-edge-p1-early-1.csv`) |
+| band grab at `tc` 400, qualifying after the settle | `grab=refused reason=offsurface`, `win close observed muted=1`, no `reveal reopen`, no `exec show`, `STATE at exit open=False`; the edge runs monotonically to 1704 and stays (`panel-edge-p1-refused-1.csv`) |
+| down in the vacated area (720,450 DIP, against a panel whose trail edge was at 625 DIP) | `reveal admit ... ok=0 reason=offsurface`, the close lands, no show, menu closed |
+| press during a live band pull, finger held through the hide | `intent close trigger=win`, `win close observed muted=1`, no touch show after the landing, and the release wrote no record (no `reveal candidate released`) |
+
+The third row caught an inverted sign on the way in: the same down was first
+admitted (`reason=deferred`) and took the close over (`grab=taken`, `live=1`),
+which is the "menu chases the finger out of the vacated area" the owner reported.
+The hit test compares the down's mapped progress with the panel's live one: at or
+below it, the panel's trail edge is at or beyond the point, so the point is on the
+surface.
+
+`tools/smoke.ps1` stays green on this build.
 
 ## Artifacts
 

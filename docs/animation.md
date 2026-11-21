@@ -82,7 +82,10 @@ owns does the same thing and then hands the panel to the follow: the retract sto
 where it is, the follow takes over at that position (`live=1`) with the
 finger-to-panel offset it found, and its chase starts on the same report instead
 of waiting out the 30 ms entry hold. The one close a pull cannot take over is one
-whose `Dismiss` call has already returned and whose hide is unconfirmed. No path
+whose `Dismiss` call has already returned and whose hide is unconfirmed; a
+retract already at or below the entry is refused for the same reason (there is no
+visible panel to take). A refused transfer consumes the contact, and the landing
+serves no touch open, so the menu stays closed until a new pull. No path
 replays from the old target.
 
 ## The coast

@@ -25,9 +25,10 @@ What it does:
   under the finger, and lifting with enough travel lets it settle open.
 - A tap on the taskbar background opens nothing; the pull must travel 24 DIP.
 - Drag the open menu back toward the taskbar to close it with the same spring.
-- A press during a close, or a pull during one, takes the menu back: the close
-  stops where it is and the panel reverses. A pull still down when the close
-  lands takes it back too, so a menu is never left shown but empty.
+- A press during a close, or a pull that grabs the panel while it is still on
+  screen, takes the menu back: the close stops where it is and the panel
+  reverses. A close that lands is final for that finger: the next open needs a
+  new touch, so a hand resting through the retract cannot reopen the menu.
 
 What you need:
 
@@ -142,8 +143,10 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   ticket: a press settles the panel back from its live position, and a pull
  *   takes the retract over there — keeping the finger-to-panel offset it took
  *   over instead of starting at the open's entry — unless the dismiss already
- *   returned from the shell call with its hide unconfirmed, in which case the
- *   pull waits for the landing.
+ *   returned from the shell call with its hide unconfirmed. That refusal spends
+ *   the contact's one grab opportunity and consumes it. A close consumes every
+ *   contact already on the glass, and a landing serves no touch open: only the
+ *   independently owed press recovery reopens.
  *   A landing the cloak never reports — the
  *   window was already hidden when `Dismiss` ran — is finished by the executor's
  *   own confirmation (`win close observed reason=confirmed-without-transition`),
@@ -1449,10 +1452,11 @@ enum class CloseKind {
     RevealCancel,
 };
 
-// A pull is a contact that starts in the taskbar edge band and becomes a reveal
-// candidate (BeginEdgeCandidate). The counter names the pull generation: a close
-// released under one generation is dropped when a later pull exists by the time
-// its dismiss would run.
+// A pull is a contact that becomes a reveal candidate (BeginEdgeCandidate): it
+// starts in the taskbar edge band, or it grabs the surface a close still shows.
+// The counter names the pull generation: a close released under one generation is
+// dropped when a later pull exists by the time its dismiss would run. A refused
+// grab does not advance it: no pull owns anything then.
 uint32_t g_pullSerial = 0;  // input thread only
 
 // The one dismiss slot. `g_pendingTapPull` is the pull generation sampled when
@@ -4502,10 +4506,13 @@ HidGestureSession g_hidSession;  // input thread only
 // against what the renderer actually shows.
 struct HidRevealSession {
     bool edgeCandidate = false;
-    // The candidate arrived while a close owned the panel. It is measured (its
-    // travel, its end-speed window and its release record) but it writes no
-    // Progress and leaves the close's dismiss armed, so the retract is the only
-    // motion; the close's landing releases it and the open adopts it.
+    // The candidate arrived while a close owned the panel, and its down hit the
+    // surface the retract still shows (or the band): it is the grab that close
+    // granted. It is measured but writes no Progress and leaves the close's
+    // dismiss armed, and it gets exactly one transfer attempt at
+    // kAdoptTravelDip. A refused transfer consumes the contact: it keeps no open
+    // right until it lifts, and no landing or later open revives it. A taken
+    // transfer clears this flag and becomes the live follow.
     bool deferred = false;
     // The one open claim of this contact. It is set when the qualified pull
     // first reaches kAdoptTravelDip and attempts the claim, whatever the
@@ -4631,10 +4638,10 @@ void SampleOriginPoint(float x, float y, uint64_t qpcMs) {
 struct RevealLateRelease {
     bool valid = false;
     uint64_t releaseQpc = 0;  // QPC; kLateRevealWindowMs bounds the age
-    // A pull that lifted while a close still owned the panel. Its record only
-    // becomes consumable when that close lands, so the age is measured from
-    // `readyQpc` (the landing) instead of the release: the pull waited for the
-    // close it must not fight, and the open that follows is still its own.
+    // Nothing defers a release any more. A pull that lifts while a close owns
+    // the panel is consumed by that close, and no landing consumes a release
+    // record; this field and `readyQpc` stay false/zero for the readers below
+    // until the sweep that removes them.
     bool deferred = false;
     uint64_t readyQpc = 0;    // QPC of the close's landing, 0 while none
     float travel = 0.0f;      // DIP away from the edge at the release
@@ -4734,15 +4741,18 @@ constexpr bool g_debugEdge = false;
 //   the contact is already ending, so nothing is muted there. The mute is read
 //   from the contact latch, so it covers the finger whether the dismiss session
 //   or the reveal owned it;
+// - every contact already on the glass is consumed by the close: the reveal
+//   flags go with the mute, so no pull that predates this close can interrupt it
+//   or be revived at its landing. Only the contact's sample history survives;
 // - the 1 ms timer period is released: no session is left that needs it.
 //
 // One helper, called by both families. It changes no dismiss slot: the
 // keyboard close drops the armed dismiss at its caller, the gesture close arms
 // one. The name answers only whether the close-suppression window is still open
-// (`tickMs < g_suppressRestoreUntil`); the settle owns Progress, and
-// `CancelCloseForQualifiedPull` is the one abort a pull can still perform. A pull
-// that arrives while the suppression is true and the close is no longer
-// cancellable is deferred, never a second owner.
+// (`tickMs < g_suppressRestoreUntil`); the settle owns Progress. A contact that
+// arrives while this is true is a grab of the surface still on screen or a
+// refusal (`BeginEdgeCandidate`); the grab's one transfer attempt is
+// `CancelCloseForQualifiedPull`, and a refused transfer consumes it.
 bool CloseInFlight(uint64_t tickMs) {
     return tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
 }
@@ -4769,9 +4779,8 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     g_intentCancel = CloseCancelTicket{};
 
     // A new close decides the menu, so a release record left by an earlier pull
-    // is moot: its open either already came or never will. The record of a pull
-    // that lands during *this* close is written after this line, so it is not
-    // touched here.
+    // is moot: its open either already came or never will. A contact admitted
+    // during this close is a grab, and a grab's release leaves no record at all.
     g_lateRelease = RevealLateRelease{};
 
     // The mute belongs to the contact, not to the session that happened to own
@@ -4780,29 +4789,21 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     // the reveal flags left the finger live, so its next report could start a
     // dismiss session on the reopened menu and its release could settle an open.
     //
-    // A reveal that is still driving the panel is the exception: it is the pull
-    // that may open the menu this close makes room for, so it becomes a deferred
-    // candidate (measured, never written) instead of a muted contact. The next
-    // open releases it, exactly as it releases a pull that landed during the
-    // close; the takeover owns the screen until then.
+    // Every contact already on the glass is consumed by the close: it cannot
+    // interrupt it and cannot reopen it. There is no exemption for a pull that
+    // was driving the panel — that pull predates the close, and the landing is
+    // not its to reopen. The mute holds its reports until it lifts; the reveal
+    // flags go, so the landing finds no candidate to revive. Only the samples
+    // stay, and they cannot be adopted: the mute refuses adoption too.
     const bool contactLive =
         g_contactDown || g_hidSession.active || g_reveal.edgeCandidate;
-    const bool liveReveal =
-        contactStillDown && (g_reveal.active || g_reveal.deferred);
-    if (contactStillDown && contactLive && !liveReveal) {
+    if (contactStillDown && contactLive) {
         g_hidSession.suppress = true;
     }
 
     g_hidSession.active = false;
-    // A live reveal keeps its candidate and its deferral; a keyboard close must
-    // not leave it owning the panel, and its release must not settle an open.
-    // Only the active flag is cleared; the measurements the release line prints
-    // stay readable. A pull deferred by an earlier close is superseded only when
-    // there is no live reveal to carry over.
-    if (!liveReveal) {
-        g_reveal.deferred = false;
-        g_reveal.edgeCandidate = false;
-    }
+    g_reveal.deferred = false;
+    g_reveal.edgeCandidate = false;
     g_reveal.active = false;
     EndContactTiming();
     // Nothing owns the panel edge any more, so a settled measurement may move it
@@ -5527,12 +5528,14 @@ bool PublishOpenClaim(const GestureGeometry& geometry, bool touch,
 // report that reaches the travel threshold; a tap anywhere in the band never
 // gets there.
 //
-// `deferred` names a contact that arrived while a close owned the panel. It is
-// the pull that opens the *next* menu, so it changes nothing about this close:
-// it neither claims nor cancels one, which is what keeps the close's dismiss
-// armed and its retract the only motion. `ActivateRevealFollow`
-// refuses while the close is in flight, so the session stays a candidate that is
-// measured but never written.
+// `deferred` names a contact that arrived while a close owned the panel: the
+// grab the close granted. It changes nothing about this close — it neither
+// claims nor cancels one, which is what keeps the close's dismiss armed and its
+// retract the only motion — and it never activates as a plain takeover:
+// `ActivateRevealFollow` refuses while the close is in flight and the deferred
+// flag keeps the contact out after it too. Its one transfer attempt is
+// `CancelCloseForQualifiedPull`, at the same travel threshold the open claim
+// uses.
 void StartRevealFollow(float downX, float downY, uint64_t downTick,
                        uint64_t tickMs, bool deferred = false) {
     g_reveal = HidRevealSession{};
@@ -5549,21 +5552,25 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     ResetEndVelocity();
 }
 
-// A qualified pull aborts the close it landed in, from the panel's live position.
-// What it may not abort is a dismiss that is already inside the shell:
+// A qualified grab spends its one opportunity here, and this is the only abort
+// of a close that remains. The answer is nullptr when the grab took the retract
+// over, or the reason it could not, which is how the trace names the refusal:
 //
 // - the close must still be in flight (the suppression window is the close's own
-//   ownership state, not a timeout to judge the pull by);
+//   ownership state, not a timeout to judge the pull by); a close that already
+//   landed has no retract to reverse;
 // - `g_pendingDismissConfirm` must be empty. That slot names a dismiss whose call
 //   returned with its hide unconfirmed, so the hide can land at any moment and
-//   there is no schedule left to drop: the pull defers to the landing instead,
-//   which is the same answer every close had before a pull could cancel one;
+//   there is no schedule left to drop;
 // - the panel must still be on screen. A retract that is already at or below the
 //   entry has no live position to take over: the cancel would open the menu from
-//   an invisible start, which reads as a switch, and the close has to land anyway.
-//   That pull keeps the landing reopen, which starts at the entry;
+//   an invisible start, which reads as a switch, and the close has to land anyway;
 // - something must actually be cancelled (the local gesture deadline or the
 //   executor command), otherwise there is no close to abort.
+//
+// Every refusal consumes the contact: the spent attempt leaves it with no open
+// right until it lifts, and nothing — not the landing, not a later open — gives
+// it another chance. No transfer is deferred.
 //
 // The executor command is revocable at any point before the bridge dispatches it,
 // which is what lets a keyboard, Start-button or click-away close be interrupted:
@@ -5575,30 +5582,32 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
 //
 // It must not run on contact-down: a contact that never enters the band or never
 // travels would otherwise keep a menu the user was closing.
-bool CancelCloseForQualifiedPull(const GestureGeometry& geometry, float x, float y,
-                                 uint64_t tickMs) {
-    if (!CloseInFlight(tickMs) || g_pendingDismissConfirm != 0) {
-        return false;
+const wchar_t* CancelCloseForQualifiedPull(const GestureGeometry& geometry,
+                                           float x, float y, uint64_t tickMs) {
+    if (!CloseInFlight(tickMs)) {
+        return L"no-close";
+    }
+    if (g_pendingDismissConfirm != 0) {
+        return L"dismiss-entered";
     }
     // Nothing left to reverse: the panel is at or below the entry, the first
     // progress at which any of it is on screen, so its retract is over and only the
     // hidden travel is left. Cancelling here would start the open from an
     // invisible position — the menu appears to switch on — while the close has to
-    // land anyway. The close lands, and the landing's own reopen starts the pull's
-    // open at the entry, which is the honest start for a panel that is not there.
+    // land anyway.
     // Without a distance there is no mapping to take over with, so the same answer.
     const float distance = geometry.distance();
     if (!(distance > 0.0f)) {
-        return false;
+        return L"geometry";
     }
     const float entry = RevealEntryProgress(geometry);
     if ((PeekProgressNow() - entry) * distance <= kProgressEpsilonDip) {
-        return false;
+        return L"offsurface";
     }
     const DismissBeforeCancel dismissed = ReadDismissBeforeCancel();
     const CloseScheduleCancel dropped = CancelCloseSchedules(L"pull");
     if (!dropped.slot && !dropped.command) {
-        return false;
+        return L"no-schedule";
     }
     g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
     g_closeCancelledTick = tickMs;
@@ -5632,7 +5641,7 @@ bool CancelCloseForQualifiedPull(const GestureGeometry& geometry, float x, float
             ShowAtRest();
         }
     }
-    return true;
+    return nullptr;
 }
 
 // The one open claim of a band contact. Admission records the contact; the
@@ -5644,6 +5653,11 @@ bool CancelCloseForQualifiedPull(const GestureGeometry& geometry, float x, float
 // executor can present the open, and asking again on every later report would
 // turn one failed request into a stream of them. An open the shell performs
 // anyway is adopted by this same contact.
+//
+// A contact admitted during a close is the grab that close granted, and this is
+// the one opportunity it spends: the transfer of the retract. Neither outcome is
+// retried — a taken transfer hands the panel to the follow, and a refused one
+// consumes the contact for the rest of its life.
 void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
                         uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
@@ -5656,40 +5670,40 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
         return;
     }
     reveal.openClaimAttempted = true;
-    TraceLog(L"reveal pull qualified travel=%.0f axis=%d", travel,
+    if (reveal.deferred) {
+        // The grab's attempt is this retract, and nothing else. A refused
+        // transfer — the retract is already off screen, or its dismiss is inside
+        // the shell — consumes the contact: it has no open right until it lifts,
+        // every later report is inert, and its release leaves no record.
+        const wchar_t* refused =
+            CancelCloseForQualifiedPull(geometry, x, y, tickMs);
+        if (!refused) {
+            reveal.deferred = false;
+            // The pull owns whatever opens next: a new generation and no release
+            // record from the previous pull.
+            g_pullSerial++;
+            g_lateRelease = RevealLateRelease{};
+            TraceLog(L"reveal pull qualified travel=%.0f axis=%d grab=taken",
+                    travel, geometry.axis());
+        } else {
+            TraceLog(L"reveal pull qualified travel=%.0f axis=%d grab=refused "
+                    L"reason=%s",
+                    travel, geometry.axis(), refused);
+        }
+        return;
+    }
+    TraceLog(L"reveal pull qualified travel=%.0f axis=%d grab=none", travel,
             geometry.axis());
     // The pull owns whatever opens next: a new generation and no release record
     // from the previous pull. These are the admission's old ownership side
-    // effects; they run at the qualified pull so a tap leaves them alone, and
-    // before the close test so an aborted close cannot leave the old record.
+    // effects; they run at the qualified pull so a tap leaves them alone.
     g_pullSerial++;
     g_lateRelease = RevealLateRelease{};
-    // A close this mod can still abort is aborted here and only here. This is
-    // the qualified moment; contact-down must not cancel a close. A close whose
-    // dismiss is already inside the shell is not cancellable and keeps the pull
-    // deferred until its landing.
-    if (CancelCloseForQualifiedPull(geometry, x, y, tickMs)) {
-        // The close is gone; the follow takes the still-open menu over from
-        // this report, at the position the retract reached.
-        reveal.deferred = false;
-        return;
-    }
-    if (reveal.deferred) {
-        // A close that cannot be aborted owns the panel. The landing releases
-        // the deferral and reopens for a qualified pull.
-        return;
-    }
     // The cloak answers "open?": a window already showing is a panel the follow
     // takes over on this same report, and an open this side already requested is
     // on its way. Neither may be answered with a second show.
     if (StartWindowIsOpen() ||
         g_intentOpenActive.load(std::memory_order_relaxed)) {
-        return;
-    }
-    // A close that began after admission and cannot be aborted still owns the
-    // panel: this pull waits for its landing (BeginLandingOpen) instead.
-    if (CloseInFlight(tickMs)) {
-        reveal.deferred = true;
         return;
     }
     if (g_pendingTapTick != 0) {
@@ -5789,14 +5803,18 @@ void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
 bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
                           uint64_t sampleQpc, uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
-    if (CloseInFlight(tickMs)) {
-        // A close owns the panel: its retract is the only motion, and the pull
-        // that will open the next menu must not write Progress under it. The
-        // session keeps its candidate, its clocks and its release history; the
-        // close's landing releases the deferral and the open adopts it.
+    if (reveal.deferred) {
+        // A grab is transferred only by its own qualified pull
+        // (CancelCloseForQualifiedPull), which clears the flag before the follow
+        // takes over. No plain takeover may start it: the menu that follows a
+        // landing is not the grab's.
         return false;
     }
-    reveal.deferred = false;
+    if (CloseInFlight(tickMs)) {
+        // A close owns the panel: its retract is the only motion, and no contact
+        // may write Progress under it.
+        return false;
+    }
     const float distance = geometry.distance();
     if (!(distance > 0.0f)) {
         // A new root is being installed under the contact, so this contact no
@@ -5938,10 +5956,10 @@ CloseScheduleCancel CancelCloseSchedules(const wchar_t* reason) {
     return dropped;
 }
 
-// A dismiss that is still settling does not block a candidate: the edge contact
-// during its retract is the pull that can still cancel the close if it began
-// before the dismiss, and refusing it would let the dismiss take the menu away
-// under the finger.
+// A down during a close is decided here and only here: the grab grant is the
+// point's own position against the surface still on screen (or the band), never
+// a travel measured later. A refused point is muted for its lifetime; a granted
+// grab spends its one opportunity at the travel threshold.
 bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
                         uint64_t tickMs) {
     float low = 0.0f;
@@ -5950,28 +5968,28 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
     const int32_t axis = geometry.axis();
     const float position = AxisScreenPosition(axis, x, y);
     const bool inBand = haveBand && position >= low && position <= high;
-    // The live position and the restore the state owes, for the `reason=open`
-    // refusal: the window reporting itself open is not proof that the menu is
-    // usable, and the two numbers are what tell a healthy refusal from the
-    // unhealed pair (window uncloaked, panel at the hidden rest).
-    const float progress = inBand ? PeekProgressNow() : -1.0f;
+    // A close this mod started owns the panel until the shell has hidden the
+    // window. A down in that window grabs the surface the retract still shows —
+    // the point's mapped progress is at or above the panel's live one, or it is
+    // in the band — and nothing else: the area the retract has already left is
+    // refused, and a contact there can never open this menu. It writes no
+    // Progress and leaves the close's dismiss armed.
+    const bool closeInFlight = CloseInFlight(tickMs);
+    // The live position and the restore the state owes, for the grab's hit test
+    // and the `reason=open` refusal: the window reporting itself open is not
+    // proof that the menu is usable, and the two numbers are what tell a healthy
+    // refusal from the unhealed pair (window uncloaked, panel at the hidden rest).
+    const float progress = (inBand || closeInFlight) ? PeekProgressNow() : -1.0f;
     const bool restoreOwed = g_commitNeedsProgressReset;
 
     // The line speaks once per contact, and only for a contact that landed in
-    // the band: a tap anywhere else is not this gesture and stays as quiet as it
-    // was. A contact that starts inside the band and is refused names the test
-    // that refused it, which is what a pull that never followed the finger reads.
+    // the band or during a close: a tap anywhere else is not this gesture and
+    // stays as quiet as it was. A contact that is refused names the test that
+    // refused it, which is what a pull that never followed the finger reads.
     const wchar_t* reason = L"admitted";
     bool admitted = false;
-    // A close this mod started owns the panel until the shell has hidden the
-    // window. A pull that lands in that window is the pull that opens the menu
-    // this close makes room for: it is tracked, never refused and never muted,
-    // and it writes no Progress. Treating it as a candidate of *this* panel is
-    // what produced two owners: the follow took the retract over, the shell hid
-    // the window under it, and the reopen replayed the open.
-    const bool closeInFlight = CloseInFlight(tickMs);
     do {
-        if (!inBand) {
+        if (!inBand && !closeInFlight) {
             break;  // a press outside the band is not this gesture
         }
         if (!RendererReady()) {
@@ -5987,6 +6005,21 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
             break;
         }
         if (closeInFlight) {
+            if (!inBand) {
+                // Axis-free by construction: the mapping the follow writes decides
+                // whether this point is on the panel that is still on screen. The
+                // panel's trail edge sits where its own progress puts it, so a
+                // point is on the surface when its mapped progress is at or below
+                // the live one; above it, the retract has already left that area.
+                float downTrail = 0.0f;
+                const float downProgress = RevealProgressDip(
+                    geometry, geometry.distance(), x, y, downTrail);
+                const float slack = kProgressEpsilonDip / geometry.distance();
+                if (downProgress > progress + slack) {
+                    reason = L"offsurface";
+                    break;
+                }
+            }
             StartRevealFollow(x, y, tickMs, tickMs, true);
             admitted = true;
             reason = L"deferred";
@@ -6015,11 +6048,22 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
         admitted = true;
     } while (false);
 
-    if (inBand) {
+    // A close consumes every contact it does not grant. A point it refused (the
+    // vacated area) or could not judge (no renderer, a stale layout, no
+    // distance) has no open right, and the mute makes that true for the rest of
+    // the contact's life: no report of it becomes a gesture, and no later open
+    // adopts it. The lift clears the mute with the contact.
+    if (closeInFlight && !admitted) {
+        g_hidSession.suppress = true;
+    }
+
+    if (inBand || closeInFlight) {
         TraceLog(L"reveal admit x=%.0f y=%.0f axis=%d band=%.0f,%.0f ok=%d "
                 L"reason=%s progress=%.3f restore=%d",
                 x, y, axis, haveBand ? low : -1.0f, haveBand ? high : -1.0f,
                 admitted ? 1 : 0, reason, progress, restoreOwed ? 1 : 0);
+    }
+    if (inBand) {
         // A contact in the band may open the menu without this mod asking: the
         // shell's own gesture starts from a strip wider than any band this mod
         // admits, and a pull that is refused here (or lifts before the claim)
@@ -6120,16 +6164,12 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
 
     if (!reveal.active) {
         if (reveal.deferred) {
-            if (CloseInFlight(tickMs)) {
-                // The close owns the panel. This contact is measured only: no
-                // Progress, no coast, no release settle. Its own reports keep the
-                // liveness clock and its history fresh so the open that follows
-                // can adopt it from its down point.
-                return;
-            }
-            // The close landed: this pull is released and the ordinary takeover
-            // below decides, exactly as it would for a pull on a closed menu.
-            reveal.deferred = false;
+            // This contact is a grab of a retract, and its only transfer is its
+            // own qualified pull. It is measured only — no Progress, no coast,
+            // no release settle — and a spent opportunity leaves it inert until
+            // it lifts. No takeover starts here, and the landing does not
+            // release it into one.
+            return;
         }
         if (!StartWindowIsOpenThrottled(tickMs)) {
             return;
@@ -6178,6 +6218,12 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
         !GeometryLayoutCurrent(geometry)) {
         return false;
     }
+    // A close owns the panel until its landing, and the only grab it grants is
+    // decided on the contact's own down (`BeginEdgeCandidate`). A travel measured
+    // after the fact is not a grant, so no contact is adopted into a retract.
+    if (CloseInFlight(tickMs)) {
+        return false;
+    }
 
     const int32_t axis = geometry.axis();
     const float travel =
@@ -6190,15 +6236,8 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     float low = 0.0f;
     float high = 0.0f;
     const bool haveBand = RevealBandDip(geometry, low, high);
-    // A contact that began while a close owned the panel is the pull that opens
-    // the next menu, not a takeover of this one: it is tracked as a deferred
-    // candidate and promoted at the open the close makes room for.
-    const bool closeInFlight = CloseInFlight(tickMs);
     StartRevealFollow(g_contactOrigin.downX, g_contactOrigin.downY,
-                      g_contactOrigin.downTick, tickMs, closeInFlight);
-    if (closeInFlight) {
-        return false;
-    }
+                      g_contactOrigin.downTick, tickMs);
     const uint64_t sampleQpc = QpcMsNow();
     if (!ActivateRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
                               sampleQpc, tickMs)) {
@@ -6222,6 +6261,11 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
 void PromoteRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     if (g_reveal.active) {
         return;  // a follow already owns the panel
+    }
+    if (g_reveal.deferred) {
+        // A grab is transferred only by its own qualified pull; the open this
+        // transition performs is not the menu that grant was for.
+        return;
     }
 
     if (g_reveal.edgeCandidate) {
@@ -6369,11 +6413,24 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
         return;
     }
 
+    // Whether this contact was the grab a close granted. Its one opportunity is
+    // spent either way, so its release carries nothing into the next menu: no
+    // late-open record, and no landing revival.
+    const bool grab = reveal.deferred;
     reveal.edgeCandidate = false;
+    reveal.deferred = false;
     // The opening contact is gone: the shell's click-away from it can no longer
     // arrive, and a real click-away is a trigger again.
     SwipeIpcSetControllerTouch(&g_ipc, false);
     if (!reveal.active) {
+        if (grab) {
+            // A refused grab's release is not a pull that waits for an open: the
+            // retract it could not take is the only menu it was ever granted, so
+            // there is nothing to carry. The qualified line already named the
+            // refusal.
+            EndContactTiming();
+            return;
+        }
         // The contact is gone and the menu never appeared under it. A tap is not
         // worth a line (it never moved); a pull that travelled says the shell
         // never opened the menu, so there was nothing to follow — and it carries
@@ -6398,12 +6455,9 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
             const float position = RevealProgressDip(
                 geometry, distance, g_contactOrigin.x, g_contactOrigin.y,
                 panelTrail);
+            g_lateRelease = RevealLateRelease{};
             g_lateRelease.valid = true;
             g_lateRelease.releaseQpc = releaseQpc;
-            // A pull that lifted while a close was still in flight waited for
-            // that close: its record becomes consumable at the landing, not now.
-            g_lateRelease.deferred = g_reveal.deferred;
-            g_lateRelease.readyQpc = 0;
             g_lateRelease.travel = travel;
             g_lateRelease.position = position;
             g_lateRelease.velocity = velocity;
@@ -6820,12 +6874,11 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     // contact, so a retried admission cannot move the down point.
     if (!g_contactOrigin.valid) {
         g_contactOrigin.valid = true;
-        // A close in flight is not an open panel. A finger that lands during the
-        // retract is the user taking the menu back, so adoption must read it as
-        // a pull from its own down point once it has travelled
-        // kAdoptTravelDip, exactly as it does with the menu closed. Reading the
-        // shown-but-leaving window as open refused that pull: it stayed inert,
-        // the armed dismiss hid the menu under it, and the reopen replayed the open.
+        // A close in flight is not an open panel. A contact that lands during the
+        // retract is decided by its own down (`BeginEdgeCandidate`): a grab of
+        // the surface still on screen, or a refusal that mutes it. Either way it
+        // did not start on an open menu, so adoption must not read the
+        // shown-but-leaving window as one.
         const bool closeInFlight =
             tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
         const bool windowOpen =
@@ -6862,13 +6915,13 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     const bool newContact = !g_contactDown;
 
     // A contact that lands while a close is in flight does not cancel it here.
-    // The close is aborted only when this contact becomes a qualified pull
-    // (CancelCloseForQualifiedPull, called from TryClaimRevealOpen), so a tap
-    // that never enters the band or never travels leaves the close alone. A
-    // close that cannot be aborted is deferred and the landing releases it.
+    // Its down decides whether it is a grab at all (BeginEdgeCandidate), and a
+    // grab aborts the close only when it reaches the travel threshold
+    // (CancelCloseForQualifiedPull, called from TryClaimRevealOpen). A tap that
+    // never travels leaves the close alone, and a refused grab is consumed by it.
 
     if (session.suppress) {
-        // A close muted this contact: its reports are not a gesture, but the
+        // A close consumed this contact: its reports are not a gesture, but the
         // contact is still on the glass, so the latch must not expire under it.
         // The lift report clears both.
         g_contactDown = true;
@@ -7069,8 +7122,8 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
 //   digitizer may go quiet for that whole window. The uncloak (or the show's
 //   refusal) is the event that ends it.
 // - A close is in flight and a contact owns the panel: the key press and the
-//   shell's hide pause the digitizer too, and the landing is the event that
-//   releases the deferral.
+//   shell's hide pause the digitizer too, and the close's end — its landing, its
+//   cancel, or the contact's own lift — is the event that ends it.
 bool IdleReleaseHeld(uint64_t tickMs) {
     const bool touchShowInFlight =
         SwipeIpcControllerTouch(&g_ipc) ||
@@ -7098,11 +7151,8 @@ void CheckHidIdleRelease(uint64_t tickMs) {
 
     // A release record that no open consumed inside its window is dead: drop it
     // here so it cannot be read long after the gesture, and so the next keyboard
-    // open finds none. The deadline is the record's readiness, not its release:
-    // a pull that lifted while a close owned the panel is not consumable until
-    // that close lands, so starting the window at the release would kill it
-    // before the landing it waits for. While it is still deferred, the landing
-    // (or the qualified pull that cancels the close) owns its fate.
+    // open finds none. The window is measured from the release: a close no longer
+    // defers a record, and its landing no longer consumes one.
     const uint64_t recordQpc =
         g_lateRelease.readyQpc != 0 ? g_lateRelease.readyQpc
                                     : g_lateRelease.releaseQpc;
@@ -8058,8 +8108,8 @@ void CheckExecAckTimeout(uint64_t now) {
 // the cloak event and the intent event are both waited on, so an intent that
 // arrived with the landing is read here before the landing acts. Only `external`
 // is reconciled here — an open or close intent is the user
-// talking to a menu, and the landing's own pull/cancel rules already own that
-// case. ApplyBridgeIntent consumes the record, so the event's later wake finds
+// talking to a menu, and the cancel/recovery rules already own that case.
+// ApplyBridgeIntent consumes the record, so the event's later wake finds
 // nothing new.
 void ReconcileSupersedingIntentBeforeLanding() {
     SwipeIpcIntent intent{};
@@ -8078,62 +8128,33 @@ void ReconcileSupersedingIntentBeforeLanding() {
     ApplyBridgeIntentRecord(intent);
 }
 
-// The one landing-open transaction. Both reasons a close's landing can serve an
-// open end here: a pull that was down (or lifted inside the late window) when the
-// close landed, and an open intent that cancelled a close whose dismiss still
-// ran. Entry, progress, the pending flag, the controller state and the show
-// request are one sequence; the caller chooses the reason and the log line.
-//
-// Touch ownership follows the *finger*, not the reason. Only a contact that is
-// still down owns the opening panel (`pullDown`); a release record means the
-// contact already lifted, and marking the shared touch word for it made the
-// bridge swallow the next real desktop click as `reason=touch-owner` on a menu
-// no finger was touching.
-bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
+// The one landing-open transaction. It serves the one open a landing can still
+// owe: an open intent that cancelled a close whose dismiss ran anyway. Entry,
+// progress, the pending flag, the controller state and the show request are one
+// sequence. The landing serves no touch open — no contact, hover or carried
+// travel turns a landed close into a Show — and the press is not a finger, so
+// the controller's touch word stays clear.
+bool BeginLandingOpen() {
     if (!RendererReady() || StartWindowIsOpen() ||
         g_intentOpenActive.load(std::memory_order_relaxed)) {
         return false;
     }
     const GestureGeometry geometry = ReadGestureGeometry();
     float entry = 0.0f;
-    if (!PublishOpenClaim(geometry, pullDown, entry)) {
+    if (!PublishOpenClaim(geometry, false, entry)) {
         // The landing cannot present anything: the panel stays retracted with the
         // window hidden, and the controller claims nothing. The next open
         // (the shell's own or a later pull) starts from the entry again.
-        TraceLog(L"landing open failed entry=%.3f pull=%d reason=no-executor",
-                entry, pullReopen ? 1 : 0);
+        TraceLog(L"landing open failed entry=%.3f reason=no-executor", entry);
         return false;
     }
-    if (pullReopen) {
-        TraceLog(L"reveal reopen after close pull=%d late=%d entry=%.3f",
-                pullDown ? 1 : 0, lateFresh ? 1 : 0, entry);
-    } else {
-        TraceLog(L"intent open recovered entry=%.3f", entry);
-    }
+    TraceLog(L"intent open recovered entry=%.3f", entry);
     return true;
 }
 
-// The pull that may reopen Start when a close lands. A contact merely resting in
-// the band during the retract is not that pull: its last positioned report must
-// have moved away from the edge by kAdoptTravelDip, the same qualification the
-// open claim uses. An active follow qualifies by construction: it has driven the
-// panel. A qualified late release is a separate record and does not come through
-// here.
-bool RevealPullQualified(const GestureGeometry& geometry) {
-    if (g_reveal.active) {
-        return true;
-    }
-    if (!g_reveal.edgeCandidate || !g_contactOrigin.valid) {
-        return false;
-    }
-    return RevealTravelDip(geometry.axis(), g_reveal.edgeStartX,
-                           g_reveal.edgeStartY, g_contactOrigin.x,
-                           g_contactOrigin.y) >= kAdoptTravelDip;
-}
-
 // The close-landing body. Its usual caller is the cloak transition: the window
-// went from shown to hidden and this classifies the close, releases a pull that
-// waited for it, and resets the controller. The executor's confirmation probe is
+// went from shown to hidden and this classifies the close, retires any grab the
+// close still held, and resets the controller. The executor's confirmation probe is
 // the second caller: it can find the window already hidden with no transition
 // left to arrive (the dismiss ran on a window something else had hidden, a
 // native hide won the race, or the transition was lost). The body is shared on
@@ -8204,7 +8225,7 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     g_intentCancel = CloseCancelTicket{};
     // A close whose command an open intent revoked can still land. The
     // ticket names that command and the menu it belongs to, so the landing
-    // is still this mod's close and its pull is released, not dropped.
+    // is still this mod's close, not an external one.
     const bool closeOurs = closeCommand || intentCancelLost;
     if (closeOurs && confirmCommand && g_pendingDismissConfirmRetained) {
         // The confirmation the cloak refused to settle has now been carried by
@@ -8219,27 +8240,11 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     // this a Win press right after the hide opened the window with Progress
     // still at 0, and the panel was invisible until the next open.
     g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
-    if (closeOurs) {
-        // A pull that arrived during the close is the pull that opens the
-        // menu this hide made room for. The landing is the one moment its
-        // deferral can end: the retract is over, nothing else writes
-        // Progress, and the open's own poll either promotes the contact from
-        // its down point (still down) or consumes the release record it left
-        // (already lifted).
-        if (g_reveal.deferred) {
-            g_reveal.deferred = false;
-            TraceLog(L"reveal defer released candidate=%d down=%d",
-                    g_reveal.edgeCandidate ? 1 : 0,
-                    g_contactOrigin.valid ? 1 : 0);
-        }
-        // The release record of a pull that lifted during this close becomes
-        // consumable now: its end speed was measured at the lift, and the
-        // window it must arrive in starts at the landing, not at the lift.
-        if (g_lateRelease.valid && g_lateRelease.deferred) {
-            g_lateRelease.deferred = false;
-            g_lateRelease.readyQpc = QpcMsNow();
-        }
-    } else {
+    // A grab the close granted dies with the retract that granted it: this
+    // landing serves no touch open, so the contact stays inert until it lifts and
+    // its release leaves no late-open record. The next menu opens from a new
+    // down, never from this one.
+    if (!closeOurs) {
         // A close this mod did not start: an external takeover owns the
         // screen. The pull is dropped, not deferred — the takeover's window
         // is not a menu to reopen — and the rest of the contact stays inert
@@ -8272,13 +8277,22 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
         g_openGeneration.load(std::memory_order_relaxed);
     const SettledMeasureRequest closing = SnapshotMeasureRequest();
     AdvanceOpenGeneration();
+    // The landing's own decision, in trace form: `muted=1` says a contact was
+    // consumed by this close and is still on the glass with no open right — the
+    // mute a close set at its start, or a grab whose opportunity died with the
+    // retract. It is never adopted, so a landing can no longer log a touch
+    // reopen.
+    const int muted =
+        (g_hidSession.suppress || (g_reveal.deferred && g_reveal.edgeCandidate))
+            ? 1
+            : 0;
     if (reason) {
         // A close the confirmation probe had to finish: no cloak event carried
         // it, so the cause is named. The word `observed` stays, because the
         // close is as real as any the transition reports.
-        TraceLog(L"win close observed reason=%s", reason);
+        TraceLog(L"win close observed reason=%s muted=%d", reason, muted);
     } else {
-        TraceLog(L"win close observed");
+        TraceLog(L"win close observed muted=%d", muted);
     }
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
     SwipeIpcSetControllerTouch(&g_ipc, false);
@@ -8290,34 +8304,12 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     // just ended; the UI thread releases them.
     PostUiOpenWatchRelease(closedGeneration, closing);
 
-    // A pull that was down when this close landed is the pull that takes the
-    // menu back — but only a qualified one. A finger merely resting in the
-    // band during the retract is not a pull, and the retract is not
-    // permission to reopen the menu it just closed. The qualification is the
-    // same signed inward travel the open claim uses; a release record left
-    // by a real pull (lateFresh) stays valid on its own.
-    const uint64_t closeQpc = QpcMsNow();
-    const bool pullDown =
-        g_contactDown && RevealPullQualified(ReadGestureGeometry());
-    // The window starts when the record became consumable: readyQpc for a
-    // pull that waited for this landing, releaseQpc for one that lifted on
-    // the closed menu. The release time stays the age the adopt line
-    // reports, never the deadline of a record that became usable late.
-    const uint64_t readyQpc =
-        g_lateRelease.readyQpc != 0 ? g_lateRelease.readyQpc
-                                    : g_lateRelease.releaseQpc;
-    const bool lateFresh =
-        g_lateRelease.valid && !g_lateRelease.deferred &&
-        readyQpc != 0 && closeQpc >= readyQpc &&
-        closeQpc - readyQpc <= kLateRevealWindowMs;
-    // The reason is computed first, then one transaction runs: the pull keeps
-    // its precedence over the cancel-recovery, and only the pull marks the
-    // contact as the panel's owner.
-    const bool pullReopen = pullDown || lateFresh;
-    if (pullReopen) {
-        BeginLandingOpen(true, pullDown, lateFresh);
-    } else if (intentCancelLost) {
-        BeginLandingOpen(false, false, false);
+    // The one open a landing can still owe is the press obligation: an open
+    // intent that cancelled a close whose dismiss ran anyway. Nothing else — no
+    // contact still down, no carried travel, no release record — turns a landed
+    // close into a Show.
+    if (intentCancelLost) {
+        BeginLandingOpen();
     }
     // The window is hidden from this point on. A cloak wake that was already
     // queued for the same hide reads this and finds no transition to run, so
@@ -8401,7 +8393,9 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         if (openDuringClose) {
             TraceLog(L"win open during close progress=%.3f", PeekProgressNow());
             g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
-            g_reveal.deferred = false;
+            // The close is over, but the finger that was grabbing it is not the
+            // owner of this window: its grant died with the retract, and the
+            // open proceeds as the shell's own.
         }
         // A fresh menu, so every executor command written for the previous one is
         // void from this point on, whatever its own deadline says. The
@@ -8504,8 +8498,8 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
                 // The open landed and there is no settle to start from the
                 // intended entry, so the entry is spent. Leaving the flag set
                 // would hold the idle release (a contact still down when the
-                // menu appeared would never be released, and the landing's own
-                // open test treats the flag as "an entry is pending").
+                // menu appeared would never be released), and `BeginLandingOpen`
+                // treats the flag as "an entry is pending".
                 g_intentOpenActive.store(false, std::memory_order_relaxed);
                 TraceLog(L"win open restore (no geometry)");
             }

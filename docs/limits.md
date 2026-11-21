@@ -134,14 +134,15 @@ landing's identity: the landing is this mod's close when its dismiss command is
 still queued/armed or executed-unconfirmed, or when the open-cancel ticket names
 that command. Measured on this machine, close takeover → `win close observed`
 was **562–593 ms over ten maximum-duration (520 ms settle) closes**, mean 578,
-so the worst sample sat 7 ms inside the window — a busy
-launcher can pass it; a pull held through such a close is still released and
-reopened (`reveal reopen after close pull=1 late=0`), but only when the close was
-past the point a pull can abort (its dismiss call already returned). A pull that
-qualifies earlier cancels the command and never reaches the landing. A landing
+so the worst sample sat 7 ms inside the window — a busy launcher can pass it.
+A pull held through such a close is not released by it: the grab's one transfer
+attempt is refused once the retract is at or below the entry (or the dismiss is
+inside the shell), and the contact is consumed (`grab=refused reason=...`), with
+no touch show at the landing. A pull that qualifies earlier cancels the command
+and never reaches the landing. A landing
 with no command
 of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
-for) and the pull is dropped by design.
+for) and the contact is dropped by design.
 
 **No transition is not a stuck close.** A dismiss can be confirmed on a window
 the shell had already hidden (a native hide won the race, the hide arrived

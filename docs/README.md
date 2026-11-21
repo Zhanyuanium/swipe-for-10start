@@ -29,7 +29,7 @@ names it.
 |---|---|
 | [architecture.md](architecture.md) | M3: the launcher read (`s_pLauncher` outer + `0x18` interface, `[+0x160]` state), the executor thread and the taskbar-thread crash, the one-decision/one-executor contract, the measured open/close/interruption chains, the accepted 245–268 ms cap, and the list of deleted M2 mechanisms. |
 | [input.md](input.md) | Why Raw HID: the falsified data sources, the report decode (report IDs, `TipSwitch`/`InRange`, contact identity and its evidence clock, the coordinate-only fallback), release detection and its timers. |
-| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the reopen on a closing panel, the gates and the settle ownership. |
+| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the grab's down hit-test and one transfer attempt (a refusal consumes the contact; the landing adopts no finger), the gates and the settle ownership. |
 | [animation.md](animation.md) | The damped-spring settle, both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam, the mirrored close, the scheduled dismiss, and the measured lines. |
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
 | [ipc.md](ipc.md) | The merged mod's shared-memory channel: names, 216-byte layout, seqlocks, the open generation, intents and acks, executor commands and acks with their admission vocabulary and expiry rules, the controller direction, peer liveness and activation identity (600 ms is a detection budget), and the init handshake. |
@@ -49,8 +49,9 @@ One mod ships, in one source with two process halves (full member list in
   whole gesture, follow and animation, the controller that consumes executor
   intents and publishes executor commands, the closing direction it publishes
   before the settle's first frame, the open that cancels a close still on
-  screen, the qualified pull that aborts a cancellable close and takes the
-  retract over from its live position, the pull-reopen at a close's landing, the
+  screen, the grab that aborts a cancellable close and takes the
+  retract over from its live position, the landing that serves only the press
+  obligation (no touch open), the
   one close path (a mirrored
   settle from the live position, then `dismiss`), the recovery ticket that
   exists only for a published command and is armed by one helper for both the
