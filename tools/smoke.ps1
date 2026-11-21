@@ -176,28 +176,39 @@ function Test-ExecutedDismiss { param([string]$text, [int]$method)
 # 3 bottom), band in DIP, panel rectangle in DIP. Physical pixels are DIP times
 # the primary screen's scale, which is what InjectTouchInput expects.
 function Get-Layout {
-    $line = $null
-    if (Test-Path -LiteralPath $Log) {
-        $line = Get-Content -LiteralPath $Log | Select-String 'reveal panelTrail=' | Select-Object -Last 1
-    }
+    $lines = @()
+    if (Test-Path -LiteralPath $Log) { $lines = @(Get-Content -LiteralPath $Log) }
     $layout = [pscustomobject]@{ Axis = 3; Low = 804; High = 900; Left = 236; Top = 265; Right = 1229; Bottom = 840; Scale = 2 }
-    if ($line -and $line.Line -match 'panelTrail=\d+ axis=(\d) rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
-        $layout.Axis = [int]$Matches[1]
-        $layout.Left = [int]$Matches[2]; $layout.Top = [int]$Matches[3]
-        $layout.Right = [int]$Matches[4]; $layout.Bottom = [int]$Matches[5]
-        if ($line.Line -match 'band=(-?\d+),(-?\d+)') {
-            $layout.Low = [int]$Matches[1]; $layout.High = [int]$Matches[2]
-        }
+    # The axis survives even when the panel rectangle was rejected (a left or
+    # right bar can put the panel off the edge the trail expects): the fallback
+    # line has the axis, the dismissal line has it too, and the rejected line
+    # still carries the measured rectangle the drag needs.
+    $axisLine = $lines | Select-String 'panelTrail=.*axis=\d|dismiss axis=\d' | Select-Object -Last 1
+    if ($axisLine -and $axisLine.Line -match 'axis=(\d)') { $layout.Axis = [int]$Matches[1] }
+    $bandLine = $lines | Select-String 'band=(-?\d+),(-?\d+)' | Select-Object -Last 1
+    if ($bandLine -and $bandLine.Line -match 'band=(-?\d+),(-?\d+)') {
+        $layout.Low = [int]$Matches[1]; $layout.High = [int]$Matches[2]
     }
-    # The scale comes from the mod's own numbers: the log's `work` rectangle is in
-    # DIP and GetSystemMetrics is physical once this process is DPI-aware, so the
-    # ratio is the monitor scale without assuming a screen size. Keep it
-    # fractional: 125 % and 150 % are 1.25 and 1.5, and rounding them to 1 or 2
-    # puts every injected point off the band or off the panel.
+    $rectLine = $lines | Select-String 'reveal .*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)' | Select-Object -Last 1
+    if ($rectLine -and $rectLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
+        $layout.Left = [int]$Matches[1]; $layout.Top = [int]$Matches[2]
+        $layout.Right = [int]$Matches[3]; $layout.Bottom = [int]$Matches[4]
+    }
+    # The scale from the taskbar's own rect: the `dismiss` line prints it in
+    # physical pixels, and the band is twice the bar in DIP. Their ratio is the
+    # monitor scale without assuming a screen size or a docked bar. It stays
+    # fractional: 125 % and 150 % are 1.25 and 1.5, and rounding them puts every
+    # injected point off the band or off the panel.
+    $barLine = $lines | Select-String 'dismiss axis=\d.*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)' | Select-Object -Last 1
     $layout.Scale = 0
-    if ($line -and $line.Line -match 'work=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
-        $workWidth = [int]$Matches[3] - [int]$Matches[1]
-        if ($workWidth -gt 0) { $layout.Scale = [Smoke.Native]::GetSystemMetrics(0) / [double]$workWidth }
+    if ($barLine -and $barLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
+        $barWidth = [int]$Matches[3] - [int]$Matches[1]
+        $barHeight = [int]$Matches[4] - [int]$Matches[2]
+        $bandDip = $layout.High - $layout.Low
+        if ($bandDip -gt 0) {
+            $barPhysical = if ($layout.Axis -eq 0 -or $layout.Axis -eq 2) { $barWidth } else { $barHeight }
+            if ($barPhysical -gt 0) { $layout.Scale = $barPhysical / ($bandDip / 2.0) }
+        }
     }
     if ($layout.Scale -lt 1) { $layout.Scale = 1 }
     return $layout
