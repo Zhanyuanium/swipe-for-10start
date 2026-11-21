@@ -176,18 +176,20 @@ function Test-ExecutedDismiss { param([string]$text, [int]$method)
 # 3 bottom), band in DIP, panel rectangle in DIP. Physical pixels are DIP times
 # the primary screen's scale, which is what InjectTouchInput expects.
 #
-# Only lines from this run count: `-Since` is the run's tick mark, so a rotated
-# trace or a previous session cannot supply historical coordinates. Every field
-# is reported separately, and the caller refuses to inject unless all four were
-# measured; the defaults below are a safe shape for the table, not a layout.
+# The layout fields (axis, band, rectangle) must come from this run: `-Since` is
+# the run's tick mark, so a rotated trace or a previous session cannot supply
+# historical coordinates. The scale is the monitor DPI, not a layout fact, and the
+# bar's thickness in DIP is constant, so its ratio may come from the last
+# `dismiss` line in the file even when that line predates the run; every field is
+# still reported separately and the caller refuses to inject unless all four were
+# measured.
 function Get-Layout {
     param([long]$Since = 0)
-    $lines = @()
-    if (Test-Path -LiteralPath $Log) {
-        $lines = @(Get-Content -LiteralPath $Log | Where-Object {
-            $_ -match '^t=(\d+) ' -and [long]$Matches[1] -ge $Since
-        })
-    }
+    $allLines = @()
+    if (Test-Path -LiteralPath $Log) { $allLines = @(Get-Content -LiteralPath $Log) }
+    $lines = @($allLines | Where-Object {
+        $_ -match '^t=(\d+) ' -and [long]$Matches[1] -ge $Since
+    })
     $layout = [pscustomobject]@{
         Axis = 3; Low = 804; High = 900; Left = 236; Top = 265; Right = 1229; Bottom = 840
         Scale = 2
@@ -218,18 +220,17 @@ function Get-Layout {
     # monitor scale without assuming a screen size or a docked bar. It stays
     # fractional: 125 % and 150 % are 1.25 and 1.5, and rounding them puts every
     # injected point off the band or off the panel.
-    $barLine = $lines | Select-String 'dismiss axis=\d.*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)' | Select-Object -Last 1
+    $barLine = $allLines | Select-String 'dismiss axis=\d.*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)' | Select-Object -Last 1
     $layout.Scale = 0
-    if ($barLine -and $barLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
+    $bandDip = $layout.High - $layout.Low
+    if ($barLine -and $layout.BandKnown -and $bandDip -gt 0 -and
+        $barLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
         $barWidth = [int]$Matches[3] - [int]$Matches[1]
         $barHeight = [int]$Matches[4] - [int]$Matches[2]
-        $bandDip = $layout.High - $layout.Low
-        if ($bandDip -gt 0) {
-            $barPhysical = if ($layout.Axis -eq 0 -or $layout.Axis -eq 2) { $barWidth } else { $barHeight }
-            if ($barPhysical -gt 0) {
-                $layout.Scale = $barPhysical / ($bandDip / 2.0)
-                $layout.ScaleKnown = $true
-            }
+        $barPhysical = if ($layout.Axis -eq 0 -or $layout.Axis -eq 2) { $barWidth } else { $barHeight }
+        if ($barPhysical -gt 0) {
+            $layout.Scale = $barPhysical / ($bandDip / 2.0)
+            $layout.ScaleKnown = $true
         }
     }
     if ($layout.Scale -lt 1) { $layout.Scale = 1 }
