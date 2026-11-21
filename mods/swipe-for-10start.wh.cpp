@@ -935,13 +935,17 @@ uint32_t g_visibilityWant = kVisibilityWantNone;
 uint64_t g_lastVisibilityPollTick = 0;
 
 // Opens the watch for a direction this mod asked for. The later deadline wins,
-// so two requests inside one window cannot shorten each other.
+// so two requests inside one window cannot shorten each other. The slow cadence
+// starts at the request: the event is the fast path, and an immediate poll would
+// race it and log a fallback that "saw" the change only because it ran first.
 void NoteVisibilityTransition(uint32_t want) {
     g_visibilityWant = want;
-    const uint64_t until = GetTickCount64() + kVisibilityGraceMs;
+    const uint64_t now = GetTickCount64();
+    const uint64_t until = now + kVisibilityGraceMs;
     if (until > g_visibilityPollUntil) {
         g_visibilityPollUntil = until;
     }
+    g_lastVisibilityPollTick = now;
 }
 
 // GetTickCount64 advances on the system tick (15.6 ms here), so it cannot tell
