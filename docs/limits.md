@@ -88,7 +88,7 @@
 ## The touch show
 
 - **The digitizer may go quiet during the uncloak and during a close.** The
-  18 ms idle release would end the candidate before the open adopts it; while a
+  idle release would end the contact before the open adopts it; while a
   touch show is in flight (`controllerTouch`/`g_intentOpenActive`), or a close
   is in flight with a reveal candidate, the idle is skipped. A real lift is a
   report and still ends the gesture with `src=report`; a genuine silence after
@@ -105,9 +105,12 @@
   finger) and `progress=0.90` at 350 DIP (0.4 px); the docked 300 DIP hold
   measured 2 px.
 - **The virtual digitizer's injected reports are sparser than the real panel.**
-  A glide's first reports can be 30–46 ms apart, which the 18 ms idle reads as a
-  new contact. The shipping panel reports at ~170 Hz; the test injector is a
-  test instrument, not the hardware.
+  A glide's first reports can be 30–46 ms apart. That is no longer read as a new
+  contact: a report gap does not end a positively tracked contact, and a band
+  candidate has its own 120 ms watchdog (`kCandidateIdleHoldMs`), so a sparse
+  injected flick still reaches the 24 DIP claim. The 18 ms idle still ends a
+  dismiss session, whose panel reports at ~170 Hz; the test injector is a test
+  instrument, not the hardware.
 
 ## The taskbar
 

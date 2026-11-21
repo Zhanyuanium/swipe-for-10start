@@ -110,8 +110,9 @@ screen. The trail is the measured panel edge (current auto-hidden
 167, docked 265). The fallback is the far screen edge. A warm auto-hidden
 measurement gives 0.255 on the 852 DIP panel (docked 0.348); a cold
 first open (no measurement yet, the request deferred because the panel is owned)
-gives 0.000, and the settle starts there honestly. The first visible frame is
-always the entry.
+gives 0.000, and the settle starts there honestly. A warm open's first visible
+frame is the entry; a cold one starts below the screen edge and reaches it on the
+first frames.
 
 ## The close
 
@@ -187,10 +188,11 @@ observed` the controller issues one fresh show (`reveal reopen after close
 pull=1 late=0 entry=...`), and the open adopts the live contact or consumes the
 release record. "Qualified" is the same signed inward travel, 24 DIP, measured
 from the contact's own down point at its last positioned report
-(`RevealPullQualified`); an active follow qualifies by construction, and the
-late-release record only exists for a pull that travelled 24 DIP. A finger
-merely resting in the band during the retract is admitted deferred, logs `reveal
-defer released candidate=1 down=1` at the landing, and is not reopened; a
+(`RevealPullQualified`). Ownership is not the test: an active follow that pulled
+out and came back toward the edge fails the current-travel check at the landing
+too. The late-release record only exists for a pull that travelled 24 DIP. A
+finger merely resting in the band during the retract is admitted deferred, logs
+`reveal defer released candidate=1 down=1` at the landing, and is not reopened; a
 qualified release and an independently owed Win/button recovery are unaffected.
 The idle is held through the close so the digitizer's pause during the key/hide
 does not drop the pull. Measured on the docked layout: held pull at 350 DIP, Win

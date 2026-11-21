@@ -23,7 +23,7 @@ What it does:
 
 - Pull the menu out from the taskbar edge with one finger; the panel stays
   under the finger, and lifting with enough travel lets it settle open.
-- A tap on the taskbar never opens Start: a pull must travel 24 DIP first.
+- A tap on the taskbar background opens nothing; the pull must travel 24 DIP.
 - Drag the open menu back toward the taskbar to close it with the same spring.
 - A press during a close, or a pull still down when it lands, takes the menu
   back; a menu is never left shown but empty.

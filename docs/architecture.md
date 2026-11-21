@@ -422,15 +422,17 @@ revalidated, and a press the 600 ms gate no longer covers is the shell's — unl
 the bridge already swallowed it, in which case it is dropped.
 
 A pull that is still down and qualified when the close lands (or that lifted
-inside the 300 ms late window) is the pull that takes the menu back: after
+inside its readiness window: the release on a closed menu, the landing for a
+deferred record) is the pull that takes the menu back: after
 `win close observed` the controller issues one fresh show
 (`reveal reopen after close pull=1 late=0 entry=...`), and the open adopts the
 live contact or consumes the release record. Qualified is the same 24 DIP signed
 inward travel at the contact's last positioned report (`RevealPullQualified`); an
-active follow qualifies by construction, and the late-release record only exists
-for a pull that travelled 24 DIP. A finger merely resting in the band through
-the retract is admitted deferred and is not reopened (`reveal defer released
-candidate=1 down=1`, no `reveal reopen`). Measured on the docked layout: the
+active follow is not qualified by its ownership — a finger that pulled out and
+came back toward the edge fails the current-travel test at the landing too. The
+late-release record only exists for a pull that travelled 24 DIP. A finger
+merely resting in the band through the retract is admitted deferred and is not
+reopened (`reveal defer released candidate=1 down=1`, no `reveal reopen`). Measured on the docked layout: the
 Win close during a held pull at `y=350 DIP`; the landing reopened, `reveal
 takeover from=0.348 offset=0.558`, the follow continued with 221 reports and
 ended `progress=0.91 behind=0.000 commit=1`, menu open; a contact resting at

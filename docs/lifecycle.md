@@ -25,7 +25,10 @@ reachable.
    availability (`PublishPeerGone`: `peerState=0` plus `controllerDirection=0`
    plus `controllerTouch=0`) before the consumer is stopped. The root install
    applies its queued hook under that same lock, so a stop here either waits for
-   a complete install or makes the next install refuse before `HookSymbols`. It
+   a complete install or makes the next install refuse before `HookSymbols`. The
+   input thread also withdraws non-terminally (`renderer-lost`) whenever
+   `RendererReady()` goes false and republishes when a usable replacement is
+   attached; that withdrawal is before any interception can happen again. It
    signals the input
    thread's stop event and posts `WM_QUIT` as a second signal for a queued
    message, then joins the thread **INFINITE**, never on that thread.

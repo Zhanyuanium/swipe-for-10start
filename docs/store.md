@@ -43,8 +43,11 @@ The mod is one file that carries both halves; the controller decides and the
 executor performs inside that file, and each half is inert in the other's
 process. Submit `swipe-for-10start` as one PR, one file. The channel has no
 version word: its object namespace is the ABI identity, so a user who installs
-it beside an old development build gets the pass-through path rather than a
-half-driven menu.
+it beside an old development build cannot cross-pair the two: each stays in its
+own namespace and a section of another layout is refused instead of half-read.
+That is all the namespace proves. It does **not** stop both images from loading
+into the same hosts and hooking them; only one copy of the mod should be
+enabled.
 
 ## Checks before opening the PR
 

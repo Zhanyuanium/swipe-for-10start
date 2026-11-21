@@ -34,14 +34,18 @@ in StartMenuExperienceHost and the executor in Explorer.
   A press during a close is read as a reopen: while the window is still on
   screen the close is cancelled and the panel settles back from where the
   retract left it; a press inside the shell's hide is latched and served when
-  the hide lands. The key never goes dead. A touch pull still down when a close
+  the hide lands. Recovery is best effort, not a guarantee: a press the bridge
+  already swallowed has no native replay left, so a peer that dies between the
+  gate and the serve loses that press. A touch pull still down when a close
   lands reopens through the controller only if it is a real pull: a finger
   resting on the taskbar through the retract does not open the menu again.
   Win+Tab, the lock screen and a display
   change pass through untouched, so a lock never waits. If the executor half is
   refused — the Explorer build does not match, or the launcher's public symbols
   cannot be resolved — the menu still opens and closes, but the close is instant.
-  The launcher hooks are found by public symbol, not by address. While the
+  The launcher hooks are found by public symbol, and their private layout is
+  enabled only on the verified reference image (the fixed file version and all
+  13 reference RVAs); any other build keeps the shell's own path. While the
   symbols are being fetched, Explorer keeps working and every press runs the
   shell's own path; with `DiagnosticTrace` on, the log shows
   `exec launcher symbols pending ...` and then
@@ -107,10 +111,11 @@ without an Explorer restart on this build.
   becomes a dismiss only once that area reaches its end.
 - A pull that starts just inside the screen edge — up to about half a taskbar's
   height, the strip the system's own swipe opens from — opens the menu, and the
-  menu follows the finger from the frame it appears. A tap on the taskbar does
-  not open it: the mod asks for the menu only after the finger has travelled
-  24 DIP away from the edge, so a tap on a pinned app, the clock, the tray or
-  the Start button stays a native press. A pull that starts further
+  menu follows the finger from the frame it appears. A tap on the taskbar
+  background does not request a touch open: the mod asks for the menu only after
+  the finger has travelled 24 DIP away from the edge. A tap on a pinned app,
+  the clock or the tray stays a native press; a tap on the Start button still
+  opens the menu, as it always does. A pull that starts further
   in does not open it: only the taskbar edge does that.
 - Mouse drag is deliberately not enabled.
 

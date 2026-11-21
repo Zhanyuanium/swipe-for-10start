@@ -88,6 +88,14 @@ it to the executor's dismiss vocabulary (`6`, the pointer-driven close the Start
 button's own dismiss uses) before publishing the command and keeps `7` in the
 decision log; the intent record is not rewritten.
 
+A refused intent has **no native replay**. The bridge swallows the trigger before
+it publishes, so the shell never saw that press; when the Start side answers
+`refused` (no executor, no channel, a show that could not be published) the
+press is lost. The refusal is reserved for the case where nothing could run, and
+the line names it (`intent open refused entry=... reason=no-executor`,
+`intent close refused from=... reason=no-executor`); the bridge does not retry the
+original on an ack.
+
 A landing reconciles an already-published `external` intent before it may issue a
 recovery: the idle timer and the intent event are two wait objects of the same
 thread, and the timer has the lower index, so the landing can otherwise run
