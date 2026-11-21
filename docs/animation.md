@@ -78,8 +78,12 @@ during a held touch started the close from `progress=1.000`; a press during a
 close drops the local dismiss slot, cancels the pending executor command, and
 settles the panel back from its live position (`intent open cancel from=...`).
 The press path is the only one that starts such a settle, and it has no finger to
-bind to; a band pull the retract refuses at or below the entry takes that same
-request (`grab=open`), so its settle is the press's curve too and follows nothing.
+bind to. A band pull the retract refuses at or below the entry is the same
+request, but only its cancel: a pull has a finger, so the grant is spent and the
+follow starts the panel at the entry and chases the mapped position at
+2.2 DIP/ms (`grab=open window=open`). A window that has already hidden has no panel to
+bind to either, so the ordinary show is requested, the entry is held, and the
+follow binds there (`grab=open window=hidden`).
 
 A qualified pull during any close this mod still owns is one take, not a take
 followed by a spring. The retract stops where it is and the position is pinned
@@ -97,8 +101,12 @@ returned and whose hide is unconfirmed; one whose published dismiss is at or pas
 its deadline, where the bridge may already be inside the call and no cancel can
 recall it (`grab=refused reason=dispatch`); and a retract already at or below the
 entry, where no panel is on screen to take. That last one is not a refusal for a
-down in the band: the attempt becomes the press's open request and the panel
-settles back from its live position (`grab=open`). A refused transfer consumes the
+down in the band: the attempt becomes the explicit open request and the pull
+follows it from the entry (`grab=open window=open`), or requests the ordinary show
+when the window has already hidden (`window=hidden`). A close that has already
+ended is the same for that band down: there is nothing left to cancel, so the pull
+asks for the open the ordinary way and the follow binds at the entry on the
+uncloak (`reason=no-close`). A refused transfer consumes the
 contact, and the landing serves no touch open, so the menu stays closed until a
 new pull. No path replays from the old target.
 
@@ -150,8 +158,10 @@ only that the primitive returned, never when it entered, so it cannot show
 whether a cancel or a fresh press reached the panel before or after the hide
 began. `motion sample` is the position and slope `TakeProgressNow` reads at the
 takeover, taken once under `g_compositionMutex` with the one `qpcNow` it uses. A
-grab has exactly one such line, `caller=pull`, at its transfer; the follow binds
-to that take and does not sample the position again.
+taken grab has exactly one such line, `caller=pull`, at its transfer; the follow
+binds to that take and does not sample the position again. The band pull that
+becomes the explicit open request has none: its close is cancelled without a
+take, so the follow's own `caller=activate` sample is the one line.
 `phase` names the motion the value came from — `settle`, `coast`, `rest` with
 nothing recorded, `none` without a renderer — and `v` is the signed slope in
 Progress per ms, `0.000` once the curve has landed.

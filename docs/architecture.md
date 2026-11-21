@@ -489,26 +489,33 @@ deadline (`reason=dispatch`: the bridge may already be inside the call), a
 retract already at or below the entry for a down on the retract's surface,
 a layout with no distance, or nothing left to cancel — consumes the contact
 (`grab=refused reason=...`): it keeps no open right until it lifts, and its
-release leaves no record. A down in the band at or below the entry is not refused:
-it is the press in that moment, so the attempt runs the press's own open body
+release leaves no record. A down in the band at or below the entry — or with the
+close already over — is not refused:
+it is the same request a press makes in that moment, so the attempt runs the
+press's cancel body when there is still a close to revoke
 (both schedules dropped, the suppression cleared, the open direction published,
-the recovery ticket armed, the panel settled back from its live position,
-`grab=open`) and the finger drives none of it.
+the recovery ticket armed) and only that body: a pull has a finger, so the grant
+is spent and the follow starts at the entry and chases the mapped position, and a
+window the retract already hid gets the ordinary show and binds there
+(`grab=open window=open|hidden entry=... reason=offsurface|no-close`).
 
 A landing adopts no finger. A close consumes every contact that was on the glass
-when it started, and a grab that outlived its retract is consumed too (the
-refusal, or the landing's retirement of an unspent grant), so after
+when it started, and a grab whose transfer is refused is consumed too, so after
 `win close observed` the controller issues no touch show and no
 carried travel or release record turns the landed close into a Show
 (`win close observed ... muted=1`, the one mute a refused down also sets). The
+landing retires no grant: a grab still on its way to its own 24 DIP report keeps
+it, and a band down among those opens the menu after the landing like any pull on
+a closed menu. The
 only open a landing still serves is the explicit request's obligation: a press or
-a band pull that cancelled a close whose dismiss ran anyway
-(`intent open recovered entry=...`). A menu closed by a touch needs a new pull.
+a band pull whose cancel armed the ticket and whose dismiss ran anyway
+(`intent open recovered entry=...`). A finger whose grab was refused needs a new
+pull.
 Measured on the bottom docked layout, the earlier build reopened its landing for
 a pull held at `y=350 DIP` (`reveal takeover from=0.348 offset=0.558 live=0`,
 221 reports, `progress=0.91 behind=0.000 commit=1`); that run is historical. A
-contact already on the glass when the close starts is consumed by it, and a new
-grab that outlives the retract is consumed with it. The bottom
+contact already on the glass when the close starts is consumed by it, and a grab
+that outlives the retract is not consumed by the landing. The bottom
 auto-hidden entry is 0.255.
 
 The suppression is what keeps the visibility service from "healing" the panel

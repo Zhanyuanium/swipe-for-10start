@@ -16,7 +16,8 @@ published at the close's start), the close cancel/recovery for an explicit open
 request during a retract (the ticket only for a published command, bounded by its
 deadline), the bounded press latch for a hide in flight, the click-away guards of an
 opening window, the grab's one transfer attempt (a band pull at or below the entry
-takes the press's open body) and the explicit request's obligation a
+takes the press's cancel body and follows from the entry) and the explicit
+request's obligation a
 landing still serves, the command-expiry rule
 (one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
 auto-hidden timing/interruption chains (the bottom docked numbers are named as
@@ -45,9 +46,12 @@ and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
 from the panel's position), the one close path (`TakeProgressNow` → mirrored
 settle → scheduled `exec dismiss`), the grab's down hit-test and its one
 transfer attempt (a taken transfer follows from the live position, a band down
-whose retract is already past the entry becomes the press's own open request, any
-other refusal consumes the contact, the landing adopts no finger, and silence
-never releases a consumed contact), the gates and settle ownership.
+whose retract is already past the entry shares the press's cancel body but follows
+from the entry, a band down whose close has already ended asks for the open like
+any pull on a closed menu, any
+refusal consumes the contact, the landing retires no unspent grant and adopts no
+finger, and silence never releases a consumed contact), the gates and settle
+ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
 start-speed seam, the mirrored close, the coast, and the measured lines.

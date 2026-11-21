@@ -4,7 +4,7 @@ C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
 tools/ - PowerShell probes, injectors, animation harnesses, the panel-edge tracker, the regression smoke, the store packager and the local installer (16 scripts + AGENTS.md)
-artifacts/ - captured measurements (17 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
+artifacts/ - captured measurements (20 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
 <config>
@@ -166,17 +166,25 @@ refused transfer — the dismiss already
 inside the shell, its published dismiss at or past its deadline (the bridge may
 already be inside the call, `reason=dispatch`), no distance, nothing left to
 cancel, or a down on the retract's surface with the retract already at or below
-the entry — consumes the contact (`grab=refused reason=...`): it keeps no open
+the entry or with the close already ended (`reason=no-close`) — consumes the
+contact (`grab=refused reason=...`): it keeps no open
 right until it lifts, every later report is inert, and its release leaves no
-record. A down **in the band** at that same point is the press instead: the
-attempt becomes the explicit open request through the one cancel-and-open body a
-press uses (`grab=open`) — both schedules dropped, the suppression cleared, the
-open direction published, the recovery ticket armed, and the panel settled back
-from its live position — and the finger drives none of it. Every one of those
-endings runs one transition: the reveal session and its timing go, panel
+record. A down **in the band** at that same point is the same request a press
+makes, with the finger still on it: the attempt shares the press's cancel body
+(`grab=open`) — both schedules dropped, the suppression cleared, the open direction
+published, the recovery ticket armed — but not its settle. The grant is spent, so
+the same report starts the follow at `RevealEntryProgress` and chases the mapped
+finger at 2.2 DIP/ms; a window the retract has already hidden gets the ordinary
+show and the follow binds at that entry. A close that has already ended is the
+same request with nothing left to cancel: a band down asks for the open the
+ordinary way (`grab=open window=open|hidden entry=... reason=no-close`), and only
+a down on the surface the retract had shown keeps no open right. A refused
+transfer runs one transition:
+the reveal session and its timing go, panel
 ownership is republished, and the contact keeps the mute a down refused at
-admission gets, so only a lift or a report that proves a new contact ends it. The
-landing retires a grant the contact never spent the same way. A
+admission gets, so only a lift or a report that proves a new contact ends it. A
+landing retires no grant: a contact still on its way to its own 24 DIP report
+keeps its open right. A
 close also consumes every contact that was already on the glass when it started.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
@@ -192,9 +200,12 @@ those keep the idle fallbacks (the candidate's 120 ms watchdog, then the 18 ms
 latch) once the close has ended.
 A landing adopts no finger: after `win close observed` the controller issues no
 touch show, and no hover, carried travel or release record turns a landed close
-into a Show; a contact still down is inert until it lifts (`win close observed
-... muted=1`). The only open a landing still serves is the explicit, independently
-owed request — a press, or a band pull the retract refused — (`intent open
+into a Show; a contact the close consumed is inert until it lifts (`win close
+observed ... muted=1`). A grab whose grant is still unspent is not consumed: it
+spends that grant after the landing and, for a band down, opens the menu as any
+pull on a closed menu. The only open a landing still owes is the
+explicit, independently
+owed request — a press, or a band pull whose cancel armed the ticket — (`intent open
 recovered ...`) with its epoch and close
 identity, unchanged.
 An intent close is

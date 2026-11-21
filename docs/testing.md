@@ -251,13 +251,19 @@ Start button must log one shell open (`exec show ... method=11`) and no band
 claim. Then pull 23 DIP and 25 DIP and lift: the first requests nothing from this
 mod (the shell's own gesture may open it), the second requests one show. Finally
 hold a contact still in the band through a Win close: its down is admitted as a
-grab (`reveal admit ... reason=grab`), it never reaches 24 DIP, and the
-landing consumes it (`win close observed ... muted=1`) with no `exec show`. A
+grab (`reveal admit ... reason=grab`), it never reaches 24 DIP, and the landing
+logs `win close observed muted=0` and leaves it alive with no `exec show`; if that
+finger then keeps pulling past 24 DIP, the same contact opens the menu (below).
+A
 band pull that does reach 24 DIP after the retract has passed the entry is the
-press in that moment: it logs `reveal pull qualified ... grab=open` and the menu
-opens through the press's own cancel settle (`intent open cancel from=...`), with
-no `exec show`; the same pull held on the visible panel *before* the crossing
-cancels the close and follows (`grab=taken`). A down on the panel surface (not in
+same open request a press makes: it logs `reveal pull qualified ... grab=open
+window=open` and the menu follows the finger from the entry (`reveal takeover ...
+live=0`, `open follow ...`), with no `intent open cancel` settle and no
+`exec show`; the same pull held on the visible panel *before* the crossing
+cancels the close and follows from the live position (`grab=taken`). The hidden
+window of the same request (`window=hidden`) asks for one show and binds at the
+entry.
+A down on the panel surface (not in
 the band) that reaches 24 DIP at or below the entry logs
 `reveal pull qualified ... grab=refused reason=offsurface` and opens nothing.
 
@@ -363,10 +369,12 @@ different depths of the same 387 ms close:
 
 The second row is why a cancel needs a panel on screen: a takeover at or below the
 entry would open the menu from an invisible start, so the close lands. That run
-predates the current rule, which serves no touch open at a landing: a grab on the
-retract's surface is
+predates the current rule, which serves no touch open of its own at a landing: a
+grab on the retract's surface is
 refused (`reason=offsurface`) and consumed, the landing logs
-`win close observed ... muted=1`, and the menu stays closed. The table cell keeps
+`win close observed ... muted=1`, and the menu stays closed; a band down at the
+same depth is the open request instead (see the band pull's open request below).
+The table cell keeps
 that build's own line as the measurement it is.
 
 Frames were captured at 200 % DPI with the tool's own DIB; `t` is the capture
@@ -398,7 +406,8 @@ surface.
 
 The P1 rows above were captured on the build that named the grant
 `reason=deferred`; P3 renamed the same line to `reason=grab` and the flag to
-`granted`. The measured text is kept as captured.
+`granted`, and P4/P5 gave a band down's late crossing the open request (the band
+pull's open request below). The measured text is kept as captured.
 
 `tools/smoke.ps1` stays green on this build.
 
@@ -415,31 +424,56 @@ reverses at 677 px and ends at 558 with the menu open. The settle that follows
 the release (`dur=160 remaining=60`) is the ordinary open settle of the lifted
 finger, not an intermediate one.
 
-A grab that loses the race refuses and is consumed: `tc` 400 on the same bar
-produced `grab=refused reason=no-close` (the report arrived after the landing),
+A grab that loses the race used to refuse and be consumed: `tc` 400 on the same
+bar produced `grab=refused reason=no-close` (the report arrived after the landing),
 no `reveal reopen`, no `exec show`, and the menu stayed closed
-(`panel-edge-p2-late-1.csv`). The press path still settles the panel back
+(`panel-edge-p2-late-1.csv`); that row is historical. A band down among those is
+now the ordinary pull on a closed menu (see the band pull's open request below).
+The press path still settles the panel back
 (`intent open cancel from=...` and one `settle dir=open`), because a press has no
-finger to bind to. P4 gives a band pull the same settle when the retract refuses
-it at or below the entry; see below.
+finger to bind to. P4 gave a band pull the same settle when the retract refused
+it at or below the entry; the pull now keeps its finger and follows instead; see
+below.
 
 The `dispatch` refusal (`reason=dispatch`, a published dismiss at or past its
 deadline) is unreachable in practice on this build: past the deadline the retract
 is already at or below the entry, so `offsurface` answers first. It stays as the
 serialisation rule that makes the promise conditional.
 
-### The band pull's open request (P4)
+### The band pull's open request (P4, revised)
 
 The P1/P2 rows above were captured before a band pull could ask for the open. A
 grab whose down was in the band and whose 24 DIP crossing finds the retract
-already past the entry is now the press in that same moment: it logs
-`reveal pull qualified ... grab=open from=... ticket=...`, runs the press's one
-cancel body (`intent open cancel from=...`, one `settle dir=open`), and the
-finger's later reports are inert until it lifts. The refusal text above stands
-for a down on the retract's surface and for the vacated-area down refused at
-admission. Both the refusal and the landing end the reveal session through one
-transition, so `win close observed ... muted=1` reads the single
-`g_hidSession.suppress` that the admission refusal also sets.
+already past the entry is the same open request a press makes. The P4 capture
+(`panel-edge-p4-late-open-1.csv`) recorded the first parity: `reveal pull
+qualified ... grab=open from=0.000 ticket=...`, the press's cancel body
+(`intent open cancel from=...`) and one `settle dir=open`; that reading is
+historical. The request now shares only the cancel body: `grab=open window=open`
+spends the grant and the same report starts the follow at the entry (`reveal
+takeover ... live=0`, `open follow ...`), and a window the retract already hid
+logs `window=hidden` and asks for the ordinary show. The refusal text above stands for
+a down on the retract's surface and for the vacated-area down refused at
+admission. One refusal transition, `ConsumeGrabContact`, still ends a refused
+grab; the open outcome does not run it, and a landing does not either — a grant
+still on its way to its 24 DIP report survives the landing. A band down's
+`no-close` is that same open with nothing left to cancel:
+`grab=open window=hidden entry=... reason=no-close`, the ordinary show, and the
+follow binds at the entry on the uncloak.
+
+Captured on the installed build the same day (bottom bar, trail 192 DIP,
+`distance` 900, entry 0.213 at that moment), one row per route:
+
+| route | measured lines |
+| --- | --- |
+| retract still shows the surface (`tc` 150) | `grab=taken`, `reveal takeover from=0.936 offset=-0.590 live=1`; the edge reverses at 499 px of 1704 and the menu ends open (`panel-edge-p6-early-1.csv`) |
+| retract off screen, window still shown (`tc` 330) | `grab=open window=open entry=0.213 reason=offsurface`, then `reveal takeover from=0.213 offset=0.133 live=0` and `open follow ... live=0` — the follow starts at the entry and the finger drives it, with no settle (`panel-edge-p6-mid-follow-1.csv`) |
+| close already landed (`tc` 400) | `win close observed muted=0`, `exec show request`, `reveal pull qualified ... grab=open window=hidden entry=0.213 reason=no-close`; the claim holds the entry, the uncloak binds the follow, and the menu ends open (`panel-edge-p6-late-open-1.csv`) |
+
+The injected pull in the middle row releases at its own qualification — 25 DIP of
+travel and no velocity — so its release runs the short-reveal close
+(`open follow ... commit=0`, then `settle dir=close ... remaining=284`). That is
+the designed outcome for a pull that short, not a lost open; a finger that keeps
+pulling commits.
 
 ### A consumed contact and silence (P3)
 

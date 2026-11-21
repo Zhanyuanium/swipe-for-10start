@@ -50,8 +50,8 @@ One mod ships, in one source with two process halves (full member list in
   intents and publishes executor commands, the closing direction it publishes
   before the settle's first frame, the open that cancels a close still on
   screen, the grab that aborts a cancellable close and takes the
-  retract over from its live position, the landing that serves only the press
-  obligation (no touch open), the
+  retract over from its live position, the landing that serves only the explicit
+  request's obligation (no touch open of its own), the
   one close path (a mirrored
   settle from the live position, then `dismiss`), the recovery ticket that
   exists only for a published command and is armed by one helper for both the

@@ -141,21 +141,25 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   dismiss command was stamped with — a close intent's zero is stamped with the
  *   section's current generation, and zero stays valid only while no open has
  *   been published. A fresh open cancels a still-queued command at the bridge.
- *   The same cancel serves an explicit open request and a qualified pull, through
- *   one recovery ticket: a press — and a band pull the retract refuses at or below
- *   the entry, which is that same request — settles the panel back from its live
- *   position, while a pull takes the retract over in one take: the position is
- *   pinned and the follow
- *   binds to it on the same report, keeping the finger-to-panel offset it took
- *   over rather than starting at the open's entry. A transfer is refused when the
+ *   The same cancel body serves an explicit open request — a press, or a band pull
+ *   the retract refused at or below the entry — through one recovery ticket, and
+ *   the tails differ because only one request has a finger: a press settles the
+ *   panel back from its live position, while a pull takes the retract over in one
+ *   take — the position is pinned and the follow binds to it on the same report,
+ *   keeping the finger-to-panel offset it took over rather than starting at the
+ *   open's entry — and a pull the retract had already hidden starts the ordinary
+ *   show at the entry and binds there. A transfer is refused when the
  *   dismiss already
  *   returned from the shell call with its hide unconfirmed, or its published
  *   deadline has passed and the bridge may already be inside the call; a refusal
  *   spends the contact's one grab opportunity and consumes it through the same
- *   mute a down refused at admission gets, and the landing retires a grant the
- *   contact never spent the same way. A close consumes every
- *   contact already on the glass, and a landing serves no touch open: only the
- *   independently owed explicit request reopens.
+ *   mute a down refused at admission gets. A close that has already ended is not
+ *   a refusal for a band down — the pull is the ordinary open of a closed menu,
+ *   and the finger is not swallowed where the key works — and a landing retires
+ *   no grant, so a contact still on its way to its own 24 DIP report keeps its
+ *   right. A close consumes every
+ *   contact already on the glass, and a landing serves no touch open of its own:
+ *   only the independently owed explicit request reopens.
  *   A landing the cloak never reports — the
  *   window was already hidden when `Dismiss` ran — is finished by the executor's
  *   own confirmation (`win close observed reason=confirmed-without-transition`),
@@ -4522,7 +4526,10 @@ struct HidRevealSession {
     // dismiss armed, and it gets exactly one transfer attempt at
     // kAdoptTravelDip. A refused transfer consumes the contact: it keeps no open
     // right until it lifts, and no landing or later open revives it. A taken
-    // transfer clears this flag and becomes the live follow.
+    // transfer clears this flag and becomes the live follow; a band down the
+    // retract had no panel left for — or one whose close had already ended —
+    // spends it as the explicit open request and becomes a follow too, at the
+    // entry.
     bool granted = false;
     // The one open claim of this contact. It is set when the qualified pull
     // first reaches kAdoptTravelDip and attempts the claim, whatever the
@@ -4560,8 +4567,9 @@ struct HidRevealSession {
     // The down that created this grab landed in the band, not on the surface the
     // retract still showed. It travels with the down point because it is the
     // down's own admission-time classification: the refusal at the travel
-    // threshold reads it to decide whether the attempt is the press's open
-    // request. Only meaningful while `granted`.
+    // threshold reads it to decide whether the attempt is the explicit open
+    // request (the press's cancel body, then the pull's follow). Only meaningful
+    // while `granted`.
     bool grantDownInBand = false;
     float distance = 0.0f;
     float panelTrail = 0.0f;
@@ -5570,8 +5578,10 @@ bool PublishOpenClaim(const GestureGeometry& geometry, bool touch,
 // keeps the contact out after it too. Its one transfer attempt is
 // `CancelCloseForQualifiedPull`, at the same travel threshold the open claim
 // uses. `downInBand` is the down's own hit test, carried next to the down point:
-// a band pull the retract refuses at the threshold is the press's open request,
-// because the finger asked for the same menu the key asks for.
+// a band pull the retract refuses at the threshold — or one whose close has
+// already ended — is the same open request a press makes, because the finger
+// asked for the same menu the key asks for; the finger keeps driving it, so the
+// pull follows where the press would settle.
 void StartRevealFollow(float downX, float downY, uint64_t downTick,
                        uint64_t tickMs, bool granted = false,
                        bool downInBand = false) {
@@ -5590,9 +5600,10 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     ResetEndVelocity();
 }
 
-// The end of a grab that has no open right left: its transfer was refused, or
-// the retract it was granted died before the contact spent it (the landing
-// retires the unspent grant). The contact is consumed exactly as one whose down
+// The end of a grab that has no open right left: its transfer was refused. That
+// refusal is the only ending that reaches here — a landing retires no grant,
+// because the contact it granted may still be on its way to its own 24 DIP
+// report. The contact is consumed exactly as one whose down
 // was refused at admission: the mute makes every later report inert, and only its
 // lift report or a report that proves a different contact ends it
 // (`hid consumed ended ... reason=new-contact|device`). The reveal session and
@@ -5610,11 +5621,15 @@ void ConsumeGrabContact() {
 // A press whose intent arrives while the close's window still shows and a
 // qualified band pull the retract refused are the same request, so they share
 // this one body: both schedules are dropped, the suppression and the pending open
-// flag are cleared, the open direction is published, the one recovery ticket is
-// armed for a dismiss that may already be inside the shell, and the panel is
-// settled back from its live position (or put at rest when there is nothing left
-// to travel). The callers own their preconditions and their one log line.
-float CancelCloseForOpenRequest() {
+// flag are cleared, the open direction is published, and the one recovery ticket
+// is armed for a dismiss that may already be inside the shell. The tails differ
+// because only one request has a finger: a press settles the panel back
+// (`SettlePressOpen`), while a pull hands it to the follow.
+//
+// Returns whether the window still showed at the end of the cancel. A hidden
+// window has no panel to settle or follow: the retract's hide arrived first, and
+// the pull's tail requests the ordinary show instead.
+bool CancelCloseForOpenRequest() {
     // Read before the cancel destroys them: either fact means a Dismiss may
     // already be inside the shell.
     const DismissBeforeCancel dismissed = ReadDismissBeforeCancel();
@@ -5623,9 +5638,8 @@ float CancelCloseForOpenRequest() {
     // has; the bridge reads this direction for the next toggle.
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
     // The local dismiss slot is dropped before the executor command can fire;
-    // the command itself was cancelled above. The window never hides, so no show
-    // is requested and no entry is applied: the menu stays on screen at its live
-    // position.
+    // the command itself was cancelled above. The window is not hidden by this
+    // cancel, so the panel stays on screen at its live position.
     ClearLocalCloseTap();
     g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
     g_commitNeedsProgressReset = false;
@@ -5638,6 +5652,15 @@ float CancelCloseForOpenRequest() {
     // command, so no other landing can serve it, and a local-only cancel arms
     // nothing.
     ArmCloseCancelTicket(cancelled, dismissed);
+    return StartWindowIsOpen();
+}
+
+// The press's tail after that body. A press has no finger to bind to, so the
+// panel the retract left is settled back from its live position, or put at rest
+// when there is nothing left to travel. The pull's tail is the follow
+// (`ActivateRevealFollow`), which starts at the reveal entry because a panel the
+// retract carried off screen has no live position to bind to.
+float SettlePressOpen() {
     const float live = TakeProgressNow(L"intent-open-cancel");
     std::chrono::milliseconds duration{0};
     if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
@@ -5647,10 +5670,13 @@ float CancelCloseForOpenRequest() {
 }
 
 // What a grab's one transfer attempt ended as. `Taken` handed the panel to the
-// follow on this same report. `Open` is the band down that became the press's
-// explicit open request because the retract had nothing left to take: the close
-// was cancelled and settled open, and the contact owns nothing. `Refused` is
-// every other answer and `reason` names it in the trace.
+// follow on this same report. `Open` is the band down that became the explicit
+// open request because the retract had nothing left to take — it was already at
+// or below the entry, or the close it was granted against had ended: what is left
+// to cancel is cancelled (nothing, when the close is over), and the finger
+// follows the panel from the entry, or waits for the ordinary show when the
+// window has hidden. `Refused` is every other answer and `reason` names it in
+// the trace.
 enum class GrabTransfer {
     Taken,
     Open,
@@ -5660,29 +5686,76 @@ enum class GrabTransfer {
 struct GrabTransferResult {
     GrabTransfer outcome = GrabTransfer::Refused;
     const wchar_t* reason = nullptr;
-    // For Open: the live position the settle started from, and whether the
-    // recovery ticket was armed for a dismiss that may already be inside the
-    // shell.
-    float from = 0.0f;
-    bool ticket = false;
+    // For Open: whether the window still showed when the attempt ran. A shown
+    // window is followed on the same report from where its panel shows, which is
+    // never below the entry; a hidden one gets the ordinary show claim and
+    // `entry` is where that follow binds. The recovery ticket a cancel arms is
+    // read by the landing, not passed back here.
+    bool windowOpen = false;
+    float entry = 0.0f;
 };
+
+// The band pull's explicit open. Two reasons reach it and they are one request:
+// the retract refused the pull at or below the entry (`offsurface`) while the
+// close was still ours, and the close the grant was for has already ended
+// (`no-close`). The menu the finger asked for is closed in both, and the owner's
+// rule is that a finger is never swallowed where the key works.
+//
+// The first shape revokes the close through the press's own cancel body: both
+// schedules dropped, the pending command cancelled, the suppression cleared, the
+// recovery ticket armed. A close that is already over has nothing to revoke, so
+// that body would write nothing: no ticket is armed, no pending entry is cleared,
+// and only the open direction is published. Both shapes then take the ordinary
+// open. A hidden window gets the one claim (entry, touch, show), and the follow
+// binds at that entry when the window uncloaks; an open already on its way is
+// that same open, so no second show is requested for it. A window that still
+// shows is followed on the same report from the panel's live position, which is
+// never below the entry.
+GrabTransferResult BandPullOpen(const GestureGeometry& geometry,
+                                const wchar_t* reason, bool closeInFlight) {
+    GrabTransferResult open;
+    open.outcome = GrabTransfer::Open;
+    open.reason = reason;
+    open.entry = std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
+    if (closeInFlight) {
+        open.windowOpen = CancelCloseForOpenRequest();
+    } else {
+        open.windowOpen = StartWindowIsOpen();
+        // The controller owns an open from this line, whichever shape the
+        // request has; the bridge reads this direction for the next toggle.
+        SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
+    }
+    if (!open.windowOpen &&
+        !g_intentOpenActive.load(std::memory_order_relaxed)) {
+        // The claim writes the entry, the pending entry, the direction and the
+        // touch, and requests the show. The contact keeps its candidate if the
+        // request is refused, so an open the shell performs anyway is adopted.
+        PublishOpenClaim(geometry, true, open.entry);
+    }
+    return open;
+}
 
 // A qualified grab spends its one opportunity here, and this is the only abort
 // of a close that remains. `Taken` means the grab took the retract over;
 // `Refused` names the reason it could not:
 //
-// - the close must still be in flight (the suppression window is the close's own
-//   ownership state, not a timeout to judge the pull by); a close that already
-//   landed has no retract to reverse;
 // - `g_pendingDismissConfirm` must be empty. That slot names a dismiss whose call
 //   returned with its hide unconfirmed, so the hide can land at any moment and
-//   there is no schedule left to drop;
+//   there is no schedule left to drop. It is not a statement about the close's
+//   window, so it is checked wherever the close stands;
+// - a layout with no distance can map no pull, so it consumes the contact;
+// - the close must still be in flight. The suppression window is the close's own
+//   ownership state, not a timeout to judge the pull by, and a close that has
+//   ended has no retract to reverse. A band down is not refused there: the menu it
+//   asked for is closed, and a press in that same moment opens it, so the attempt
+//   becomes the ordinary `Open`. A down on the surface the retract had shown, or
+//   in the area it has already left, is not that request and stays `no-close`;
 // - the panel must still be on screen. A retract that is already at or below the
 //   entry has no live position to take over. A down in the band is the exception:
 //   it is the same request a press makes in that same moment, and a press opens
-//   the menu, so the attempt becomes `Open` through the press's own
-//   cancel-and-open body. A down on the surface the retract had shown, or in the
-//   area it has already left, is not that request and stays `offsurface`;
+//   the menu, so the attempt becomes `Open` through the press's own cancel body.
+//   A down on the surface the retract had shown, or in the area it has already
+//   left, is not that request and stays `offsurface`;
 // - a published dismiss is revocable only while its deadline is still ahead. At
 //   or past `executeAt` the bridge may already be inside the shell's `Dismiss`
 //   call, and no cancel recalls a call that has entered;
@@ -5691,8 +5764,9 @@ struct GrabTransferResult {
 //
 // Every refusal consumes the contact: the spent attempt leaves it with no open
 // right until it lifts, and nothing — not the landing, not a later open — gives
-// it another chance. `Open` ends it the same way: the settle, not a follow,
-// drives the panel back.
+// it another chance. `Open` does not: that contact has a finger, and it becomes
+// the pull that opens the menu — the follow takes the panel over at the entry
+// (or on the ordinary show when the retract's window had already hidden).
 //
 // The executor command is revocable at any point before the bridge dispatches it,
 // which is what lets a keyboard, Start-button or click-away close be interrupted:
@@ -5710,35 +5784,40 @@ struct GrabTransferResult {
 GrabTransferResult CancelCloseForQualifiedPull(const GestureGeometry& geometry,
                                                float x, float y,
                                                uint64_t tickMs) {
-    if (!CloseInFlight(tickMs)) {
-        return {GrabTransfer::Refused, L"no-close"};
-    }
     if (g_pendingDismissConfirm != 0) {
         return {GrabTransfer::Refused, L"dismiss-entered"};
     }
-    // Nothing left to reverse: the panel is at or below the entry, the first
-    // progress at which any of it is on screen, so its retract is over and only
-    // the hidden travel is left, and cancelling here would start the open from an
-    // invisible position. Without a distance there is no mapping to take over
-    // with, so the same answer.
     const float distance = geometry.distance();
     if (!(distance > 0.0f)) {
         return {GrabTransfer::Refused, L"geometry"};
     }
+    // The close this grant was for is over. Nothing is left to reverse, and the
+    // contact is not the retract's any more: a band down is a pull on a closed
+    // menu, which is the ordinary open claim; a down on the surface the retract
+    // had shown keeps no open right.
+    if (!CloseInFlight(tickMs)) {
+        if (!g_reveal.grantDownInBand) {
+            return {GrabTransfer::Refused, L"no-close"};
+        }
+        return BandPullOpen(geometry, L"no-close", false);
+    }
+    // Nothing left to reverse: the panel is at or below the entry, the first
+    // progress at which any of it is on screen, so its retract is over and only
+    // the hidden travel is left, and cancelling here would start the open from an
+    // invisible position.
     const float entry = RevealEntryProgress(geometry);
     if ((PeekProgressNow() - entry) * distance <= kProgressEpsilonDip) {
         if (!g_reveal.grantDownInBand) {
             return {GrabTransfer::Refused, L"offsurface"};
         }
-        // The band down is the press: the owner's finger is not swallowed where
-        // the key works. The attempt becomes that explicit open request — the
-        // close is cancelled and the panel settles back from its live position
-        // (there is nothing on screen to take over, so no follow can bind to it).
-        GrabTransferResult open;
-        open.outcome = GrabTransfer::Open;
-        open.from = CancelCloseForOpenRequest();
-        open.ticket = g_intentCancel.pending;
-        return open;
+        // The band down is the same request a press makes, and the owner's
+        // finger is not swallowed where the key works. The close is cancelled
+        // through the press's own body, but the tail is not the press's: this
+        // request has a finger, so the grant is spent and the follow takes the
+        // panel over at the entry. A window the retract already hid has no panel
+        // to follow, so the ordinary open is requested and the follow binds at
+        // that entry when the show arrives.
+        return BandPullOpen(geometry, L"offsurface", true);
     }
     const DismissBeforeCancel dismissed = ReadDismissBeforeCancel();
     // The deadline is in the same tick domain as this report. At or past it the
@@ -5796,8 +5875,9 @@ GrabTransferResult CancelCloseForQualifiedPull(const GestureGeometry& geometry,
 // A contact admitted during a close is the grab that close granted, and this is
 // the one opportunity it spends: the transfer of the retract. No outcome is
 // retried — a taken transfer hands the panel to the follow, a band down the
-// retract had no panel left for becomes the press's own open request, and every
-// other refusal consumes the contact for the rest of its life.
+// retract had no panel left for spends the grant as the explicit open request and
+// follows it too, and every refusal consumes the contact for the rest of its
+// life.
 void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
                         uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
@@ -5814,11 +5894,11 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
         // The grab's attempt is this retract, and nothing else. A taken transfer
         // pinned the position, and the follow binds to it on this same report
         // (`liveBound`); this contact's one take is that one. A band down that
-        // the retract refused only because it had no panel left became the
-        // press's own open request (`grab=open`), and every other refusal names
-        // its reason. Both of those consume the contact: it has no open right
-        // until it lifts, every later report is inert, and its release leaves no
-        // record.
+        // finds no retract left — the panel at or below the entry, or the close
+        // already ended — spends the grant as the explicit open request
+        // (`grab=open`), and the follow takes the entry; every other answer names
+        // its reason and consumes the contact — no open right until it lifts,
+        // every later report inert, no release record.
         const GrabTransferResult transfer =
             CancelCloseForQualifiedPull(geometry, x, y, tickMs);
         if (transfer.outcome == GrabTransfer::Taken) {
@@ -5830,15 +5910,22 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
             TraceLog(L"reveal pull qualified travel=%.0f axis=%d grab=taken",
                     travel, geometry.axis());
         } else if (transfer.outcome == GrabTransfer::Open) {
-            // The menu is already opening through the press's cancel-and-open
-            // body: the close's schedules are gone, the recovery ticket is armed
-            // for a dismiss that may already be inside the shell, and the settle
-            // runs on its own. The finger drives none of it.
-            ConsumeGrabContact();
+            // The grant is spent and the finger follows the open: the same
+            // report's UpdateRevealSession starts the other kind of start — a
+            // panel below the entry chases the finger from the entry — and
+            // nothing settles. A window that was already hidden got the ordinary
+            // show instead; this contact binds at that entry when the open
+            // promotes it. One line for both reasons that reach it: the retract
+            // refused the pull at or below the entry (`offsurface`), or its
+            // close had already ended (`no-close`).
+            reveal.granted = false;
+            g_pullSerial++;
+            g_lateRelease = RevealLateRelease{};
             TraceLog(L"reveal pull qualified travel=%.0f axis=%d grab=open "
-                    L"from=%.3f ticket=%d",
-                    travel, geometry.axis(), transfer.from,
-                    transfer.ticket ? 1 : 0);
+                    L"window=%s entry=%.3f reason=%s",
+                    travel, geometry.axis(),
+                    transfer.windowOpen ? L"open" : L"hidden", transfer.entry,
+                    transfer.reason);
         } else {
             ConsumeGrabContact();
             TraceLog(L"reveal pull qualified travel=%.0f axis=%d grab=refused "
@@ -7394,9 +7481,10 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         g_reveal.edgeCandidate && qpcNow >= g_reveal.lastAliveQpc &&
         qpcNow - g_reveal.lastAliveQpc >= kCandidateIdleHoldMs;
     if (revealIdle && !held) {
-        // A granted grab is released here with the candidate, but the mute it
-        // belongs to is not this watchdog's to clear: the close consumed that
-        // contact, and only a lift report or a proven new contact ends it.
+        // A released contact that a close consumed keeps its mute: this watchdog
+        // is not the evidence that ends it — a lift report or a proven new
+        // contact is. A grant that outlived its close has no mute, and is
+        // released here like any other candidate.
         const bool consumed = session.suppress;
         ReleaseRevealSession(geometry);
         if (!consumed) {
@@ -7877,14 +7965,16 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         const GestureGeometry geometry = ReadGestureGeometry();
         if (StartWindowIsOpen()) {
             // The close this request answers has not hidden the window yet, so
-            // the request cancels it. The body is shared with the band pull the
-            // retract refused: the local dismiss slot is dropped before the
+            // the request cancels it. The cancel body is shared with the band pull
+            // the retract refused: the local dismiss slot is dropped before the
             // executor command can fire, that command is cancelled, the
-            // suppression goes, the open direction is published, the recovery
-            // ticket is armed for a dismiss that may already be inside the shell,
-            // and the panel settles back up from where the retract left it. The
-            // window never hides, so no show is requested and no entry is applied.
-            const float live = CancelCloseForOpenRequest();
+            // suppression goes, the open direction is published, and the recovery
+            // ticket is armed for a dismiss that may already be inside the shell.
+            // The tail is the press's own: a press has no finger, so the panel is
+            // settled back up from where the retract left it. The window never
+            // hides, so no show is requested and no entry is applied.
+            CancelCloseForOpenRequest();
+            const float live = SettlePressOpen();
             TraceLog(L"intent open cancel from=%.3f ticket=%d ticket_open=%u "
                     L"ticket_seq=%lld ticket_expire=%llu",
                     live, g_intentCancel.pending ? 1 : 0,
@@ -8323,9 +8413,11 @@ bool BeginLandingOpen() {
 }
 
 // The close-landing body. Its usual caller is the cloak transition: the window
-// went from shown to hidden and this classifies the close, retires any grab the
-// close still held, and resets the controller. The executor's confirmation probe is
-// the second caller: it can find the window already hidden with no transition
+// went from shown to hidden and this classifies the close and resets the
+// controller. It retires no grab: a grant is spent by the contact at its own
+// travel threshold, and until then the contact is on its way there. The
+// executor's confirmation probe is the second caller: it can find the window
+// already hidden with no transition
 // left to arrive (the dismiss ran on a window something else had hidden, a
 // native hide won the race, or the transition was lost). The body is shared on
 // purpose — one landing, one set of generation and ticket rules — but the log
@@ -8410,10 +8502,6 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     // this a Win press right after the hide opened the window with Progress
     // still at 0, and the panel was invisible until the next open.
     g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
-    // A grab the close granted dies with the retract that granted it: this
-    // landing serves no touch open, so the contact stays inert until it lifts and
-    // its release leaves no late-open record. The next menu opens from a new
-    // down, never from this one.
     if (!closeOurs) {
         // A close this mod did not start: an external takeover owns the
         // screen. The pull is dropped, not deferred — the takeover's window
@@ -8438,14 +8526,15 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
             g_contactOrigin = HidContactOrigin{};
         }
         g_lateRelease = RevealLateRelease{};
-    } else if (g_reveal.granted && g_reveal.edgeCandidate && !g_reveal.active) {
-        // The retract this grant was for is over. An unspent grant dies with it
-        // through the same transition a refused transfer runs: the contact is
-        // consumed, so no report of it can become a gesture and no later open can
-        // adopt it. A taken transfer cleared `granted` and owns the panel through
-        // its follow, so it is not this branch.
-        ConsumeGrabContact();
     }
+    // A grant is deliberately not retired here. A grab spends it at its own 24
+    // DIP report, and until that report the contact is still on its way to it: a
+    // landing is not evidence that it gave up. The unspent grant therefore
+    // survives this close — `granted`, `edgeCandidate` and the panel ownership it
+    // holds all stay — and that contact's crossing then finds the close over
+    // (`no-close`) and, for a band down, asks for the open like any pull on a
+    // closed menu. Only a refusal consumes it (`ConsumeGrabContact`), and so does
+    // the external classification above, whose window is nobody's to reopen.
     // The closed menu shows no panel, and the layout of the next open is a
     // new epoch: a measurement still in flight belongs to the menu that just
     // went away. The request id is captured before the epoch moves, so the
@@ -8455,10 +8544,11 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     const SettledMeasureRequest closing = SnapshotMeasureRequest();
     AdvanceOpenGeneration();
     // The landing's own decision, in trace form: `muted=1` says a contact was
-    // consumed by this close and is still on the glass with no open right — the
-    // one mute a close sets at its start, at a refused down, at a refused grab, or
-    // at a grant that died with its retract. It is never adopted, so a landing can
-    // no longer log a touch reopen.
+    // consumed and is still on the glass with no open right — the one mute a
+    // close sets at its start, at a refused down, or at a refused grab. A grant
+    // this close never saw spent is not a mute: that contact still has its open
+    // to claim. A consumed contact is never adopted, so a landing can no longer
+    // log a touch reopen.
     const int muted = g_hidSession.suppress ? 1 : 0;
     if (reason) {
         // A close the confirmation probe had to finish: no cloak event carried

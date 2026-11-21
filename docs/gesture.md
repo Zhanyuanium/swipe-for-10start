@@ -20,11 +20,14 @@
   hit-tested against the panel surface that is still on screen (or the band); a
   point in the area the retract has already left is refused
   (`reveal admit ... reason=offsurface`) and muted for the rest of its contact.
-  A grab is measured but writes no `Progress`, gets exactly one transfer attempt
-  at 24 DIP, and dies with the retract it could not take. A refused transfer ends
-  the session through the same mute a refused down gets; a band down whose
-  transfer is refused only because the retract has no panel left is the press's
-  own open request instead (`grab=open`), and that settle opens the menu.
+  A grab is measured but writes no `Progress` and gets exactly one transfer
+  attempt at 24 DIP. A refused transfer ends the session through the same mute a
+  refused down gets. A band down whose transfer finds nothing left to take — the
+  retract at or below the entry, or a close that has already ended — is the
+  explicit open request a press makes, but the pull keeps the finger: it is
+  `grab=open`, the follow starts at the reveal entry and chases the finger, where
+  a press would settle. A landing retires no grant: a contact still on its way to
+  its 24 DIP report keeps its one attempt.
 
 One contact owns the panel: `g_hidSession.active` (dismiss) or
 `g_reveal.edgeCandidate` (reveal or grab). The other session is refused until the
@@ -56,8 +59,13 @@ contact lifts.
    grab=none`, `reveal show request ...`; a tap logs neither). A grab spends the
    same crossing on the transfer of its retract instead
    (`grab=taken|open|refused`). A taken transfer hands the panel to the follow; a
-   band down that finds the retract already past the entry is the press's open
-   request and opens the menu (`grab=open`); every other answer consumes the
+   band down that finds nothing left to take — the retract already past the
+   entry, or a close that has already ended (`reason=offsurface|no-close`, named
+   on the same line) — shares the press's cancel body when there is still a close
+   to cancel, but not its settle: the grant is spent and the follow starts at
+   the entry (`grab=open`, `window=open`), or, when the window has already hidden,
+   the ordinary show is requested and the follow binds at that entry
+   (`window=hidden`); every refusal consumes the
    contact. Measured on the
    bottom docked layout: 31 ms from the first positioned report to the 24 DIP
    crossing on a ~1 DIP/ms pull, and +15 ms from the crossing to the executor's
@@ -70,9 +78,12 @@ contact lifts.
    0.348, cold 0.000), not at 0.
 4. **Live takeover** — at the open, `PromoteRevealContact` adopts the contact
    that began in the band if it is still down and has travelled
-   `kAdoptTravelDip` (24 DIP). A grab is never adopted here, or anywhere else:
-   its flag keeps every takeover out, so the open that follows a landing is the
-   shell's own. The same test gates the candidate branch of
+   `kAdoptTravelDip` (24 DIP). A grab that still holds its grant is never adopted
+   here, or anywhere else: the flag keeps every takeover out while the grant is
+   unspent, so an open another path performs before the crossing is not the
+   grab's. The transfer that spends the grant — a take, or the band pull that
+   becomes the open request — clears it, so the same finger is promoted when the
+   open it asked for arrives. The same test gates the candidate branch of
    `UpdateRevealSession`: a contact that landed on a shown but off-rest panel
    (the unhealed case) does not take `Progress` over without the 24 DIP, or
    without having qualified earlier (`claimAttempted`). A stationary finger
@@ -84,7 +95,11 @@ contact lifts.
    is already presented — the pull cancelled a close — binds to the position the
    transfer already took (it does not take again, and holds nothing), and chases
    `mapped - liveOffset`, the offset the finger-to-panel pair had when the pull
-   took the retract over. The finger's own motion is the mapping; only the
+   took the retract over. A band pull the retract carried below the entry is the
+   hidden-panel start even though its window still shows: the panel is off
+   screen, so the follow starts at the entry, holds it, and chases the finger,
+   and the same report that cancelled the close activates it — no settle stands
+   in between. The finger's own motion is the mapping; only the
    written position is rate-limited.
 5. **Follow** — once caught up, `behind=0.000`: the panel is glued (bottom
    auto-hidden `progress=0.96` at a held 300 DIP finger, the panel edge 1.8 px
@@ -203,23 +218,34 @@ transfer is refused there too (`reason=dispatch`): the grab lost the race and th
 close finishes.
 
 A refusal — the dismiss is already inside the shell, its deadline has passed,
-nothing is left to cancel, or a down on the retract's surface finds it already at
-or below the entry where no panel is on screen — consumes the contact
+nothing is left to cancel, or a down on the retract's surface finds no panel on
+screen (its retract already at or below the entry, or a close that has already
+ended) — consumes the contact
 (`grab=refused reason=...`): it keeps no open right until it lifts, every later
-report is inert, and its release leaves no late-open record. The one exception is
-a down in the band that finds the retract already past the entry: that finger
-asked for the same menu the Win key asks for, so the attempt becomes the press's
-own open request instead of a refusal (`grab=open`). The close is cancelled by
-the press's cancel body — both schedules dropped, the pending command cancelled,
-the suppression cleared, the open direction published, the recovery ticket armed,
-and the panel settled back from its live position (`intent open cancel
-from=...`) or put at rest when there is nothing left to travel. The pull owns
-none of that settle: the finger's later reports are inert until it lifts, exactly
-as after a refusal. A down on the surface the retract had shown, or in the area it
-has already left, is not a band down and stays refused. A contact that never
-travels leaves the close to run; a tap in the band was admitted as a grab and
-never gets there. A taken transfer starts no settle: the only settle a grab starts
-is that press cancel's own curve.
+report is inert, and its release leaves no late-open record. The confirmation
+that the hide may still arrive and a layout with no distance consume it wherever
+the close stands. The exception is the band down: that finger
+asked for the same menu the Win key asks for, so the attempt becomes the explicit
+open request instead of a refusal (`grab=open`). With a close still in flight it
+shares the press's cancel body
+— both schedules dropped, the pending command cancelled, the suppression cleared,
+the open direction published, the recovery ticket armed — and only that body: a
+press has no finger and settles the panel back (`intent open cancel from=...`),
+while the pull keeps its finger, spends the grant, and the follow starts the panel
+at the reveal entry and chases the mapped position at 2.2 DIP/ms. The window is
+still shown, but its panel is below the entry, so there is nothing on screen to
+take over and nothing settles. If the window has already hidden by the time the
+request runs, there is no panel to follow either: the ordinary show is requested,
+the entry is held, and the follow binds there when the open promotes the contact
+(`grab=open window=hidden`). A close that has already ended has nothing to cancel:
+the same band down is the ordinary pull on a closed menu — the open direction is
+published, the show is requested when the window is hidden (or the follow binds
+at the live position when it still shows), and the reason on the line names that
+end (`reason=no-close`). A down on the surface the retract had shown, or in
+the area it has already left, is not a band down and stays refused. A contact
+that never travels leaves the close to run; a tap in the band was admitted as a
+grab and never gets there. A taken transfer starts no settle either: the follow
+continues from the pinned position.
 
 A press while the close runs is recovered, not guaranteed. `IntentShouldClose`
 reads the controller's phase, so a press during the retract is an open:
@@ -266,8 +292,12 @@ A close consumes every contact that was already on the glass when it started:
 that contact cannot interrupt the close and cannot reopen the menu. A landing
 therefore adopts no finger. After `win close observed` the controller issues no
 touch show; no hover, carried travel or release record turns the landed close
-into a `Show`; and a contact still down is inert until it lifts
-(`win close observed muted=1`). Silence through the hide does not end it: the
+into a `Show`; and a contact the close consumed is inert until it lifts
+(`win close observed muted=1`). A grab is not one of those: a grant the contact
+has not spent yet is not retired by the landing, so the finger that landed in the
+band keeps it, and its 24 DIP report asks for the open the ordinary way, with the
+close it was granted against already over (`grab=open ... reason=no-close`).
+Silence through the hide does not end it: the
 latch and the mute stay until a lift report or a report that proves a new
 contact — another device, a different asserted Contact Identifier, or a
 different asserted node on a device that does not name contacts. A Contact
@@ -277,10 +307,11 @@ once the close has ended they keep the idle fallbacks (the candidate's 120 ms
 watchdog, then the 18 ms latch) as the missing-lift guard.
 Its risk is a consumed finger that stays silent past the landing and then
 resumes, read as a new down. The only open a landing can still serve is the
-explicit request's obligation: a press or a band pull that cancelled a close whose
+explicit request's obligation: a press, or a band pull whose cancel armed the
+ticket, that cancelled a close whose
 dismiss ran anyway
 (`intent open recovered entry=...`). A menu closed by a touch is opened again by
-a new pull, never by the finger that lost its grab.
+a new pull, never by the finger whose grab was refused.
 
 A close can also land without a transition: when the executor's confirmation
 probe reads hidden and no cloak event carried the hide (the window was already
@@ -306,13 +337,18 @@ its cancel, or the contact's own lift, and a real lift is still a report. The
 earlier build released a held pull *at* the landing and replayed the open from
 the panel's position (`reveal takeover ... live=0`, measured on the bottom docked
 layout with a 350 DIP pull held through a Win close); that adoption is gone. A
-contact already down when the close starts is consumed by it, and a grab that
-outlives its retract is consumed by the landing (an unspent grant) or by its
-crossing (a close that ended by a terminal repair, `reason=no-close`); silence
-after the landing does not release it, and the menu stays closed until a new pull.
+contact already down when the close starts is consumed by it. A grab that
+outlives its retract is not: its grant stays unspent until its own crossing, and
+while the close is still cancellable that crossing takes the retract over (or, for
+a band down, becomes the open request); once the close has ended the same
+crossing is the ordinary open of a closed menu for a band down, and a refusal
+otherwise. Silence after the landing does not release a consumed contact, and the
+menu it belongs to stays closed.
 A band down that crosses while the retract is still in flight cancels it and opens
-the menu instead (`grab=open`), so the asymmetry the owner rejected — a finger
-swallowed where the key works — no longer exists in that window. The
+the menu instead (`grab=open`), following the finger from the entry rather than
+settling it open, so the asymmetry the owner rejected — a finger
+swallowed where the key works — no longer exists in that window, and neither does
+the switch-open of the first parity. The
 bottom auto-hidden entry is 0.255.
 
 The gesture close (a touch drag with enough travel/velocity) uses its own release

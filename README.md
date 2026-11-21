@@ -35,11 +35,14 @@ in StartMenuExperienceHost and the executor in Explorer.
   screen the close is cancelled and the panel settles back from where the
   retract left it; a press inside the shell's hide is latched and served when
   the hide lands. A pull during the close does the same at 24 DIP of inward
-  travel, but only when it grabbed the panel while some of it was still on
-  screen: the armed dismiss is cancelled and the panel
+  travel. When it grabbed the panel while some of it was still on screen, the
+  armed dismiss is cancelled and the panel
   reverses from where the retract reached instead of finishing and then popping
-  open. A pull that lands where the panel has already left, or one the close
-  outruns, gets no second chance: it must lift, and the menu stays closed until a
+  open. A pull that began in the band and reaches 24 DIP only after the close has
+  finished is still an open: `ShowStartView` is requested and the panel follows
+  the finger from the entry. A pull that lands where the panel has already left,
+  or one on the retract's surface that the close outruns, gets no second chance:
+  it must lift, and the menu stays closed until a
   new pull. Recovery is best
   effort, not a guarantee: a press the bridge
   already swallowed has no native replay left, so a peer that dies between the
