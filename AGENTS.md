@@ -160,11 +160,14 @@ service from healing the retracted panel before the dismiss lands.
 The close is judged by behaviour: the shell's hidden event (`own state
 event=hidden open=0`), the executor's `confirmed` (hidden) at its bounded 300 ms
 confirmation — `unconfirmed`/`unknown` is a repair, not a hide — and the next open
-working. A confirmed dismiss on a window the cloak already read hidden, with no
-transition left to arrive, finishes through the same landing
+working. The cloak read is tri-state: a failed read is unknown, never hidden. A
+confirmed dismiss on a window the cloak already read hidden, with no transition
+left to arrive, finishes through the same landing
 (`win close observed reason=confirmed-without-transition`), so the controller
-cannot keep publishing `closing` into the next press; the transition is not
-invented, only the close is completed.
+cannot keep publishing `closing` into the next press. When the confirmation and
+the cloak disagree (or the cloak cannot answer), the command and its open
+generation are kept for the transition, within a bounded wait; a later open
+invalidates them. The transition is not invented, only the close is completed.
 The internal `0xA` value is **not** an acceptance criterion and is no longer
 quoted.
 

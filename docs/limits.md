@@ -139,9 +139,15 @@ the shell had already hidden (a native hide won the race, the hide arrived
 before the close was observed, or its transition was lost). The executor's 300 ms
 confirmation is then the bound: with the cloak reading hidden and the dismiss
 slot still naming that command, the Start side runs the same landing and logs
-`win close observed reason=confirmed-without-transition`. The direction returns
-to unowned (open-capable) without another press, and the next Win press opens
-exactly once; the transition itself is never synthesized.
+`win close observed reason=confirmed-without-transition`. If the cloak still reads
+open, or the read fails (the read is tri-state; a failure is unknown, never
+hidden), the command and its open generation are retained for the transition,
+which lands them once (`exec dismiss retained served`) within one more
+confirmation budget. A command from a menu that a later open replaced is stale
+and cannot land the new hide, and a retained command that no transition reaches
+retires with `exec dismiss retained expired` and the ordinary repair. The
+direction returns to unowned (open-capable) without another press, and the next
+Win press opens exactly once; the transition itself is never synthesized.
 
 ## The touch show
 

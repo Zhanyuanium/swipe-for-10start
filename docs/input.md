@@ -78,8 +78,11 @@ queries no DWM and writes no trace; it compares the HWND and sets an auto-reset
 event. The event is a signal to re-read, not the state itself: the callback may
 arrive after the window has moved again, and two transitions can collapse into
 one wake, so the service reads the current `DWMWA_CLOAKED` and runs the same
-open/close transition code the old 20 ms poll ran. The state is therefore
-sampled: seeded when this activation first can serve (and again after a
+open/close transition code the old 20 ms poll ran. That read is tri-state: a
+failed query is **unknown**, never hidden, and the sample is skipped so the last
+state and the watch stand until the next event or poll. The state is therefore
+sampled: seeded when this activation first can serve (a failed seed is retried;
+and again after a
 renderer replacement, where the window may have changed while this side could
 not drive it), kept by each event, and sampled once more when a watch window
 expires. A transition this mod asked

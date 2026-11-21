@@ -142,10 +142,17 @@ core (see [../docs/limits.md](../docs/limits.md)).
   answer for the recovery ticket's own sequence retires it **before the
   pending-slot gate**, because the open that cancelled the close already cleared
   the slot that gate reads. An `executed` dismiss clears the pending slot
-  but keeps the command in `g_pendingDismissConfirm`; `confirmed` closes it —
-  by the landing itself when the cloak reads hidden and no transition carried
-  the hide (`win close observed reason=confirmed-without-transition`), otherwise
-  by retiring the answer for the transition still to come — while
+  but keeps the command in `g_pendingDismissConfirm` and its open generation;
+  `confirmed` closes it — by the landing itself when the cloak reads
+  hidden (`win close observed reason=confirmed-without-transition`) and the
+  command's generation is current — or **retains** it when the cloak reads open
+  or unknown, for the transition to land under the same command and generation
+  (`exec dismiss retained` → `exec dismiss retained served`). A retained command
+  carries a bound. A generation that a
+  later open replaced is stale (`exec dismiss stale`) and retires without
+  landing; a fresh open drops a retained confirmation (`exec dismiss confirm
+  dropped ... (fresh open=...)`), and a retained command that outlives its bound
+  retires with `exec dismiss retained expired` and the ordinary repair.
   `unconfirmed`/`unknown` is the same terminal repair, and `superseded` needs no
   repair. A 400 ms silence does the same from `g_pendingShowUntil` for a
   show and from `g_pendingDismissExecAt + 400 ms` for a dismiss (the deadline the
@@ -205,6 +212,13 @@ core (see [../docs/limits.md](../docs/limits.md)).
   a maximum-duration close plus launcher dispatch and cloak delivery measured
   562–593 ms over ten runs (mean 578, 7 ms inside the window at the worst), and
   the window would drop a genuine pull held through a slower one.
+  The command is also bound to the **open generation** it was stamped with
+  (`DismissGenerationCurrent`): a retained confirmation from a menu that a later
+  open replaced is stale, and the landing classifies the hide as external.
+  A retained command that the transition carries logs
+  `exec dismiss retained served command=... gen=...` before the one
+  `win close observed`, so the same command and generation are visible as the
+  close that landed.
   The window still governs admission and the unhealed rule. Both landing opens
   run the one `BeginLandingOpen`
   transaction; the pull keeps its precedence, and **only a still-down contact

@@ -422,11 +422,17 @@ backwards, full travel (387 ms at the bottom auto-hidden 852 DIP; 409 ms at the
 bottom docked 900). The dismiss is scheduled at the end plus 30 ms.
 The bridge's timer runs `Dismiss`; the shell's cloak event follows
 and the Start side logs `win close observed`, clears the direction and
-`controllerTouch`, and the next open is ready. A window the shell already had
+`controllerTouch`, and the next open is ready. The cloak read is tri-state: a
+failed read is unknown, never hidden. A window the shell already had
 hidden produces no transition; the executor's 300 ms confirmation then runs the
 same landing itself (`win close observed
-reason=confirmed-without-transition`), identified by the pending dismiss command,
-so the direction cannot stay `closing` into the next press. The close is
+reason=confirmed-without-transition`), identified by the pending dismiss command
+and its open generation, so the direction cannot stay `closing` into the next
+press. When the confirmation reads hidden but the cloak still says open or
+cannot answer, the command and generation are **retained** for the transition
+(`exec dismiss retained`), which then lands them once
+(`exec dismiss retained served`); a later open invalidates the retained
+command, and its bound ends the wait if no transition comes. The close is
 judged by that hidden event and the executor's `confirmed` (hidden) at its 300 ms
 probe, not by an internal `0xA` value;
 that value is not a criterion. `unconfirmed`/`unknown` is a repair, not a hide. A

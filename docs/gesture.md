@@ -207,10 +207,16 @@ A close can also land without a transition: when the executor's confirmation
 probe reads hidden and no cloak event carried the hide (the window was already
 hidden when `Dismiss` ran, a native hide won the race, or the transition was
 lost), the same landing body finishes the close and logs
-`win close observed reason=confirmed-without-transition`. A held pull is released
-and a still-down qualified contact reopens exactly as it does after a transition;
-the command that owns the pending dismiss is the identity, never the suppression
-window.
+`win close observed reason=confirmed-without-transition`. When the cloak still
+reads open, or cannot answer, the confirmation is **retained** instead
+(`exec dismiss retained command=... gen=...`): the command and its open
+generation wait for the transition, which lands them once
+(`exec dismiss retained served`) within a bounded wait. The command that owns the
+pending dismiss is the identity, never the suppression window, and a
+confirmation from a menu a later open replaced is stale: it cannot land the new
+menu's hide. A held pull is released by that landing, and a still-down qualified
+contact reopens exactly as it does after any transition. The transition itself is
+never synthesized.
 
 The idle is held through the close so the digitizer's pause during the key/hide
 does not drop the pull. Measured on the bottom docked layout: held pull at 350

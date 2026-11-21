@@ -128,10 +128,14 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   a touch-first open can reach the launcher before any Win or Start-button
  *   hook ran. The controller decides; the executor performs. The one shared rule
  *   is the suppression window: a close suppresses the retracted panel until the
- *   executor's dismiss has landed. A landing the cloak never reports — the
+ *   executor's dismiss has landed. The cloak read is tri-state (a failed read is
+ *   unknown, never hidden), and a landing is bound to the open generation the
+ *   dismiss command was stamped with. A landing the cloak never reports — the
  *   window was already hidden when `Dismiss` ran — is finished by the executor's
  *   own confirmation (`win close observed reason=confirmed-without-transition`),
- *   never by inventing a transition. Nothing in either half runs on a period: the
+ *   never by inventing a transition; a confirmation whose cloak sample disagrees
+ *   or cannot answer keeps the command, and its bound, for the transition.
+ *   Nothing in either half runs on a period: the
  *   controller arms one high-resolution one-shot for the soonest deadline it has
  *   and waits on its events otherwise (the open/close state is a WinEvent with a
  *   bounded fallback poll), and the executor's worker blocks on its events once
@@ -1720,6 +1724,36 @@ CloseCancelTicket g_intentCancel;  // input thread only
 // the probe (or a landing) closes it, so an unconfirmed dismiss can still be
 // repaired after the immediate ack cleared the pending slot.
 LONG64 g_pendingDismissConfirm = 0;  // input thread only
+// The open generation each pending dismiss was stamped with: the section's
+// `open` value, the same one the bridge checks before it calls the launcher. A
+// landing may claim the close only while that generation is still the current
+// one; a retained confirmation from an older menu must not land a later hide.
+uint64_t g_pendingDismissExecGeneration = 0;     // input thread only
+uint64_t g_pendingDismissConfirmGeneration = 0;  // input thread only
+// Set while a confirmation is retained because the cloak disagreed or could not
+// answer. The bound is the landing's wait for the transition; no landing can
+// claim the command after it, and the ordinary terminal repair runs instead.
+uint64_t g_pendingDismissConfirmUntil = 0;  // input thread only
+bool g_pendingDismissConfirmRetained = false;  // input thread only
+
+// The confirmation slot and everything bound to it. The exec slot keeps its own
+// generation; a landing checks the two separately.
+void ForgetConfirmedDismiss() {
+    g_pendingDismissConfirm = 0;
+    g_pendingDismissConfirmGeneration = 0;
+    g_pendingDismissConfirmUntil = 0;
+    g_pendingDismissConfirmRetained = false;
+}
+
+// Both halves of a dismiss: the command may still be queued at the executor and
+// the confirmation may still be owed. Used where the close is revoked as a whole
+// (a new close, an external takeover, an open-intent cancel, the ack timeout).
+void ForgetPendingDismiss() {
+    g_pendingDismissExec.store(0, std::memory_order_relaxed);
+    g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+    g_pendingDismissExecGeneration = 0;
+    ForgetConfirmedDismiss();
+}
 
 float TrailEdge(int32_t axis, float left, float top, float right, float bottom);
 float GeometryTrailDip(const GestureGeometry& geometry);
@@ -3424,7 +3458,7 @@ bool RequestBridgeShow(uint32_t method, uint32_t flags) {
     }
     // A show is an open; any dismiss still awaiting its visibility confirmation
     // belongs to the close this open ended.
-    g_pendingDismissConfirm = 0;
+    ForgetConfirmedDismiss();
     const LONG64 sequence = SwipeIpcPublishExec(
         &g_ipc, kSwipeExecShow, static_cast<int32_t>(method),
         static_cast<int32_t>(flags), 0, 0);
@@ -3485,9 +3519,13 @@ bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
     }
     g_pendingDismissExec.store(sequence, std::memory_order_relaxed);
     g_pendingDismissExecAt.store(executeAt, std::memory_order_relaxed);
+    // The section's open generation, the same value the bridge compares before
+    // it calls the launcher. A landing for a later menu must not claim this
+    // command, so the start side carries the same identity.
+    g_pendingDismissExecGeneration = open;
     // The new command replaces whatever confirmation an earlier dismiss still
     // owed; the bridge answers the superseded one with its own state.
-    g_pendingDismissConfirm = 0;
+    ForgetConfirmedDismiss();
     // The close is on its way: watch for its cloak event, and poll slowly if it
     // never arrives.
     NoteVisibilityTransition(kVisibilityWantClosed);
@@ -4184,22 +4222,51 @@ uint64_t g_lastOpenCheckTick = 0;  // input thread only
 // The menu closes by cloaking its CoreWindow, not by destroying or hiding it.
 // Called once per down; nothing is cached here, because the menu opens and
 // closes many times on the same HWND.
-bool StartWindowIsOpen() {
+//
+// The read is tri-state on purpose. A failed attribute read (no window, no DWM
+// entry point, a failed call) is neither open nor hidden: a confirmation that
+// finds it hidden would otherwise be allowed to complete a close without ever
+// seeing a hidden sample, and the visibility service would read a failure as a
+// transition.
+enum class CloakState { Open, Hidden, Unknown };
+
+CloakState ReadCloakState() {
     HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
     if (!hwnd) {
-        return false;
+        return CloakState::Unknown;
     }
 
     DwmGetWindowAttribute_t dwmGetWindowAttribute =
         g_dwmGetWindowAttribute.load(std::memory_order_relaxed);
     if (!dwmGetWindowAttribute) {
-        return false;
+        return CloakState::Unknown;
     }
 
     DWORD cloaked = 0;
     const HRESULT hr =
         dwmGetWindowAttribute(hwnd, kDwmwaCloaked, &cloaked, sizeof(cloaked));
-    return hr == S_OK && cloaked == 0;
+    if (hr != S_OK) {
+        return CloakState::Unknown;
+    }
+    return cloaked == 0 ? CloakState::Open : CloakState::Hidden;
+}
+
+const wchar_t* CloakStateName(CloakState state) {
+    switch (state) {
+        case CloakState::Open:
+            return L"open";
+        case CloakState::Hidden:
+            return L"hidden";
+        default:
+            return L"unknown";
+    }
+}
+
+// The gesture paths want the binary answer: only an uncloaked window is open.
+// A failed read is not "open", so admission and the unhealed rule keep their old
+// conservative answer; the landing and the visibility service use the tri-state.
+bool StartWindowIsOpen() {
+    return ReadCloakState() == CloakState::Open;
 }
 
 // The candidate contact needs the open state on every report, but the cloaked
@@ -4546,6 +4613,9 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     g_suppressRestoreUntil.store(tickMs + kRestoreSuppressMs,
                                  std::memory_order_relaxed);
     SwipeIpcSetControllerTouch(&g_ipc, false);
+    // A new close decides the menu: an earlier close's confirmation, retained or
+    // not, can no longer land this one's hide.
+    ForgetConfirmedDismiss();
     // The controller publishes the close before its first frame. The bridge's
     // one toggle rule reads this direction for a Win, Start-button or click-away
     // press, so a press during the settle is a reopen, not a second close. The
@@ -4867,13 +4937,12 @@ void ResetActivationState() {
     // wrote, and an open entry would seed the next menu from a menu that is gone.
     g_pendingShowExec.store(0, std::memory_order_relaxed);
     g_pendingShowUntil.store(0, std::memory_order_relaxed);
-    g_pendingDismissExec.store(0, std::memory_order_relaxed);
-    g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+    // The confirmation slot names a command of the previous activation; its ack
+    // can no longer arrive through this activation's channel, and neither its
+    // generation nor its retained deadline may survive.
+    ForgetPendingDismiss();
     g_intentOpenActive.store(false, std::memory_order_relaxed);
     g_intentOpenEntry.store(0.0f, std::memory_order_relaxed);
-    // The confirmation slot names a command of the previous activation; its ack
-    // can no longer arrive through this activation's channel.
-    g_pendingDismissConfirm = 0;
     // The attach seeds the next intent boundary; 0 here means this activation has
     // acted on nothing, and OpenIpcChannel overwrites it before the thread runs.
     g_lastIntentSeq = 0;
@@ -7312,7 +7381,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         g_intentCancel = CloseCancelTicket{};
         g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
         g_intentOpenActive.store(false, std::memory_order_relaxed);
-        g_pendingDismissConfirm = 0;
+        ForgetPendingDismiss();
         if (g_hidSession.active) {
             g_hidSession.active = false;
             EndContactTiming();
@@ -7354,7 +7423,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
             g_commitNeedsProgressReset = false;
             g_intentOpenActive.store(false, std::memory_order_relaxed);
-            g_pendingDismissConfirm = 0;
+            ForgetPendingDismiss();
             // A dismiss that already entered the shell's Dismiss call cannot be
             // recalled by the cancel above; if it still hides the window, the
             // close's landing reissues this open once. The ticket names the menu
@@ -7398,6 +7467,10 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                     static_cast<long long>(g_intentCancel.dismissSeq),
                     static_cast<unsigned long long>(g_intentCancel.expireAt));
         } else {
+            // The window is already hidden: the close this press answers has
+            // landed, so its command (already cancelled above) and any retained
+            // confirmation end before the new open claims the panel.
+            ForgetPendingDismiss();
             const float entry =
                 std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
             g_intentOpenEntry.store(entry, std::memory_order_relaxed);
@@ -7421,10 +7494,12 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             }
         }
     } else if (intent.kind == kSwipeIntentClose) {
-        g_pendingDismissConfirm = 0;
         // One close at a time: a close intent supersedes whatever an earlier
         // close left scheduled, local slot and executor command alike.
         CancelCloseSchedules(L"close-intent");
+        // The cancel above needs the exec slot to publish its `exec cancel`; the
+        // confirmation and the generation are void from here.
+        ForgetPendingDismiss();
         // The close owns the panel now: one close mechanism, the same ownership
         // the gesture and keyboard closes take. It sets the restore suppression
         // so the visibility poll cannot "heal" the retracted panel while the
@@ -7492,6 +7567,25 @@ void ReleaseExecutorOwnership() {
     g_intentOpenEntry.store(0.0f, std::memory_order_relaxed);
 }
 
+// Whether a dismiss command still belongs to the menu the section is showing.
+// The command carries the open generation the Start side published when it was
+// requested; the bridge refuses a record whose generation no longer matches, and
+// this side uses the same rule before a landing may claim a close. 0 on either
+// side is the section's wildcard (a command written before an open record
+// existed), so it stays admissible; a failed read proves nothing and is not
+// admissible for a command that carries a generation.
+bool DismissGenerationCurrent(uint64_t commandGeneration) {
+    if (commandGeneration == 0) {
+        return true;
+    }
+    uint64_t currentGeneration = 0;
+    uint64_t openTick = 0;
+    if (!SwipeIpcReadOpen(&g_ipc, &currentGeneration, &openTick)) {
+        return false;
+    }
+    return currentGeneration == 0 || currentGeneration == commandGeneration;
+}
+
 void ApplyExecAck() {
     SwipeIpcExecAck ack{};
     if (!SwipeIpcReadExecAck(&g_ipc, &ack)) {
@@ -7544,8 +7638,11 @@ void ApplyExecAck() {
             // Returned is not hidden. The command stays identified until the
             // confirmation probe (or the landing) says what happened.
             if (dismissPending) {
+                g_pendingDismissConfirmGeneration =
+                    g_pendingDismissExecGeneration;
                 g_pendingDismissExec.store(0, std::memory_order_relaxed);
                 g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+                g_pendingDismissExecGeneration = 0;
             }
             g_pendingDismissConfirm = ack.command;
             TraceLog(L"exec dismiss executed command=%lld visible=%d "
@@ -7559,28 +7656,66 @@ void ApplyExecAck() {
             // The probe said the window is hidden. If a cloak transition had
             // carried this hide, it would have landed the close and cleared the
             // slot that still names this command; the slot surviving means no
-            // transition arrived inside the probe's own bound (the dismiss ran
-            // on a window something else had already hidden, a native hide won
-            // the race, or the transition was lost). The close is still this
-            // command's, so it finishes through the same landing, and the log
-            // names the probe as the cause. The cloak is read again here because
-            // it, not the probe, is the state: a window it still reports open
-            // has a transition still to come, and that landing keeps the close.
-            if (ack.visible == 0 && !StartWindowIsOpen()) {
-                LandClosedMenu(GetTickCount64(),
-                               L"confirmed-without-transition");
+            // transition arrived inside the probe's own bound. The cloak is read
+            // again here because it, not the probe, is the state, and the read is
+            // tri-state: a failed read is unknown, not hidden.
+            bool retained = false;
+            if (ack.visible == 0) {
+                const uint64_t commandGeneration =
+                    dismissConfirming
+                        ? g_pendingDismissConfirmGeneration
+                        : g_pendingDismissExecGeneration;
+                const CloakState cloak = ReadCloakState();
+                if (!DismissGenerationCurrent(commandGeneration)) {
+                    // A newer open owns the section: this command belongs to the
+                    // menu that open replaced, and no hide of the current one is
+                    // its close.
+                    TraceLog(L"exec dismiss stale command=%lld gen=%llu",
+                            static_cast<long long>(ack.command),
+                            static_cast<unsigned long long>(commandGeneration));
+                } else if (cloak == CloakState::Hidden) {
+                    // The window genuinely reads hidden and no transition carried
+                    // it: the close finishes here, under the same identity.
+                    LandClosedMenu(GetTickCount64(),
+                                   L"confirmed-without-transition");
+                } else {
+                    // The cloak disagrees or cannot answer. Keep the command and
+                    // its generation: the transition is the one event allowed to
+                    // land it, and the pull it holds must not lose its identity
+                    // because a sample disagreed. The bound retires it if no
+                    // transition comes.
+                    if (dismissPending) {
+                        g_pendingDismissConfirm = ack.command;
+                        g_pendingDismissConfirmGeneration =
+                            g_pendingDismissExecGeneration;
+                    }
+                    g_pendingDismissConfirmUntil =
+                        GetTickCount64() + kDismissConfirmGraceMs;
+                    g_pendingDismissConfirmRetained = true;
+                    retained = true;
+                    TraceLog(L"exec dismiss retained command=%lld gen=%llu "
+                            L"cloak=%s",
+                            static_cast<long long>(ack.command),
+                            static_cast<unsigned long long>(
+                                g_pendingDismissConfirmGeneration),
+                            CloakStateName(cloak));
+                }
             }
-            // The landing consumed both slots. A confirmation the cloak did not
-            // agree with retires only the answer: its transition (or the watch)
-            // still owns the close, and the old code left nothing for it either.
+            // The exec slot has served its purpose; a landing or the retained
+            // slot owns the command from here. A confirmation that could not be
+            // retained (or was landed) retires the answer.
             g_pendingDismissExec.store(0, std::memory_order_relaxed);
             g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
-            g_pendingDismissConfirm = 0;
+            g_pendingDismissExecGeneration = 0;
+            if (!retained) {
+                ForgetConfirmedDismiss();
+            }
             return;
         }
         if (dismissPending) {
             g_pendingDismissExec.store(0, std::memory_order_relaxed);
             g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+            g_pendingDismissExecGeneration = 0;
         }
         if (unconfirmed || failed) {
             // A dismiss that did not hide the window — refused, expired, still
@@ -7593,7 +7728,7 @@ void ApplyExecAck() {
                 g_intentCancel.dismissSeq == ack.command) {
                 g_intentCancel = CloseCancelTicket{};
             }
-            g_pendingDismissConfirm = 0;
+            ForgetConfirmedDismiss();
             ReleaseExecutorOwnership();
             TraceLog(L"exec dismiss %s command=%lld state=%u hr=%08X visible=%d",
                     unconfirmed ? L"unconfirmed" : L"failed",
@@ -7605,9 +7740,7 @@ void ApplyExecAck() {
         // activation) already owns the window. It is reported so the two cases
         // are distinguishable in the log.
         if (ack.state == kSwipeAckSuperseded) {
-            if (dismissConfirming) {
-                g_pendingDismissConfirm = 0;
-            }
+            ForgetConfirmedDismiss();
             TraceLog(L"exec dismiss superseded command=%lld",
                     static_cast<long long>(ack.command));
             return;
@@ -7674,25 +7807,45 @@ void CheckExecAckTimeout(uint64_t now) {
                 static_cast<long long>(show), StartWindowIsOpen() ? 1 : 0);
     }
     const LONG64 dismiss = g_pendingDismissExec.load(std::memory_order_relaxed);
-    if (dismiss == 0) {
+    if (dismiss != 0) {
+        const uint64_t executeAt =
+            g_pendingDismissExecAt.load(std::memory_order_relaxed);
+        if (executeAt != 0 && now >= executeAt + kBridgeAckTimeoutMs) {
+            g_pendingDismissExec.store(0, std::memory_order_relaxed);
+            g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
+            g_pendingDismissExecGeneration = 0;
+            if (g_ipc.state) {
+                SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0,
+                                    dismiss);
+                TraceLog(L"exec cancel request target=%lld "
+                        L"reason=dismiss-expired",
+                        static_cast<long long>(dismiss));
+            }
+            ForgetConfirmedDismiss();
+            ReleaseExecutorOwnership();
+            TraceLog(L"exec ack timeout seq=%lld kind=dismiss open=%d (resync "
+                    L"from cloak)",
+                    static_cast<long long>(dismiss),
+                    StartWindowIsOpen() ? 1 : 0);
+            return;
+        }
+    }
+    // A confirmation retained because the cloak disagreed or could not answer
+    // waits for its transition only until this bound. Past it no landing can
+    // claim the command, and the ordinary terminal repair resyncs from the cloak.
+    const LONG64 retained = g_pendingDismissConfirm;
+    if (!g_pendingDismissConfirmRetained || retained == 0 ||
+        g_pendingDismissConfirmUntil == 0 ||
+        now < g_pendingDismissConfirmUntil) {
         return;
     }
-    const uint64_t executeAt =
-        g_pendingDismissExecAt.load(std::memory_order_relaxed);
-    if (executeAt == 0 || now < executeAt + kBridgeAckTimeoutMs) {
-        return;
-    }
-    g_pendingDismissExec.store(0, std::memory_order_relaxed);
-    g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
-    if (g_ipc.state) {
-        SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, dismiss);
-        TraceLog(L"exec cancel request target=%lld reason=dismiss-expired",
-                static_cast<long long>(dismiss));
-    }
+    TraceLog(L"exec dismiss retained expired command=%lld gen=%llu (resync "
+            L"from cloak)",
+            static_cast<long long>(retained),
+            static_cast<unsigned long long>(
+                g_pendingDismissConfirmGeneration));
+    ForgetPendingDismiss();
     ReleaseExecutorOwnership();
-    TraceLog(L"exec ack timeout seq=%lld kind=dismiss open=%d (resync from "
-            L"cloak)",
-            static_cast<long long>(dismiss), StartWindowIsOpen() ? 1 : 0);
 }
 
 // A superseding intent that arrived with the landing. See ServiceRootVisibility:
@@ -7802,9 +7955,18 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     // that revokes it (a cancel, a failure, an external intent) clears those
     // slots first, so this cannot claim someone else's close. A close whose
     // command an open intent revoked is added below through its ticket.
-    const bool closeCommand =
-        g_pendingDismissExec.load(std::memory_order_relaxed) != 0 ||
-        g_pendingDismissConfirm != 0;
+    //
+    // The command is only ours while the open generation it was stamped with is
+    // still the section's current one. A retained confirmation from a menu that a
+    // later open replaced is a leftover, not this landing's close; the bridge
+    // refuses a record by the same rule, so this side must too.
+    const bool execCommand =
+        g_pendingDismissExec.load(std::memory_order_relaxed) != 0 &&
+        DismissGenerationCurrent(g_pendingDismissExecGeneration);
+    const bool confirmCommand =
+        g_pendingDismissConfirm != 0 &&
+        DismissGenerationCurrent(g_pendingDismissConfirmGeneration);
+    const bool closeCommand = execCommand || confirmCommand;
     // An open that cancelled a close while the window still showed is owed
     // only if that close still lands, and only for the menu the cancel named.
     // The ticket is consumed here, by the landing, and by nothing else: the
@@ -7838,6 +8000,15 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     // ticket names that command and the menu it belongs to, so the landing
     // is still this mod's close and its pull is released, not dropped.
     const bool closeOurs = closeCommand || intentCancelLost;
+    if (closeOurs && confirmCommand && g_pendingDismissConfirmRetained) {
+        // The confirmation the cloak refused to settle has now been carried by
+        // the transition. Naming the command and generation here is the proof
+        // that the retained close, not a later menu's hide, is what landed.
+        TraceLog(L"exec dismiss retained served command=%lld gen=%llu",
+                static_cast<long long>(g_pendingDismissConfirm),
+                static_cast<unsigned long long>(
+                    g_pendingDismissConfirmGeneration));
+    }
     // The close has landed, so its suppression no longer applies. Without
     // this a Win press right after the hide opened the window with Progress
     // still at 0, and the panel was invisible until the next open.
@@ -7906,9 +8077,9 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
     SwipeIpcSetControllerTouch(&g_ipc, false);
     g_intentOpenActive.store(false, std::memory_order_relaxed);
-    g_pendingDismissExec.store(0, std::memory_order_relaxed);
-    g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
-    g_pendingDismissConfirm = 0;
+    // Both slots and both generations end here, whether the landing consumed
+    // them as its close or classified the close as external and dropped them.
+    ForgetPendingDismiss();
     // The measurement request and the cached scroller belong to the open that
     // just ended; the UI thread releases them.
     PostUiOpenWatchRelease(closedGeneration, closing);
@@ -7980,8 +8151,16 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
 // reissue an open the takeover had just revoked. The intent event and the cloak
 // event are waited on in the same set, and the landing reads the intent record
 // itself, so the order between the two wakes cannot resurrect a revoked open.
-void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
-    const bool open = StartWindowIsOpen();
+bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
+    // A failed read is not a state. Keep the last sample and let the event or the
+    // watch try again: treating the failure as hidden would land a close nothing
+    // observed, and treating it as open would run the open path for a menu that
+    // may still be closed.
+    const CloakState sample = ReadCloakState();
+    if (sample == CloakState::Unknown) {
+        return false;
+    }
+    const bool open = sample == CloakState::Open;
     const bool wasOpen = g_rootWasOpen;
     // The open state this call is a sample of. A request stops being waited for
     // the moment the state matches it; every observation keeps a short settle
@@ -8023,8 +8202,20 @@ void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         // generation goes out before any close of this open can be answered, and
         // the open was published on this same pass, so no user closes a menu they
         // have not seen yet.
-        SwipeIpcPublishOpen(&g_ipc, tickMs);
+        const LONG64 publishedOpen = SwipeIpcPublishOpen(&g_ipc, tickMs);
         g_ipcOpenTickLow = static_cast<uint32_t>(tickMs);
+        // A fresh open invalidates a confirmation retained for the menu it
+        // replaced. The command's generation is now older than this open, and a
+        // later hide of this menu must not be landed by it.
+        if (g_pendingDismissConfirm != 0) {
+            TraceLog(L"exec dismiss confirm dropped command=%lld gen=%llu "
+                    L"(fresh open=%lld)",
+                    static_cast<long long>(g_pendingDismissConfirm),
+                    static_cast<unsigned long long>(
+                        g_pendingDismissConfirmGeneration),
+                    static_cast<long long>(publishedOpen));
+            ForgetConfirmedDismiss();
+        }
         // A new open is also a new geometry epoch: every measurement recorded for
         // the previous one is stale from this point on, and a request that was
         // still live is cancelled by the epoch check in its turn.
@@ -8185,6 +8376,7 @@ void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         TraceLog(L"win state fallback open=%d want=%u", open ? 1 : 0, want);
     }
     g_rootWasOpen = open;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -8302,6 +8494,12 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
     if (g_pendingDismissExec.load(std::memory_order_relaxed) != 0 &&
         dismissAt != 0) {
         considerTick(dismissAt + kBridgeAckTimeoutMs);
+    }
+    // A confirmation retained because the cloak disagreed or could not answer
+    // must come back when its wait for the transition ends, even if no event and
+    // no report arrives.
+    if (g_pendingDismissConfirmRetained && g_pendingDismissConfirmUntil != 0) {
+        considerTick(g_pendingDismissConfirmUntil);
     }
     // The settled measurement's own turn, and the scroller retry that replaces a
     // pass which could not commit. Both are posted to the UI thread; the deadline
@@ -9090,15 +9288,16 @@ DWORD WINAPI HidInputThread(LPVOID) {
             rendererWaitLogged = true;
             TraceLog(L"ipc peer withheld reason=no-renderer");
         }
-        if (peerAnnounced && !visibilitySeeded) {
+        if (peerAnnounced && !visibilitySeeded &&
+            ServiceRootVisibility(GetTickCount64(), false)) {
             // First sample once this activation can serve: the state is the
             // current DWM answer, so a menu already on screen is adopted and a
             // closed one seeds "closed" instead of leaving a stale default that
             // makes the next close look like the first transition. The same
             // sample runs again after a renderer replacement, because the window
-            // may have changed while this side could not drive it.
+            // may have changed while this side could not drive it. A failed read
+            // returns false and the next heartbeat retries the seed.
             visibilitySeeded = true;
-            ServiceRootVisibility(GetTickCount64(), false);
         }
 
         // Arm the one thing this thread has to do on a clock, or nothing. The
