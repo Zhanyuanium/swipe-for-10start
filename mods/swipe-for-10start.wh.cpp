@@ -7807,9 +7807,9 @@ void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         }
         // A fresh menu, so every executor command written for the previous one is
         // void from this point on, whatever its own deadline says. The
-        // generation goes out before any close of this open can be answered; the
-        // 20 ms poll below is the only delay, and no user closes a menu they have
-        // not seen yet.
+        // generation goes out before any close of this open can be answered, and
+        // the open was published on this same pass, so no user closes a menu they
+        // have not seen yet.
         SwipeIpcPublishOpen(&g_ipc, tickMs);
         g_ipcOpenTickLow = static_cast<uint32_t>(tickMs);
         // A new open is also a new geometry epoch: every measurement recorded for
@@ -7931,7 +7931,7 @@ void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         // An open that cancelled a close while the window still showed is owed
         // only if that close still lands, and only for the menu the cancel named.
         // The ticket is consumed here, by the landing, and by nothing else: the
-        // still-open poll below must not clear it, because between the cancel and
+        // still-open read below must not clear it, because between the cancel and
         // the cloak transition the window is open for the whole window in which
         // the dismiss can still land, and the suppression may already have expired
         // by the time it does. A new close clears it in TakeCloseOwnership, an
