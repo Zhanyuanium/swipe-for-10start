@@ -12993,6 +12993,29 @@ const wchar_t* OwnCallerName(OwnCaller caller) {
     }
 }
 
+// The one admission rule for a Hide close intent. Method 7 is click-away
+// evidence, so it is admitted only from the wrapper that proves that source; a
+// method-7 Hide from any other caller is the shell's own close and passes. 1 and
+// 6 are admitted from every caller that reaches this point. `reason` names a
+// refusal for the decision line; the caller keeps the capability gate and the
+// trigger ahead of this rule.
+bool CloseIntentFromCaller(uint32_t method, OwnCaller caller,
+                           const wchar_t** reason) {
+    if (method == kDismissMethodClickAway && caller != OwnCaller::ClickAway) {
+        if (reason) {
+            *reason = L"caller-scope";
+        }
+        return false;
+    }
+    if (!SwipeCloseIntentAllowed(method)) {
+        if (reason) {
+            *reason = L"unsupported";
+        }
+        return false;
+    }
+    return true;
+}
+
 using DismissFn = HRESULT (*)(void*, uint32_t);
 using ShowStartViewFn = HRESULT (*)(void*, uint32_t, uint32_t);
 
@@ -13473,13 +13496,11 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     // an ordinary caller's method-7 Hide is the shell's own close and passes.
     // Anything else outside the shared vocabulary passes too, instead of being
     // swallowed for a command that would be refused.
-    const bool methodFitsCaller =
-        method != kDismissMethodClickAway || caller == OwnCaller::ClickAway;
-    if (!methodFitsCaller || !SwipeCloseIntentAllowed(method)) {
+    const wchar_t* methodReason = nullptr;
+    if (!CloseIntentFromCaller(method, caller, &methodReason)) {
         TraceLog(L"intent pass close trigger=%s caller=%s method=%u reason=%s",
                 trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win",
-                OwnCallerName(caller), method,
-                methodFitsCaller ? L"unsupported" : L"caller-scope");
+                OwnCallerName(caller), method, methodReason);
         callOriginal();
         OwnResyncFromState(self);
         return;
