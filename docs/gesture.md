@@ -75,12 +75,18 @@ contact lifts.
    live takeover, an admitted newer pull, the consumption and the window
    invalidate it; a new down does not.
 7. **Show/close in flight** — while `controllerTouch` or `g_intentOpenActive` is
-   set, and while a close is in flight with a reveal candidate, the 18 ms idle
+   set, and while a close is in flight with a reveal candidate, the idle
    release is skipped: the digitizer may go quiet during the shell's uncloak and
    during the key/hide, and that silence is not a lift. A real lift is a report
    and still ends the contact.
 
-The 18 ms idle still ends a contact that is truly silent, with `src=idle`.
+The 18 ms idle still ends a dismiss session that is truly silent, with
+`src=idle`. A band candidate is held for `kCandidateIdleHoldMs` (120 ms)
+instead, so a sparse report stream (20–30 ms steps) can still deliver its 25 DIP
+flick; the watchdog that releases it is the missing-lift case and also clears
+the contact latch, the origin, the open-check cache and the tracked identity. A
+report gap alone is not a new down: the next report continues the same contact
+from its original admission point.
 
 A tap must not open the menu. Measured on the docked layout, with the trace on:
 a tap on the taskbar's empty background, on the clock and on the tray's empty

@@ -55,7 +55,8 @@ Contact Identifier and X/Y are decoded before a contact is chosen.
 are read per collection and per report: in range with the tip up is a hover and
 drives nothing, and only the tracked slot's tip going up (or its in-range bit
 clearing) ends the contact while coordinates keep arriving. A count-only lift
-report is not a lift; the 18 ms idle ends the contact instead. A tracked report
+report is not a lift; the idle window ends the contact instead (18 ms for a
+dismiss session, 120 ms for a band candidate). A tracked report
 that carries no coordinates refreshes the liveness clock only when it asserts
 contact (`TipSwitch`/`InRange`, or a slot state of Contact), never on
 identifier presence alone; the liveness clock is separate from the position
@@ -100,9 +101,15 @@ rejected as another contact.
 ## Release detection
 
 The digitizer keeps reporting while the finger rests (measured 255 reports in a
-1.5 s hold), so an 18 ms window without a report is a reliable lift. On a
+1.5 s hold), so an 18 ms window without a report is a reliable lift for a
+dismiss session. A band candidate is measured against a longer window
+(`kCandidateIdleHoldMs`, 120 ms): a touch panel that samples sparsely, or an
+injected test with 20–30 ms steps, must not lose an admitted 25 DIP flick. A
+report gap alone never begins a new contact — the latch is cleared by a lift
+report or by the candidate's own watchdog — so the admission origin survives the
+gap and the crossing point cannot replace it. On a
 device whose reports carry `TipSwitch`, the tracked slot's lift report ends the
-contact instead: the release line says `src=report`, and the 18 ms window is
+contact instead: the release line says `src=report`, and the idle window is
 only the fallback for a device that goes silent or a contact that leaves
 without a lift report (`src=idle`). A report that carries only a contact count,
 or no contact field for the tracked slot, says nothing about it, so a

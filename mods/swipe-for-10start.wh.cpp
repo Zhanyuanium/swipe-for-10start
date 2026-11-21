@@ -600,6 +600,13 @@ constexpr int kEndVelocitySamples = 8;
 // 15-16 ms gaps), so a step never reads as a lift, and the 5 ms high-resolution
 // idle tick then lands the release 18-23 ms after the last report.
 constexpr uint64_t kIdleReleaseMs = 18;
+// A band candidate survives a sparse report stream. A touch panel that samples
+// slower than the built-in one (or an injected test with 20-30 ms steps) would
+// otherwise lose the candidate at the 18 ms idle and re-admit it at the crossing
+// point, so a 25 DIP flick could never reach the claim. The candidate's own
+// watchdog is longer; a real lift is a report or this window. The 18 ms idle
+// still ends a dismiss session, whose panel samples at ~170 Hz.
+constexpr uint64_t kCandidateIdleHoldMs = 120;
 constexpr UINT_PTR kIdleTimerId = 1;
 constexpr UINT kIdleTimerMs = 5;  // also the waitable timer period
 // The DWM cloaked query is a syscall. The report handler accepts one answer
@@ -6329,10 +6336,12 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
 
     // The edge test belongs to the first report of the contact: a finger that
     // slides into the band after starting elsewhere is not a reveal candidate,
-    // and a candidate that already exists owns the contact until it lifts.
-    const bool newContact =
-        !g_contactDown ||
-        (tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs);
+    // and a candidate that already exists owns the contact until it lifts. A
+    // report gap is not a new down by itself: a sparse digitizer (or an injected
+    // 20-30 ms step) would otherwise re-admit at the crossing point and lose the
+    // admission origin. The latch is cleared by the lift or by the candidate's
+    // own watchdog, which is the missing-lift case.
+    const bool newContact = !g_contactDown;
 
     // A contact that lands while a close is in flight does not cancel it here.
     // The close is aborted only when this contact becomes a qualified pull
@@ -6444,10 +6453,9 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
     // A new contact may not start from a cached copy that predates a resize.
     // The report path uses the try-read; the first report of a contact can
     // afford the writer lock, and an obsolete identity means no gesture until
-    // the writer publishes the new layout.
-    const bool newContact =
-        !g_contactDown ||
-        (tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs);
+    // the writer publishes the new layout. The latch is the contact's identity:
+    // a report gap alone is not a new down (see OnHidSampleStep).
+    const bool newContact = !g_contactDown;
     if (newContact && !GeometryLayoutCurrent(geometry)) {
         geometry = ReadGestureGeometry(true);
     }
@@ -6630,9 +6638,16 @@ void CheckHidIdleRelease(uint64_t tickMs) {
 
     const bool revealIdle =
         g_reveal.edgeCandidate && qpcNow >= g_reveal.lastAliveQpc &&
-        qpcNow - g_reveal.lastAliveQpc >= kIdleReleaseMs;
+        qpcNow - g_reveal.lastAliveQpc >= kCandidateIdleHoldMs;
     if (revealIdle && !touchShowInFlight && !holdThroughClose) {
         ReleaseRevealSession(geometry);
+        // This watchdog is the missing lift (a slow digitizer is the other
+        // reading). The next report is a new down, not a continuation whose
+        // original admission point this latch still holds.
+        g_contactDown = false;
+        g_contactOrigin = HidContactOrigin{};
+        g_openCheckValid = false;
+        ForgetTrackedContact();
     }
 
     // The tracked identity carries its own evidence clock, independent of the

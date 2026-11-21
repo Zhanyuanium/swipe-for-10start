@@ -142,7 +142,12 @@ republish that races the unload is refused by the same lock.
   outranks the intent event. Both landing opens run the one `BeginLandingOpen`
   transaction; the pull keeps its precedence and marks the touch.
 - The 18 ms idle is held through a touch show and through a close in flight, so
-  the digitizer's pause during the key/hide cannot drop the contact.
+  the digitizer's pause during the key/hide cannot drop the contact. A band
+  candidate has its own watchdog (`kCandidateIdleHoldMs`, 120 ms): a sparse
+  report stream must not expire an admitted flick before it reaches 24 DIP, and
+  its release clears the latch, the origin, the open-check cache and the
+  tracked identity. `newContact` is `!g_contactDown` in both sample handlers: a
+  report gap alone is never a new down, so the admission origin survives it.
 
 **Deleted here.** The `VK_LWIN` tap, the close record publishes, the retract
 request handler/answer, the reveal claim, the deferred candidate's close
