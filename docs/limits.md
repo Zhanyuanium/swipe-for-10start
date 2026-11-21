@@ -39,6 +39,15 @@
   The same call also delays the INFINITE join at unload: disabling the mod while
   a cold fetch is in flight blocks `Wh_ModUninit` until the call returns. With a
   warm cache the join is immediate.
+- **The private launcher layout is enabled only for the verified twinui identity.**
+  `launcher+0x160`, `state+0x28` and the state vtable `+0x70` were read from one
+  image. The mod requires the fixed file version `10.0.26100.9974` and all 13
+  named symbols at the reference RVAs before it enables the decision hooks or
+  lets the executor read the launcher. Any other image — even one that keeps all
+  13 names — runs the shell's own path; the one line
+  `exec launcher layout unverified ... native=1 reason=version|rva` states why.
+  This is deliberately version-locked: a monthly update needs a new reference
+  check, not a sentinel probe.
 - **A teardown that cannot be proved gone blocks the unload.** The image is not
   pinned, so returning while a mod-owned thread, delegate or owner window is
   still reachable would hand it unmapped code. The unload joins threads

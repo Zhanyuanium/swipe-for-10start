@@ -49,7 +49,19 @@ object. The shell passes the **`IXamlLauncher` subobject at `outer + 0x18`** to
 `ShowStartView` / `Dismiss` / `IsVisible`; that subobject's `[+0x160]` is the
 live `IXamlLauncherState`.
 
-Measured in explorer (10.0.26100.9949):
+The offsets are reference-build facts, and a name alone does not prove them. The
+capability is enabled only when the loaded image is the identity those offsets
+were read from: fixed file version **10.0.26100.9974** and all 13 named symbols
+at the reference RVAs. `ModuleFixedFileVersion` reads the fixed version through
+`version.dll` (resolved at runtime), and `InstallExplorerHooks` compares every
+resolved RVA. On any other image the capability is off: the decision hooks pass
+their original, `LauncherNow` returns null, the executor refuses its command,
+and the shell serves the press. One line states it:
+`exec launcher layout unverified version=... matches=... native=1 reason=version|rva`;
+the verified image logs `exec launcher layout verified ... native=0`.
+
+Measured in explorer (10.0.26100.9949); the same RVAs still match the
+10.0.26100.9974 image (13/13), which is the identity the gate requires:
 
 | Read | Value |
 |---|---|

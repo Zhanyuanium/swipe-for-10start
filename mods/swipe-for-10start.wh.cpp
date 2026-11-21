@@ -11973,6 +11973,65 @@ constexpr uintptr_t kRvaDismissStartAndCortana = 0x4991C0;
 constexpr uintptr_t kRvaDismissSynchronously = 0x48F7C0;
 constexpr uintptr_t kRvaActiveZBand = 0x24FC50;
 
+// The private offsets below were read from one image: twinui.pcshell.dll fixed
+// file version 10.0.26100.9974, with all 13 named symbols at the reference
+// RVAs. A name alone is not the layout: a rebuild can keep every name and move
+// a member or a vtable slot, and the failure mode is an Explorer crash. The
+// offset-dependent capability is therefore enabled only when this exact
+// identity is present; anything else is a native pass-through, never a
+// null/sentinel probe.
+constexpr uint64_t kTwinuiReferenceVersion =
+    (static_cast<uint64_t>(10) << 48) |
+    (static_cast<uint64_t>(26100) << 16) | 9974;
+std::atomic<bool> g_launcherLayoutVerified{false};
+
+// The fixed file version of a loaded module, or 0 when it cannot be read.
+// version.dll is resolved at runtime, so the build gains no import.
+uint64_t ModuleFixedFileVersion(HMODULE module) {
+    using GetSize_t = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+    using GetInfo_t = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+    using Query_t = BOOL(WINAPI*)(LPVOID, LPCWSTR, LPVOID*, PUINT);
+    static HMODULE versionDll = LoadLibraryW(L"version.dll");
+    static GetSize_t getSize =
+        versionDll ? reinterpret_cast<GetSize_t>(
+                         GetProcAddress(versionDll,
+                                        "GetFileVersionInfoSizeW"))
+                   : nullptr;
+    static GetInfo_t getInfo =
+        versionDll ? reinterpret_cast<GetInfo_t>(
+                         GetProcAddress(versionDll, "GetFileVersionInfoW"))
+                   : nullptr;
+    static Query_t query =
+        versionDll ? reinterpret_cast<Query_t>(
+                         GetProcAddress(versionDll, "VerQueryValueW"))
+                   : nullptr;
+    if (!getSize || !getInfo || !query) {
+        return 0;
+    }
+    WCHAR path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(module, path, ARRAYSIZE(path))) {
+        return 0;
+    }
+    DWORD handle = 0;
+    const DWORD size = getSize(path, &handle);
+    if (size == 0) {
+        return 0;
+    }
+    std::vector<BYTE> data(size);
+    if (!getInfo(path, 0, size, data.data())) {
+        return 0;
+    }
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT length = 0;
+    if (!query(data.data(), L"\\", reinterpret_cast<void**>(&info), &length) ||
+        !info || length < sizeof(VS_FIXEDFILEINFO) ||
+        info->dwSignature != 0xFEEF04BD) {
+        return 0;
+    }
+    return (static_cast<uint64_t>(info->dwFileVersionMS) << 32) |
+           info->dwFileVersionLS;
+}
+
 // The launcher keeps its IXamlLauncherState interface at +0x160 (the hotkey's
 // outer object keeps the launcher at +0x18, and the same state at +0x178).
 constexpr uintptr_t kLauncherStatePointerOffset = 0x160;
@@ -13382,26 +13441,6 @@ bool InstallExplorerHooks(HMODULE module) {
         return false;
     }
 
-    // The executor calls the trampolines: its own calls are not triggers.
-    // t_execCall still marks the frame for the Hide hook.
-    g_dismiss = Dismiss_Original;
-    g_showStartView = ShowStartView_Original;
-    g_closeHookEnabled.store(true, std::memory_order_relaxed);
-    g_ownPrimitivesEnabled.store(true, std::memory_order_relaxed);
-    g_ownWinEnabled.store(true, std::memory_order_relaxed);
-    g_ownButtonEnabled.store(true, std::memory_order_relaxed);
-    g_ownEventsEnabled.store(true, std::memory_order_relaxed);
-    g_callersVerified.store(true, std::memory_order_relaxed);
-    g_explorerSymbolsReady.store(true, std::memory_order_release);
-    // The apply belongs to this serialized install, not to the caller: a stop
-    // that takes the lock between the release and a caller-side apply would
-    // return while this thread still added hooks. Applying here means
-    // BeforeUninit either waits for the complete install or sees the stop and
-    // makes this call refuse before HookSymbols.
-    Wh_ApplyHookOperations();
-    TraceLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
-    ReleaseSRWLockExclusive(&g_explorerSymbolLock);
-
     const uintptr_t base = reinterpret_cast<uintptr_t>(module);
     struct ResolvedSymbol {
         const wchar_t* label;
@@ -13435,27 +13474,75 @@ bool InstallExplorerHooks(HMODULE module) {
         {L"visible", reinterpret_cast<const void*>(g_launcherIsVisible),
          kRvaLauncherIsVisible},
     };
+    // The identity is settled before any capability is enabled. The names
+    // resolved; the RVAs and the fixed file version must also be the reference
+    // image the private offsets were read from. A mismatch is a native
+    // pass-through, never a probe of a guessed layout.
     int matches = 0;
     for (const ResolvedSymbol& symbol : resolved) {
         const uintptr_t rva =
             reinterpret_cast<uintptr_t>(symbol.address) - base;
-        const bool match = rva == symbol.expectedRva;
-        matches += match ? 1 : 0;
+        matches += rva == symbol.expectedRva ? 1 : 0;
+    }
+    const uint64_t version = ModuleFixedFileVersion(module);
+    const bool layoutVerified =
+        matches == static_cast<int>(ARRAYSIZE(resolved)) &&
+        version == kTwinuiReferenceVersion;
+    g_launcherLayoutVerified.store(layoutVerified, std::memory_order_release);
+
+    // The executor calls the trampolines: its own calls are not triggers.
+    // t_execCall still marks the frame for the Hide hook. Every capability that
+    // reads the private layout is enabled only on the verified identity.
+    g_dismiss = Dismiss_Original;
+    g_showStartView = ShowStartView_Original;
+    g_closeHookEnabled.store(layoutVerified, std::memory_order_relaxed);
+    g_ownPrimitivesEnabled.store(layoutVerified, std::memory_order_relaxed);
+    g_ownWinEnabled.store(layoutVerified, std::memory_order_relaxed);
+    g_ownButtonEnabled.store(layoutVerified, std::memory_order_relaxed);
+    g_ownEventsEnabled.store(layoutVerified, std::memory_order_relaxed);
+    g_callersVerified.store(layoutVerified, std::memory_order_relaxed);
+    g_explorerSymbolsReady.store(true, std::memory_order_release);
+    // The apply belongs to this serialized install, not to the caller: a stop
+    // that takes the lock between the release and a caller-side apply would
+    // return while this thread still added hooks. Applying here means
+    // BeforeUninit either waits for the complete install or sees the stop and
+    // makes this call refuse before HookSymbols.
+    Wh_ApplyHookOperations();
+    TraceLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
+    ReleaseSRWLockExclusive(&g_explorerSymbolLock);
+
+    for (const ResolvedSymbol& symbol : resolved) {
+        const uintptr_t rva =
+            reinterpret_cast<uintptr_t>(symbol.address) - base;
         TraceLog(L"exec launcher symbol label=%s rva=0x%llX expected=0x%llX "
                 L"match=%d",
                 symbol.label, static_cast<unsigned long long>(rva),
                 static_cast<unsigned long long>(symbol.expectedRva),
-                match ? 1 : 0);
+                rva == symbol.expectedRva ? 1 : 0);
     }
     TraceLog(L"exec launcher symbols resolved base=0x%llX count=%d matches=%d "
             L"match=%d",
             static_cast<unsigned long long>(base),
             static_cast<int>(ARRAYSIZE(resolved)), matches,
             matches == static_cast<int>(ARRAYSIZE(resolved)) ? 1 : 0);
+    // One line states the identity and what it enabled. The degrade path is a
+    // single native pass-through announcement, not a per-trigger repeat.
+    TraceLog(L"exec launcher layout %s version=%u.%u.%u.%u matches=%d "
+            L"native=%d reason=%s",
+            layoutVerified ? L"verified" : L"unverified",
+            static_cast<unsigned>((version >> 48) & 0xFFFF),
+            static_cast<unsigned>((version >> 32) & 0xFFFF),
+            static_cast<unsigned>((version >> 16) & 0xFFFF),
+            static_cast<unsigned>(version & 0xFFFF), matches,
+            layoutVerified ? 0 : 1,
+            version != kTwinuiReferenceVersion
+                ? L"version"
+                : (matches != static_cast<int>(ARRAYSIZE(resolved)) ? L"rva"
+                                                                    : L"none"));
     Wh_Log(L"twinui.pcshell.dll symbols resolved at %p (%d/%d at the reference "
-           L"RVAs); launcher hooks installed",
+           L"RVAs); launcher hooks installed layout=%d",
            reinterpret_cast<void*>(base), matches,
-           static_cast<int>(ARRAYSIZE(resolved)));
+           static_cast<int>(ARRAYSIZE(resolved)), layoutVerified ? 1 : 0);
     return true;
 }
 
@@ -13556,6 +13643,13 @@ void* LauncherNow(uint64_t* stateOut, void** outerOut) {
     }
     if (outerOut) {
         *outerOut = nullptr;
+    }
+    // The offsets below belong to the verified reference image. On any other
+    // image the executor call is refused here and the shell serves the press;
+    // nothing reads a member or a vtable slot of a layout this mod has not
+    // proved. `exec launcher layout unverified ...` states the reason once.
+    if (!g_launcherLayoutVerified.load(std::memory_order_acquire)) {
+        return nullptr;
     }
     if (!g_launcherSlot) {
         return nullptr;

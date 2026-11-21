@@ -213,7 +213,13 @@ logged against the reference RVA (`exec launcher symbol label=... rva=...
 expected=... match=0|1`); the set line
 `exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence
 line. One missing symbol refuses the whole set and the hooks are not applied: a
-toggle that can open but not close is worse than the shell's path. The apply
+toggle that can open but not close is worse than the shell's path. The private
+layout is gated on identity, not names: the fixed file version must be
+`10.0.26100.9974` and all 13 resolved RVAs must match the reference. On any
+other image the hooks pass, `LauncherNow` returns null, the executor refuses
+and the shell serves the press; one
+`exec launcher layout unverified ... native=1 reason=...` line states it, and
+the verified image logs `exec launcher layout verified ... native=0`. The apply
 (`Wh_ApplyHookOperations`) is inside the symbol-install critical section, before
 the lock is released: `BeforeUninit` either waits for the complete install or
 takes the lock first and makes the install refuse before `HookSymbols`, so no
