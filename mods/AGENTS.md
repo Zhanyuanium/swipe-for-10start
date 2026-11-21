@@ -150,8 +150,9 @@ translation, resets the scroller watches and drops the UI-owned objects
 module entries are drained through their event; the IPC view and handles close
 last. A revoke or thread proof that cannot be obtained keeps waiting rather than
 returning success. The root hook is resolved by public symbol
-(`StartUI::App::PrepareRootElement`): the `LoadLibraryExW` notification only
-records the returned module, and the input thread runs `HookSymbols`, because
+(`StartUI::App::PrepareRootElement`): the `LoadLibraryExW` notification and the
+init/AfterInit probes only record the module handle (`GetModuleHandleW`), and
+the input thread runs `HookSymbols` on its first tick, because
 the first call starts Windhawk's PDB fetch and blocking the shell's loader
 thread makes the menu host look hung. A false result while the fetch runs is
 pending (logged with its attempt, elapsed time and the 120 s deadline) and is

@@ -11004,7 +11004,6 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
 // thread can retry the same image.
 std::atomic<HMODULE> g_startUIModuleSeen{nullptr};
 std::atomic<HMODULE> g_startUIHookModule{nullptr};
-std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_loadHookMatchLogged{false};
 
 // The input thread's retry schedule for the root symbol. The first symbol load
@@ -11101,26 +11100,19 @@ bool InstallStartUIHooks(HMODULE module) {
     return true;
 }
 
-// One probe of the already-loaded image, from init and AfterInit. The module is
-// found by name; the symbol API reads the actual image. StartUI_ is not loaded
-// at init in the measured host, so the normal first attempt happens later, on
-// the input thread.
-void TryInstallFromLoadedModules(bool apply) {
+// One look for an already-loaded image, from init and AfterInit. It only
+// records the module for the input thread; it must never resolve the symbol.
+// Both callers run on the host's own thread, and the first symbol load blocks
+// for Windhawk's PDB fetch: on a shell thread that makes the menu host look
+// hung, and the root hook is then queued by a thread that cannot apply it. The
+// input thread owns every resolution and its own Wh_ApplyHookOperations.
+void RecordLoadedStartUIModule() {
     if (g_disabled.load(std::memory_order_relaxed)) {
         return;
     }
-    if (g_rootHookReady.load(std::memory_order_acquire) ||
-        g_rootHookRefused.load(std::memory_order_acquire)) {
-        return;
-    }
     HMODULE startUI = GetModuleHandleW(kStartUIModuleName);
-    if (!startUI) {
-        return;
-    }
-    g_startUIModuleSeen.store(startUI, std::memory_order_release);
-    if (InstallStartUIHooks(startUI) && apply &&
-        g_afterInit.load(std::memory_order_relaxed)) {
-        Wh_ApplyHookOperations();
+    if (startUI) {
+        g_startUIModuleSeen.store(startUI, std::memory_order_release);
     }
 }
 
@@ -11571,8 +11563,8 @@ BOOL RoleInit() {
                                                    "LoadLibraryExW"))
                               : nullptr;
     if (!loadLibraryExW) {
-        // Without the notification the root hook is still installed from the
-        // already-loaded image below; only a StartUI_ that loads later than
+        // Without the notification the image is still recorded below and the
+        // input thread installs from it; only a StartUI_ that loads later than
         // this init would be missed.
         Wh_Log(L"LoadLibraryExW not found; the late StartUI_ load is not "
                L"notified");
@@ -11585,8 +11577,10 @@ BOOL RoleInit() {
     }
 
     // The usual case: StartUI_ is already loaded when the host creates its
-    // window, and this is the attempt that installs the root hook.
-    TryInstallFromLoadedModules(false);
+    // window. Record the image here, on this host thread, and let the input
+    // thread's first tick install the root hook; resolving it here would run
+    // the PDB fetch on the shell's own thread.
+    RecordLoadedStartUIModule();
 
     g_initialised = true;
     return TRUE;
@@ -11596,12 +11590,11 @@ void RoleAfterInit() {
     if (!g_initialised) {
         return;
     }
-    g_afterInit = true;
-    // The LoadLibraryExW notification takes effect here; only after this can a
-    // StartUI_ that loaded during init be trusted to have been seen, so the
-    // recheck is after the apply, not before it.
+    // The LoadLibraryExW notification takes effect here. Record an image that
+    // loaded during init; the input thread installs from the record, so no
+    // symbol work runs on this host thread.
     Wh_ApplyHookOperations();
-    TryInstallFromLoadedModules(false);
+    RecordLoadedStartUIModule();
 
     TraceLog(L"hid init");
     if (!g_hidStopEvent) {
