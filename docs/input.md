@@ -71,11 +71,17 @@ The open/close state is pushed, not polled: `SetWinEventHook(EVENT_OBJECT_CLOAKE
 EVENT_OBJECT_UNCLOAKED)` is installed on this thread for its own process and
 filtered to the CoreWindow HWND. The callback takes no lock, reads no XAML,
 queries no DWM and writes no trace; it compares the HWND and sets an auto-reset
-event. The service behind it reads `DWMWA_CLOAKED` once and runs the same
-open/close transition code the old 20 ms poll ran. A transition this mod asked
+event. The event is a signal to re-read, not the state itself: the callback may
+arrive after the window has moved again, and two transitions can collapse into
+one wake, so the service reads the current `DWMWA_CLOAKED` and runs the same
+open/close transition code the old 20 ms poll ran. The state is therefore
+sampled: seeded when this activation first can serve (and again after a
+renderer replacement, where the window may have changed while this side could
+not drive it), kept by each event, and sampled once more when a watch window
+expires. A transition this mod asked
 for (a show or a dismiss), or has just observed, opens a bounded watch in which
 the slow fallback poll runs at 100 ms, so a missed event cannot leave the state
-stuck; a clean run never uses it (see [limits.md](limits.md)).
+stuck; a clean run never uses the fallback (see [limits.md](limits.md)).
 
 The one wake that exists with nothing to do is the peer heartbeat: while this
 activation advertises a service, the wait times out every

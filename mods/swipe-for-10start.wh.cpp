@@ -8234,11 +8234,14 @@ void ServiceDeadlineWork(uint64_t tickMs) {
     CheckExecAckTimeout(tickMs);
     if (g_visibilityPollUntil != 0) {
         if (tickMs >= g_visibilityPollUntil) {
-            // The window closed without the state being observed or the
-            // transition landing. Nothing more is owed: the next cloak event is
-            // the source again.
+            // The window closes: take one last sample before it does. The
+            // callback may collapse two transitions into one wake, and a change
+            // that landed after the last poll would otherwise be forgotten with
+            // the watch. The watch is cleared first so the sample cannot renew
+            // it; the state it reads is the current DWM answer, not an event's.
             g_visibilityPollUntil = 0;
             g_visibilityWant = kVisibilityWantNone;
+            ServiceRootVisibility(tickMs, true);
         } else if (g_lastVisibilityPollTick == 0 ||
                    tickMs - g_lastVisibilityPollTick >= kVisibilityFallbackMs) {
             g_lastVisibilityPollTick = tickMs;
@@ -8937,6 +8940,11 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // the loading thread.
     bool peerAnnounced = false;
     bool rendererWaitLogged = false;
+    // Whether this activation has taken its first visibility sample since the
+    // peer service became available. The state is a sample, not an event's
+    // payload: without the seed, a menu that was already on screen at attach
+    // would be read as "closed" until some later event.
+    bool visibilitySeeded = false;
     // The root hook is resolved here and not by the LoadLibraryExW notification:
     // the first symbol load blocks for Windhawk's PDB fetch, and this thread is
     // the mod's own. A pending result leaves the peer unpublished.
@@ -8959,6 +8967,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
         if (peerAnnounced && !RendererReady()) {
             SetPeerGone(L"renderer-lost", false);
             peerAnnounced = false;
+            visibilitySeeded = false;
         }
         if (!peerAnnounced &&
             g_rootHookReady.load(std::memory_order_acquire) && RendererReady()) {
@@ -8972,6 +8981,16 @@ DWORD WINAPI HidInputThread(LPVOID) {
             // nothing and every press stays native.
             rendererWaitLogged = true;
             TraceLog(L"ipc peer withheld reason=no-renderer");
+        }
+        if (peerAnnounced && !visibilitySeeded) {
+            // First sample once this activation can serve: the state is the
+            // current DWM answer, so a menu already on screen is adopted and a
+            // closed one seeds "closed" instead of leaving a stale default that
+            // makes the next close look like the first transition. The same
+            // sample runs again after a renderer replacement, because the window
+            // may have changed while this side could not drive it.
+            visibilitySeeded = true;
+            ServiceRootVisibility(GetTickCount64(), false);
         }
 
         // Arm the one thing this thread has to do on a clock, or nothing. The
@@ -9091,6 +9110,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 if (peerAnnounced && !RendererReady()) {
                     SetPeerGone(L"renderer-lost", false);
                     peerAnnounced = false;
+                    visibilitySeeded = false;
                 } else if (!peerAnnounced &&
                            g_rootHookReady.load(std::memory_order_acquire) &&
                            RendererReady()) {
