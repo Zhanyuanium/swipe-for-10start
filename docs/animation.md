@@ -19,8 +19,9 @@ The duration is planned from the travel, not a time:
 T = clamp(|target - start| * distance / 2.2 DIP/ms, 160 ms, 520 ms)
 ```
 
-A 852 DIP panel takes 387 ms (auto-hidden; the docked 900 DIP panel takes 409 ms;
-the earlier auto-hidden variant also measured 852 DIP and 387 ms). The curve is
+A 852 DIP panel takes 387 ms (bottom auto-hidden; the bottom docked 900 DIP panel
+takes 409 ms; the earlier bottom auto-hidden variant also measured 852 DIP and
+387 ms). The curve is
 generated as samples (`BuildSpringSamples`), scaled by its own value at `T`, so
 it lands exactly on the target with no step.
 The first keyframe, up to 4 ms in, shows the first segment's average speed
@@ -41,9 +42,12 @@ initial slope, which is why the seam factor is a computed value, not a constant.
 - keyboard/Start-button open: the settle from rest (`vel=0.00`) to 1, `dur=409`
   on the full travel;
 - intent open: the Start side holds the entry (`RevealEntryProgress`, warm
-  0.255 auto-hidden, 0.348 docked, cold 0.000) and starts the same
+  0.255 bottom auto-hidden, 0.348 bottom docked, cold 0.000) and starts the same
   settle from there when the shell's
-  shown event arrives (`win open intent from=... dur=...`);
+  shown event arrives (`win open intent from=... dur=...`). That event is
+  `EVENT_OBJECT_UNCLOAKED` for the CoreWindow, delivered to the input thread —
+  not a poll. Measured on this build, the settle line lands 31–47 ms after the
+  `exec show` ack, which is the shell's own uncloak, not the mod's wake;
 - touch: the reveal takeover starts at the entry and chases the mapped finger at
   2.2 DIP/ms, then follows. The rate limit is the planner's own speed; the cost
   is time (a 0.326 gap closes in ~148 ms), and the visible position never
@@ -77,7 +81,22 @@ command, and settles the panel back from its live position
 After 8 ms without a report the panel continues linearly for 200 ms on the last
 measured speed; the next report pins the panel at its own mapped position. The
 coast is the only animation besides the settle, and a release within it ends it
-and plans the settle from the visible value.
+and plans the settle from the visible value. The 8 ms start and the 200 ms end
+are both one-shot deadlines on the input thread, armed only while they are
+ahead: with nothing moving there is no tick to start a coast from. A follow's
+start is the later of its 8 ms report gap and its 50 ms entry guard, so the
+armed wake is one `MaybeCoast` can use instead of one its guard refuses.
+
+## One wake per deadline
+
+No animation is driven by the input thread: the settle, the coast and the
+reveal chase are composition animations, so the panel moves with the thread
+asleep. The input thread's clock exists only for the decisions around them —
+the release, the close tap, the executor budgets and the measurement turn — and
+each of those is one one-shot deadline (see [input.md](input.md)). The "heal"
+pass that brings back a panel left at the hidden rest is part of the visibility
+service; after an open it runs from the settle watch's 100 ms polls, which end
+when that watch does.
 
 ## Measured lines
 

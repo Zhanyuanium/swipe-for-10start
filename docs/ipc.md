@@ -1,71 +1,50 @@
-# IPC — the v7 channel
+# IPC — the merged mod's channel
 
-> Start 0.44.0 / bridge 0.25.0. One session-local section, seven named objects,
-> every record a seqlock. There is no file and no polling on either side.
+> Mod 0.7.0 (one source, two process halves). One session-local section, four
+> named events, every record a seqlock. There is no file, no mutex, no command
+> channel and no polling on either side.
 
 ## Names and layout
 
 ```
-Local\SwipeFor10Start_v7_State        SwipeIpcState (744 bytes, v7)
-Local\SwipeFor10Start_v7_Cmd          manual-reset, tools -> Start
-Local\SwipeFor10Start_v7_CmdWrite     mutex, one command writer
-Local\SwipeFor10Start_v7_Intent       auto-reset, bridge -> Start
-Local\SwipeFor10Start_v7_IntentAck    auto-reset, Start -> bridge
-Local\SwipeFor10Start_v7_Exec         auto-reset, Start -> bridge
-Local\SwipeFor10Start_v7_ExecAck      auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod_State      SwipeIpcState (216 bytes)
+Local\SwipeFor10Start_SingleMod_Intent     auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod_IntentAck  auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod_Exec       auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod_ExecAck    auto-reset, bridge -> Start
 ```
 
-`kSwipeIpcMagic = 0x53313053` (`S01S`), `kSwipeIpcVersion = 7`. The names carry
-the version, so a layout change is a new channel, never a silent mismatch. Every
-field's offset is pinned by a `static_assert` in `mods/swipe_ipc_shared.h`;
-`layoutBytes` publishes `sizeof(SwipeIpcState)` and a reader that sees a different
-value refuses with `ERROR_INVALID_DATA` instead of reading a foreign layout.
-
-**v7 adds the Start side's activation identity.** `peerEpoch` fills the four
-bytes after `peerState` (740), because the struct's 8-byte alignment had left
-them, so the section stays 744 bytes. The size alone therefore no longer names the
-layout: the version word, in the object names and in the section, separates v6
-from v7. The field answers one question: *which Start activation is answering
-now*. The Start side increments it once per attach, before any tick or `alive`;
-the bridge reads it beside the press it latched, and a serve against a different
-epoch is a serve into a controller that never saw that press, so the latch is
-invalidated instead of published.
-
-**v6 added the Start side's liveness pair.** `peerTick` and `peerState` extended
-the tail (736 -> 744). The bridge creates the section, so a mapped channel is not
-evidence that the Start side runs; this pair is the precondition every
-interception reads. It is not a seqlock: independent words, written by the Start
-side only, read as one liveness answer (see "Peer liveness" below).
-
-**v5 replaced v4's controller words.** v4 published `controllerOwning` and
-`controllerPhase` as separate atomics, so a bridge reader could see new ownership
-with the previous phase and read a close in flight as an open. v5 published one
-`controllerDirection` word (`0` unowned, `1` open, `2` closing) that both sides
-read and write, and dropped `controllerOpen`, which no reader used. That changed
-the tail's meaning and the section size (744 -> 736), so the version was bumped
-deliberately. The M2 close/retract slots are still **gone** (v3 reserved them;
-v4 removed them). The layout is:
+`kSwipeIpcMagic = 0x53313053` (`S01S`). There is no product version word: the
+**namespace is the ABI identity**. A future incompatible layout changes the
+prefix, so an old pinned development image can never join this channel and a
+same-size change is never reinterpreted across a staggered update. Every field's
+offset is pinned by a `static_assert` in `mods/swipe_ipc_shared.h`;
+`layoutBytes` publishes `sizeof(SwipeIpcState)` and a reader that sees a
+different value refuses with `ERROR_INVALID_DATA` instead of reading a foreign
+layout.
 
 ```
-0    magic           4    version
-8    cmdSeq          16   cmdText[512]     528  cmdTick
-536  openSeq         544  openTick
-552  initState       556  layoutBytes      560  initTick
-568  intentSeq       576  intentTick       584  intentKind
-588  intentTrigger   592  intentMethod     596  intentFlags
-600  intentOpen
-608  intentAckSeq    616  intentAckFor     624  intentAckState
-628  intentAckDuration 632 intentAckEntry   636 intentAckHr
-640  execSeq         648  execTick         656  execKind
-660  execMethod      664  execFlags        672  execExecuteAt
-680  execOpen        688  execTarget
-696  execAckSeq      704  execAckFor       712  execAckState
-716  execAckHr       720  execAckVisible
-724  controllerDirection
-728  controllerTouch
-732  peerTick        736  peerState        740  peerEpoch
-size 744
+0    magic
+8    openSeq          16   openTick
+24   initState        28   layoutBytes      32   initTick
+40   intentSeq        48   intentTick       56   intentKind
+60   intentTrigger    64   intentMethod     68   intentFlags
+72   intentOpen
+80   intentAckSeq     88   intentAckFor     96   intentAckState
+100  intentAckDuration 104 intentAckEntry   108  intentAckHr
+112  execSeq          120  execTick         128  execKind
+132  execMethod       136  execFlags        144  execExecuteAt
+152  execOpen         160  execTarget
+168  execAckSeq       176  execAckFor       184  execAckState
+188  execAckHr        192  execAckVisible
+196  controllerDirection
+200  controllerTouch
+204  peerTick         208  peerState        212  peerEpoch
+size 216
 ```
+
+The debug command channel is **gone**: its record, mutex, event and parser were
+deleted in 0.7.0, and `tools/ipc.ps1` is read-only.
 
 ## Seqlocks
 
@@ -103,6 +82,20 @@ with `SwipeIpcAnswerIntent(seq, state, durationMs, entryPercent, hr)` on
 executor command first and then the ack: the ack reports the decision, it is not
 a barrier the bridge waits for before the command.
 
+`method` is **evidence about the shell path that produced the trigger**, not an
+execution method. A click-away carries the Hide method `7`. The Start side maps
+it to the executor's dismiss vocabulary (`6`, the pointer-driven close the Start
+button's own dismiss uses) before publishing the command and keeps `7` in the
+decision log; the intent record is not rewritten.
+
+A refused intent has **no native replay**. The bridge swallows the trigger before
+it publishes, so the shell never saw that press; when the Start side answers
+`refused` (no executor, no channel, a show that could not be published) the
+press is lost. The refusal is reserved for the case where nothing could run, and
+the line names it (`intent open refused entry=... reason=no-executor`,
+`intent close refused from=... reason=no-executor`); the bridge does not retry the
+original on an ack.
+
 A landing reconciles an already-published `external` intent before it may issue a
 recovery: the idle timer and the intent event are two wait objects of the same
 thread, and the timer has the lower index, so the landing can otherwise run
@@ -121,16 +114,41 @@ supersedes it (the launcher-thread sequence watermark ignores the same record
 delivered twice). `execTick` is the publication tick and is the deadline of a
 show and a cancel.
 
+**Admission before any launcher call.** The bridge validates the record before it
+arms a timer or calls the shell:
+
+| kind | allowed method | flags | other fields |
+|---|---|---|---|
+| `show` | `1` (keyboard/touch), `11` (Start button), `16` (touch/edge) | only bits `0x8|0x4` | `executeAt=0`, `target=0` |
+| `dismiss` | `1` (Win), `6` (Start button) | `0` | `target=0` |
+| `cancel` | `0` | `0` | `executeAt=0` |
+
+Anything else is answered `kSwipeAckRefused` with `E_INVALIDARG` and the log
+line `exec refused ... reason=invalid`; a numeric range is never clamped into a
+legitimate shell action. The show flag mask is the mask `ShowStartView` actually
+reads (`0x8` relaxes the foreground/context-menu check, `0x4` tolerates an open
+context menu).
+
+The producer validates the same vocabulary before it swallows a press: the Win
+key, the Start button, the launcher's `Dismiss`/`ShowStartView` and the
+click-away's close intent all check `SwipeShowAllowed`/`SwipeDismissAllowed`
+(or `SwipeCloseIntentAllowed` for the observed close method) at admission. An
+unsupported combination goes to the shell's original (`own pass ...
+reason=unsupported`) instead of becoming an intent that the executor would
+refuse after the press was lost. The executor's check above is therefore defence
+in depth, not the only validation. The click-away's evidence method 7 is allowed
+as an intent and mapped to 6 at the producer; the executor never accepts 7.
+
 **Expiry.** The controller's budget is 400 ms: a show is answered within 400 ms
 of its publication, a dismiss within 400 ms of the deadline it was given. The
 comparison is `>= due + 400` on both sides, so a dispatch exactly at the boundary
-is expired for the bridge and for the publisher. A
-dispatch that starts after that is stale — the publisher has already cleared its
-sequence, published a cancel where it could, and released ownership — so the
-bridge answers `kSwipeAckExpired` and does not call the primitive. The publisher
-does the same from its side: an unanswered dismiss is cancelled by sequence at its
-timeout, and an unanswered show, which has no armed command to revoke, is
-invalidated by the executor's age check.
+is expired for the bridge and for the publisher. A dispatch that starts after
+that is stale — the publisher has already cleared its sequence, published a
+cancel where it could, and released ownership — so the bridge answers
+`kSwipeAckExpired` and does not call the primitive. The publisher does the same
+from its side: an unanswered dismiss is cancelled by sequence at its timeout, and
+an unanswered show, which has no armed command to revoke, is invalidated by the
+executor's age check.
 
 A deadline is **not** a guaranteed response and not a lease on the shell call. A
 primitive can enter before the deadline and return after the publisher timed out;
@@ -146,19 +164,18 @@ The Start side publishes a `cancel(target=0)` at attach for the same reason: a r
 from the previous activation must not act on the menu the new one opens.
 
 The bridge answers on `execAckSeq` with `(command, state, hr, visible)`, where
-`visible` is the visibility probe, now three-valued: `kSwipeVisibilityHidden` (0),
+`visible` is the visibility probe, three-valued: `kSwipeVisibilityHidden` (0),
 `kSwipeVisibilityVisible` (1), and `kSwipeVisibilityUnknown` (-1) when there is no
 launcher or `IsVisible` failed. The mailbox holds one answer: a later answer can
 replace an earlier one before the Start side reads it, so the reader matches
 `command` and never reads one command's state under another's sequence. A dismiss
 is answered in two steps: `executed` means the primitive returned; then the
 300 ms probe answers `confirmed` (hidden), `unconfirmed` (visible), or `unknown`
-(probe or timer failed). A record replaced by
-a newer one is answered `superseded`, which is distinct from `expired`. The log
-prints the probe's real elapsed time (`after=<n> ms`), not the requested delay.
-`unconfirmed` and `unknown` are terminal repairs for the Start side, which releases
-ownership and reads the cloak on the next poll; `executed` alone is never taken
-as a hide.
+(probe or timer failed). A record replaced by a newer one is answered
+`superseded`, which is distinct from `expired`. The log prints the probe's real
+elapsed time (`after=<n> ms`), not the requested delay. `unconfirmed` and
+`unknown` are terminal repairs for the Start side, which releases ownership and
+reads the cloak on the next poll; `executed` alone is never taken as a hide.
 
 ### Controller direction — Start -> bridge
 
@@ -212,7 +229,9 @@ stops, and the gate closes 600 ms later. A few presses during a start or a stop
 are therefore served natively by the shell, by design.
 
 `alive` means **intent-consumer readiness**: that thread's window, its message
-loop and the intent event exist. It is not a claim about the digitizer: a refused
+loop and the intent event exist, and the renderer it will drive is usable
+(`RendererReady`: the root is attached and its scalar set was not invalidated).
+It is not a claim about the digitizer: a refused
 raw-input registration is logged by `RegisterHidUsage` and the intent half still
 runs; the `ipc peer alive` line prints `touch=`/`pen=` so the difference is
 visible. The publication and the terminal withdrawal are serialised in one
@@ -220,6 +239,14 @@ critical section, so a startup that is already in flight either lands before the
 withdrawal or is refused after it; a flag check followed by an independent store
 would let `alive` overwrite `gone`.
 
+Readiness is continuing, not a one-time announcement. When the root is torn down
+for replacement, or a failed scalar write invalidates it, the input thread
+withdraws the peer (`ipc peer gone reason=renderer-lost terminal=0`) before the
+bridge can intercept again; the press then runs the shell's own path exactly
+once. The UI thread signals a renderer event and the input thread republishes
+(`ipc peer alive reason=renderer`) only once a usable replacement is attached.
+The unload's terminal withdrawal still wins: a republish that races it is
+refused by the same lock.
 
 The window is six refresh intervals: five consecutive refreshes may be missed
 without closing the gate, so a stalled input thread (a settle, a busy message
@@ -241,27 +268,21 @@ call has a 550 ms budget, so a young claim is abandoned inside the call rather
 than waited on. A missing event disables only the direction it carries. Both
 mods call it at `Wh_ModInit`, never in a hook.
 
-A reinstall maps a new image at a new base while the old one stays pinned. The
-new image opens the same section; the old image's handles are closed by its
-unload. The names carry the version, so a v7 build opens its own section and
-leaves a v6 one of the same 744 bytes to the old pair; the version word is what
-refuses it if it is handed over anyway (`ipc open failed err=13`,
-`ERROR_INVALID_DATA`). Measured on the v5 upgrade: install Start first, then the
-bridge; a bridge that still held the old section was one Start reload behind.
-
-## The debug command
-
-`Local\SwipeFor10Start_v7_Cmd` is the only command path: `tools/ipc.ps1` takes
-the mutex, writes one line, sets the event. The Start side's input thread takes
-it (`SwipeIpcTakeCommand`) and applies the documented debug lines. Nothing
-polls. `tools/ipc.ps1 -State` prints the executor ack with its outcome name
-(`executed|confirmed|unconfirmed|unknown|superseded|refused|expired`) and the
-visibility word as `hidden|visible|unknown` beside the raw numbers, so the three
-outcomes are told apart without decoding the constants by hand.
+A reinstall loads a fresh image at a fresh base; the old image is unmapped by its
+unload, and the new image opens the same section because the namespace is
+unchanged. There is no version word, so a build that predates this namespace
+opens its own older section and cannot join this one at all.
 
 ## What is not in the channel
 
-No file, no named pipe, no window message between the processes. The section is
-session-local because both processes run as the same user in the same session.
-The bridge's hidden executor window is process-local; its only input is the
-section.
+No file, no named pipe, no window message between the processes, no command
+record and no command mutex. The section is session-local because both processes
+run as the same user in the same session. The bridge's hidden executor window is
+process-local; its only input is the section.
+
+## Verification
+
+`pwsh -File tools/ipc.ps1 -State` prints one snapshot: the open generation, the
+intent and its ack, the executor command and its ack with outcome and visibility
+names, the controller direction/touch, and the peer triple. It refuses a section
+whose `initState` is not ready or whose magic or `layoutBytes` disagrees.

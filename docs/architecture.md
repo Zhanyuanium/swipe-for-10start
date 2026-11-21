@@ -1,28 +1,54 @@
 # M3.2 architecture — one controller, one executor
 
-> L3-level design record. Start **0.44.0**, bridge **0.25.0**, channel **v7 /
-> 744 B**. The measured evidence is quoted with the build and the layout it came
-> from; everything below was run on this machine. **Layouts:** *auto-hidden* =
-> work `0,0,1440,900`, the bar off screen, band `804..900`, panel
-> `236,265..1229,840`, trail 265, Distance 852 (current). *Docked* = work
-> `0,0,1440,852`, tray `0,852..1440,900`, same panel, trail 265 (historical).
+> L3-level design record. Mod **0.7.0** (one source, two process halves),
+> channel **216 B, no version word**. The measured evidence is quoted with the build and the
+> layout it came from; everything below was run on this machine. **Layouts:**
+> *left docked* (live, measured 2026-11-21) = `axis=0`, work `48,0,1440,900`,
+> the bar at `0,0..48,900` (96 physical wide), band `0..96`, panel
+> `60,151..1053,726`, trail 1053, Distance 1392. *Bottom auto-hidden*
+> (historical) = work `0,0,1440,900`, the bar off screen, band `804..900`, panel
+> `236,265..1229,840`, trail 265, Distance 852. *Bottom docked* (historical) =
+> work `0,0,1440,852`, tray `0,852..1440,900`, same panel, trail 265.
 
 ## What ships
 
-Two Windhawk mods:
+One Windhawk mod, two process halves:
 
-- `mods/start-menu-legacy-swipe.wh.cpp` (0.44.0) runs in
-  `StartMenuExperienceHost.exe`. It owns the touch gesture, the claim on
-  `Progress`, the settle planner, the gates and the decision state. It consumes
-  bridge intents, publishes executor commands, and publishes its own liveness.
-- `mods/start-menu-touch-gesture-bridge.wh.cpp` (0.25.0) runs in
-  `explorer.exe`. It turns the Win key, the Start button and the click-away into
-  intents, and executes the Start side's `show`/`dismiss`/`cancel` commands on
-  the launcher's own thread. It also swallows the shell's own duplicate
-  show/close while the controller owns the panel.
+- `mods/swipe-for-10start.wh.cpp` (0.7.0) is installed once and loaded into both
+  hosts. Its `start` namespace runs in `StartMenuExperienceHost.exe` and owns the
+  touch gesture, the claim on `Progress`, the settle planner, the gates and the
+  decision state. It consumes executor intents, publishes executor commands, and
+  publishes its own liveness. Its `bridge` namespace runs in `explorer.exe` and
+  turns the Win key, the Start button and the click-away into intents, and
+  executes the Start side's `show`/`dismiss`/`cancel` commands on the launcher's
+  own thread. It also swallows the shell's own duplicate show/close while the
+  controller owns the panel. `Wh_ModInit` selects the half from the host
+  executable name; the other half's hooks and threads never exist there.
 
-The shell still performs every visual transition. Neither mod writes the
-launcher's state.
+The shell still performs every visual transition. The mod writes no launcher
+state.
+
+## Logging
+
+Every decision line goes through one `TraceLog` wrapper. It always calls
+`Wh_Log`, which Windhawk stores only while the mod's own debug logging is
+enabled, and it appends the same line to the role's file only while the
+`DiagnosticTrace` setting is on: `<mod storage>\renderer.log` in the Start host,
+`<mod storage>\bridge.log` in Explorer. The file line keeps the
+`t=<GetTickCount64>` prefix the regression tools read. The file is capped at
+`kTraceMaxLines` (20,000 lines): the count is seeded from the existing file and
+the next write truncates it, and the counter is reset only when the truncation
+succeeded. The cut uses its own `FILE_WRITE_DATA` handle and the line is then
+written through a `FILE_APPEND_DATA` handle: a handle carrying both bits does not
+append (measured: it writes at offset 0 and overwrites the trace from the start).
+The CRLF is part of the same buffer, so one line is one `WriteFile` and an append
+cannot tear against the other activation's lines. A failed truncation stops the
+file half for the session and logs why
+once; `Wh_Log` keeps the line. Formatting is truncating
+(`_vsnwprintf_s`/`_snwprintf_s` with `_TRUNCATE`), so a long setting or object
+name can never reach the CRT invalid-parameter handler. The setting is read at
+init and on every settings change; with it off no file is opened, and it is the
+only debug switch.
 
 ## The launcher read (corrected)
 
@@ -31,7 +57,19 @@ object. The shell passes the **`IXamlLauncher` subobject at `outer + 0x18`** to
 `ShowStartView` / `Dismiss` / `IsVisible`; that subobject's `[+0x160]` is the
 live `IXamlLauncherState`.
 
-Measured in explorer (10.0.26100.9949):
+The offsets are reference-build facts, and a name alone does not prove them. The
+capability is enabled only when the loaded image is the identity those offsets
+were read from: fixed file version **10.0.26100.9974** and all 13 named symbols
+at the reference RVAs. `ModuleFixedFileVersion` reads the fixed version through
+`version.dll` (resolved at runtime), and `InstallExplorerHooks` compares every
+resolved RVA. On any other image the capability is off: the decision hooks pass
+their original, `LauncherNow` returns null, the executor refuses its command,
+and the shell serves the press. One line states it:
+`exec launcher layout unverified version=... matches=... native=1 reason=version|rva`;
+the verified image logs `exec launcher layout verified ... native=0`.
+
+Measured in explorer (10.0.26100.9949); the same RVAs still match the
+10.0.26100.9974 image (13/13), which is the identity the gate requires:
 
 | Read | Value |
 |---|---|
@@ -76,31 +114,23 @@ manager's `Show` or the worker's targeted `WM_GETMESSAGE` adopts the thread (`ex
 launcher thread`), and a window is never created from the `LoadLibraryExW` hook,
 which runs on whichever thread loaded twinui. A worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
-an empty stack. The window
-class is unique per activation
-(`WindhawkSwipeExecutor_<WndProc address>`); a fixed name would return
-`ERROR_CLASS_ALREADY_EXISTS` after a Windhawk reinstall and create the window
-with the previous image's WndProc, whose channel is already closed.
+an empty stack. The window class is one fixed name
+(`WindhawkSwipeFor10Start.Executor`) registered under `&__ImageBase`;
+`ERROR_CLASS_ALREADY_EXISTS` is a failure, never adopted, because a surviving
+class from an earlier image points at an unmapped procedure.
 
-Creation and shutdown are one protocol, not two checks. A creator reserves
-`g_execCreating`, asks `g_execAdmissionOpen`, publishes the HWND and releases the
-reservation; the stop closes admission, drains the reservation, joins the worker,
-then destroys the **identified** owner window — directly when it already runs on
-that thread, otherwise with the private `kExecTeardownMessage` whose
-`WM_NCDESTROY` acknowledgement names that HWND (any other window's destruction
-signals nothing, and the procedure destroys only a window that equals the
-recorded target). A teardown that
-does not complete keeps every handle the outstanding participant still uses,
-including the channel with the `Exec` event the worker waits on, and the unload
-defers its close (`ipc close deferred`). The next enable refuses while that join
-or destruction is still outstanding (`exec reinit refused: ...`), reaps a worker
-that has exited since, proves the creator out **before** it snapshots the HWND,
-and only then clears the activation. The alternative — a
-re-enable that clears the HWND, the owner TID and the watermark anyway — would
-hand a surviving old window the new activation's channel, and an acknowledgement
-from the old window would answer a teardown it does not belong to. The procedure
-also refuses every ordinary dispatch for an HWND other than the published current
-one, so a survivor's armed dismiss cannot fire into a new menu.
+Shutdown is an order, not a set of flags. BeforeUninit clears readiness and
+signals the worker's stop; Uninit joins the worker **INFINITE**, then destroys the
+one published window on its owner thread — directly when it already runs there,
+otherwise with the private `kExecTeardownMessage`, whose `WM_NCDESTROY` signals
+`g_execWindowGone`. The class is unregistered under the same `&__ImageBase`
+instance only after the window is gone, and the worker/stop/window-gone handles
+and the channel close last. The old creator reservation, admission flag, creator
+drain, reaper and `CloseCallLease` count are gone; the join and the class
+ownership are the barriers. A window or worker that does not go away blocks the
+unload rather than returning success into an image it still points at. The
+procedure also refuses every ordinary dispatch for an HWND other than the
+published current one, so a stale message cannot act on this activation.
 
 `IsVisible` is the confirmation. Immediately after `ShowStartView` it is
 honestly `0` (the shell is still cloaking); a 300 ms timer on the same thread
@@ -113,8 +143,9 @@ second 300 ms probe keeps the bounded obligation and logs
 `exec dismiss unconfirmed seq=... visible=visible at_call=1 after=<real ms>`; a
 probe that cannot answer (no launcher, a failed call, an unarmed timer) is
 `unknown`. The Start side treats `unconfirmed` and `unknown` as a terminal
-repair — release the direction, drop the ticket, read the cloak on the next poll
-— because a dismiss that is not observed to hide the window is not a hide.
+repair — release the direction, drop the ticket, read the cloak on the next
+transition — because a dismiss that is not observed to hide the window is not a
+hide.
 
 A command is not run late. The controller gives each one 400 ms from its
 scheduled time (the dismiss's `executeAt`, or the publication tick of a show);
@@ -144,7 +175,7 @@ Triggers and their decision lines:
 | Start button open | `ShowStartView` method 11 | `own toggle decide trigger=startbutton …` |
 | Start button close | `Dismiss` method 6 | `own toggle decide trigger=startbutton …` |
 | click-away | `HideStartAndCortana` method 7 | `intent close trigger=clickaway` |
-| touch | the Start side's band admission | `reveal show request` |
+| touch | the Start side's qualified band pull (24 DIP) | `reveal show request` |
 
 `IntentShouldClose` is the only toggle rule: the controller's one direction word
 decides while it owns the panel (`2` is a close in flight, so the press is an
@@ -180,14 +211,32 @@ flag-check-then-store let the startup write `alive` after the unload had written
 raw-input registrations are not part of readiness — this is **intent-consumer
 readiness**; `RegisterHidUsage` logs a refusal and the touch half degrades, while
 the intent half the interception depends on still runs. The `ipc peer alive` line
-prints `touch=`/`pen=` so the difference is visible. A press during a start or a
+prints `touch=`/`pen=` so the difference is visible. Readiness is continuing: the
+input thread also withdraws (`ipc peer gone reason=renderer-lost terminal=0`)
+when the root is torn down for replacement or a failed scalar write invalidates
+it, and republishes (`ipc peer alive reason=renderer`) only when a usable
+replacement is attached; the UI thread signals a renderer event, so a press in
+that interval runs natively exactly once. The terminal unload withdrawal still
+wins the race. A press during a start or a
 stop is served natively by the shell; that is the intended trade, because an
 `alive` written before the consumer runs would swallow a press for a service that
 does not exist. A press the bridge has already swallowed is a different case:
 it is ours, and the recovery paths below decide it.
 
+That thread has no period. It waits on the stop event, the intent and
+executor-ack events, the renderer event, the cloak event, and one high-resolution
+one-shot armed for the soonest deadline only; `docs/input.md` lists the deadlines
+and their clocks. A release that cannot act (a touch show in flight, a close in
+flight with a contact on the panel) arms nothing, and with no deadline the timer
+is disarmed. The open/closed state is `EVENT_OBJECT_CLOAKED`/`UNCLOAKED` on the
+CoreWindow, delivered to that thread; the callback only sets an event, and the
+service behind it reads the cloaked attribute once. A bounded 100 ms fallback
+poll runs while a requested or just-observed transition is outstanding, so a
+missed event costs latency, not state. The one idle wake is the 100 ms
+`peerTick` heartbeat, and only while the peer is advertised.
+
 The close intent's capability is checked separately (`HideCanServeClose`): peer,
-proven caller sites, a started worker, the **recorded** launcher thread (a Hide
+the caller wrappers, a started worker, the **recorded** launcher thread (a Hide
 never adopts one), a window on that thread, and a callable `Dismiss`. One missing
 piece and the shell's close runs, because converting a native close into a
 command nothing can execute leaves the window shown over the controller's
@@ -217,7 +266,7 @@ stuck at 3, no Shown), while a show 16 ms after it opened normally. The arm is
 posted to the executor window when the event runs on another thread, so the slot
 and its timer stay owned by the launcher thread. A second
 press replaces the slot (`own press latch replaced ...`); the serve logs `own
-press served wait=...` (current auto-hidden medians: 219 ms Win close, 210 ms
+press served wait=...` (bottom auto-hidden medians: 219 ms Win close, 210 ms
 Start-button, 234 ms click-away; the gesture latch is rare and measured 94 ms).
 The 400 ms timer is only the fallback for a landing the event missed. Any newer
 press discards the slot through the shared dispatcher
@@ -238,18 +287,23 @@ and the confirmation probe); past it, the command cannot still be inside the
 shell, so a later landing is not served. A refused, expired or superseded answer
 for **that sequence** retires it before the pending-slot gate, which the open
 that cancelled the close has already cleared; the landing, a new close and an
-external takeover retire it explicitly. A still-open poll does not clear it: an
+external takeover retire it explicitly. A still-open state read does not clear
+it: an
 entered `Dismiss` may land at any point while the window is up. Before a landing
 may recover it reconciles an already-published `external` intent
 (`intent reconcile ... (before landing recovery)`) and applies the record it
-examined, not a second read, because the idle timer is
-waited on before the intent event and processing the takeover afterwards would
-not revoke a Show the landing had already issued.
+examined, not a second read: the cloak event and the intent event are separate
+wakes, so processing the takeover after the landing would not revoke a Show the
+landing had already issued.
 The
-click-away that the shell issues while the window is appearing (state 1/3), and
-the Hide(7) it issues inside our own `ShowStartView` in state 1/3, are the
-pointer-away check, not a user click, and are swallowed
-(`reason=opening`/`reason=own-show`). Without that, the served open came back
+click-away that the shell issues while the window is appearing (state 1/3) is
+swallowed only from the `ActiveZBand` caller (`caller=clickaway`,
+`reason=opening`); the Hide(7) inside our own `ShowStartView` is swallowed only
+on the executor's own call stack with an unattributed caller
+(`caller=unknown state=1|3 depth>0`, `reason=own-show`). A lock, an unattributed
+Hide outside that stack, or any other caller takes the external path first and
+passes. Each line prints caller, method, internal state and executor depth
+together. Without the guards, the served open came back
 and was hidden in the same millisecond.
 
 **Executed is not hidden.** A successful `Dismiss` answers `executed`; the hide is
@@ -258,7 +312,8 @@ visible) or `unknown` (no launcher, no state, a failed probe, or no timer). The
 Start side keeps the command identity in `g_pendingDismissConfirm` after the
 executed ack clears the pending slot, and an unconfirmed or unknown result is a
 terminal repair: ownership is released, the ticket dies by its own sequence, and
-the next poll reads the cloak. A superseded confirmation is reported separately
+the next transition reads the cloak. A superseded confirmation is reported
+separately
 and needs no repair.
 
 "Never lost" is the intent of the mechanism, not a theorem. The cases it does not
@@ -307,9 +362,9 @@ Fallbacks, each logged once:
   `exec show|dismiss seq=... expired`, answered `kSwipeAckExpired` without a
   launcher call.
 
-## The open and the close (auto-hidden; docked numbers named)
+## The open and the close (bottom auto-hidden; bottom docked numbers named)
 
-Open (touch, docked, warm):
+Open (touch, bottom docked, warm):
 
 ```
 contact / hid usages          172817328
@@ -320,29 +375,39 @@ reveal takeover              172817437   (+109 ms)
 exec visible ... visible=1   172817640   (+312 ms)
 ```
 
-The Win open, current auto-hidden layout (three captures at `x=1200` in a
+The Win open, bottom auto-hidden layout (three captures at `x=1200` in a
 16×1600 strip, `top` counts the first panel row): key → `exec show` **+31–32 ms**
 → `own state event=shown` **+46–141 ms** → first panel pixel **+82–187 ms**
-(median +115) → `exec visible ... visible=1` **+343–344 ms**. The docked capture
-was `key=172830139`, `exec show` +79 ms, `shown` +142 ms, first panel pixel
-**+190 ms**, `visible=1` +392 ms. The shell's cloak is the dominant term; the
-executor removes the shell's 60–250 ms gesture wait. The earlier auto-hidden
-variant measured +257 ms for the same pixel.
+(median +115) → `exec visible ... visible=1` **+343–344 ms**. The bottom docked
+capture was `key=172830139`, `exec show` +79 ms, `shown` +142 ms, first panel
+pixel **+190 ms**, `visible=1` +392 ms. The shell's cloak is the dominant term;
+the executor removes the shell's 60–250 ms gesture wait. The earlier bottom
+auto-hidden variant measured +257 ms for the same pixel.
 
-The touch show is requested once per open (`g_intentOpenActive` guards a second
-report while the window is still closed). The entry is
-`RevealEntryProgress`; auto-hidden it reads **0.255** (warm; the panel trail is
-265, the Distance 852); the docked layout read 0.348. A cold first open still
-reads 0.000. The first visible frame is the entry, not 0.
+The touch show is requested once per contact, and only after inward travel:
+admission records the contact, and `TryClaimRevealOpen` claims the open on the
+first positioned report whose signed inward travel reaches `kAdoptTravelDip`
+(24 DIP). `g_intentOpenActive` refuses a second claim. A tap anywhere in the band
+requests nothing; a refused claim is marked and not retried, and an open the
+shell performs on its own is adopted. Measured on the bottom docked layout, with
+the trace on: 31 ms from the first positioned report to the 24 DIP crossing on
+a ~1 DIP/ms pull, +15 ms from the crossing to the executor's `ShowStartView`
+(request published in the crossing millisecond), and the uncloak +125 ms with the
+first captured panel frame +141 ms after `ShowStartView`. A 23 DIP drag requested
+nothing from this mod (the shell's own edge gesture, which opens from about
+20 DIP, opened the menu); a 25 DIP drag requested one show. The entry is
+`RevealEntryProgress`; the bottom auto-hidden layout read **0.255** (warm; the
+panel trail is 265, the Distance 852); the bottom docked layout read 0.348. A
+cold first open still reads 0.000. The first visible frame is the entry, not 0.
 
 The reveal takeover starts at the entry and chases the mapped finger at
-`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. Current auto-hidden, a held
+`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. Bottom auto-hidden, a held
 contact (`follow_hold`, 85 reports): `reveal takeover from=0.255 offset=0.338`,
 `open follow travel=488 max=488 progress=0.90 behind=0.000 commit=1`; the panel
 edge is 350.2 DIP at the held 350 DIP finger, **0.4 px** away. The 300 DIP hold
-gives `progress=0.96` and a 299.1 DIP edge, **1.8 px** away; the docked 300 DIP
-hold measured 2 px. The `offset` is the inherited gap at the takeover; the chase
-closes it at 2.2 DIP/ms, and `behind=0.000` is the glued state.
+gives `progress=0.96` and a 299.1 DIP edge, **1.8 px** away; the bottom docked
+300 DIP hold measured 2 px. The `offset` is the inherited gap at the takeover;
+the chase closes it at 2.2 DIP/ms, and `behind=0.000` is the glued state.
 
 A digitizer that goes quiet while the shell uncloaks, or while a close is in
 flight, is not a lift: while the touch show or the close suppression is active
@@ -353,11 +418,25 @@ Close: a Win, Start-button or click-away intent calls `TakeCloseOwnership`
 (sets `g_suppressRestoreUntil`, publishes the closing direction before the
 settle's first frame, mutes the contact, clears the reveal) and runs
 `BeginMirrorCloseSettle` from `TakeProgressNow()`: the open curve played
-backwards, full travel (387 ms at the current 852 DIP; 409 ms at the docked 900).
-The dismiss is scheduled at the end
-plus 30 ms. The bridge's timer runs `Dismiss`; the shell's hidden event follows
+backwards, full travel (387 ms at the bottom auto-hidden 852 DIP; 409 ms at the
+bottom docked 900). The dismiss is scheduled at the end plus 30 ms.
+The bridge's timer runs `Dismiss`; the shell's cloak event follows
 and the Start side logs `win close observed`, clears the direction and
-`controllerTouch`, and the next open is ready. The close is
+`controllerTouch`, and the next open is ready. The cloak read is tri-state: a
+failed read is unknown, never hidden. A window the shell already had
+hidden produces no transition; the executor's 300 ms confirmation then runs the
+same landing itself (`win close observed
+reason=confirmed-without-transition`), identified by the pending dismiss command
+and its open generation, so the direction cannot stay `closing` into the next
+press. When the confirmation reads hidden but the cloak still says open or
+cannot answer, the command and generation are **retained** for the transition
+(`exec dismiss retained`), which then lands them once
+(`exec dismiss retained served`); a later open retires both slots — cancelling a
+still-queued command at the bridge and dropping the confirmation — and the bound
+ends the wait if no transition comes. The dismiss is stamped with the section's
+current open generation at request time even when the close intent carries 0,
+and the generation comparison is exact: a zero stamp is admissible only while no
+open has been published. The close is
 judged by that hidden event and the executor's `confirmed` (hidden) at its 300 ms
 probe, not by an internal `0xA` value;
 that value is not a criterion. `unconfirmed`/`unknown` is a repair, not a hide. A
@@ -370,7 +449,8 @@ not because the shell's state does. The open intent takes the live panel, drops
 the local dismiss slot, cancels a pending `exec dismiss` and settles back to 1
 (`intent open cancel from=...`); the window never hides. The dismiss can already
 be inside the shell's `Dismiss` call when that press lands
-(a 1–15 ms window); the close then lands and the next poll reissues the open
+(a 1–15 ms window); the close then lands and the next transition reissues the
+open
 (`intent open recovered entry=...`), so that particular press is recovered — it is
 the one race this ticket exists for. A press during a
 shell hide (state 9/11) or with an armed executor dismiss is latched and served
@@ -379,29 +459,45 @@ serves a landing for the menu it was taken for, the latch is bounded and
 revalidated, and a press the 600 ms gate no longer covers is the shell's — unless
 the bridge already swallowed it, in which case it is dropped.
 
-A pull that is still down when the close lands (or that lifted inside the
-300 ms late window) is the pull that takes the menu back: after
+A pull that is still down and qualified when the close lands (or that lifted
+inside its readiness window: the release on a closed menu, the landing for a
+deferred record) is the pull that takes the menu back: after
 `win close observed` the controller issues one fresh show
 (`reveal reopen after close pull=1 late=0 entry=...`), and the open adopts the
-live contact or consumes the release record. Measured on the docked layout: the
-Win close during a held pull at `y=350 DIP`; the landing reopened, `reveal
-takeover from=0.348 offset=0.558`, the follow continued with 221 reports and
-ended `progress=0.91 behind=0.000 commit=1`, menu open. The auto-hidden entry is
-0.255.
+live contact or consumes the release record. Qualified is the same 24 DIP signed
+inward travel at the contact's last positioned report (`RevealPullQualified`); an
+active follow is not qualified by its ownership — a finger that pulled out and
+came back toward the edge fails the current-travel test at the landing too. The
+late-release record only exists for a pull that travelled 24 DIP. A finger
+merely resting in the band through the retract is admitted deferred and is not
+reopened (`reveal defer released candidate=1 down=1`, no `reveal reopen`).
+Measured on the bottom docked layout: the Win close during a held pull at
+`y=350 DIP`; the landing reopened, `reveal takeover from=0.348 offset=0.558`,
+the follow continued with 221 reports and
+ended `progress=0.91 behind=0.000 commit=1`, menu open; a contact resting at
+898 DIP through the same close left the menu closed. The bottom auto-hidden
+entry is 0.255.
 
-The suppression is what keeps the visibility poll from "healing" the panel that
-the close has retracted: without it the poll saw a shown window with the panel
+The suppression is what keeps the visibility service from "healing" the panel
+that
+the close has retracted: without it the service saw a shown window with the panel
 at 0 and started an open settle between the settle end and the dismiss
 (`win open unhealed`), a flash. `TakeCloseOwnership` now sets it for the intent
-close too.
+close too. The window is a *suppression* rule, not the landing's identity: the
+landing is this mod's close when its dismiss command is still queued/armed or
+executed-unconfirmed, or when the open-cancel ticket names that command. A
+maximum-duration close measured 562–593 ms from takeover to `win close
+observed` over ten runs (mean 578, 7 ms inside the window at the worst), so a
+busy launcher can pass the window and must not decide a pull's fate (see
+[limits.md](limits.md)).
 
-Measured interruption (current auto-hidden unless named):
+Measured interruption (bottom auto-hidden unless named):
 
 - open settle interrupted: the Win close 172 ms into the open started at
   `from=0.542` (the live position), not 1.0;
 - drag interrupted: a Win press while a touch was held at `y=399.5` ran the
   close from `progress=1.000`, hid at +437 ms, and the touch's later lift was
-  ignored (docked);
+  ignored (bottom docked);
 - press during a close, 40 randomised trials per kind, press offset random
   50–500 ms: **0 lost**. Win close: 29 latched (waits 94–359 ms, median 219), 11
   direct, 0 cancelled. Start-button close: 30 latched (median 210), 10 direct.
@@ -421,17 +517,17 @@ Measured interruption (current auto-hidden unless named):
   press arrived) is the safety net for the 1–15 ms race; it did not fire in the
   runs above.
 
-## Mixed cycles (docked)
+## Mixed cycles (bottom docked)
 
 Ten cycles across the four triggers (Win, Start button, click-away, touch) on
-the docked layout, after the latch and the opening guards: every cycle ended
-with the menu closed (`START ... open=False`), the bridge log for the series
-contains **0** `own state resync`, **0** refused commands, **0** ack timeouts
-and **0** dropped commands, and every close logged `own state event=hidden
-open=0` and the executor's `visible=0`. The Start-button cycles worked because
-the docked bar is always visible (the auto-hidden run could not re-trigger
-them). The decision/executor lines for the four triggers are in the session
-report.
+the bottom docked layout, after the latch and the opening guards: every cycle
+ended with the menu closed (`START ... open=False`), the bridge log for the
+series contains **0** `own state resync`, **0** refused commands, **0** ack
+timeouts and **0** dropped commands, and every close logged
+`own state event=hidden open=0` and the executor's `visible=0`. The
+Start-button cycles worked because the bottom docked bar is always visible (the
+bottom auto-hidden run could not re-trigger them). The decision/executor lines
+for the four triggers are in the session report.
 
 ## Deleted in M3
 
@@ -453,31 +549,95 @@ The M2 mechanisms that no longer exist in the shipping path:
   `CloseInFlight` early return that guards the follow, so it could never fire;
   the pull-reopen and the press latch are the reopen paths that remain.
 
-**v7** adds the Start side's activation identity at the tail: `peerEpoch` at 740,
-which the struct's alignment had already paid for, so the section stays 744 bytes
-and the **version word** — in the object names and in the section — is what
-separates v6 from v7. It answers which Start activation is speaking: the attach
-claims a new epoch and the bridge reads it beside a latched press.
+0.7.0 also deleted the explorer gesture publisher: the four observer hooks
+(`InputGestureOperationStarted`/`Ended`, `ReportEdgeGesture`,
+`SetAnimationData`), the `CStartExperienceManager::Hide` observation hook, and
+the process-lifetime gesture mapping with its seqlock writer and the
+inactive-at-unload publication. The Start half's Raw Input is the product's
+contact source; that mapping only fed the Phase 0 probes.
 
-**v6** adds the Start side's liveness pair at the tail: `peerTick` at 732
-(GetTickCount64 low bits, refreshed at most once per 100 ms) and `peerState` at
-736 (alive/gone), taking the section from 736 to 744 bytes. It is the bridge's
-interception precondition, described above; it is not a seqlock, because each
-word is a single value written by the Start side and read whole.
+The same release moved the Start root hook from a fixed address to a public
+symbol. Deleted with the address: the `StartUI_.dll` file-version compare, the
+executable-range check, both prologue probes and the module poll thread that
+searched for the DLL for 20 seconds. Deleted with the animation instrumentation:
+the animation-request hook, its three argument getters and the debug switch that
+suppressed the shell's open storyboard. `PrepareRootElement` is resolved with one
+`HookSymbols` call, and that call runs on the mod's input thread: the first
+symbol load starts Windhawk's PDB fetch, and blocking the shell's loader thread
+makes the menu host look hung to the watchdog, which restarts it and restarts the
+fetch. The apply (`Wh_ApplyHookOperations`) is inside the same symbol-install
+lock as the resolution, so `BeforeUninit` either waits for the complete install or
+makes it refuse before `HookSymbols`; no root hook can become live after the stop.
+The `LoadLibraryExW` notification only records the returned module, and so
+do the init and AfterInit probes (`GetModuleHandleW` only): the input thread's
+first tick installs from the record, which keeps the warm case fast without any
+symbol work on a shell thread. A
+false result while the fetch runs is pending with a 120 s deadline, and only the
+deadline logs `unresolved`, installs no root hook and withholds the controller
+service. The shell keeps pumping for the whole fetch.
 
-**v5** removed the retired M2 slots from the header: the section became 736
-bytes and contained only the command, the open generation, the intent and its
-ack, the executor command and its ack, one controller direction word and the
-touch flag. No dead field remains; v5 also replaced v4's owning/phase pair with
-that one word, so the bridge's toggle rule cannot read new ownership beside a
-stale phase.
+The explorer half moved the same way. The launcher entry points, the
+`s_pLauncher` slot and `IsVisible` are resolved by one `HookSymbols` call on
+`twinui.pcshell.dll`; the fixed VAs, the `twinui` file-version/timestamp gate,
+the executable-range check and the prologue/body probes are deleted. The
+`LoadLibraryExW` notification only records the returned image; the executor
+worker runs the resolution at most once per 100 ms with a 240 s pending
+deadline. A still-blocked PDB fetch leaves the mod passive — every press runs
+the shell's own path — and never blocks `explorer.exe`, because the fetch runs
+on the mod's worker rather than on a thread the shell owns. Every resolved
+address is logged against the reference RVA; the set line
+`exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence,
+and one missing symbol refuses the whole set instead of installing half a
+toggle.
+
+The close caller is a thread-local category set around a wrapper of each proven
+caller, not a return-address match: `DismissStartAndCortana` is ordinary,
+`DismissSynchronouslyWithoutTransition` is lock/display, and
+`ImmersiveMonitorHelper::ActiveZBandChangedForMonitor` is the click-away (its
+synchronous `mov edx,7; call [vtable+0x48]` is verified in the binary). The
+unnamed `0x4916D0` WRL delegate invoker cannot be reached by symbol and is not
+classified; a Hide it reaches outside those scopes stays `unknown` and runs
+natively. The measured desktop click-away is inside the ActiveZBand scope, so
+it keeps the animated close.
+
+The controller advertises that service only once the root is attached
+(`PublishPeerReady` requires `g_rendererReady`, not just the hook). A session
+that missed `PrepareRootElement` during the cold fetch has no geometry, so a
+press admitted there would be swallowed for a controller that can only pass it
+through (`win open restore (no geometry)` was measured); with the gate, the peer
+stays unpublished and every press is native until the next host session attaches
+a root.
+
+The merged channel is **216 bytes** with one section and four events. The names
+use one merged-mod prefix (`Local\SwipeFor10Start_SingleMod_*`) and there is **no
+product version word**: the ABI namespace is the identity, so an old development
+image cannot join and a future layout changes the prefix. The records are the open
+generation, the intent and its ack, the executor command and its ack, one
+controller direction word plus the touch flag, and the liveness triple
+`peerTick`/`peerState`/`peerEpoch`. The debug command channel — its record,
+mutex, event and parser — is gone; `tools/ipc.ps1` is read-only. The executor
+validates every command before the launcher call (show 1/11/16 with flags under
+`0x8|0x4`, dismiss 1/6 with no flags, cancel 0) and refuses anything else instead
+of clamping it. The producer checks the same vocabulary (`SwipeShowAllowed`,
+`SwipeDismissAllowed`) before it swallows a press: an unsupported method/flags
+combination is passed to the shell's original at admission (`own pass ...
+reason=unsupported`), so the executor's refusal is defence in depth, never the
+first time the press is validated. A click-away intent's method 7 is evidence
+and is mapped to 6 at the producer, but only for the click-away trigger: an
+ordinary caller's method-7 Hide is passed to the shell, never converted. The
+executor sees 1 or 6 only.
+
+**A note on the retired versions.** v7 added `peerEpoch` at 740 inside v6's
+744-byte section; v6 added the liveness pair at 732/736; v5 removed the M2 slots
+and replaced the owning/phase pair with one direction word. These are history,
+not the current layout; the asserts in `swipe_ipc_shared.h` are the contract.
 
 ## The accepted cap, restated
 
 The shell's first visible frame is 245–268 ms after a band show in the worst
-case. The current auto-hidden Win open showed its first panel pixel at
+case. The bottom auto-hidden Win open showed its first panel pixel at
 **+82–187 ms** from the key (median +115 over three runs; `exec show` +31–32 ms,
-`shown` +46–141 ms), and the docked capture at **+190 ms** (79 ms to
+`shown` +46–141 ms), and the bottom docked capture at **+190 ms** (79 ms to
 `exec show`, 111 ms to the first pixel). The shell owns
 that window; the early-uncloak experiment found DWM attribute 13 returns
 `E_ACCESSDENIED` without the shell's IAM ticket, and the owning process cannot

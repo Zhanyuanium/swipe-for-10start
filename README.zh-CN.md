@@ -11,25 +11,25 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 - **Windhawk** 2.0 或更高版本。
 - 触摸屏或手写笔。（本模组刻意不响应鼠标拖动。）
 
-## 两个模组
+## 模组由两部分组成
 
-两个模组配套发布，两个都装才有完整体验：
+只发布一个 Windhawk 模组，但它同时运行在需要的两个进程中：StartMenuExperienceHost 里是控制器，Explorer 里是执行器。
 
-- **Start menu legacy swipe**（`start-menu-legacy-swipe`）——负责手势本身：边缘划入打开、跟随手指、拖动关闭，以及滑动动画。同一个控制器接收桥接模组的意图，并在关闭时安排 dismiss。
-- **Start menu touch gesture bridge**（`start-menu-touch-gesture-bridge`）——运行在 Explorer 中，在启动器自己的线程上执行系统自己的 `ShowStartView`/`Dismiss`。Win 键、开始按钮和点击空白各发布一个意图；控制器根据自己的已发布状态决定打开或关闭，跑完唯一的镜像回弹，再请桥接模组 dismiss。关闭使用与手势关闭相同的动画。关闭过程中的按键按“重新打开”处理：窗口还在屏幕上时取消这次关闭，面板从收回到的位置回弹；按键落在系统 hide 里时被锁存，等 hide 落地再补发。按键不会失灵。关闭落地时仍按住的手指会通过控制器重新打开。Win+Tab、锁屏和显示变化直接透传，锁屏绝不会被拖住。没有它，菜单照常开关，但关闭是瞬间的。
+- **控制器**负责手势本身：边缘划入打开、跟随手指、拖动关闭，以及滑动动画。它还接收执行器的意图，并在关闭时安排 dismiss。
+- **执行器**运行在 Explorer 中，在启动器自己的线程上执行系统自己的 `ShowStartView`/`Dismiss`。Win 键、开始按钮和点击空白各发布一个意图；控制器根据自己的已发布状态决定打开或关闭，跑完唯一的镜像回弹，再请执行器 dismiss。关闭使用与手势关闭相同的动画。关闭过程中的按键按“重新打开”处理：窗口还在屏幕上时取消这次关闭，面板从收回到的位置回弹；按键落在系统 hide 里时被锁存，等 hide 落地再补发。恢复是尽力而为，不是保证：桥已经吞掉的按键没有原生回放，若控制器在门禁与补发之间消失，这一次按键就丢了。关闭落地时仍按住的手指只有在该手指确实向外拉过一段距离时才通过控制器重新打开；只是搭在任务栏上不动的手指不会重新打开。Win+Tab、锁屏和显示变化直接透传，锁屏绝不会被拖住。如果 Explorer 的半边被拒绝——系统版本不符，或启动器的公开符号解析不到——菜单照常开关，但关闭是瞬间的。启动器的钩子按公开符号查找，私有布局只在已验证的参考映像上启用（固定的文件版本和全部 13 个参考 RVA）；其他版本仍走系统自己的路径。符号还在下载时 Explorer 不受影响，每次按键都走系统自己的路径；开启 `DiagnosticTrace` 后，日志里先出现 `exec launcher symbols pending ...`，随后是 `exec launcher symbols resolved ... match=1`。Start 半边在没有可用渲染器时也会撤回拦截：菜单根正在替换，或一次几何写入失败使其失效时，按键恰好在系统自己的路径上执行一次；可用根挂上后恢复。
 
 ## 安装
 
-在 Windhawk 界面中安装两个模组，或者在仓库目录下以管理员身份运行 PowerShell：
+在 Windhawk 界面中安装该模组，或者在仓库目录下以管理员身份运行 PowerShell：
 
 ```powershell
 pwsh -File .\tools\install_mods.ps1
 ```
 
-脚本先运行 `tools/make_store_mods.ps1 -Profile local`，把共享头文件内联后的单文件构建写到 `dist\local\`（`@compilerOptions` 中不再有 `-I`，因为安装后的模组由 Windhawk 从标准输入编译，旁边没有仓库）；随后安装并启用两个模组。Windhawk 的安装目录必须在 `PATH` 上；`-Compiler` 可直接指定 `windhawk-cli`，`-All` 会一并安装诊断探针，`-SkipRestart` 则不重启菜单宿主。
+脚本先运行 `tools/make_store_mods.ps1 -Profile local`，把共享头文件内联后的单文件构建写到 `dist\local\`（`@compilerOptions` 中不再有 `-I`，因为安装后的模组由 Windhawk 从标准输入编译，旁边没有仓库）；随后安装并启用该模组。Windhawk 的安装目录必须在 `PATH` 上；`-Compiler` 可直接指定 `windhawk-cli`，`-All` 会一并安装诊断探针，`-SkipRestart` 则不重启菜单宿主。
 
 脚本结束时重启 `StartMenuExperienceHost.exe`；手动操作时在任务管理器 → 详细信息 →
-`StartMenuExperienceHost.exe` → 结束任务，它会自动重启，或者注销并重新登录——模组只能在菜单进程创建窗口时挂载。`mod install` 不会启用先前被禁用的模组，所以脚本会显式启用两者；bridge 启用时会挂钩 Explorer，在当前系统版本上不必重启它。
+`StartMenuExperienceHost.exe` → 结束任务，它会自动重启，或者注销并重新登录——模组只能在菜单进程创建窗口时挂载。`mod install` 不会启用先前被禁用的模组，所以脚本会显式启用它；Explorer 的半边在模组启用时挂钩 Explorer，在当前系统版本上不必重启它。
 
 ## 设置项
 
@@ -37,13 +37,14 @@ pwsh -File .\tools\install_mods.ps1
   键开合菜单时的动画。
 - **动画起步速度（占滑动速度的百分比）**（`GestureStartSpeedPercent`，默认 100，范围 0–300）——松手瞬间菜单继续滑动的速度，取手指朝菜单目标方向的速度分量的百分比。100 表示按手指速度继续；更大的值甩得更快；0 总是从静止起步。手指停住再抬起时无论设多少都从静止起步；用
   Windows 键打开也总是从静止起步——这两种情况都不受这个设置影响。
+- **写入诊断跟踪文件**（`DiagnosticTrace`，默认关闭）——打开下文所述的决策日志。日常使用请保持关闭；只有在维护者或缺陷报告要求时才打开。
 
 ## 适用的场景
 
 - 任务栏在**左侧**、**顶部**或**底部**——已验证。**右侧**走的是同一代码路径，早前验证过，但未在当前环境上验证。支持**自动隐藏**（日常使用就是这个配置）。
 - **触摸**可用。**手写笔**输入已解码（悬停被忽略），但尚未在真机上实测过。
 - 任务栏在顶部或底部时，在已打开的菜单里上下滑动，会先滚动手指下方的内容（应用列表，或固定磁贴的网格）；等这块区域滚到底，同一次滑动才开始关闭菜单。
-- 从屏幕边缘稍微靠里一点起手——大约半个任务栏高，也就是系统自带滑动的起手范围——菜单会打开，并且从出现的那一帧起就跟随手指。起手位置更靠里则不会打开菜单：只有任务栏边缘能打开它。
+- 从屏幕边缘稍微靠里一点起手——大约半个任务栏高，也就是系统自带滑动的起手范围——菜单会打开，并且从出现的那一帧起就跟随手指。单击任务栏空白不会请求触摸打开：手指要朝桌面方向移动满 24 DIP，模组才会请求打开。点在固定应用、时钟或托盘上是一次原生点击；点开始按钮仍会打开菜单，和平时一样。起手位置更靠里则不会打开菜单：只有任务栏边缘能打开它。
 - 鼠标拖动刻意未启用。
 
 ## 上手一试
@@ -54,9 +55,12 @@ pwsh -File .\tools\install_mods.ps1
 
 ## 如果看起来不对
 
-- 每个模组的日志写进它自己的 Windhawk 存储目录（Windhawk 在模组页面上显示该路径）：`local@start-menu-legacy-swipe` 的 `renderer.log`、`local@start-menu-touch-gesture-bridge` 的 `bridge.log`。
+- 模组可以把决策日志写进它的 Windhawk 存储目录（Windhawk 在模组页面上显示该路径）下的两个文件：Start 半边的 `renderer.log` 和 Explorer 半边的 `bridge.log`，都在 `local@swipe-for-10start` 下。只有打开 **写入诊断跟踪文件**（`DiagnosticTrace`）时才会写；打开一次即可：
+  `windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true`，
+  也可以在模组设置里打开（命令行需要管理员权限），然后复现问题。
 - 禁用再启用模组后要重启 `StartMenuExperienceHost.exe`——手势无法挂到已经存在的菜单窗口上。
-- 本模组要求 `StartUI_.dll` 的版本正好是 `10.0.22621.3733`；版本不符则不启动任何手势，日志里会看到 `startui root hook skipped ...`。
+- 根钩子按公开符号查找，不依赖固定地址。若 `StartUI_.dll` 不含 `StartUI::App::PrepareRootElement`（或读不到符号），手势不会启动，日志里会看到 `startui root symbol unresolved ...`；此时所有按键都交给系统自行处理。
 - 拖动菜单期间，菜单内容仍在原位置接收触摸——这是已知限制；另一条已知限制：本模组假设触摸面板覆盖主显示器。
+- **没有事情发生时，模组处于休眠。** 不存在常驻的 5 毫秒定时器：只有在手势、动画、已排定的关闭或待执行的执行器命令需要时，才会武装一个高精度一次性定时器；菜单开合状态由窗口事件送达，不再每 20 毫秒轮询。实测（菜单关闭、屏幕无触摸）：**每秒 9.2 次唤醒（原为 190 次）**、**不再查询 cloak（原为每秒 32 次）**；Start 宿主的空闲 CPU 从单核 0.625 % 降到 0.026 %。唯一周期性的唤醒是 Explorer 半边在提供服务时所需的 100 毫秒存活心跳。若某次 cloak 事件丢失，100 毫秒的慢速兜底轮询会在有界窗口内把状态补上。
 - 完整的技术文档在 [docs/](docs/README.md)（英文），其中有测量数据、被证伪的方案和每项设计决定的理由，也包括完整的[已知限制列表](docs/limits.md)。
-- 每次发布的 tag 与对应的 Start、bridge 版本号见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)（英文版 [CHANGELOG.md](CHANGELOG.md)）。
+- 每次发布的 tag 与对应的版本号见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)（英文版 [CHANGELOG.md](CHANGELOG.md)）。

@@ -9,16 +9,17 @@ architecture.md: M3.3, the shipping design. The launcher read (`s_pLauncher`
 outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`
 checked again at the post-call resync),
 the executor thread (the `OnHotkeyInvoke` thread, not the taskbar thread), the
-window-creation/shutdown protocol with the creator-before-HWND reaper order and
-the private teardown, one
+window lifetime (worker joined, the one window destroyed on its owner thread,
+the fixed class unregistered under `&__ImageBase`), one
 decision/one executor per trigger, the controller-direction toggle rule (closing
 published at the close's start), the close cancel/recovery for a press during a
 retract (the ticket only for a published command, bounded by its deadline), the
 bounded press latch for a hide in flight, the click-away guards of an
-opening window, the pull-reopen at a close's landing, the command-expiry rule
+opening window, the qualified pull-reopen at a close's landing, the command-expiry rule
 (one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
-auto-hidden timing/interruption chains (docked numbers named as historical), the
-accepted cloak cap, the v7 channel, the intent-consumer readiness/interception
+auto-hidden timing/interruption chains (the bottom docked numbers are named as
+historical; the live left docked layout is a separate set), the
+accepted cloak cap, the 216-byte channel, the intent-consumer readiness/interception
 capability precondition, and the deleted M2 mechanisms.
 
 re/: reverse-engineering records, read-only analysis of this build's shell, kept
@@ -32,12 +33,15 @@ notices.
 
 input.md: why Raw Input; the report decode (report IDs, `TipSwitch`/`InRange`,
 contact identity and its evidence clock, the coordinate-only fallback), the
-liveness and idle rules, and the release timers.
+liveness and idle rules, the release deadlines, and what wakes the input thread
+(events, the one one-shot deadline, the cloak event and its fallback poll, the
+peer heartbeat) with the measured idle cost.
 
-gesture.md: the `Progress` model, the dismiss/reveal sessions, the band and the
-once-per-open show request, the reveal entry and the 2.2 DIP/ms chase, the one
-close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the
-reopen on a closing panel, the gates and settle ownership.
+gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admission
+and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry
+and the 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored
+settle → scheduled `exec dismiss`), the qualified pull-reopen on a closing panel,
+the gates and settle ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
 start-speed seam, the mirrored close, the coast, and the measured lines.
@@ -46,28 +50,33 @@ geometry.md: the `GestureGeometry` snapshot and its lock, the panel-trail
 measurement and band, the taskbar axis probe, the deferred measurement, the
 scroll survey, and the measured layouts.
 
-ipc.md: the v7 channel — names, 744-byte layout, seqlocks, open generation,
-intent/ack, executor command/ack (expiry and the dismiss confirmation), controller
-direction, peer liveness/identity (epoch, tick, state, the 600 ms detection
-budget), init handshake.
+ipc.md: the merged mod's channel — names, 216-byte layout, seqlocks, open
+generation, intent/ack, executor command/ack (admission vocabulary, expiry and
+the dismiss confirmation), controller direction, peer liveness/identity (epoch,
+tick, state, the 600 ms detection budget), init handshake.
 
-lifecycle.md: the pin, the instance guard, the counted entries, the unload
-order and residuals, the re-initialisation and the host's unload boundary.
+lifecycle.md: quiescing both roles before the image is unmapped — the Start
+join/UI-teardown/entry-drain order, the bridge worker join/window destruction/
+class unregistration order, the no-safe-success rule, and the host's unload
+boundary.
 
-testing.md: the probes/injectors and the captured measurements in `artifacts/`.
+testing.md: the probes/injectors and the captured measurements in `artifacts/`;
+the smoke's `DiagnosticTrace` precondition and the tap tests.
 
-limits.md: the measured limits — the shell cap, launcher readiness, the
-launcher thread, the touch-show idle suppression, the cold entry, the taskbar
-auto-hide state, and the hardware still owed.
+limits.md: the measured limits — the shell cap, the launcher readiness, the
+launcher thread, the 24 DIP band threshold with the native-gesture trade-off,
+the touch-show idle suppression, the cold entry, the taskbar auto-hide state,
+the engine's symbol cache layout and four-hour error cache, and the hardware
+still owed.
 
-README.md: the map and the shipping pair.
+README.md: the map and the one shipping mod.
 
-store.md: how the pair reaches `ramensoftware/windhawk-mods` — the one-file-per-PR
+store.md: how the mod reaches `ramensoftware/windhawk-mods` — the one-file-per-PR
 rule that forces `tools/make_store_mods.ps1` to inline the shared headers, what
 the `store` and `local` profiles each change (no `-I` in either; the store also
-drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage` plus the
-companion-mod note), the local install flow that consumes `local`, why it is two
-PRs, and the four checks to run before opening one.
+drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage`), the local
+install flow that consumes `local`, why it is one PR, and the four checks to run
+before opening it.
 
 ## Laws
 

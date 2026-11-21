@@ -606,7 +606,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
     return module;
 }
 
-DWORD WINAPI PollModulesThread(LPVOID) {
+DWORD WINAPI ProbeModulesThread(LPVOID) {
     // The wait is the stop event, so a disable is observed at once; the 50 ms
     // timeout keeps the scan cadence when nothing signals it. The handle is
     // joined by Wh_ModUninit before the log is released.
@@ -647,7 +647,7 @@ BOOL Wh_ModInit() {
     TryInstallFromLoadedModules(false);
 
     g_pollThread =
-        CreateThread(nullptr, 0, PollModulesThread, nullptr, 0, nullptr);
+        CreateThread(nullptr, 0, ProbeModulesThread, nullptr, 0, nullptr);
     if (!g_pollThread) {
         Log("poll thread failed err=%lu", GetLastError());
     }

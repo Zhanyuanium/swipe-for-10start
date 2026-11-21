@@ -2,8 +2,8 @@
 
 C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
-mods/ - Windhawk mod sources (8 sources + AGENTS.md: start-menu-legacy-swipe, touch-gesture-bridge, touch-gesture-consumer, touch-gesture-probe, msgprobe, inputprobe, start_gesture_shared.h, swipe_ipc_shared.h)
-tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke, the store packager and the local installer (18 scripts + AGENTS.md)
+mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
+tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke, the store packager and the local installer (15 scripts + AGENTS.md)
 artifacts/ - captured measurements (6 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
@@ -17,15 +17,17 @@ CHANGELOG.zh-CN.md - the Chinese page of the release history
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.3, Start 0.44.0 / bridge 0.25.0)
+## What ships (M3.3, 0.7.0, one mod)
 
-Two mods, one path. `mods/start-menu-legacy-swipe.wh.cpp` runs in
-`StartMenuExperienceHost.exe` and owns the touch gesture, the panel claims, the
-settle planner, the gates and the controller state.
-`mods/start-menu-touch-gesture-bridge.wh.cpp` runs in `explorer.exe` and owns the
-launcher call and the non-touch triggers.
+One mod, two processes. `mods/swipe-for-10start.wh.cpp` is installed once and
+loaded into `StartMenuExperienceHost.exe` (namespace `start`) and into
+`explorer.exe` (namespace `bridge`): the controller owns the touch gesture, the
+panel claims, the settle planner, the gates and the controller state; the
+executor owns the launcher call and the non-touch triggers. Wh_ModInit picks one
+role table from the host executable name before either half runs, and the other
+half's hooks, threads and handles are never created there.
 
-The controller decides; the bridge executes. The Win key
+The controller decides; the executor performs. The Win key
 (`XamlLauncher::OnHotkeyInvoke`), the Start button (`ShowStartView` method 11,
 `Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) publish
 one `intent(seq, kind, trigger, method, flags, open)`; the Start side answers
@@ -84,7 +86,8 @@ while the window is up. A dismiss already inside the shell's `Dismiss` call
 cannot be recalled; the window hides, and the landing reissues that open once
 (`intent open recovered entry=...`) — after reconciling an `external` intent that
 arrived with the landing (applying the record it examined, not a second read),
-because the idle timer outranks the intent event. A
+because the cloak event and the intent event are separate wakes and the landing
+reads the intent record itself. A
 shell hide in flight (`InternalState` 9/11), or an executor dismiss already armed
 at the bridge, latches the press (one slot, with its tick and **the epoch the
 admission was decided under**). The hidden event arms a 50 ms timer and the timer
@@ -130,24 +133,45 @@ left is answered `superseded menu=... now=...`; the Start side also cancels a
 record the previous activation left queued when it attaches. No scheme recalls a call
 already inside the shell; an entered dismiss is handled by the landing rules.
 
-The open runs from the band contact: one `exec show` per open, the content settle
-starts at `RevealEntryProgress`, and the reveal takeover chases the mapped finger
-at 2.2 DIP/ms, then follows (`behind=0.000`). While a touch show or a close is in
-flight the 18 ms idle release is held, because the digitizer goes quiet during
-the uncloak and during the key/hide. A pull that is still down when a close lands
-(or that lifted within the 300 ms late window) is the pull that takes the menu
-back: after `win close observed` the controller issues the same show the band
-admission would, and the open adopts the live contact or the release record
-(`reveal reopen after close pull=1 late=0`). An intent close is
+The open runs from the band contact, but only after travel: admission records the
+contact and its down point, and the one `exec show` of that contact is requested
+on the first positioned report whose signed inward travel reaches 24 DIP
+(`reveal pull qualified ...` then `reveal show request ...`). A tap anywhere in
+the band — twice the taskbar's thickness — requests nothing and stays a native
+press; the shell's own edge gesture (from about 20 DIP) remains the fallback and
+an open it performs is adopted. One attempt per contact: a refused request is
+not retried. The content settle starts at `RevealEntryProgress`, and the reveal
+takeover chases the mapped finger at 2.2 DIP/ms, then follows (`behind=0.000`).
+While a touch show or a close is in flight the 18 ms idle release is held,
+because the digitizer goes quiet during the uncloak and during the key/hide. A
+pull that is still down and qualified when a close lands (or that lifted within
+its readiness window: the release on a closed menu, the landing for a deferred
+record) is the pull that takes the menu back: after `win close
+observed` the controller issues the same show the qualified pull would, and the
+open adopts the live contact or the release record (`reveal reopen after close
+pull=1 late=0`). "Qualified" is the same 24 DIP at the contact's last positioned
+report; a finger merely resting in the band through the retract is not reopened.
+An intent close is
 `TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
 `Dismiss` on the launcher thread. The close suppression keeps the visibility
-poll from healing the retracted panel before the dismiss lands.
+service from healing the retracted panel before the dismiss lands.
 
 The close is judged by behaviour: the shell's hidden event (`own state
 event=hidden open=0`), the executor's `confirmed` (hidden) at its bounded 300 ms
 confirmation — `unconfirmed`/`unknown` is a repair, not a hide — and the next open
-working.
+working. The cloak read is tri-state: a failed read is unknown, never hidden. A
+confirmed dismiss on a window the cloak already read hidden, with no transition
+left to arrive, finishes through the same landing
+(`win close observed reason=confirmed-without-transition`), so the controller
+cannot keep publishing `closing` into the next press. When the confirmation and
+the cloak disagree (or the cloak cannot answer), the command and its open
+generation are kept for the transition, within a bounded wait; a later open
+retires them — a queued command is cancelled at the bridge, and a confirmation
+is dropped. A close intent's zero generation is stamped with the section's
+current one at request time, and a zero stamp is valid only while no open has
+been published, never as a wildcard for a newer menu. The transition is not
+invented, only the close is completed.
 The internal `0xA` value is **not** an acceptance criterion and is no longer
 quoted.
 
@@ -157,8 +181,9 @@ candidate **as an arbitration mechanism**, and the reveal claim. The deferred
 candidate still has one live use, and it is not arbitration:
 `BeginEdgeCandidate` (the touch show's band admission) calls `StartRevealFollow`
 with `deferred=true` while `CloseInFlight`, so a contact that lands during a
-close is tracked without writing `Progress`; the landing (`PollRootVisibility`)
-releases it. `CloseInFlight` remains only as the
+close is tracked without writing `Progress`; the landing (`LandClosedMenu`, run
+by the visibility service and by the executor's confirmation) releases it.
+`CloseInFlight` remains only as the
 suppression-window predicate: the settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
 `CloseInFlight` early return that guards the follow, so it could never fire; the
@@ -167,36 +192,47 @@ removes the retired v2 close/retract slots from the header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h` **v7**: one session-local section (744 bytes), seven
-named objects (State/Cmd/CmdWrite, Intent/IntentAck, Exec/ExecAck), every record a
-seqlock with its own counter and an `offsetof` assert. The M2 close/retract slots
-are gone; the records are the command, the open generation, the intent and its
-ack, the executor command and its ack, one controller direction word plus the
-touch flag, and the liveness triple `peerTick` (732) / `peerState` (736) /
-`peerEpoch` (740, the activation identity). The size did not move from v6, so the
-**version word** is what refuses a v6 section.
-`tools/ipc.ps1` is the only command publisher and takes the mutex; `-State` reads
-v7/744 and prints the peer epoch.
+`mods/swipe_ipc_shared.h`: one session-local section (216 bytes) and four named
+events (`State/Intent/IntentAck/Exec/ExecAck` — five objects), every record a
+seqlock with its own counter and an `offsetof` assert. The names carry the merged
+mod's own prefix (`SwipeFor10Start_SingleMod_`) and there is **no product version
+word**: the namespace is the ABI identity, so an older development image cannot
+join, and a future layout changes the prefix. The records are the open
+generation, the intent and its ack, the executor command and its ack, one
+controller direction word plus the touch flag, and the liveness triple
+`peerTick` (204) / `peerState` (208) / `peerEpoch` (212). The debug command
+channel — its record, mutex, event and parser — is **gone**.
+`tools/ipc.ps1` is read-only: `-State` reads 216 bytes and prints the records and
+the peer epoch.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
-`initState` are refused, never waited on. Both mods open the channel at
-`Wh_ModInit`, never in a hook.
+`initState` are refused, never waited on. Each role opens the channel at its
+`RoleInit`, never in a hook.
 
 ## Machine
 
 Windows 11 10.0.26100.9949, ExplorerPatcher legacy Start
 (`Start_ShowClassicMode=1`), 2880x1800 physical at 200 % (1440x900 DIP).
-**Current layout: auto-hidden** (auto-hide on): work `0,0,1440,900`, the bar off
-screen, band `804..900`, panel `236,265..1229,840`, trail 265, Distance 852. The
-docked layout (work `0,0,1440,852`, tray `0,852..1440,900`) and the earlier
-auto-hidden variant (panel `236,167..1229,840`, trail 167) are historical; their
-numbers are not the current ones. The Start button is off screen until the bar
-is revealed; the button test hovers the bottom edge first, then clicks physical
-`(36,1748)`.
+**Current layout: left, docked** (`axis=0`): work `48,0,1440,900`, the bar at
+`0,0..48,900` (96 physical wide), band `0..96`, panel `60,151..1053,726`, trail
+1053, Distance 1392; measured 2026-11-21. The bottom docked layout (work
+`0,0,1440,852`, tray `0,852..1440,900`, band `804..900`, Distance 852), the
+bottom auto-hidden layout (work `0,0,1440,900`, band `804..900`, panel
+`236,265..1229,840`, trail 265) and the earlier bottom auto-hidden variant (panel
+`236,167..1229,840`, trail 167) are historical; their numbers are not the current
+ones. The smoke reads the axis, band, panel rectangle and scale from the mod's own
+log lines, so it runs on whichever edge is live.
 
 ## Rules
 
 - One data source per claim: the cloak decides the shell state, the controller's
   published direction decides the toggle, the geometry snapshot decides the mapping.
+- No period. The Start side's input thread arms one high-resolution one-shot for
+  the soonest deadline it has and disarms it when that is served; the open/close
+  state is a WinEvent, not a poll, with a bounded 100 ms fallback while a
+  transition is outstanding. The only idle wake is the 100 ms `peerTick`
+  heartbeat, and only while the peer is advertised. The Explorer worker blocks
+  on its events once the launcher symbols resolved or were refused. A change that
+  reintroduces a periodic tick or a state poll is a regression.
 - A mapped channel is not a live peer. Interception needs the Start side's
   `peerState=alive` and a `peerTick` younger than 600 ms; otherwise the shell's
   own path runs. Availability is published only by the ready consumer and
@@ -211,6 +247,15 @@ is revealed; the button test hovers the bottom edge first, then clicks physical
   recorded launcher thread.
 - The shell owns every visual transition. The mods read and request, never
   write the launcher's state.
+- The trace is a setting. Every decision line calls `Wh_Log`; the file is
+  written only while `DiagnosticTrace` is on, one file per role, capped at
+  20,000 lines. The smoke requires it and otherwise prints the one command that
+  enables it.
+- The image is not pinned. Unloading joins every owned thread, runs the UI
+  teardown turn, drains the counted entries, destroys the launcher window and
+  the raw-input window, and unregisters both fixed classes under `&__ImageBase`
+  before the channel closes. A proof that cannot be
+  obtained blocks the unload; there is no residual success.
 - Docs and code move together. Update this header, the L2 map and the L3 header
   of the file you changed.
 

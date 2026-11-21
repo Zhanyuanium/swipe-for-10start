@@ -39,8 +39,6 @@
 - `tools/measure_swipe.ps1` — samples the Start window rect while a swipe runs
   and writes `artifacts/start-window.csv`; it asks for 8 ms and this host's
   15.6 ms timer quantum delivers ~16 ms, which the file itself shows.
-- `tools/read_shared_gesture.ps1` — reads the bridge's
-  `Local\WindhawkStartGestureShared` mapping, optionally while injecting a swipe.
 - `tools/probe_cursor_follow.ps1` — polls `GetCursorPos`/`GetCursorInfo` while an
   injected touch drag runs and writes `artifacts/cursor-follow.csv`.
 - `tools/native_flyout_frames.ps1` — capture the native Quick Settings flyout
@@ -61,10 +59,10 @@
   the panel's bottom edge for 500 ms; its release time comes from `End-Contact`,
   so `t=0` is the UP and not the end of the preceding capture. Its start point
   and scan band are the top-taskbar geometry.
-- `tools/ipc.ps1` — the debug channel's only command publisher; see
-  [ipc.md](ipc.md) for the protocol, the v7 records and the commands it takes.
-  `-State` prints `peerEpoch` beside `peerTick`/`peerState`, which is how a
-  re-enable is told from a still-running activation.
+- `tools/ipc.ps1` — the read-only view of the channel; see
+  [ipc.md](ipc.md) for the protocol and the records. `-State` prints `peerEpoch`
+  beside `peerTick`/`peerState`, which is how a re-enable is told from a
+  still-running activation. There is no command publisher any more.
 
 ## Touch producers: real digitizer vs injected contact
 
@@ -98,17 +96,14 @@ record left this side), **consumed** (the other side applied it),
 **superseded** (a newer command or activation replaced the record before it
 could act, or before its confirmation could land).
 
-- **A — unload acknowledgement.** Enable the bridge, disable it, enable it again.
-  `bridge.log` shows `exec window destroyed` (or `destroyed directly`) and
-  `ipc close` on the first cycle, then `activation state reset` and a fresh
-  `exec window hwnd=...` on the second. A forced timeout must instead show
-  `ipc close deferred` and the next enable `exec reinit refused: ...`, never a
-  second `exec window hwnd` while the old one lives. A teardown that completes
-  between the two enables is **accepted**: `exec teardown completed late` (or
-  `exec teardown found a surviving window` and then `completed late`) followed by
-  `activation state reset` is the success path, not a failure. See
-  [lifecycle.md](lifecycle.md) for the test-build hold that stages the
-  creator/reaper interleaving.
+- **A — unload quiescence.** Enable, disable and enable again in the same PIDs.
+  `bridge.log` shows `exec worker joined`, `exec window destroyed`, `exec window
+  class unregistered` and `ipc close` on the first cycle, then a fresh
+  `exec window hwnd=...` on the second; both hosts keep running, and the old DLL
+  is gone from the `explorer.exe` and `StartMenuExperienceHost.exe` module lists.
+  There is no deferred close and no re-enable refusal any more: a proof that
+  cannot be obtained (a worker, a window, a delegate) blocks the unload instead
+  of returning success. See [lifecycle.md](lifecycle.md) for the order.
 - **B — activation identity and availability.** Disable the Start mod while a
   close is running; `bridge.log` must show `own pass trigger=... reason=no-peer`
   (or `exec pass hide method=... reason=no-peer`) from the moment of the disable,
@@ -193,19 +188,57 @@ could act, or before its confirmation could land).
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges
-each step by `start_menu.ps1`'s state plus the lines the pair wrote in that step:
-a VK_LWIN tap opens (`kind=open`, `exec show`) and closes (`kind=close`,
-`exec dismiss`), an injected edge pull opens (`reveal admit|takeover`), an
-injected panel drag closes, and a desktop click closes (`trigger=clickaway`,
-`method=7`). The last step fails on any error-shaped line in the run — a non-zero
+each step by `start_menu.ps1`'s state plus the lines the two halves wrote in that
+step: a VK_LWIN tap opens (`kind=open`, `exec show`) and closes (`kind=close`,
+`exec dismiss`); an injected edge pull opens only with `reveal pull qualified`
+and the executor's ack for the exact show sequence the Start side published; an
+injected panel drag closes only with its producer line (`close dismiss kind=...`
+for a real digitizer, `intent close trigger=clickaway ... method=7` for the
+injected pointer) and the executed dismiss for the sequence that producer
+requested; and a desktop click closes only with the click-away intent, the
+matching method-6 dismiss and `win close observed` — a close the shell performed
+natively fails that row. The last step fails on any error-shaped line in the run —
+a non-zero
 `hr=`, `timeout`, `refused`, a lost press or a dropped latch. Run it before
 handing the tree to a review: two of the defects fixed during the M3.3 review
 rounds were caught by it and by nothing else (a dismiss whose identity guard
 compared a generation with a tick, so every close was refused, and an ACK
 ordering that hid the answer Start needed).
 
+The trace rotates at its 20,000-line cap, so the script does not trust a line
+index: every mark is `GetTickCount64` and every read re-opens the log and keeps
+the lines at or after it. The monitor scale is kept fractional (1.25 at 125 %,
+1.5 at 150 %, 2 at 200 %), because rounding it puts every injected point off the
+band or off the panel.
+
+**The trace must be on for the run.** The mod writes the lines to disk only
+while `DiagnosticTrace` is on; `Wh_Log` always receives them, but Windhawk's own
+debug logging is a separate switch and does not create the files. The smoke
+checks, after its first trigger, that `renderer.log` or `bridge.log` was written
+since the run started; if neither was, it prints
+
+```
+windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true
+```
+
+and exits non-zero. The command needs an elevated shell (the settings live
+under HKLM). A file from an earlier session is stale and is rejected the
+same way, so the check is about this run, not about the file's existence. With
+the trace on, no other switch is needed.
+
+The band-tap rule has its own manual checks, because a tap that opens nothing is
+not a row the four triggers can express: tap the taskbar background, the clock,
+the tray's empty area and the Start button with the menu closed. The first three
+must log `reveal admit ... ok=1 reason=admitted` with no `reveal pull qualified`,
+no `reveal show request` and no `exec show`, and leave the menu cloaked; the
+Start button must log one shell open (`exec show ... method=11`) and no band
+claim. Then pull 23 DIP and 25 DIP and lift: the first requests nothing from this
+mod (the shell's own gesture may open it), the second requests one show. Finally
+hold a contact still through a Win close's landing: it must not reopen
+(`reveal defer released candidate=1 down=1`, no `reveal reopen`).
+
 What it does not cover, on purpose: the click-away step waits for the executor's
-`exec visible ... visible=1` because a click inside the window's presentation
+`exec visible ... visible=visible` because a click inside the window's presentation
 (state 1/3) is swallowed; the open step uses the VK_LWIN tap because the
 auto-hidden bar cannot be opened through UIA; and the **HID dismiss** path
 (`close dismiss kind=...`) is unreachable from an injection, because every

@@ -53,7 +53,7 @@ import math
 import os
 import sys
 
-# The shipping settle's constants, copied from mods/start-menu-legacy-swipe.wh.cpp.
+# The shipping settle's constants, copied from mods/swipe-for-10start.wh.cpp.
 WIN11_DAMPING = 1.72   # kWin11SpringDamping, the default AnimationStyle
 SPEED_DIP_PER_MS = 2.2
 MIN_MS = 160

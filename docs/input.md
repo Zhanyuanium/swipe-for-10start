@@ -30,12 +30,74 @@ is closed after the down, so the only in-process source is the digitizer itself.
 
 ## Capturing reports
 
-A worker thread in `mods/start-menu-legacy-swipe.wh.cpp` registers Raw Input for
-the digitizer (`usUsagePage 0x0D / usUsage 0x04` for touch, `0x0D / 0x02` for
-pen, `RIDEV_INPUTSINK`) on a hidden top-level window. A message-only window
+A worker thread in the `start` namespace of `mods/swipe-for-10start.wh.cpp`
+registers Raw Input for the digitizer (`usUsagePage 0x0D / usUsage 0x04` for
+touch, `0x0D / 0x02` for pen, `RIDEV_INPUTSINK`) on a hidden top-level window. A message-only window
 would not receive the `WM_SETTINGCHANGE` (`SPI_SETWORKAREA`) and
 `WM_DISPLAYCHANGE` broadcasts that move the taskbar, and those broadcasts are
 the whole event-driven axis refresh (see [geometry.md](geometry.md)).
+
+## What wakes the thread
+
+The thread has no period. It waits on its events — raw input, stop, the bridge's
+intent and executor-ack events, the renderer event — plus one high-resolution
+**one-shot** timer, and the timer is armed only for the soonest deadline the
+state has:
+
+| Deadline | Clock | Window |
+|---|---|---|
+| coast start after the last positioned point (a follow: its 50 ms guard too) | QPC | 8 ms, later for a fresh follow |
+| idle release of a dismiss session | QPC | `kIdleReleaseMs`, 18 ms |
+| band candidate's watchdog | QPC | `kCandidateIdleHoldMs`, 120 ms |
+| contact latch and tracked identity expiry | tick | the same 18 ms |
+| the armed close tap | tick | the settle's end (`ScheduleCloseTap`) |
+| a show's executor budget | tick | `kBridgeAckTimeoutMs`, 400 ms |
+| a dismiss's executor budget | tick | `executeAt + 400 ms` |
+| the settled measurement's guaranteed turn | tick | `kSettledMeasureDeadlineMs`, 400 ms |
+| the scroller retry (UI thread; its post re-plans) | tick | `g_scrollerRetryAt` |
+| the slow fallback under a transition | tick | `kVisibilityFallbackMs`, 100 ms |
+| the root-hook bootstrap probe | tick | `kRootProbeMs`, 100 ms |
+
+`NextInputDeadlineMs` collects them and returns the minimum; nothing due returns
+0 and the timer is disarmed. A deadline that has already passed is armed at 1 ms
+only where serving it clears the condition that produced it (a one-shot turn, a
+release, a watchdog); the coast start is armed only while it is still ahead,
+because `MaybeCoast` runs again on the release wake, and a follow's start is the
+later of its 8 ms report gap and the 50 ms entry guard, so the wake is one the
+coast can actually use. The one deadline published from the UI thread (the
+scroller retry) posts a wake to the input window, so a planner that already read
+the previous value re-reads it. A release that is held —
+a touch show in flight, or a close in flight with a contact owning the panel —
+contributes nothing: its hold ends on a cloak event or an executor answer, and a
+deadline that cannot act would spin the thread.
+
+The open/close state is pushed, not polled: `SetWinEventHook(EVENT_OBJECT_CLOAKED,
+EVENT_OBJECT_UNCLOAKED)` is installed on this thread for its own process and
+filtered to the CoreWindow HWND. The callback takes no lock, reads no XAML,
+queries no DWM and writes no trace; it compares the HWND and sets an auto-reset
+event. The event is a signal to re-read, not the state itself: the callback may
+arrive after the window has moved again, and two transitions can collapse into
+one wake, so the service reads the current `DWMWA_CLOAKED` and runs the same
+open/close transition code the old 20 ms poll ran. That read is tri-state: a
+failed query is **unknown**, never hidden, and the sample is skipped so the last
+state and the watch stand until the next event or poll. The state is therefore
+sampled: seeded when this activation first can serve (a failed seed is retried;
+and again after a
+renderer replacement, where the window may have changed while this side could
+not drive it), kept by each event, and sampled once more when a watch window
+expires. A transition this mod asked
+for (a show or a dismiss), or has just observed, opens a bounded watch in which
+the slow fallback poll runs at 100 ms, so a missed event cannot leave the state
+stuck; a clean run never uses the fallback (see [limits.md](limits.md)).
+
+The one wake that exists with nothing to do is the peer heartbeat: while this
+activation advertises a service, the wait times out every
+`kSwipePeerTickIntervalMs` (100 ms) to refresh `peerTick`, because the bridge
+reads a tick younger than `kSwipePeerStaleMs` (600 ms). With the peer withheld
+or gone the wait is `INFINITE` — no timer, no poll, no wake. Measured with the
+menu closed and nothing touching the screen, on this build: **190 wakes/s and
+32 DWM cloak queries/s before, 9.2 wakes/s and 0 queries/s after**, and the
+Start host's idle CPU fell from 0.625 % to 0.026 % of one core.
 
 ## Decoding a report
 
@@ -55,7 +117,8 @@ Contact Identifier and X/Y are decoded before a contact is chosen.
 are read per collection and per report: in range with the tip up is a hover and
 drives nothing, and only the tracked slot's tip going up (or its in-range bit
 clearing) ends the contact while coordinates keep arriving. A count-only lift
-report is not a lift; the 18 ms idle ends the contact instead. A tracked report
+report is not a lift; the idle window ends the contact instead (18 ms for a
+dismiss session, 120 ms for a band candidate). A tracked report
 that carries no coordinates refreshes the liveness clock only when it asserts
 contact (`TipSwitch`/`InRange`, or a slot state of Contact), never on
 identifier presence alone; the liveness clock is separate from the position
@@ -91,7 +154,7 @@ evidence clock: `lastEvidenceTick` moves only when the report proves the
 contact — the tracked slot's `TipSwitch`/`InRange` asserts it with no point, or
 the report carries a position this path feeds. A name-only report updates the
 slot and the identifier for diagnostics, then returns: no position, no liveness
-and no clock write. The same 18 ms idle tick, once no session owns the contact,
+and no clock write. The same 18 ms idle deadline, once no session owns the contact,
 forgets an identity whose last evidence is that old — admitted or not — and
 logs `hid identity expired slot=... latch=0` when no contact latch held it, so
 a refused admission cannot strand a name and make every later finger be
@@ -100,9 +163,15 @@ rejected as another contact.
 ## Release detection
 
 The digitizer keeps reporting while the finger rests (measured 255 reports in a
-1.5 s hold), so an 18 ms window without a report is a reliable lift. On a
+1.5 s hold), so an 18 ms window without a report is a reliable lift for a
+dismiss session. A band candidate is measured against a longer window
+(`kCandidateIdleHoldMs`, 120 ms): a touch panel that samples sparsely, or an
+injected test with 20–30 ms steps, must not lose an admitted 25 DIP flick. A
+report gap alone never begins a new contact — the latch is cleared by a lift
+report or by the candidate's own watchdog — so the admission origin survives the
+gap and the crossing point cannot replace it. On a
 device whose reports carry `TipSwitch`, the tracked slot's lift report ends the
-contact instead: the release line says `src=report`, and the 18 ms window is
+contact instead: the release line says `src=report`, and the idle window is
 only the fallback for a device that goes silent or a contact that leaves
 without a lift report (`src=idle`). A report that carries only a contact count,
 or no contact field for the tracked slot, says nothing about it, so a
@@ -120,7 +189,7 @@ settle's release window spans the open instead of starting at the takeover
 ([gesture.md](gesture.md)). A duplicate is kept on purpose: the window, not the
 buffer, is what collapses a resting finger to one value. A release that ends
 before its menu opens replays the same buffer at the release, into a record the
-same input thread reads when its visibility poll sees the open, so nothing is
+same input thread reads when its visibility service sees the open, so nothing is
 published between them.
 
 Measured layouts on this machine: ELAN2513 Col01 touch is five contact
@@ -131,12 +200,16 @@ on this build, and each was measured separately:
 
 - the idle check needs a **`QueryPerformanceCounter`** silence: `GetTickCount64`
   only advances every 15.6 ms, so an 18 ms window read as 31 ms;
-- the idle tick needs a **`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` waitable
-  timer**: `WM_TIMER` stayed on the 15.6 ms quantum even while the process held
-  a 1 ms `timeBeginPeriod(1)` request. The request is still made, paired through
-  `timeEndPeriod`, for the time a contact is down.
+- the deadline timer needs a **`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` one-shot**:
+  `WM_TIMER` stayed on the 15.6 ms quantum even while the process held a 1 ms
+  `timeBeginPeriod(1)` request. The request is still made, paired through
+  `timeEndPeriod`, for the time a contact is down. `SetTimer` remains the
+  fallback when the timer cannot be created, armed at the deadline itself and
+  therefore 15.6 ms late at worst.
 
-Measured release latency (`relms` on the release line): 31 ms before, 19-23 ms
-after. `vel=` on the `hid release`, `open follow` and `settle` lines is always
+Measured release latency (`relms` on the release line, QPC): 31 ms with the old
+periodic tick, **18-19 ms** with the one-shot deadline. The window is still the
+same 18 ms product decision; only the wake that lands it got exact.
+`vel=` on the `hid release`, `open follow` and `settle` lines is always
 DIP/ms toward that settle's target, so a finger held still reads `vel=0.00` on
 all three.

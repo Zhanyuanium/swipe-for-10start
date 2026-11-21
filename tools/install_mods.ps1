@@ -11,12 +11,11 @@ an `-I`. `tools/make_store_mods.ps1 -Profile local` produces exactly that into
 but `-Wall -Wextra` kept and no store metadata added. This script installs those
 generated files, never `mods/` directly.
 
-The shipping pair is always installed and enabled. `-All` adds the diagnostic
-mods: `start-menu-touch-gesture-consumer` comes from `dist/local/` because it
-includes `start_gesture_shared.h`; `inputprobe`, `msgprobe` and
-`start-menu-touch-gesture-probe` install from `mods/` as they are. `inputprobe`
-takes the Raw Input stream from the Start mod, so `-All` belongs to a probe
-session, not to a normal install.
+The shipping mod (`swipe-for-10start`, both halves in one file) is always
+installed and enabled. `-All` adds the diagnostic mods: `inputprobe`, `msgprobe`
+and `start-menu-touch-gesture-probe` install from `mods/` as they are.
+`inputprobe` takes the Raw Input stream from the Start half, so `-All` belongs
+to a probe session, not to a normal install.
 
 Each `mod install --file` also compiles the mod; a compile or metadata failure
 fails the script. After the installs `StartMenuExperienceHost.exe` is restarted,
@@ -91,18 +90,10 @@ $cli = Resolve-WindhawkCli $Compiler
 
 $targets = New-Object System.Collections.Generic.List[hashtable]
 $targets.Add(@{
-        Id = 'start-menu-legacy-swipe'
-        File = Join-Path $localDir 'start-menu-legacy-swipe.wh.cpp'
-    })
-$targets.Add(@{
-        Id = 'start-menu-touch-gesture-bridge'
-        File = Join-Path $localDir 'start-menu-touch-gesture-bridge.wh.cpp'
+        Id = 'swipe-for-10start'
+        File = Join-Path $localDir 'swipe-for-10start.wh.cpp'
     })
 if ($All) {
-    $targets.Add(@{
-            Id = 'start-menu-touch-gesture-consumer'
-            File = Join-Path $localDir 'start-menu-touch-gesture-consumer.wh.cpp'
-        })
     foreach ($name in 'inputprobe', 'msgprobe', 'start-menu-touch-gesture-probe') {
         $targets.Add(@{
                 Id = $name

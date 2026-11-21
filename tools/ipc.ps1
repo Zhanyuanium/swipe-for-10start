@@ -1,35 +1,26 @@
-# IPC tool for the Start mod: sends a debug command, or reads the channel.
+# IPC tool for the Start mod: reads the controller/executor channel.
 #
-# [INPUT]: .NET MemoryMappedFile / EventWaitHandle / Mutex, against the section,
-#          events and mutex `mods/swipe_ipc_shared.h` defines.
-# [OUTPUT]: `pwsh -File tools/ipc.ps1 p=0.5` publishes one command; -State
-#           prints one snapshot of the channel (each record with the sequence it
-#           was copied under, plus the controller words, the peer liveness pair and
-#           the peer activation epoch) and refuses a section whose initState is not
-#           ready or whose magic, version or layoutBytes is not this header's.
-# [POS]: replaces writing into the mod's debug.txt from a shell. The offsets
-#        below are the contract in swipe_ipc_shared.h; the mod asserts the same
-#        numbers at compile time, and this tool compares the section's initState,
-#        magic, version and layoutBytes before it reads or writes, so a foreign
-#        or uninitialised section is refused instead of misread. v7 keeps the
-#        744-byte size of v6 and only adds `peerEpoch` at 740, so the version word
-#        is what separates the two layouts; a v6 section of the same size is
-#        refused rather than read at v7's offsets. Every record is
-#        a seqlock: the counter is bumped to odd before a write and to even
-#        after, and a reader retries while it is odd or changed, returning the
-#        accepted counter with the copy so no display can mix two publishes. The
-#        command record needs the channel's writer mutex as well, because two
-#        tools publishing at once would interleave their text. An interrupted
-#        publish leaves cmdSeq odd on purpose: -State then prints that record as
-#        `unstable`, no reader accepts the half-written line, and the next
-#        publisher steps the odd value forward before it writes a complete
-#        record. The command event is set only after the even publish, never by
-#        a failed one.
+# [INPUT]: .NET MemoryMappedFile, against the section `mods/swipe_ipc_shared.h`
+#          defines.
+# [OUTPUT]: `pwsh -File tools/ipc.ps1 -State` prints one snapshot of the channel
+#           (each record with the sequence it was copied under, plus the controller
+#           words, the peer liveness pair and the peer activation epoch) and
+#           refuses a section whose initState is not ready or whose magic or
+#           layoutBytes is not this header's.
+# [POS]: the read-only view of the merged mod's channel. There is no command
+#        publisher any more: the debug command record, its mutex and its event are
+#        gone, so a position argument is refused instead of silently doing
+#        nothing. The offsets below are the contract in swipe_ipc_shared.h; the mod
+#        asserts the same numbers at compile time, and this tool compares the
+#        section's initState, magic and layoutBytes before it reads. The object
+#        namespace is the ABI identity, so a section from an older development
+#        image cannot be opened at these names at all. Every record is a seqlock:
+#        the counter is bumped to odd before a write and to even after, and a
+#        reader retries while it is odd or changed, returning the accepted counter
+#        with the copy so no display can mix two publishes.
 #
-# Examples:
+# Example:
 #   pwsh -NoProfile -File tools\ipc.ps1 -State
-#   pwsh -NoProfile -File tools\ipc.ps1 p=0.5
-#   pwsh -NoProfile -File tools\ipc.ps1 anim=0
 
 [CmdletBinding()]
 param(
@@ -39,54 +30,46 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_v7_State'
-$CommandEventName = 'Local\SwipeFor10Start_v7_Cmd'
-$CommandMutexName = 'Local\SwipeFor10Start_v7_CmdWrite'
+$StateName = 'Local\SwipeFor10Start_SingleMod_State'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
-$OffsetVersion = 4
-$OffsetCmdSeq = 8
-$OffsetCmdText = 16
-$CmdTextBytes = 512
-$OffsetCmdTick = 528
-$OffsetOpenSeq = 536
-$OffsetOpenTick = 544
-$OffsetInitState = 552
-$OffsetLayoutBytes = 556
-$OffsetIntentSeq = 568
-$OffsetIntentTick = 576
-$OffsetIntentKind = 584
-$OffsetIntentTrigger = 588
-$OffsetIntentMethod = 592
-$OffsetIntentFlags = 596
-$OffsetIntentOpen = 600
-$OffsetIntentAckSeq = 608
-$OffsetIntentAckFor = 616
-$OffsetIntentAckState = 624
-$OffsetIntentAckDuration = 628
-$OffsetIntentAckEntry = 632
-$OffsetIntentAckHr = 636
-$OffsetExecSeq = 640
-$OffsetExecTick = 648
-$OffsetExecKind = 656
-$OffsetExecMethod = 660
-$OffsetExecFlags = 664
-$OffsetExecExecuteAt = 672
-$OffsetExecOpen = 680
-$OffsetExecTarget = 688
-$OffsetExecAckSeq = 696
-$OffsetExecAckFor = 704
-$OffsetExecAckState = 712
-$OffsetExecAckHr = 716
-$OffsetExecAckVisible = 720
-$OffsetControllerDirection = 724
-$OffsetControllerTouch = 728
-$OffsetPeerTick = 732
-$OffsetPeerState = 736
-$OffsetPeerEpoch = 740
-$StateVersion = 7
-$StateBytes = 744
+$OffsetOpenSeq = 8
+$OffsetOpenTick = 16
+$OffsetInitState = 24
+$OffsetLayoutBytes = 28
+$OffsetIntentSeq = 40
+$OffsetIntentTick = 48
+$OffsetIntentKind = 56
+$OffsetIntentTrigger = 60
+$OffsetIntentMethod = 64
+$OffsetIntentFlags = 68
+$OffsetIntentOpen = 72
+$OffsetIntentAckSeq = 80
+$OffsetIntentAckFor = 88
+$OffsetIntentAckState = 96
+$OffsetIntentAckDuration = 100
+$OffsetIntentAckEntry = 104
+$OffsetIntentAckHr = 108
+$OffsetExecSeq = 112
+$OffsetExecTick = 120
+$OffsetExecKind = 128
+$OffsetExecMethod = 132
+$OffsetExecFlags = 136
+$OffsetExecExecuteAt = 144
+$OffsetExecOpen = 152
+$OffsetExecTarget = 160
+$OffsetExecAckSeq = 168
+$OffsetExecAckFor = 176
+$OffsetExecAckState = 184
+$OffsetExecAckHr = 188
+$OffsetExecAckVisible = 192
+$OffsetControllerDirection = 196
+$OffsetControllerTouch = 200
+$OffsetPeerTick = 204
+$OffsetPeerState = 208
+$OffsetPeerEpoch = 212
+$StateBytes = 216
 
 # The ack outcome and visibility words are shared constants (swipe_ipc_shared.h).
 # A missing key prints a blank name, the number is still shown beside it.
@@ -139,213 +122,99 @@ function Read-Record {
     return $null
 }
 
-if ($State) {
-    $mapping = Open-State
-    try {
-        $view = $mapping.CreateViewAccessor(
-            0, $StateBytes,
-            [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+if (-not $State) {
+    if ($Command) {
+        throw ('The debug command channel is gone; this tool is read-only. ' +
+               'Use: ipc.ps1 -State')
+    }
+    throw 'Usage: ipc.ps1 -State'
+}
 
-        # Validate the layout before printing any number from it. The offsets
-        # below are this header's; a section of another version would be read at
-        # the wrong places, and its numbers would look plausible. magic, version
-        # and layoutBytes are written once by the claimer and initState is its
-        # publication barrier, so a section still initialising fails here too.
-        $magic = $view.ReadUInt32($OffsetMagic)
-        $version = $view.ReadUInt32($OffsetVersion)
-        $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
-        $initState = $view.ReadInt32($OffsetInitState)
-        if ($initState -ne 2 -or $magic -ne 0x53313053 -or
-            $version -ne $StateVersion -or $layoutBytes -ne $StateBytes) {
-            $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
-                       'initState={3}') -f $magic, $version, $layoutBytes,
-                       $initState
-            throw ("The section '$StateName' is not the ready v$StateVersion " +
-                   "layout this tool reads: $detail. Nothing was printed.")
-        }
+$mapping = Open-State
+try {
+    $view = $mapping.CreateViewAccessor(
+        0, $StateBytes,
+        [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
 
-        $cmd = Read-Record $view $OffsetCmdSeq {
-            # One byte array, decoded up to the first NUL: a shorter command must
-            # not show the tail of a longer one written earlier in the same
-            # record.
-            $raw = [byte[]]::new($CmdTextBytes)
-            $view.ReadArray($OffsetCmdText, $raw, 0, $CmdTextBytes) | Out-Null
-            $length = [Array]::IndexOf($raw, [byte]0)
-            if ($length -lt 0) { $length = $CmdTextBytes }
-            [pscustomobject]@{
-                text = [System.Text.Encoding]::UTF8.GetString($raw, 0, $length)
-                tick = $view.ReadInt64($OffsetCmdTick)
-            }
-        }
-        $open = Read-Record $view $OffsetOpenSeq {
-            $view.ReadInt64($OffsetOpenTick)
-        }
-        $intent = Read-Record $view $OffsetIntentSeq {
-            [pscustomobject]@{
-                kind    = $view.ReadInt32($OffsetIntentKind)
-                trigger = $view.ReadInt32($OffsetIntentTrigger)
-                method  = $view.ReadInt32($OffsetIntentMethod)
-                flags   = $view.ReadInt32($OffsetIntentFlags)
-                open    = $view.ReadInt64($OffsetIntentOpen)
-            }
-        }
-        $intentAck = Read-Record $view $OffsetIntentAckSeq {
-            [pscustomobject]@{
-                for      = $view.ReadInt64($OffsetIntentAckFor)
-                state    = $view.ReadInt32($OffsetIntentAckState)
-                duration = $view.ReadInt32($OffsetIntentAckDuration)
-                entry    = $view.ReadInt32($OffsetIntentAckEntry)
-                hr       = $view.ReadInt32($OffsetIntentAckHr)
-            }
-        }
-        $exec = Read-Record $view $OffsetExecSeq {
-            [pscustomobject]@{
-                kind      = $view.ReadInt32($OffsetExecKind)
-                method    = $view.ReadInt32($OffsetExecMethod)
-                flags     = $view.ReadInt32($OffsetExecFlags)
-                executeAt = $view.ReadInt64($OffsetExecExecuteAt)
-                open      = $view.ReadInt64($OffsetExecOpen)
-                target    = $view.ReadInt64($OffsetExecTarget)
-            }
-        }
-        $execAck = Read-Record $view $OffsetExecAckSeq {
-            [pscustomobject]@{
-                command  = $view.ReadInt64($OffsetExecAckFor)
-                state    = $view.ReadInt32($OffsetExecAckState)
-                stateName = $script:AckNames[$view.ReadInt32($OffsetExecAckState)]
-                hr       = $view.ReadInt32($OffsetExecAckHr)
-                visible  = $view.ReadInt32($OffsetExecAckVisible)
-                visibleName = $script:VisibilityNames[$view.ReadInt32($OffsetExecAckVisible)]
-            }
-        }
+    # Validate the layout before printing any number from it. The offsets below
+    # are this header's; a section of another layout would be read at the wrong
+    # places, and its numbers would look plausible. magic and layoutBytes are
+    # written once by the claimer and initState is its publication barrier, so a
+    # section still initialising fails here too.
+    $magic = $view.ReadUInt32($OffsetMagic)
+    $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
+    $initState = $view.ReadInt32($OffsetInitState)
+    if ($initState -ne 2 -or $magic -ne 0x53313053 -or
+        $layoutBytes -ne $StateBytes) {
+        $detail = ('magic=0x{0:X8} layoutBytes={1} initState={2}') -f
+                  $magic, $layoutBytes, $initState
+        throw ("The section '$StateName' is not the ready merged-mod layout " +
+               "this tool reads: $detail. Nothing was printed.")
+    }
 
+    $open = Read-Record $view $OffsetOpenSeq {
+        $view.ReadInt64($OffsetOpenTick)
+    }
+    $intent = Read-Record $view $OffsetIntentSeq {
         [pscustomobject]@{
-            magic      = '0x{0:X8}' -f $magic
-            version    = $version
-            initState  = $initState
-            layoutBytes = $layoutBytes
-            cmdSeq     = $(if ($cmd) { $cmd.Seq } else { 'unstable' })
-            cmdText    = $(if ($cmd) { $cmd.Value.text } else { 'unstable' })
-            cmdTick    = $(if ($cmd) { $cmd.Value.tick } else { 'unstable' })
-            openSeq    = $(if ($open) { $open.Seq } else { 'unstable' })
-            openTick   = $(if ($open) { $open.Value } else { 'unstable' })
-            intentSeq  = $(if ($intent) { $intent.Seq } else { 'unstable' })
-            intent     = $(if ($intent) { "kind=$($intent.Value.kind) trigger=$($intent.Value.trigger) method=$($intent.Value.method) flags=$($intent.Value.flags) open=$($intent.Value.open)" } else { 'unstable' })
-            intentAckSeq = $(if ($intentAck) { $intentAck.Seq } else { 'unstable' })
-            intentAck  = $(if ($intentAck) { "for=$($intentAck.Value.for) state=$($intentAck.Value.state) duration=$($intentAck.Value.duration) entry=$($intentAck.Value.entry) hr=$($intentAck.Value.hr)" } else { 'unstable' })
-            execSeq    = $(if ($exec) { $exec.Seq } else { 'unstable' })
-            exec       = $(if ($exec) { "kind=$($exec.Value.kind) method=$($exec.Value.method) flags=$($exec.Value.flags) executeAt=$($exec.Value.executeAt) open=$($exec.Value.open) target=$($exec.Value.target)" } else { 'unstable' })
-            execAckSeq = $(if ($execAck) { $execAck.Seq } else { 'unstable' })
-            execAck    = $(if ($execAck) { "command=$($execAck.Value.command) state=$($execAck.Value.state)($($execAck.Value.stateName)) hr=$($execAck.Value.hr) visible=$($execAck.Value.visible)($($execAck.Value.visibleName))" } else { 'unstable' })
-            controllerDirection = $view.ReadInt32($OffsetControllerDirection)
-            controllerTouch     = $view.ReadInt32($OffsetControllerTouch)
-            peerTick            = $view.ReadUInt32($OffsetPeerTick)
-            peerState           = $view.ReadInt32($OffsetPeerState)
-            peerEpoch           = $view.ReadUInt32($OffsetPeerEpoch)
-        } | Format-List
-        $view.Dispose()
-    } finally {
-        $mapping.Dispose()
-    }
-    return
-}
-
-if (-not $Command) {
-    throw 'Usage: ipc.ps1 <command> | ipc.ps1 -State  (commands: p=, t=, e=, anim=)'
-}
-
-$text = $Command.Trim()
-if ($text.Length -eq 0 -or $text.Length -ge $CmdTextBytes) {
-    throw "Command must be 1..$($CmdTextBytes - 1) characters."
-}
-
-$bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
-# The record is a byte field, so the limit is bytes, not characters: a longer
-# multibyte line would otherwise write past cmdText into the record's next field.
-if ($bytes.Length -ge $CmdTextBytes) {
-    throw ("Command is $($bytes.Length) bytes; the record holds at most " +
-           "$($CmdTextBytes - 1).")
-}
-
-$mutex = $null
-try {
-    $mutex = [System.Threading.Mutex]::OpenExisting($CommandMutexName)
-} catch {
-    throw ("The Start mod's command mutex '$CommandMutexName' is not open; " +
-           'nothing would serialise this write against another tool.')
-}
-
-$taken = $false
-try {
-    try {
-        $taken = $mutex.WaitOne(200)
-    } catch [System.Threading.AbandonedMutexException] {
-        # The previous holder died mid-write; the record is republished below.
-        $taken = $true
-    }
-    if (-not $taken) {
-        throw 'Another ipc.ps1 holds the command mutex; nothing was sent.'
-    }
-
-    $mapping = Open-State
-    try {
-        $view = $mapping.CreateViewAccessor(
-            0, $StateBytes,
-            [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::ReadWrite)
-
-        # The same layout check as -State, before a byte is written: the offsets
-        # below are this header's, a section of another version would take this
-        # text and this counter into fields that mean something else, and a
-        # section that is not ready may still be initialising.
-        $magic = $view.ReadUInt32($OffsetMagic)
-        $version = $view.ReadUInt32($OffsetVersion)
-        $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
-        $initState = $view.ReadInt32($OffsetInitState)
-        if ($initState -ne 2) {
-            throw ("The section '$StateName' is not ready " +
-                   "(initState=$initState); nothing was sent.")
+            kind    = $view.ReadInt32($OffsetIntentKind)
+            trigger = $view.ReadInt32($OffsetIntentTrigger)
+            method  = $view.ReadInt32($OffsetIntentMethod)
+            flags   = $view.ReadInt32($OffsetIntentFlags)
+            open    = $view.ReadInt64($OffsetIntentOpen)
         }
-        if ($magic -ne 0x53313053 -or $version -ne $StateVersion -or
-            $layoutBytes -ne $StateBytes) {
-            $detail = ('magic=0x{0:X8} version={1} layoutBytes={2} ' +
-                       'initState={3}') -f $magic, $version, $layoutBytes,
-                       $initState
-            throw ("The section '$StateName' is not the v$StateVersion layout " +
-                   "this tool writes: $detail. Nothing was sent.")
-        }
-
-        # Seqlock: odd marks a write in progress, even publishes it. There is no
-        # restore on failure: if a write below throws, the record stays odd, so
-        # no reader accepts the half-written line and a command event that was
-        # signalled earlier cannot wake the Start side with it. The next
-        # publisher steps the odd value forward (the same rule as
-        # SwipeIpcBeginWrite in the header) and writes the whole record again;
-        # -State reports the odd record as `unstable` until then.
-        $sequence = $view.ReadInt64($OffsetCmdSeq)
-        $odd = if (($sequence -band 1) -eq 0) { $sequence + 1 } else { $sequence + 2 }
-        $view.Write($OffsetCmdSeq, $odd)
-        $view.WriteArray($OffsetCmdText, $bytes, 0, $bytes.Length)
-        $view.Write($OffsetCmdText + $bytes.Length, [byte]0)
-        $view.Write($OffsetCmdTick, [Environment]::TickCount64)
-        $view.Write($OffsetCmdSeq, $odd + 1)
-        $sequence = $odd + 1
-        $view.Dispose()
-    } finally {
-        $mapping.Dispose()
     }
+    $intentAck = Read-Record $view $OffsetIntentAckSeq {
+        [pscustomobject]@{
+            for      = $view.ReadInt64($OffsetIntentAckFor)
+            state    = $view.ReadInt32($OffsetIntentAckState)
+            duration = $view.ReadInt32($OffsetIntentAckDuration)
+            entry    = $view.ReadInt32($OffsetIntentAckEntry)
+            hr       = $view.ReadInt32($OffsetIntentAckHr)
+        }
+    }
+    $exec = Read-Record $view $OffsetExecSeq {
+        [pscustomobject]@{
+            kind      = $view.ReadInt32($OffsetExecKind)
+            method    = $view.ReadInt32($OffsetExecMethod)
+            flags     = $view.ReadInt32($OffsetExecFlags)
+            executeAt = $view.ReadInt64($OffsetExecExecuteAt)
+            open      = $view.ReadInt64($OffsetExecOpen)
+            target    = $view.ReadInt64($OffsetExecTarget)
+        }
+    }
+    $execAck = Read-Record $view $OffsetExecAckSeq {
+        [pscustomobject]@{
+            command  = $view.ReadInt64($OffsetExecAckFor)
+            state    = $view.ReadInt32($OffsetExecAckState)
+            stateName = $script:AckNames[$view.ReadInt32($OffsetExecAckState)]
+            hr       = $view.ReadInt32($OffsetExecAckHr)
+            visible  = $view.ReadInt32($OffsetExecAckVisible)
+            visibleName = $script:VisibilityNames[$view.ReadInt32($OffsetExecAckVisible)]
+        }
+    }
+
+    [pscustomobject]@{
+        magic       = '0x{0:X8}' -f $magic
+        initState   = $initState
+        layoutBytes = $layoutBytes
+        openSeq     = $(if ($open) { $open.Seq } else { 'unstable' })
+        openTick    = $(if ($open) { $open.Value } else { 'unstable' })
+        intentSeq   = $(if ($intent) { $intent.Seq } else { 'unstable' })
+        intent      = $(if ($intent) { "kind=$($intent.Value.kind) trigger=$($intent.Value.trigger) method=$($intent.Value.method) flags=$($intent.Value.flags) open=$($intent.Value.open)" } else { 'unstable' })
+        intentAckSeq = $(if ($intentAck) { $intentAck.Seq } else { 'unstable' })
+        intentAck   = $(if ($intentAck) { "for=$($intentAck.Value.for) state=$($intentAck.Value.state) duration=$($intentAck.Value.duration) entry=$($intentAck.Value.entry) hr=$($intentAck.Value.hr)" } else { 'unstable' })
+        execSeq     = $(if ($exec) { $exec.Seq } else { 'unstable' })
+        exec        = $(if ($exec) { "kind=$($exec.Value.kind) method=$($exec.Value.method) flags=$($exec.Value.flags) executeAt=$($exec.Value.executeAt) open=$($exec.Value.open) target=$($exec.Value.target)" } else { 'unstable' })
+        execAckSeq  = $(if ($execAck) { $execAck.Seq } else { 'unstable' })
+        execAck     = $(if ($execAck) { "command=$($execAck.Value.command) state=$($execAck.Value.state)($($execAck.Value.stateName)) hr=$($execAck.Value.hr) visible=$($execAck.Value.visible)($($execAck.Value.visibleName))" } else { 'unstable' })
+        controllerDirection = $view.ReadInt32($OffsetControllerDirection)
+        controllerTouch     = $view.ReadInt32($OffsetControllerTouch)
+        peerTick            = $view.ReadUInt32($OffsetPeerTick)
+        peerState           = $view.ReadInt32($OffsetPeerState)
+        peerEpoch           = $view.ReadUInt32($OffsetPeerEpoch)
+    } | Format-List
+    $view.Dispose()
 } finally {
-    if ($taken) { $mutex.ReleaseMutex() | Out-Null }
-    $mutex.Dispose()
+    $mapping.Dispose()
 }
-
-try {
-    $event = [System.Threading.EventWaitHandle]::OpenExisting(
-        $CommandEventName)
-    $event.Set() | Out-Null
-    $event.Dispose()
-} catch {
-    throw ("Command '$text' was written, but the Start mod's command event " +
-           "'$CommandEventName' is not open, so nothing woke to read it.")
-}
-
-"sent seq=$sequence '$text'"
