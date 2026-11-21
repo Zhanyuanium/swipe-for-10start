@@ -57,7 +57,9 @@ them explicitly on the UI thread.
 1. **`Wh_ModBeforeUninit`** takes the symbol-install lock, sets `g_disabled`,
    clears `g_execReady` and signals `g_execStopEvent`. Every hook and the
    executor's WndProc reads `g_disabled` and passes; the worker's wait sees the
-   stop before the `Exec` event.
+   stop before the `Exec` event. The launcher hooks are applied inside the same
+   lock as their resolution, so a stop either waits for the complete install or
+   makes the install refuse; the worker never applies hooks after this point.
 2. **`Wh_ModUninit`** joins the posting worker **INFINITE**. The worker never
    calls the launcher synchronously and never waits for an owner callback, so
    this join cannot be held up by the launcher thread.

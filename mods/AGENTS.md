@@ -207,7 +207,11 @@ logged against the reference RVA (`exec launcher symbol label=... rva=...
 expected=... match=0|1`); the set line
 `exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence
 line. One missing symbol refuses the whole set and the hooks are not applied: a
-toggle that can open but not close is worse than the shell's path.
+toggle that can open but not close is worse than the shell's path. The apply
+(`Wh_ApplyHookOperations`) is inside the symbol-install critical section, before
+the lock is released: `BeforeUninit` either waits for the complete install or
+takes the lock first and makes the install refuse before `HookSymbols`, so no
+hook can become live after the stop.
 
 **Executor.** A hidden message-only window, class
 `WindhawkSwipeFor10Start.Executor` (fixed, registered under `&__ImageBase`),

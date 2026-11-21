@@ -13332,6 +13332,13 @@ bool InstallExplorerHooks(HMODULE module) {
     g_ownEventsEnabled.store(true, std::memory_order_relaxed);
     g_callersVerified.store(true, std::memory_order_relaxed);
     g_explorerSymbolsReady.store(true, std::memory_order_release);
+    // The apply belongs to this serialized install, not to the caller: a stop
+    // that takes the lock between the release and a caller-side apply would
+    // return while this thread still added hooks. Applying here means
+    // BeforeUninit either waits for the complete install or sees the stop and
+    // makes this call refuse before HookSymbols.
+    Wh_ApplyHookOperations();
+    TraceLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
     ReleaseSRWLockExclusive(&g_explorerSymbolLock);
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(module);
@@ -13436,8 +13443,7 @@ void ProbeExplorerSymbolsFromWorker() {
     }
 
     if (InstallExplorerHooks(module)) {
-        Wh_ApplyHookOperations();
-        TraceLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
+        // The install applied its own queued hooks under the lock.
         return;
     }
     if (g_explorerSymbolsReady.load(std::memory_order_acquire) ||
