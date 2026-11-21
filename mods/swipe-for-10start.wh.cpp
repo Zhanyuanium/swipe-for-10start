@@ -104,7 +104,8 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   StartMenuExperienceHost.exe (namespace start): StartUI_.dll
  *   (PrepareRootElement and the root it returns), Raw Input (RegisterRawInputDevices/
  *   GetRawInputData/GetRawInputDeviceInfoW) for the digitizer, the window, DWM
- *   and taskbar APIs for geometry and layout, the composition Visual/Element
+ *   and taskbar APIs for geometry and layout, SetWinEventHook for the
+ *   CoreWindow's cloak transitions, the composition Visual/Element
  *   APIs for Progress, and swipe_ipc_shared.h for the intents, executor
  *   commands and acks, the open generation, the controller direction and peer
  *   liveness. In explorer.exe (namespace bridge): twinui.pcshell.dll
@@ -126,7 +127,12 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   a touch-first open can reach the launcher before any Win or Start-button
  *   hook ran. The controller decides; the executor performs. The one shared rule
  *   is the suppression window: a close suppresses the retracted panel until the
- *   executor's dismiss has landed.
+ *   executor's dismiss has landed. Nothing in either half runs on a period: the
+ *   controller arms one high-resolution one-shot for the soonest deadline it has
+ *   and waits on its events otherwise (the open/close state is a WinEvent with a
+ *   bounded fallback poll), and the executor's worker blocks on its events once
+ *   the launcher symbols resolved or were refused. The only idle wake is the
+ *   100 ms peer-tick heartbeat, and only while the peer is advertised.
  * [PROTOCOL]: Update this header on change, then check AGENTS.md
  */
 
@@ -529,13 +535,14 @@ constexpr int kGestureStartSpeedMax = 300;
 // is already off screen when the window hides.
 
 // A close this mod started hides the menu a moment later. Until then the shell
-// still reports the window open, so the reopen poll must not read that as a
-// fresh open and restore Progress while the close is in flight.
+// still reports the window open, so the visibility service must not read that as
+// a fresh open and restore Progress while the close is in flight.
 constexpr uint64_t kRestoreSuppressMs = 600;
 
-// The scheduled dismiss has to run inside that window, or the poll reads the
-// still-open window as a fresh open and restores Progress while the close is in
-// flight. Both styles must land inside it, and the clamp is their upper bound.
+// The scheduled dismiss has to run inside that window, or the visibility service
+// reads the still-open window as a fresh open and restores Progress while the
+// close is in flight. Both styles must land inside it, and the clamp is their
+// upper bound.
 static_assert(static_cast<uint64_t>(kSettleMaxDuration.count()) <=
                   kRestoreSuppressMs,
               "the close dismiss must run inside the restore suppression");
@@ -613,8 +620,9 @@ constexpr int kEndVelocitySamples = 8;
 // The panel reports at ~170 Hz (about 6 ms apart) and keeps reporting while the
 // finger rests, so a short silence really is a lift. 18 ms is above the 15.6 ms
 // quantum that an injected step really takes (measured: Sleep(8) in pwsh yields
-// 15-16 ms gaps), so a step never reads as a lift, and the 5 ms high-resolution
-// idle tick then lands the release 18-23 ms after the last report.
+// 15-16 ms gaps), so a step never reads as a lift. The release is a deadline on
+// this window, armed as a one-shot at the last report, so it lands at 18-19 ms
+// instead of waiting for a periodic tick.
 constexpr uint64_t kIdleReleaseMs = 18;
 // A band candidate survives a sparse report stream. A touch panel that samples
 // slower than the built-in one (or an injected test with 20-30 ms steps) would
@@ -623,11 +631,45 @@ constexpr uint64_t kIdleReleaseMs = 18;
 // watchdog is longer; a real lift is a report or this window. The 18 ms idle
 // still ends a dismiss session, whose panel samples at ~170 Hz.
 constexpr uint64_t kCandidateIdleHoldMs = 120;
+// The fallback tick: only armed when the high-resolution timer cannot be
+// created, and only while a deadline is outstanding, at that deadline's own
+// period. WM_TIMER cannot go faster than the 15.6 ms system quantum, so it
+// degrades the release to 31-34 ms rather than losing it.
 constexpr UINT_PTR kIdleTimerId = 1;
-constexpr UINT kIdleTimerMs = 5;  // also the waitable timer period
 // The DWM cloaked query is a syscall. The report handler accepts one answer
-// per interval and reuses it for every other report.
+// per interval and reuses it for every other report. This is not the idle
+// state's poll: the transition itself is a WinEvent, and the slow fallback poll
+// below only runs while a transition is outstanding.
 constexpr uint64_t kOpenCheckIntervalMs = 20;
+
+// The one idle wake left while the peer service is advertised: the bridge reads
+// a tick younger than kSwipePeerStaleMs (600), and the panic write is throttled
+// to kSwipePeerTickIntervalMs (100) in the shared header. Ten wakes a second on
+// this event alone, none of them a timer, are the price of a live controller.
+constexpr uint64_t kPeerHeartbeatMs = kSwipePeerTickIntervalMs;
+
+// The input thread's root-symbol retry interval (StartUI_'s PrepareRootElement).
+// It is also the wait planner's bootstrap deadline: while the answer is neither
+// ready nor terminally refused, the thread has to come back for the probe, so a
+// module that loads late is still noticed. See kRootPendingDeadlineMs for the
+// budget this retry runs inside.
+constexpr uint64_t kRootProbeMs = 100;
+
+// The fallback poll under the cloak event. A WinEvent can be missed (a dropped
+// message, a hook installed after the transition); a menu left in the wrong
+// state is a bug the user sees, so a request keeps a bounded window open in
+// which the poll runs at this slow cadence. It is not a 20 ms poll: nothing
+// polls while no transition is outstanding.
+constexpr uint64_t kVisibilityFallbackMs = 100;
+// How long a requested transition waits for its cloak event. Longer than the
+// executor's 400 ms expiry plus its 300 ms confirmation probe and the shell's
+// own hide, and short enough that a stuck state is repaired inside a second.
+constexpr uint64_t kVisibilityGraceMs = 1000;
+// How long an observed transition keeps the fallback watching after it landed.
+// The unhealed-panel repair needs a poll after the open's own measurement turn
+// has run (an open that landed before the first publish restores at rest), and
+// that turn is posted, not waited for.
+constexpr uint64_t kVisibilitySettleWatchMs = 500;
 
 // A measured panel rectangle is this layout's panel only when it lies on the
 // monitor and the side against the taskbar sits in the strip that side defines:
@@ -741,27 +783,30 @@ using GetCoreWindowHandleAbi = HRESULT(STDMETHODCALLTYPE*)(void*, HWND*);
 // reliable open/closed signal: 0 while the menu is shown.
 constexpr DWORD kDwmwaCloaked = 14;
 using DwmGetWindowAttribute_t = HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD);
-// Timer resolution
+// Timer resolution and the wake policy
 //
-// The idle timer detects the release: the tick is every 5 ms, but the process
-// keeps the default 15.6 ms system timer quantum, so a 20 ms silence plus one
-// quantum measured `relms=31`. Two separate clocks have to be fixed, and each
-// was measured on this build (26300.9974):
+// The input thread owns no period. It wakes for an event, or for the one
+// deadline it armed a high-resolution one-shot timer for, and with no deadline
+// it waits on its events alone. Two clocks have to be kept exact, and both were
+// measured on this build (26300.9974):
 //
 // - the tick: a 1 ms timeBeginPeriod request is held while a contact is down,
 //   as asked, and it raises the process resolution (Sleep(1) takes 1-2 ms).
 //   WM_TIMER ignores it: a 5 ms SetTimer still delivered every 15.6 ms. The
-//   idle tick is therefore a waitable timer created with
-//   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, which fires at the requested 5 ms
-//   with or without the period request (measured 5-6 ms). SetTimer remains the
-//   fallback when the timer cannot be created.
+//   deadline timer is therefore a waitable timer created with
+//   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, which fires at the requested
+//   millisecond with or without the period request (measured 5-6 ms at a 5 ms
+//   due). SetTimer remains the fallback when the timer cannot be created.
 // - the clock: GetTickCount64 also advances only every 15.6 ms, so an 18 ms
 //   silence read as 31. The silence is measured with QueryPerformanceCounter
 //   (QpcMsNow below).
 //
 // The silence window itself is 18 ms: above the 15.6 ms quantum that an
 // injected step really takes, below the 20 ms the mod used to wait. A 15 ms
-// window split every injected step into its own one-sample session.
+// window split every injected step into its own one-sample session. Nothing
+// here changes that: the deadline is `lastAliveQpc + 18`, armed as a one-shot,
+// so the release lands at 18-19 ms instead of on the 20 ms tick it used to
+// land on.
 // ---------------------------------------------------------------------------
 
 constexpr UINT kContactTimerPeriodMs = 1;
@@ -804,26 +849,69 @@ void EndContactTiming() {
     }
 }
 
-// The idle tick, independent of the 15.6 ms WM_TIMER quantum. Created on the
-// input thread and closed by it; nullptr means "use the WM_TIMER tick", which
-// is slower but still releases.
-HANDLE CreateIdleWaitableTimer() {
-    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
-                                          kCreateWaitableTimerHighResolution,
-                                          TIMER_ALL_ACCESS);
-    if (!timer) {
-        return nullptr;
-    }
+// The deadline timer, independent of the 15.6 ms WM_TIMER quantum. Created on
+// the input thread and closed by it, and never armed here: the loop's planner
+// arms it for the one deadline it has and disarms it when that is served, so a
+// loaded mod with nothing happening costs no timer at all. nullptr means "use
+// the WM_TIMER fallback", which is coarser but still serves every deadline.
+HANDLE CreateDeadlineTimer() {
+    return CreateWaitableTimerExW(nullptr, nullptr,
+                                 kCreateWaitableTimerHighResolution,
+                                 TIMER_ALL_ACCESS);
+}
 
-    // Relative due time in 100 ns units, so the first tick is one period away.
+// Arms the one-shot for `delayMs` from now. The relative due time is in 100 ns
+// units and the timer is not periodic: a periodic timer is exactly the 5 ms
+// wake this design removes.
+bool ArmDeadlineTimer(HANDLE timer, uint64_t delayMs) {
     LARGE_INTEGER due{};
-    due.QuadPart = -static_cast<LONGLONG>(kIdleTimerMs) * 10000;
-    if (!SetWaitableTimer(timer, &due, kIdleTimerMs, nullptr, nullptr, FALSE)) {
-        CloseHandle(timer);
-        return nullptr;
-    }
+    due.QuadPart = -static_cast<LONGLONG>(delayMs) * 10000;
+    return SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE) != FALSE;
+}
 
-    return timer;
+void DisarmDeadlineTimer(HANDLE timer) {
+    CancelWaitableTimer(timer);
+}
+
+// ---------------------------------------------------------------------------
+// The transition watch
+//
+// The open/close transition is a WinEvent now (EVENT_OBJECT_CLOAKED /
+// UNCLOAKED on the CoreWindow), not a 20 ms poll of the cloaked attribute. The
+// event is the signal; this watch is the net under it, and it is the only thing
+// that can bring the cloaked query back. It is open in exactly two situations:
+//
+// - a transition this mod asked for (a show or a dismiss request) has not been
+//   observed yet: `want` names the direction, and the window ends when the
+//   matching event lands or after kVisibilityGraceMs, whichever is first. A
+//   missed event then still lands the state instead of leaving it stuck.
+// - a transition has just been observed: every observation keeps
+//   kVisibilitySettleWatchMs of slow polling, because the unhealed-panel repair
+//   runs after the open's measurement turn, and that turn is posted.
+//
+// Nothing here polls while neither holds: an idle mod has no transition to
+// watch.
+// ---------------------------------------------------------------------------
+enum : uint32_t {
+    kVisibilityWantNone = 0,
+    kVisibilityWantOpen = 1,
+    kVisibilityWantClosed = 2,
+};
+
+// Input thread only: the requests and the service both run there, and the
+// WinEvent callback touches none of them.
+uint64_t g_visibilityPollUntil = 0;   // tick; 0 = no watch
+uint32_t g_visibilityWant = kVisibilityWantNone;
+uint64_t g_lastVisibilityPollTick = 0;
+
+// Opens the watch for a direction this mod asked for. The later deadline wins,
+// so two requests inside one window cannot shorten each other.
+void NoteVisibilityTransition(uint32_t want) {
+    g_visibilityWant = want;
+    const uint64_t until = GetTickCount64() + kVisibilityGraceMs;
+    if (until > g_visibilityPollUntil) {
+        g_visibilityPollUntil = until;
+    }
 }
 
 // GetTickCount64 advances on the system tick (15.6 ms here), so it cannot tell
@@ -1281,7 +1369,7 @@ NO_DESTROY wux::FrameworkElement g_sizeRoot{nullptr};     // UI thread only
 std::atomic<bool> g_dismissSettling{false};
 std::atomic<uint32_t> g_dismissSerial{0};
 // Set whenever this mod starts a close itself: the committed dismiss and the
-// cancelled reveal both set it when their settle starts. PollRootVisibility
+// cancelled reveal both set it when their settle starts. ServiceRootVisibility
 // must not read the still-open window as a reopen while the close is in flight.
 // 0 means no close of this mod is pending.
 std::atomic<uint64_t> g_suppressRestoreUntil{0};
@@ -1349,6 +1437,43 @@ std::atomic<HWND> g_coreHwnd{nullptr};
 // Resolved in Wh_ModInit. A runtime resolve keeps the mod loadable without
 // dwmapi.dll in the import table.
 std::atomic<DwmGetWindowAttribute_t> g_dwmGetWindowAttribute{nullptr};
+
+// ---------------------------------------------------------------------------
+// The cloak event
+//
+// The menu closes by cloaking its CoreWindow, not by destroying or hiding it,
+// and the cloaked attribute is the one reliable open/closed signal. It used to
+// be read every 20 ms for the whole life of the process; it is now pushed:
+// EVENT_OBJECT_CLOAKED / EVENT_OBJECT_UNCLOAKED for this process's CoreWindow,
+// delivered out of context to the input thread that installed the hook.
+//
+// The callback is a filter and a signal, nothing else. It takes no lock, reads
+// no XAML, queries no DWM and writes no trace: it compares the HWND against the
+// one the input thread recorded and sets an auto-reset event. Everything it
+// could have done runs on the input thread after its wait returns, where the
+// state machine and its locks live. An event that arrives for any other window
+// of this process is dropped here, before it can become a wake.
+// ---------------------------------------------------------------------------
+std::atomic<HANDLE> g_cloakEvent{nullptr};  // owned by the input thread
+HWINEVENTHOOK g_cloakHook = nullptr;        // owned by the input thread
+
+void CALLBACK CloakWinEventProc(HWINEVENTHOOK, DWORD event, HWND hwnd,
+                                LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (event != EVENT_OBJECT_CLOAKED && event != EVENT_OBJECT_UNCLOAKED) {
+        return;
+    }
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF) {
+        return;
+    }
+    HWND core = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!core || hwnd != core) {
+        return;
+    }
+    HANDLE signal = g_cloakEvent.load(std::memory_order_relaxed);
+    if (signal) {
+        SetEvent(signal);  // the whole callback
+    }
+}
 
 // Filled in at setup and on every PrepareRootElement.
 int32_t g_dismissAxis = static_cast<int32_t>(DismissAxis::Left);
@@ -3069,12 +3194,13 @@ bool g_penRegistered = false;
 SRWLOCK g_peerLock = SRWLOCK_INIT;
 bool g_peerTerminal = false;
 
-// Refreshes the bridge's liveness clock. Called from the input thread's idle
-// tick and from every positioned report, so silence on the digitizer cannot
-// make a live controller look gone; the idle tick alone already proves the
-// thread runs, and a report is the one moment its work is known to be current.
+// Refreshes the bridge's liveness clock. Called from the deadline service and
+// from every positioned report, so silence on the digitizer cannot make a live
+// controller look gone. Nothing is written while this activation is not
+// advertised: the bridge reads the state first, and an idle mod must not write
+// into a channel it does not serve.
 void PublishPeerTick(uint64_t tickMs) {
-    if (!g_ipc.state) {
+    if (!g_ipc.state || !g_peerPublished.load(std::memory_order_relaxed)) {
         return;
     }
     const uint32_t now = static_cast<uint32_t>(tickMs);
@@ -3269,6 +3395,9 @@ bool RequestBridgeShow(uint32_t method, uint32_t flags) {
     g_pendingShowExec.store(sequence, std::memory_order_relaxed);
     g_pendingShowUntil.store(GetTickCount64() + kBridgeAckTimeoutMs,
                              std::memory_order_relaxed);
+    // The open is on its way: watch for its cloak event, and poll slowly if it
+    // never arrives.
+    NoteVisibilityTransition(kVisibilityWantOpen);
     TraceLog(L"exec show request seq=%lld method=%u flags=%u",
             static_cast<long long>(sequence), method, flags);
     return true;
@@ -3311,6 +3440,9 @@ bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
     // The new command replaces whatever confirmation an earlier dismiss still
     // owed; the bridge answers the superseded one with its own state.
     g_pendingDismissConfirm = 0;
+    // The close is on its way: watch for its cloak event, and poll slowly if it
+    // never arrives.
+    NoteVisibilityTransition(kVisibilityWantClosed);
     TraceLog(L"exec dismiss request seq=%lld method=%u executeAt=%llu open=%llu",
             static_cast<long long>(sequence), method,
             static_cast<unsigned long long>(executeAt),
@@ -3339,9 +3471,9 @@ LONG64 CancelPendingDismiss(const wchar_t* reason) {
 // The repair every terminal executor failure performs, whatever kind the command
 // was: the controller stops owning the panel and stops marking the touch in the
 // same step, and the pending open entry is dropped. The published direction then
-// follows the window's cloak on the next poll, which is the one source of truth
-// for a panel the controller no longer drives. Declared here because the open
-// and close paths above use it; defined with the ack handling.
+// follows the window's cloak on the next transition, which is the one source of
+// truth for a panel the controller no longer drives. Declared here because the
+// open and close paths above use it; defined with the ack handling.
 void ReleaseExecutorOwnership();
 
 // ---------------------------------------------------------------------------
@@ -5256,7 +5388,7 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
         // No executor can present this open: the claim is withdrawn by the
         // helper and the shell's own band gesture remains the owner of the
         // open. The pull keeps its candidate and its release history, so an
-        // open the shell performs anyway is adopted at the next poll.
+        // open the shell performs anyway is adopted at the next cloak event.
         TraceLog(L"reveal show request failed entry=%.3f reason=no-executor",
                 entry);
     }
@@ -5548,6 +5680,13 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
                 L"reason=%s progress=%.3f restore=%d",
                 x, y, axis, haveBand ? low : -1.0f, haveBand ? high : -1.0f,
                 admitted ? 1 : 0, reason, progress, restoreOwed ? 1 : 0);
+        // A contact in the band may open the menu without this mod asking: the
+        // shell's own gesture starts from a strip wider than any band this mod
+        // admits, and a pull that is refused here (or lifts before the claim)
+        // still opens it. That open has no show request of ours, so this is the
+        // one transition whose event must not be the only source: the watch
+        // gives it the same slow fallback poll a requested one gets.
+        NoteVisibilityTransition(kVisibilityWantOpen);
     }
     return admitted;
 }
@@ -5684,9 +5823,9 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
 // Three tests keep a tap a tap: the contact must have started while the menu was
 // closed (a contact on the open panel is a dismiss), it must have moved
 // `kAdoptTravelDip` along the opening axis (a tap does not move), and no session
-// may already own it. The adoption runs from the open's own poll and from the
-// report path, so a flick whose lift arrives before the next poll is still
-// adopted.
+// may already own it. The adoption runs from the open transition's own service
+// pass and from the report path, so a flick whose lift arrives before the cloak
+// event is still adopted.
 bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     if (g_reveal.edgeCandidate || g_reveal.active || g_hidSession.active ||
         g_hidSession.suppress || !g_contactOrigin.valid ||
@@ -5765,12 +5904,12 @@ void PromoteRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
 }
 
 // Consumes a release that ended before its menu opened. Runs on the input thread
-// from the visibility poll, in the same tick that just saw the closed-to-open
+// from the visibility service, in the same pass that just saw the closed-to-open
 // transition, so the record it reads was written by this thread: the release runs
-// in the report handler or the idle tick and the poll runs in the same message
-// loop, so no publication exists and none is needed. A live takeover already
-// cleared the record; an admitted newer pull invalidates it; an expired one is
-// dropped.
+// in the report handler or the deadline service and this pass runs in the same
+// message loop, so no publication exists and none is needed. A live takeover
+// already cleared the record; an admitted newer pull invalidates it; an expired
+// one is dropped.
 //
 // The settle is the ordinary one, from the position the panel actually shows at
 // this instant (`TakeProgressNow()`) at the recorded speed, so a fast pull leaves
@@ -5804,13 +5943,14 @@ bool ConsumeLateRevealRelease(const GestureGeometry& geometry) {
     // One open consumes it, whatever the settle does next.
     record.valid = false;
     // The value the panel will show when this frame is composited. The root was
-    // cloaked at the previous poll, and the follow and every settle are gated on
-    // an uncloaked root, so nothing wrote a visible position through that cloak:
-    // the compositor holds the off-screen rest (0 after any close), not the
-    // record's mapped `pos`. Starting from `pos` made the panel appear already
-    // 80 % open, because the settle had been running for the poll-to-presentation
-    // gap by the time the first frame was composited. The same reading covers a
-    // panel that was already on screen when this poll saw the open: then it is
+    // cloaked when the state was last read, and the follow and every settle are
+    // gated on an uncloaked root, so nothing wrote a visible position through
+    // that cloak: the compositor holds the off-screen rest (0 after any close),
+    // not the record's mapped `pos`. Starting from `pos` made the panel appear
+    // already 80 % open, because the settle had been running for the
+    // state-read-to-presentation gap by the time the first frame was composited.
+    // The same reading covers a
+    // panel that was already on screen when the state was read: then it is
     // the live position, not 0. `TakeProgressNow()` is the one reader that turns
     // an animation's recorded base into a position, and the caller already
     // refuses the record while a close is still running, so this cannot take an
@@ -6558,13 +6698,34 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
     }
 }
 
+// Whether the idle release of both gesture families is held. The two holds end
+// on an event, never on a clock, and that is why the wait planner leaves the
+// release deadline unarmed while either is up: a deadline that cannot act would
+// spin the thread at the timer's smallest delay.
+//
+// - A touch show is in flight: the shell is uncloaking the window and the
+//   digitizer may go quiet for that whole window. The uncloak (or the show's
+//   refusal) is the event that ends it.
+// - A close is in flight and a contact owns the panel: the key press and the
+//   shell's hide pause the digitizer too, and the landing is the event that
+//   releases the deferral.
+bool IdleReleaseHeld(uint64_t tickMs) {
+    const bool touchShowInFlight =
+        SwipeIpcControllerTouch(&g_ipc) ||
+        g_intentOpenActive.load(std::memory_order_relaxed);
+    const bool holdThroughClose =
+        CloseInFlight(tickMs) && (g_reveal.edgeCandidate || g_reveal.active);
+    return touchShowInFlight || holdThroughClose;
+}
+
 // A device that leaves the surface without a lift report still ends the
-// gesture; the idle tick only has to notice the silence, which is measured on
-// the QPC clock because the tick clock is quantised to 15.6 ms.
+// gesture; the deadline service only has to notice the silence, which is
+// measured on the QPC clock because the tick clock is quantised to 15.6 ms.
 void CheckHidIdleRelease(uint64_t tickMs) {
-    // The idle tick is this thread's heartbeat: it runs whether or not a finger
-    // is on the glass, so a live controller never looks stale between gestures.
-    // The throttle makes this one interlocked write per 100 ms at most.
+    // This is also this thread's heartbeat: it runs on every wake, so a live
+    // controller never looks stale between gestures. The throttle makes this
+    // one interlocked write per 100 ms at most, and the write itself is skipped
+    // while no peer is advertised.
     PublishPeerTick(tickMs);
 
     HidGestureSession& session = g_hidSession;
@@ -6630,32 +6791,28 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         }
     }
 
-    // A touch show is in flight: the shell is uncloaking the window and the
-    // digitizer may go quiet for that whole window (the show starts at the
-    // qualified pull, before the shell's own gesture would have). The contact is
-    // still down as far as this mod knows — no lift report arrived — so the idle
-    // must not release the candidate the open is about to adopt. The flag is
-    // cleared at the live takeover or when the show fails.
-    const bool touchShowInFlight =
-        SwipeIpcControllerTouch(&g_ipc) ||
-        g_intentOpenActive.load(std::memory_order_relaxed);
-    // A close in flight is a gap in the digitizer stream too (the key press and
-    // the shell's hide both pause it). A contact that was already owning the
-    // panel is held through that gap; its real lift is a report and releases it
-    // explicitly. This is the pull the close's landing reopens.
-    const bool holdThroughClose =
-        CloseInFlight(tickMs) && (g_reveal.edgeCandidate || g_reveal.active);
+    // A touch show in flight holds the release: the shell is uncloaking the
+    // window and the digitizer may go quiet for that whole window (the show
+    // starts at the qualified pull, before the shell's own gesture would have).
+    // The contact is still down as far as this mod knows — no lift report
+    // arrived — so the idle must not release the candidate the open is about to
+    // adopt. A close in flight is a gap in the digitizer stream too (the key
+    // press and the shell's hide both pause it); a contact that was already
+    // owning the panel is held through that gap, and its real lift is a report
+    // that releases it explicitly. Both holds are IdleReleaseHeld's, and its
+    // comment says why the wait planner reads the same predicate.
+    const bool held = IdleReleaseHeld(tickMs);
     const bool sessionIdle =
         session.active && qpcNow >= session.lastAliveQpc &&
         qpcNow - session.lastAliveQpc >= kIdleReleaseMs;
-    if (sessionIdle && !touchShowInFlight && !holdThroughClose) {
+    if (sessionIdle && !held) {
         ReleaseHidSession(geometry, true, L"idle");
     }
 
     const bool revealIdle =
         g_reveal.edgeCandidate && qpcNow >= g_reveal.lastAliveQpc &&
         qpcNow - g_reveal.lastAliveQpc >= kCandidateIdleHoldMs;
-    if (revealIdle && !touchShowInFlight && !holdThroughClose) {
+    if (revealIdle && !held) {
         ReleaseRevealSession(geometry);
         // This watchdog is the missing lift (a slow digitizer is the other
         // reading). The next report is a new down, not a continuation whose
@@ -6756,8 +6913,8 @@ void RunPendingCloseTap(uint64_t tickMs) {
     SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick);
     if (!RequestBridgeDismiss(1, GetTickCount64(), openGeneration)) {
         // Nothing can run this dismiss: the window would stay shown over a
-        // retracted panel. Give the ownership up now, and the poll's unhealed
-        // rule restores the panel once the suppression window ends.
+        // retracted panel. Give the ownership up now, and the unhealed rule
+        // restores the panel once the suppression window ends.
         ReleaseExecutorOwnership();
         TraceLog(L"close dismiss skipped kind=%s reason=no-executor",
                 CloseKindName(kind));
@@ -6812,6 +6969,14 @@ bool TakeMeasureDeadline(uint64_t tickMs, SettledMeasureRequest& request) {
     g_measureRequest.dueTick = 0;  // one shot per request
     request = g_measureRequest;
     return true;
+}
+
+// Input thread only: the same deadline, read without taking it, so the wait
+// planner can arm the timer for it. The lock is the request's own; no other
+// lock is held here and none is taken inside it.
+uint64_t PeekMeasureDeadlineTick() {
+    std::lock_guard lock(g_measureMutex);
+    return g_measureRequest.id != 0 ? g_measureRequest.dueTick : 0;
 }
 
 // Both parts are compared: the id is unique while the process lives and the
@@ -7040,8 +7205,9 @@ void PostUiOpenWatchRelease(uint32_t closedGeneration,
     }
 }
 
-// The open/close transitions the poll below observes, including why a close that
-// is not this mod's own is not fought, are documented at PollRootVisibility.
+// The open/close transitions the service below observes, including why a close
+// that is not this mod's own is not fought, are documented at
+// ServiceRootVisibility.
 
 // M3: one intent handler for the bridge's four triggers. The controller never
 // branches on the trigger: open sets the entry and asks the bridge for Show,
@@ -7099,6 +7265,10 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
         SwipeIpcSetControllerTouch(&g_ipc, false);
         g_commitNeedsProgressReset = false;
+        // The takeover's own close is still a transition this mod must classify
+        // (the landing tells an external close from ours), so it is watched the
+        // same way a requested one is.
+        NoteVisibilityTransition(kVisibilityWantClosed);
         TraceLog(L"intent external drop trigger=%s slot=%d command=%d", trigger,
                 dropped.slot ? 1 : 0, dropped.command ? 1 : 0);
     } else if (intent.kind == kSwipeIntentOpen) {
@@ -7182,7 +7352,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             } else {
                 // No sequence was published, so there is nothing a timeout could
                 // repair. The panel is not claimed: the shell's own gesture (the
-                // band contact) opens the menu and the next poll adopts it.
+                // band contact) opens the menu and the next cloak event adopts it.
                 ShowAtRest();
                 g_commitNeedsProgressReset = false;
                 ReleaseExecutorOwnership();
@@ -7226,7 +7396,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                         static_cast<long long>(duration.count()));
             } else {
                 // Nothing will hide this window. The settle already retracted the
-                // panel; the ownership goes back now and the poll's unhealed rule
+                // panel; the ownership goes back now and the unhealed rule
                 // restores the panel after the suppression window.
                 ReleaseExecutorOwnership();
                 ackState = kSwipeAckRefused;
@@ -7251,11 +7421,11 @@ void ApplyBridgeIntent() {
 // The one repair every terminal executor failure performs, whatever kind the
 // command was. The controller stops owning the panel and stops marking the touch
 // in the same step, and the pending open entry is dropped. The published
-// direction then follows the window's cloak on the next poll, which is the one
-// source of truth for a panel the controller no longer drives. A failed dismiss
-// leaves the panel retracted with the window still shown; the suppression window
-// still expires, and the poll's unhealed rule then brings the panel back instead
-// of leaving an invisible menu attached to a shown window.
+// direction then follows the window's cloak on the next transition, which is the
+// one source of truth for a panel the controller no longer drives. A failed
+// dismiss leaves the panel retracted with the window still shown; the
+// suppression window still expires, and the unhealed rule then brings the panel
+// back instead of leaving an invisible menu attached to a shown window.
 void ReleaseExecutorOwnership() {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
     SwipeIpcSetControllerTouch(&g_ipc, false);
@@ -7336,10 +7506,10 @@ void ApplyExecAck() {
         if (unconfirmed || failed) {
             // A dismiss that did not hide the window — refused, expired, still
             // visible at the probe, or unanswerable — is terminal: the panel is
-            // retracted, the controller stops owning it, and the next poll reads
-            // the cloak. A refused/expired ticket for this sequence was retired
-            // above, before this gate; `unconfirmed`/`unknown` retires one here,
-            // because the pending slot still names the command.
+            // retracted, the controller stops owning it, and the next transition
+            // reads the cloak. A refused/expired ticket for this sequence was
+            // retired above, before this gate; `unconfirmed`/`unknown` retires
+            // one here, because the pending slot still names the command.
             if (unconfirmed && g_intentCancel.pending &&
                 g_intentCancel.dismissSeq == ack.command) {
                 g_intentCancel = CloseCancelTicket{};
@@ -7390,8 +7560,8 @@ void ApplyExecAck() {
 }
 
 // A command the bridge never answered: the Start side stops owning the panel
-// and reads the truth from the window's cloak on the next poll, exactly as it
-// does for any open it did not perform. A dismiss expires from the deadline it
+// and reads the truth from the window's cloak on the next transition, exactly as
+// it does for any open it did not perform. A dismiss expires from the deadline it
 // was scheduled for, not from the request: the bridge's timer runs at
 // `executeAt`, so the ack cannot be expected before that plus the same budget.
 //
@@ -7446,9 +7616,10 @@ void CheckExecAckTimeout(uint64_t now) {
             static_cast<long long>(dismiss), StartWindowIsOpen() ? 1 : 0);
 }
 
-// A superseding intent that arrived with the landing. See PollRootVisibility: the
-// idle timer is waited on before the intent event, so the landing can be served
-// first. Only `external` is reconciled here — an open or close intent is the user
+// A superseding intent that arrived with the landing. See ServiceRootVisibility:
+// the cloak event and the intent event are both waited on, so an intent that
+// arrived with the landing is read here before the landing acts. Only `external`
+// is reconciled here — an open or close intent is the user
 // talking to a menu, and the landing's own pull/cancel rules already own that
 // case. ApplyBridgeIntent consumes the record, so the event's later wake finds
 // nothing new.
@@ -7528,31 +7699,48 @@ bool RevealPullQualified(const GestureGeometry& geometry) {
 // nothing is inserted, the pull is dropped, and the next open starts from 0
 // again.
 //
-// The poll runs on the 5 ms idle tick but accepts one cloaked answer per 20 ms;
-// it used 100 ms for the restore check alone. Measured against the uncloak, a
+// It runs when a cloak event says the window changed, not on a clock. The
+// uncloak used to be found by a 20 ms poll: measured against the uncloak, a
 // 100 ms throttle started the open slide up to 94 ms late, so the panel sat at
-// rest first and then jumped out and slid back in. 20 ms keeps the start within
-// one compositor frame of the shell's own open, which is what makes the two read
-// as one animation.
+// rest first and then jumped out and slid back in, and 20 ms kept the start
+// within one compositor frame of the shell's own open. The event is the same
+// latency without the query: the thread is signalled the moment DWM cloaks or
+// uncloaks the CoreWindow, and the attribute read below is then the answer, not
+// a sample of a slow clock. A transition whose event is missed is still caught
+// by the watch (see NoteVisibilityTransition): a requested or just-observed
+// transition opens a bounded window in which the slow fallback poll runs.
 //
 // The open transition is also the one place the gesture geometry is refreshed
 // without a system event: the XAML root is reused between opens, so
 // PrepareRootElement does not fire again and the axis, Distance and DirX/DirY
 // captured by Setup can belong to a taskbar that has moved since.
 //
-// The landing runs on this thread's idle timer, which is waited on before the
-// intent event: a superseding intent that arrived with the landing is reconciled
-// before the landing may serve a recovery (ReconcileSupersedingIntentBeforeLanding),
-// or the now-external close would reissue an open the takeover had just revoked.
-void PollRootVisibility(uint64_t tickMs) {
-    static uint64_t lastPollTick = 0;
-    if (tickMs - lastPollTick < kOpenCheckIntervalMs) {
-        return;
-    }
-    lastPollTick = tickMs;
-
+// The landing runs on this thread as well: a superseding intent that arrived
+// with the landing is reconciled before the landing may serve a recovery
+// (ReconcileSupersedingIntentBeforeLanding), or the now-external close would
+// reissue an open the takeover had just revoked. The intent event and the cloak
+// event are waited on in the same set, and the landing reads the intent record
+// itself, so the order between the two wakes cannot resurrect a revoked open.
+void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
     const bool open = StartWindowIsOpen();
-    const bool justOpened = open && !g_rootWasOpen;
+    const bool wasOpen = g_rootWasOpen;
+    // The open state this call is a sample of. A request stops being waited for
+    // the moment the state matches it; every observation keeps a short settle
+    // watch so the unhealed repair below still gets its polls after the open's
+    // posted measurement turn. A fallback call never extends the watch, or the
+    // poll would keep itself alive.
+    const uint32_t want = g_visibilityWant;
+    if ((want == kVisibilityWantOpen && open) ||
+        (want == kVisibilityWantClosed && !open)) {
+        g_visibilityWant = kVisibilityWantNone;
+    }
+    if (!viaFallback) {
+        const uint64_t watch = tickMs + kVisibilitySettleWatchMs;
+        if (watch > g_visibilityPollUntil) {
+            g_visibilityPollUntil = watch;
+        }
+    }
+    const bool justOpened = open && !wasOpen;
     // A close this mod started reports the window open until the shell has run
     // the Hide its dismiss caused. Reading that as a reopen restored Progress 1
     // while the close was still in flight, so a follow that began in that window
@@ -7663,6 +7851,12 @@ void PollRootVisibility(uint64_t tickMs) {
                 }
             } else {
                 ShowAtRest();
+                // The open landed and there is no settle to start from the
+                // intended entry, so the entry is spent. Leaving the flag set
+                // would hold the idle release (a contact still down when the
+                // menu appeared would never be released, and the landing's own
+                // open test treats the flag as "an entry is pending").
+                g_intentOpenActive.store(false, std::memory_order_relaxed);
                 TraceLog(L"win open restore (no geometry)");
             }
         }
@@ -7863,7 +8057,170 @@ void PollRootVisibility(uint64_t tickMs) {
         }
     }
 
+    if (viaFallback && open != wasOpen) {
+        // The net under the cloak event. A clean run never writes this line: the
+        // event lands first and the watch is the only thing that would poll. It
+        // appearing in a trace is the proof the fallback served a missed event.
+        TraceLog(L"win state fallback open=%d want=%u", open ? 1 : 0, want);
+    }
     g_rootWasOpen = open;
+}
+
+// ---------------------------------------------------------------------------
+// The one deadline
+//
+// Everything the input thread has to do on a clock is a deadline, and this is
+// where they are collected. The soonest is armed as a single one-shot; with
+// none, the timer is disarmed and the thread waits on its events alone. That
+// state — no deadline — is what a loaded mod spends its life in.
+//
+// The two clocks stay apart. `tick` is GetTickCount64 (quantised to 15.6 ms
+// here), `qpc` is QueryPerformanceCounter: the contact release, the candidate
+// watchdog and the coast are measured on QPC because the tick cannot tell 18 ms
+// from 31, while the close tap, the executor budgets and the measurement turn
+// were always tick deadlines and stay on it. Both are reduced to "milliseconds
+// from now", which is what the timer takes, and both are monotonic, so the
+// minimum of the two is a real instant.
+//
+// A deadline that has already passed is armed at 1 ms only where serving it
+// clears the condition that produced it (a one-shot turn, a release, a watchdog).
+// The coast start is the exception: it is armed only while it is still ahead.
+// MaybeCoast runs again on the release wake, and a coast that cannot start now
+// must not be retried every millisecond.
+//
+// A release that is held (IdleReleaseHeld) contributes nothing: its hold ends on
+// a cloak event or an executor answer, and a deadline that cannot act would spin
+// the thread at the timer's smallest delay.
+// ---------------------------------------------------------------------------
+uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
+    uint64_t soonest = 0;
+    const auto consider = [&soonest](uint64_t delay) {
+        if (delay != 0 && (soonest == 0 || delay < soonest)) {
+            soonest = delay;
+        }
+    };
+    const auto considerTick = [&](uint64_t due) {
+        consider(due > nowTick ? due - nowTick : 1);
+    };
+    const auto considerQpc = [&](uint64_t due) {
+        consider(due > nowQpc ? due - nowQpc : 1);
+    };
+    const auto considerQpcAhead = [&](uint64_t due) {
+        if (due > nowQpc) {
+            consider(due - nowQpc);
+        }
+    };
+
+    // The root-hook bootstrap. The module and the symbol resolve from this
+    // thread, so until the answer is ready or terminally refused the loop has to
+    // come back; the probe itself is throttled to the same interval. This is the
+    // only deadline a healthy activation has before its first publication.
+    if (!g_rootHookReady.load(std::memory_order_acquire) &&
+        !g_rootHookRefused.load(std::memory_order_acquire)) {
+        consider(kRootProbeMs);
+    }
+
+    const bool coasting = g_panel.coasting.load(std::memory_order_relaxed);
+    // The coast's own end: when no report and no release stopped it, this is the
+    // wake that pins the value it reached.
+    if (coasting) {
+        considerQpc(g_panel.coastStartQpc +
+                    static_cast<uint64_t>(kCoastDuration.count()));
+    }
+
+    if (!IdleReleaseHeld(nowTick)) {
+        // The coast starts 8 ms after the last point, so the panel is already
+        // moving when the release is planned 10 ms later. The release itself is
+        // the 18 ms silence, and the candidate's watchdog is its longer window.
+        if (!coasting) {
+            if (g_hidSession.active) {
+                considerQpcAhead(g_hidSession.lastSampleQpc + kCoastStartMs);
+            }
+            if (g_reveal.active) {
+                considerQpcAhead(g_reveal.lastSampleQpc + kCoastStartMs);
+            }
+        }
+        if (g_hidSession.active) {
+            considerQpc(g_hidSession.lastAliveQpc + kIdleReleaseMs);
+        }
+        if (g_reveal.edgeCandidate) {
+            considerQpc(g_reveal.lastAliveQpc + kCandidateIdleHoldMs);
+        }
+        // The latch and the identity clocks expire on the same 18 ms silence as
+        // a session, and only while no session owns the contact.
+        if (!g_hidSession.active && !g_reveal.edgeCandidate) {
+            if (g_contactDown) {
+                considerTick(g_contactTick + kIdleReleaseMs);
+            }
+            if (g_trackedContact.slot >= 0) {
+                considerTick(g_trackedContact.lastEvidenceTick + kIdleReleaseMs);
+            }
+        }
+    }
+
+    // The close tap's deadline: the end of the settle it was armed for.
+    if (g_pendingTapTick != 0) {
+        considerTick(g_pendingTapTick);
+    }
+    // The executor's budget. A show expires at its own deadline; a dismiss is
+    // measured from the time it was scheduled to run, because the bridge's timer
+    // fires there and the ack cannot arrive before that.
+    const uint64_t showUntil = g_pendingShowUntil.load(std::memory_order_relaxed);
+    if (showUntil != 0) {
+        considerTick(showUntil);
+    }
+    const uint64_t dismissAt =
+        g_pendingDismissExecAt.load(std::memory_order_relaxed);
+    if (g_pendingDismissExec.load(std::memory_order_relaxed) != 0 &&
+        dismissAt != 0) {
+        considerTick(dismissAt + kBridgeAckTimeoutMs);
+    }
+    // The settled measurement's own turn, and the scroller retry that replaces a
+    // pass which could not commit. Both are posted to the UI thread; the deadline
+    // here is the guaranteed path when the layout watch never delivers.
+    const uint64_t measureDue = PeekMeasureDeadlineTick();
+    if (measureDue != 0) {
+        considerTick(measureDue);
+    }
+    const uint64_t scrollerRetry =
+        g_scrollerRetryAt.load(std::memory_order_relaxed);
+    if (scrollerRetry != 0) {
+        considerTick(scrollerRetry);
+    }
+
+    // The net under the cloak event: only while a transition is being waited for
+    // or has just landed. The cadence is slow because it only has to keep a
+    // missed event from leaving the state stuck.
+    if (g_visibilityPollUntil != 0 && nowTick < g_visibilityPollUntil) {
+        const uint64_t due =
+            (g_lastVisibilityPollTick != 0
+                 ? g_lastVisibilityPollTick + kVisibilityFallbackMs
+                 : nowTick + kVisibilityFallbackMs);
+        considerTick(due < g_visibilityPollUntil ? due : g_visibilityPollUntil);
+    }
+
+    return soonest;
+}
+
+// One service pass for a due deadline. Each step is the same work the old 5 ms
+// tick did; what changed is that nothing calls it while nothing is due.
+void ServiceDeadlineWork(uint64_t tickMs) {
+    RunPendingCloseTap(tickMs);
+    CheckHidIdleRelease(tickMs);
+    CheckExecAckTimeout(tickMs);
+    if (g_visibilityPollUntil != 0) {
+        if (tickMs >= g_visibilityPollUntil) {
+            // The window closed without the state being observed or the
+            // transition landing. Nothing more is owed: the next cloak event is
+            // the source again.
+            g_visibilityPollUntil = 0;
+            g_visibilityWant = kVisibilityWantNone;
+        } else if (g_lastVisibilityPollTick == 0 ||
+                   tickMs - g_lastVisibilityPollTick >= kVisibilityFallbackMs) {
+            g_lastVisibilityPollTick = tickMs;
+            ServiceRootVisibility(tickMs, true);
+        }
+    }
 }
 
 // A report that names the tracked contact but carries no point is still that
@@ -8342,11 +8699,11 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
             HandleRawInput(reinterpret_cast<HRAWINPUT>(lParam));
             return 0;
         case WM_TIMER:
+            // The fallback tick, armed by the wait planner only when the
+            // high-resolution timer could not be created and only while a
+            // deadline is outstanding. It runs the same pass the timer does.
             if (wParam == kIdleTimerId) {
-                const uint64_t now = GetTickCount64();
-                RunPendingCloseTap(now);
-                CheckHidIdleRelease(now);
-                PollRootVisibility(now);
+                ServiceDeadlineWork(GetTickCount64());
             }
             return 0;
         // The taskbar moved or the display layout changed: the dismiss axis and
@@ -8473,29 +8830,50 @@ DWORD WINAPI HidInputThread(LPVOID) {
     RegisterHidUsage(kUsageTouchScreen, hwnd);
     RegisterHidUsage(kUsagePen, hwnd);
 
-    // The idle tick: a high-resolution waitable timer, because WM_TIMER stays on
-    // the 15.6 ms tick on this build even while a 1 ms period is held. The
-    // WM_TIMER tick stays as the fallback.
-    HANDLE idleTimer = CreateIdleWaitableTimer();
-    if (!idleTimer) {
+    // The deadline timer: a high-resolution waitable timer, because WM_TIMER
+    // stays on the 15.6 ms tick on this build even while a 1 ms period is held.
+    // It is never armed here; the wait planner below arms it for the one deadline
+    // the thread has and disarms it when that is served. The WM_TIMER tick stays
+    // as the fallback for a host that cannot create the timer.
+    HANDLE deadlineTimer = CreateDeadlineTimer();
+    if (!deadlineTimer) {
         TraceLog(L"hid timer fallback err=%u",
                 static_cast<unsigned>(GetLastError()));
-        SetTimer(hwnd, kIdleTimerId, kIdleTimerMs, nullptr);
     }
 
-    // Object 0 is the stop event, then the idle tick when the waitable timer
-    // exists, then the intent, exec-ack and renderer events, then the message
-    // queue. The stop event does not depend on the window: the unload sets it
-    // even if this thread has not published the HWND yet, and it is checked again
-    // after every message batch, because a queued message can win the wait over a
+    // The cloak signal. The event is created and published before the hook is
+    // installed, so no delivery can find a null handle; both are destroyed on
+    // this thread (the hook is unhooked first, so no callback can outlive the
+    // event).
+    HANDLE cloakEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!cloakEvent) {
+        TraceLog(L"hid cloak event failed err=%u",
+                static_cast<unsigned>(GetLastError()));
+    }
+    g_cloakEvent.store(cloakEvent, std::memory_order_relaxed);
+    if (cloakEvent) {
+        g_cloakHook = SetWinEventHook(
+            EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED, nullptr,
+            CloakWinEventProc, GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
+        if (!g_cloakHook) {
+            TraceLog(L"hid cloak hook failed err=%u",
+                    static_cast<unsigned>(GetLastError()));
+        }
+    }
+
+    // Object 0 is the stop event, then the deadline timer and the cloak event,
+    // then the intent, exec-ack and renderer events, then the message queue. The
+    // stop event does not depend on the window: the unload sets it even if this
+    // thread has not published the HWND yet, and it is checked again after every
+    // message batch, because a queued message can win the wait over a
     // just-signalled event.
-    HANDLE waits[6] = {};
+    HANDLE waits[8] = {};
     DWORD waitCount = 0;
     if (g_hidStopEvent) {
         waits[waitCount++] = g_hidStopEvent;
     }
-    if (idleTimer) {
-        waits[waitCount++] = idleTimer;
+    if (deadlineTimer) {
+        waits[waitCount++] = deadlineTimer;
     }
     if (g_ipc.intentEvent) {
         waits[waitCount++] = g_ipc.intentEvent;
@@ -8506,9 +8884,19 @@ DWORD WINAPI HidInputThread(LPVOID) {
     if (g_rendererEvent) {
         waits[waitCount++] = g_rendererEvent;
     }
+    if (cloakEvent) {
+        waits[waitCount++] = cloakEvent;
+    }
 
     MSG msg;
     bool running = true;
+    // Whether the one-shot is currently armed, and whether the WM_TIMER fallback
+    // is. Both exist so a plan that does not change the wake state costs no
+    // syscall: a report-heavy gesture would otherwise cancel and re-arm on every
+    // iteration.
+    bool timerArmed = false;
+    bool fallbackArmed = false;
+    bool timerFailLogged = false;
     // The consumer is ready here: the window exists, both raw-input usages have
     // been registered (a refused registration is logged and leaves the intent
     // half of this thread working, so it does not withdraw availability), the
@@ -8533,14 +8921,16 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
     while (running) {
         // The module appears after this thread starts in the measured host, so
-        // every tick is a chance to begin the fetch. The call is throttled while
-        // the result is pending and stops as soon as ready or refused is set.
+        // the bootstrap deadline (NextInputDeadlineMs) is what brings this thread
+        // back to look. The call is throttled while the result is pending and
+        // stops as soon as ready or refused is set.
         ProbeRootSymbolFromInputThread();
         // Readiness is a continuing capability, not a one-time announcement. A
         // root that is torn down, replaced or invalidated by a failed scalar
         // write must withdraw the peer first; the bridge then passes the press
         // natively instead of swallowing it for a controller that cannot animate
-        // it. The renderer event is the immediate path; this is the safety net.
+        // it. The renderer event is the path that wakes this loop for the
+        // transition; these tests are what turn the wake into a publication.
         if (peerAnnounced && !RendererReady()) {
             SetPeerGone(L"renderer-lost", false);
             peerAnnounced = false;
@@ -8558,17 +8948,63 @@ DWORD WINAPI HidInputThread(LPVOID) {
             rendererWaitLogged = true;
             TraceLog(L"ipc peer withheld reason=no-renderer");
         }
-        // Bounded, so the stop flag is observed even if the stop event were
-        // missing from the set; the event itself is object 0 and wakes this at
-        // once.
-        const DWORD wait =
-            MsgWaitForMultipleObjects(waitCount, waits, FALSE, 10, QS_ALLINPUT);
+
+        // Arm the one thing this thread has to do on a clock, or nothing. The
+        // deadline is recomputed after every wake, so a served deadline disappears
+        // from the plan and its arm is undone here, not in each handler.
+        const uint64_t nowTick = GetTickCount64();
+        const uint64_t deadlineMs = NextInputDeadlineMs(nowTick, QpcMsNow());
+        if (deadlineTimer) {
+            if (deadlineMs != 0) {
+                const bool armed = ArmDeadlineTimer(deadlineTimer, deadlineMs);
+                if (!armed && !timerFailLogged) {
+                    timerFailLogged = true;
+                    TraceLog(L"hid timer arm failed err=%u",
+                            static_cast<unsigned>(GetLastError()));
+                }
+                timerArmed = armed;
+            } else if (timerArmed) {
+                DisarmDeadlineTimer(deadlineTimer);
+                timerArmed = false;
+            }
+        } else if (deadlineMs != 0) {
+            // The fallback's own period is the deadline: a WM_TIMER cannot go
+            // faster than the system quantum, so a sub-quantum deadline arrives
+            // late (the release then lands at 31-34 ms) but it still arrives.
+            fallbackArmed =
+                SetTimer(hwnd, kIdleTimerId, static_cast<UINT>(deadlineMs),
+                         nullptr) != 0;
+        } else if (fallbackArmed) {
+            KillTimer(hwnd, kIdleTimerId);
+            fallbackArmed = false;
+        }
+
+        // Nothing due: wait on the events. The only clock left is the peer
+        // heartbeat, a wait timeout rather than a timer, and it exists only while
+        // this activation advertises a service to keep alive. The one other state
+        // that keeps it is waiting for a root to attach, which the renderer event
+        // announces — the timeout there is the net under that event, and it ends
+        // at the attach. With the peer withheld or gone and no root in reach the
+        // wait is INFINITE: no timer, no poll, no wake.
+        const bool heartbeat = g_peerPublished.load(std::memory_order_relaxed);
+        const bool waitingForRenderer =
+            !peerAnnounced && g_rootHookReady.load(std::memory_order_acquire) &&
+            !RendererReady();
+        const DWORD wait = MsgWaitForMultipleObjects(
+            waitCount, waits, FALSE,
+            (heartbeat || waitingForRenderer)
+                ? static_cast<DWORD>(kPeerHeartbeatMs)
+                : INFINITE,
+            QS_ALLINPUT);
         if (wait == WAIT_TIMEOUT) {
             if (g_hidStopEvent &&
                 WaitForSingleObject(g_hidStopEvent, 0) == WAIT_OBJECT_0) {
                 running = false;
+                continue;
             }
-            CheckExecAckTimeout(GetTickCount64());
+            // The heartbeat itself: the pass publishes the tick and serves any
+            // deadline that came due inside the timeout.
+            ServiceDeadlineWork(GetTickCount64());
             continue;
         }
         if (wait == WAIT_OBJECT_0 + waitCount) {
@@ -8592,12 +9028,14 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 running = false;
                 continue;
             }
-            if (signalled == idleTimer) {
-                const uint64_t now = GetTickCount64();
-                RunPendingCloseTap(now);
-                CheckHidIdleRelease(now);
-                CheckExecAckTimeout(now);
-                PollRootVisibility(now);
+            if (signalled == deadlineTimer) {
+                ServiceDeadlineWork(GetTickCount64());
+                continue;
+            }
+            if (signalled == cloakEvent) {
+                // The event itself is the authority on the transition: one
+                // attribute read, then the same service the poll used to run.
+                ServiceRootVisibility(GetTickCount64(), false);
                 continue;
             }
             if (signalled == g_ipc.intentEvent) {
@@ -8631,10 +9069,22 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 static_cast<unsigned>(GetLastError()));
     }
 
+    // The hook first, then the event it signals: a callback that runs after the
+    // handle is closed would set a recycled handle. Both belong to this thread,
+    // and the unload has already joined it before anything else is freed.
+    if (g_cloakHook) {
+        UnhookWinEvent(g_cloakHook);
+        g_cloakHook = nullptr;
+        TraceLog(L"hid cloak hook removed");
+    }
+    g_cloakEvent.store(nullptr, std::memory_order_relaxed);
+    if (cloakEvent) {
+        CloseHandle(cloakEvent);
+    }
     KillTimer(hwnd, kIdleTimerId);
-    if (idleTimer) {
-        CancelWaitableTimer(idleTimer);
-        CloseHandle(idleTimer);
+    if (deadlineTimer) {
+        CancelWaitableTimer(deadlineTimer);
+        CloseHandle(deadlineTimer);
     }
 
     // Availability goes before anything this activation owns is reset, and it
@@ -11221,7 +11671,10 @@ std::atomic<bool> g_loadHookMatchLogged{false};
 // two full downloads at the measured ~600 KB/s for the 35 MB reference PDB, plus
 // the symbol parse, and still bounded before a user concludes the feature is
 // broken. Input thread only; a fresh image starts them at zero.
-constexpr uint64_t kRootProbeMs = 100;
+//
+// `kRootProbeMs` is the retry interval and, through NextInputDeadlineMs, the wait
+// planner's bootstrap deadline: while the answer is neither ready nor refused,
+// the thread has to come back for the probe.
 constexpr uint64_t kRootPendingDeadlineMs = 120000;
 uint64_t g_rootProbeNextTick = 0;
 uint64_t g_rootProbeFirstTick = 0;
@@ -14606,13 +15059,28 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
 
     HANDLE events[2] = {g_execStopEvent, g_ipc.execEvent};
     for (;;) {
-        // A bounded wait, because this worker also owns the launcher symbol
-        // install. HookSymbols blocks on Windhawk's PDB fetch for
-        // twinui.pcshell.pdb, and running that on a thread Explorer owns freezes
-        // the shell. The timeout only schedules the probe; the command event
-        // still wakes the loop at once.
-        const DWORD wait = WaitForMultipleObjects(
-            2, events, FALSE, static_cast<DWORD>(kExecSymbolProbeMs));
+        // The only deadline this worker owns is the launcher symbol probe. HookSymbols
+        // blocks on Windhawk's PDB fetch for twinui.pcshell.pdb, and running that on
+        // a thread Explorer owns freezes the shell, so the install is scheduled from
+        // here; the command event still wakes the loop at once.
+        //
+        // The probe is throttled by `g_execProbeNextTick` while an attempt is
+        // pending, and it is over for good once the symbols resolved or the 240 s
+        // budget refused them: at that point this wait has no timeout at all and the
+        // worker sleeps on its two events. The executor's own timers — the dismiss
+        // delay, the visibility confirmation and the press latch — are message
+        // timers on the launcher thread's window, which the worker never services,
+        // so they add no wake here; they are listed in the AGENTS contract so a
+        // later change does not turn this into a poll again.
+        DWORD waitMs = INFINITE;
+        if (!g_explorerSymbolsReady.load(std::memory_order_acquire) &&
+            !g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
+            const uint64_t now = GetTickCount64();
+            waitMs = g_execProbeNextTick > now
+                         ? static_cast<DWORD>(g_execProbeNextTick - now)
+                         : static_cast<DWORD>(kExecSymbolProbeMs);
+        }
+        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, waitMs);
         if (wait == WAIT_OBJECT_0) {
             return 0;
         }

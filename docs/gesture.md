@@ -69,7 +69,7 @@ contact lifts.
    position and end speed in one `RevealLateRelease` record. The window it may be
    consumed in is 300 ms measured from its readiness: the release time when the
    menu was closed, or `readyQpc` (the landing) when the pull waited for a close.
-   The idle-tick expiry uses that same clock and skips a record that is still
+   The idle-deadline expiry uses that same clock and skips a record that is still
    deferred. The open
    reads it and settles from the panel's live position with that end speed. A
    live takeover, an admitted newer pull, the consumption and the window
@@ -81,7 +81,9 @@ contact lifts.
    and still ends the contact.
 
 The 18 ms idle still ends a dismiss session that is truly silent, with
-`src=idle`. A band candidate is held for `kCandidateIdleHoldMs` (120 ms)
+`src=idle`. That window is armed as a one-shot deadline at the last report, so
+the release lands 18-19 ms later instead of on the next periodic tick. A band
+candidate is held for `kCandidateIdleHoldMs` (120 ms)
 instead, so a sparse report stream (20–30 ms steps) can still deliver its 25 DIP
 flick; the watchdog that releases it is the missing-lift case and also clears
 the contact latch, the origin, the open-check cache and the tracked identity. A
@@ -126,8 +128,8 @@ intent close -> TakeCloseOwnership -> BeginMirrorCloseSettle(TakeProgressNow())
 A gesture close runs the same pipeline with its own release settle and `exec
 dismiss` at that settle's end; it has no 30 ms lead.
 
-`TakeCloseOwnership` sets `g_suppressRestoreUntil` (the visibility poll must not
-heal the retracted panel), publishes the `closing` direction **before the
+`TakeCloseOwnership` sets `g_suppressRestoreUntil` (the visibility service must
+not heal the retracted panel), publishes the `closing` direction **before the
 settle's first frame**, mutes a contact still on the glass, and clears the reveal
 and `controllerTouch`. That one word is the whole toggle answer while it is set;
 the shell's cloak and state cannot answer it, because they still say open for the

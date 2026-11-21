@@ -37,6 +37,55 @@ would not receive the `WM_SETTINGCHANGE` (`SPI_SETWORKAREA`) and
 `WM_DISPLAYCHANGE` broadcasts that move the taskbar, and those broadcasts are
 the whole event-driven axis refresh (see [geometry.md](geometry.md)).
 
+## What wakes the thread
+
+The thread has no period. It waits on its events — raw input, stop, the bridge's
+intent and executor-ack events, the renderer event — plus one high-resolution
+**one-shot** timer, and the timer is armed only for the soonest deadline the
+state has:
+
+| Deadline | Clock | Window |
+|---|---|---|
+| coast start after the last positioned point | QPC | `kCoastStartMs`, 8 ms |
+| idle release of a dismiss session | QPC | `kIdleReleaseMs`, 18 ms |
+| band candidate's watchdog | QPC | `kCandidateIdleHoldMs`, 120 ms |
+| contact latch and tracked identity expiry | tick | the same 18 ms |
+| the armed close tap | tick | the settle's end (`ScheduleCloseTap`) |
+| a show's executor budget | tick | `kBridgeAckTimeoutMs`, 400 ms |
+| a dismiss's executor budget | tick | `executeAt + 400 ms` |
+| the settled measurement's guaranteed turn | tick | `kSettledMeasureDeadlineMs`, 400 ms |
+| the scroller retry | tick | `g_scrollerRetryAt` |
+| the slow fallback under a transition | tick | `kVisibilityFallbackMs`, 100 ms |
+| the root-hook bootstrap probe | tick | `kRootProbeMs`, 100 ms |
+
+`NextInputDeadlineMs` collects them and returns the minimum; nothing due returns
+0 and the timer is disarmed. A deadline that has already passed is armed at 1 ms
+only where serving it clears the condition that produced it (a one-shot turn, a
+release, a watchdog); the coast start is armed only while it is still ahead,
+because `MaybeCoast` runs again on the release wake. A release that is held —
+a touch show in flight, or a close in flight with a contact owning the panel —
+contributes nothing: its hold ends on a cloak event or an executor answer, and a
+deadline that cannot act would spin the thread.
+
+The open/close state is pushed, not polled: `SetWinEventHook(EVENT_OBJECT_CLOAKED,
+EVENT_OBJECT_UNCLOAKED)` is installed on this thread for its own process and
+filtered to the CoreWindow HWND. The callback takes no lock, reads no XAML,
+queries no DWM and writes no trace; it compares the HWND and sets an auto-reset
+event. The service behind it reads `DWMWA_CLOAKED` once and runs the same
+open/close transition code the old 20 ms poll ran. A transition this mod asked
+for (a show or a dismiss), or has just observed, opens a bounded watch in which
+the slow fallback poll runs at 100 ms, so a missed event cannot leave the state
+stuck; a clean run never uses it (see [limits.md](limits.md)).
+
+The one wake that exists with nothing to do is the peer heartbeat: while this
+activation advertises a service, the wait times out every
+`kSwipePeerTickIntervalMs` (100 ms) to refresh `peerTick`, because the bridge
+reads a tick younger than `kSwipePeerStaleMs` (600 ms). With the peer withheld
+or gone the wait is `INFINITE` — no timer, no poll, no wake. Measured with the
+menu closed and nothing touching the screen, on this build: **190 wakes/s and
+32 DWM cloak queries/s before, 9.2 wakes/s and 0 queries/s after**, and the
+Start host's idle CPU fell from 0.625 % to 0.026 % of one core.
+
 ## Decoding a report
 
 Each report is decoded with `GetRawInputDeviceInfoW(RIDI_PREPARSEDDATA)` +
@@ -92,7 +141,7 @@ evidence clock: `lastEvidenceTick` moves only when the report proves the
 contact — the tracked slot's `TipSwitch`/`InRange` asserts it with no point, or
 the report carries a position this path feeds. A name-only report updates the
 slot and the identifier for diagnostics, then returns: no position, no liveness
-and no clock write. The same 18 ms idle tick, once no session owns the contact,
+and no clock write. The same 18 ms idle deadline, once no session owns the contact,
 forgets an identity whose last evidence is that old — admitted or not — and
 logs `hid identity expired slot=... latch=0` when no contact latch held it, so
 a refused admission cannot strand a name and make every later finger be
@@ -127,7 +176,7 @@ settle's release window spans the open instead of starting at the takeover
 ([gesture.md](gesture.md)). A duplicate is kept on purpose: the window, not the
 buffer, is what collapses a resting finger to one value. A release that ends
 before its menu opens replays the same buffer at the release, into a record the
-same input thread reads when its visibility poll sees the open, so nothing is
+same input thread reads when its visibility service sees the open, so nothing is
 published between them.
 
 Measured layouts on this machine: ELAN2513 Col01 touch is five contact
@@ -138,12 +187,16 @@ on this build, and each was measured separately:
 
 - the idle check needs a **`QueryPerformanceCounter`** silence: `GetTickCount64`
   only advances every 15.6 ms, so an 18 ms window read as 31 ms;
-- the idle tick needs a **`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` waitable
-  timer**: `WM_TIMER` stayed on the 15.6 ms quantum even while the process held
-  a 1 ms `timeBeginPeriod(1)` request. The request is still made, paired through
-  `timeEndPeriod`, for the time a contact is down.
+- the deadline timer needs a **`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` one-shot**:
+  `WM_TIMER` stayed on the 15.6 ms quantum even while the process held a 1 ms
+  `timeBeginPeriod(1)` request. The request is still made, paired through
+  `timeEndPeriod`, for the time a contact is down. `SetTimer` remains the
+  fallback when the timer cannot be created, armed at the deadline itself and
+  therefore 15.6 ms late at worst.
 
-Measured release latency (`relms` on the release line): 31 ms before, 19-23 ms
-after. `vel=` on the `hid release`, `open follow` and `settle` lines is always
+Measured release latency (`relms` on the release line, QPC): 31 ms with the old
+periodic tick, **18-19 ms** with the one-shot deadline. The window is still the
+same 18 ms product decision; only the wake that lands it got exact.
+`vel=` on the `hid release`, `open follow` and `settle` lines is always
 DIP/ms toward that settle's target, so a finger held still reads `vel=0.00` on
 all three.

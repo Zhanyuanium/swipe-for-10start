@@ -32,7 +32,9 @@ notices.
 
 input.md: why Raw Input; the report decode (report IDs, `TipSwitch`/`InRange`,
 contact identity and its evidence clock, the coordinate-only fallback), the
-liveness and idle rules, and the release timers.
+liveness and idle rules, the release deadlines, and what wakes the input thread
+(events, the one one-shot deadline, the cloak event and its fallback poll, the
+peer heartbeat) with the measured idle cost.
 
 gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admission
 and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry

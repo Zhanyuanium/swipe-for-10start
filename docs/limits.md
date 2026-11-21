@@ -85,6 +85,42 @@
   it. A press already swallowed and then lost (peer or epoch changed before the
   serve) has no shell path left; it is dropped, not passed on.
 
+## The idle cost
+
+The mod is loaded all day on the tablets and touch laptops it targets, so what
+it does with nothing happening is a product number, not an implementation
+detail. Measured on this build with the menu closed and nothing touching the
+screen, for 60 s, with a counter build of each version and the same session
+afterwards for the CPU figure:
+
+| | input-thread wakes | `DwmGetWindowAttribute` | Start host CPU | Explorer CPU |
+|---|---|---|---|---|
+| before (5 ms period + 20 ms poll) | 190.6 /s | 32 /s | 0.625 % of one core | 1.615 % |
+| after (one-shot deadlines + cloak event) | 9.2 /s | 0 | 0.026 % | 1.094 % |
+
+The remaining 9.2 wakes/s are the peer heartbeat: `peerTick` must stay younger
+than the bridge's 600 ms staleness window, and it is refreshed only while this
+activation advertises a service. With the peer withheld or gone the wait is
+`INFINITE` and the thread does not wake at all. Explorer's figure includes its
+own idle work and the other installed mods; the Explorer half's own share is
+the symbol-probe worker, which now blocks on its events instead of waking every
+100 ms once the launcher symbols resolved (or were terminally refused).
+
+The 20 ms poll was 32 queries a second, not 50: `kOpenCheckIntervalMs` is
+compared against the 15.6 ms tick clock, so the throttle quantised to two
+quanta. The new figure is 0 because the cloaked attribute is read only when a
+cloak event arrives.
+
+**A missed cloak event costs latency, not correctness.** Every transition the
+mod asks for (a show or a dismiss) or has just observed opens a bounded watch
+in which the slow fallback polls at 100 ms, so a dropped or delayed
+`EVENT_OBJECT_CLOAKED`/`UNCLOAKED` still lands the open or the close; the
+measured drill (a build with the hook deliberately not installed) landed both
+states with `win state fallback open=1` and `win state fallback open=0`. A clean
+run never writes that line. A band pull that the shell opens natively, without
+a show request from this mod, opens the same watch when the contact is admitted,
+so it is covered too.
+
 ## The touch show
 
 - **The digitizer may go quiet during the uncloak and during a close.** The
@@ -92,7 +128,8 @@
   touch show is in flight (`controllerTouch`/`g_intentOpenActive`), or a close
   is in flight with a reveal candidate, the idle is skipped. A real lift is a
   report and still ends the gesture with `src=report`; a genuine silence after
-  those windows ends it with `src=idle`.
+  those windows ends it with `src=idle`. A held release arms no deadline at all:
+  the hold ends on the cloak event or on the executor's answer.
 - **The cold entry is 0.000.** The first open after a host start has no settled
   geometry (the measurement is deferred while the panel is owned), so the settle
   starts at 0 and the takeover chases. A warm auto-hidden open uses 0.255 (the
@@ -114,12 +151,13 @@
 
 ## The taskbar
 
-- **Current layout: auto-hidden** (auto-hide on): work `0,0,1440,900`, the bar
-  off screen, band `804..900`, panel `236,265..1229,840`, trail 265, Distance
-  852. The Start button is off screen until the bar is revealed; the
-  Start-button test hovers the bottom edge first. The docked layout (work
-  `0,0,1440,852`, tray `0,852..1440,900`, Distance 900) is historical and its
-  work area is never the current one.
+- **Current layout: left, docked** (`axis=0`): work `48,0,1440,900`, the bar at
+  `0,0..48,900` (96 physical wide), band `0..96`, panel `60,151..1053,726`, trail
+  1053, Distance 1392; measured 2026-11-21. The bottom docked layout (work
+  `0,0,1440,852`, tray `0,852..1440,900`, Distance 852) and the bottom auto-hidden
+  layouts are historical and their numbers are not the current ones. The smoke
+  reads the axis, band, rectangle and scale from the mod's own log lines, so it
+  runs on whichever edge is live.
 - The auto-hidden bar once stopped revealing after an injected-touch session
   (`Shell_TrayWnd` stayed at `0,899,1440,947`, `ABM_GETSTATE=1`, Win+`T` did not
   draw it); that state is historical. The Win/touch/click-away paths do not

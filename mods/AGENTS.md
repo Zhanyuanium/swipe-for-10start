@@ -55,7 +55,8 @@ gate reads. `peerEpoch` is claimed once per attach; `peerState=alive` is
 published only by the input thread once its window, its message loop and its
 intent event exist (intent-consumer readiness — a refused raw-input registration
 is logged and does not withdraw it), and the tick is refreshed from that thread's
-idle tick and every positioned report at most once per 100 ms. Readiness is
+deadline service on every wake and from every positioned report, at most once per
+100 ms, and only while the peer is advertised. Readiness is
 continuing: `RendererReady()` (root attached and not invalidated) is part of the
 announcement, and a renderer loss withdraws
 (`ipc peer gone reason=renderer-lost terminal=0`) before the bridge can intercept;
@@ -67,6 +68,41 @@ leaves for any reason. Publication and the terminal withdrawal share one SRW
 critical section, so a startup cannot write `alive` after the unload wrote `gone`;
 the consumer withdraws before it unregisters its devices, and a renderer
 republish that races the unload is refused by the same lock.
+
+**What wakes the input thread.** There is no period. The thread waits on the
+stop event, the bridge's intent and executor-ack events, the renderer event, the
+cloak event and one high-resolution one-shot timer, and `NextInputDeadlineMs`
+arms that timer for the soonest deadline only: the 8 ms coast start, the 18 ms
+idle release, the 120 ms candidate watchdog, the 18 ms latch/identity expiry, the
+armed close tap, the show/dismiss executor budgets, the settled measurement's
+400 ms guaranteed turn, the scroller retry, the fallback watch and the root-hook
+bootstrap probe. Nothing due disarms it. A held release (a touch show in flight,
+a close in flight with a contact on the panel) contributes no deadline: its hold
+ends on a cloak event or an executor answer, and a deadline that could not act
+would spin. The tick-domain deadlines are armed at 1 ms when already past
+because serving them clears them; the coast start is armed only while ahead.
+
+The open/close state is pushed. `SetWinEventHook(EVENT_OBJECT_CLOAKED,
+EVENT_OBJECT_UNCLOAKED)` is installed and removed on the input thread, scoped to
+this process and filtered to the CoreWindow HWND; the callback takes no lock,
+reads no XAML, queries no DWM and writes no trace — it sets an auto-reset event
+and nothing else. `ServiceRootVisibility` reads `DWMWA_CLOAKED` once per signal
+and runs the transition code the 20 ms poll used to run. A requested or freshly
+observed transition opens `g_visibilityPollUntil`, in which `ServiceDeadlineWork`
+runs the slow 100 ms fallback poll (`win state fallback open=...` when it, not
+the event, saw the change); a band contact that the shell may open natively opens
+the same watch. The watch is bounded (`kVisibilityGraceMs` 1000 ms for a request,
+`kVisibilitySettleWatchMs` 500 ms after an observation), so nothing polls while
+no transition is outstanding.
+
+The only idle wake is the peer heartbeat: while `peerState=alive`, the wait times
+out every 100 ms to refresh `peerTick`; with the peer withheld or gone it is
+`INFINITE`. Before its first publication the thread additionally wakes every
+100 ms until the renderer attaches, which is the net under the renderer event.
+Measured with the menu closed, the old build woke 190.6 times/s and queried
+`DwmGetWindowAttribute` 32 times/s; this one wakes 9.2 times/s and queries it
+zero times, and the Start host's idle CPU fell from 0.625 % to 0.026 % of one
+core (see [../docs/limits.md](../docs/limits.md)).
 
 **M3 paths.**
 - `ApplyBridgeIntent` — the only intent consumer. The record is passed to
@@ -143,10 +179,12 @@ republish that races the unload is refused by the same lock.
   (`intent open recovered entry=...`); the ticket is bound to the open tick,
   so a landing for another menu cannot serve it. The landing first reconciles an
   already-published `external` intent
-  (`intent reconcile ... (before landing recovery)`) because the idle timer
-  outranks the intent event. Both landing opens run the one `BeginLandingOpen`
+  (`intent reconcile ... (before landing recovery)`) because the cloak event and
+  the intent event are separate wakes and the landing reads the intent record
+  itself before it acts. Both landing opens run the one `BeginLandingOpen`
   transaction; the pull keeps its precedence and marks the touch.
-- The 18 ms idle is held through a touch show and through a close in flight, so
+- The 18 ms idle is a one-shot deadline armed at the last report, and it is held
+  through a touch show and through a close in flight, so
   the digitizer's pause during the key/hide cannot drop the contact. A band
   candidate has its own watchdog (`kCandidateIdleHoldMs`, 120 ms): a sparse
   report stream must not expire an admitted flick before it reaches 24 DIP, and
@@ -166,7 +204,9 @@ its debug switch; the root is resolved by symbol.
 **Lifecycle.** No pin and no instance guard: Windhawk unloads the image, so the
 role quiesces before it returns. The stop event is created before the input
 thread; `Wh_ModBeforeUninit` withdraws the peer, signals the thread and joins it
-`INFINITE` (never on that thread). The thread unregisters raw input, releases the
+`INFINITE` (never on that thread). The thread unhooks the WinEvent hook, clears
+the published cloak handle, closes the cloak event and the deadline timer,
+unregisters raw input, releases the
 1 ms timer period, destroys its window and unregisters its fixed class under
 `&__ImageBase` before exiting; a failed unregister is retried, never returned as
 success. Registration is fixed-name and treats `ERROR_CLASS_ALREADY_EXISTS` as
@@ -221,11 +261,17 @@ file-version/timestamp compare, the executable-range check and the prologue/body
 probes are deleted. The `LoadLibraryExW` notification only records the returned
 module; the executor worker runs the resolution, because the first call starts
 Windhawk's PDB fetch and blocking a thread Explorer owns freezes the shell. The
-worker probes at most once per 100 ms, so a false result while the fetch runs is
+worker's wait has a deadline only while that probe is unresolved: it is throttled
+to one attempt per 100 ms, so a false result while the fetch runs is
 pending (`exec launcher symbols pending attempt=... waited=...ms
 deadline=240000ms`), never a refusal. The deadline produces `unresolved` and no
 launcher hook; a still-blocked fetch leaves the mod passive (the shell's own
-path serves every trigger) but never blocks Explorer. Each resolved address is
+path serves every trigger) but never blocks Explorer. **Once the symbols resolve
+or the deadline terminally refuses them, the worker's wait is `INFINITE`**: it
+blocks on the stop and Exec events and wakes only for a command. The executor's
+own timers — the dismiss delay, the visibility confirmation and the press latch —
+are message timers on the launcher thread's window, which the worker never
+services, so a pending close adds no wake to it. Each resolved address is
 logged against the reference RVA (`exec launcher symbol label=... rva=...
 expected=... match=0|1`); the set line
 `exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence

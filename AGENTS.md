@@ -86,7 +86,8 @@ while the window is up. A dismiss already inside the shell's `Dismiss` call
 cannot be recalled; the window hides, and the landing reissues that open once
 (`intent open recovered entry=...`) — after reconciling an `external` intent that
 arrived with the landing (applying the record it examined, not a second read),
-because the idle timer outranks the intent event. A
+because the cloak event and the intent event are separate wakes and the landing
+reads the intent record itself. A
 shell hide in flight (`InternalState` 9/11), or an executor dismiss already armed
 at the bridge, latches the press (one slot, with its tick and **the epoch the
 admission was decided under**). The hidden event arms a 50 ms timer and the timer
@@ -154,7 +155,7 @@ An intent close is
 `TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
 `Dismiss` on the launcher thread. The close suppression keeps the visibility
-poll from healing the retracted panel before the dismiss lands.
+service from healing the retracted panel before the dismiss lands.
 
 The close is judged by behaviour: the shell's hidden event (`own state
 event=hidden open=0`), the executor's `confirmed` (hidden) at its bounded 300 ms
@@ -169,7 +170,7 @@ candidate **as an arbitration mechanism**, and the reveal claim. The deferred
 candidate still has one live use, and it is not arbitration:
 `BeginEdgeCandidate` (the touch show's band admission) calls `StartRevealFollow`
 with `deferred=true` while `CloseInFlight`, so a contact that lands during a
-close is tracked without writing `Progress`; the landing (`PollRootVisibility`)
+close is tracked without writing `Progress`; the landing (`ServiceRootVisibility`)
 releases it. `CloseInFlight` remains only as the
 suppression-window predicate: the settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
@@ -199,18 +200,27 @@ the peer epoch.
 
 Windows 11 10.0.26100.9949, ExplorerPatcher legacy Start
 (`Start_ShowClassicMode=1`), 2880x1800 physical at 200 % (1440x900 DIP).
-**Current layout: auto-hidden** (auto-hide on): work `0,0,1440,900`, the bar off
-screen, band `804..900`, panel `236,265..1229,840`, trail 265, Distance 852. The
-docked layout (work `0,0,1440,852`, tray `0,852..1440,900`) and the earlier
-auto-hidden variant (panel `236,167..1229,840`, trail 167) are historical; their
-numbers are not the current ones. The Start button is off screen until the bar
-is revealed; the button test hovers the bottom edge first, then clicks physical
-`(36,1748)`.
+**Current layout: left, docked** (`axis=0`): work `48,0,1440,900`, the bar at
+`0,0..48,900` (96 physical wide), band `0..96`, panel `60,151..1053,726`, trail
+1053, Distance 1392; measured 2026-11-21. The bottom docked layout (work
+`0,0,1440,852`, tray `0,852..1440,900`, band `804..900`, Distance 852), the
+bottom auto-hidden layout (work `0,0,1440,900`, band `804..900`, panel
+`236,265..1229,840`, trail 265) and the earlier bottom auto-hidden variant (panel
+`236,167..1229,840`, trail 167) are historical; their numbers are not the current
+ones. The smoke reads the axis, band, panel rectangle and scale from the mod's own
+log lines, so it runs on whichever edge is live.
 
 ## Rules
 
 - One data source per claim: the cloak decides the shell state, the controller's
   published direction decides the toggle, the geometry snapshot decides the mapping.
+- No period. The Start side's input thread arms one high-resolution one-shot for
+  the soonest deadline it has and disarms it when that is served; the open/close
+  state is a WinEvent, not a poll, with a bounded 100 ms fallback while a
+  transition is outstanding. The only idle wake is the 100 ms `peerTick`
+  heartbeat, and only while the peer is advertised. The Explorer worker blocks
+  on its events once the launcher symbols resolved or were refused. A change that
+  reintroduces a periodic tick or a state poll is a regression.
 - A mapped channel is not a live peer. Interception needs the Start side's
   `peerState=alive` and a `peerTick` younger than 600 ms; otherwise the shell's
   own path runs. Availability is published only by the ready consumer and

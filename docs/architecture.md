@@ -140,8 +140,9 @@ second 300 ms probe keeps the bounded obligation and logs
 `exec dismiss unconfirmed seq=... visible=visible at_call=1 after=<real ms>`; a
 probe that cannot answer (no launcher, a failed call, an unarmed timer) is
 `unknown`. The Start side treats `unconfirmed` and `unknown` as a terminal
-repair — release the direction, drop the ticket, read the cloak on the next poll
-— because a dismiss that is not observed to hide the window is not a hide.
+repair — release the direction, drop the ticket, read the cloak on the next
+transition — because a dismiss that is not observed to hide the window is not a
+hide.
 
 A command is not run late. The controller gives each one 400 ms from its
 scheduled time (the dismiss's `executeAt`, or the publication tick of a show);
@@ -219,6 +220,18 @@ stop is served natively by the shell; that is the intended trade, because an
 does not exist. A press the bridge has already swallowed is a different case:
 it is ours, and the recovery paths below decide it.
 
+That thread has no period. It waits on the stop event, the intent and
+executor-ack events, the renderer event, the cloak event, and one high-resolution
+one-shot armed for the soonest deadline only; `docs/input.md` lists the deadlines
+and their clocks. A release that cannot act (a touch show in flight, a close in
+flight with a contact on the panel) arms nothing, and with no deadline the timer
+is disarmed. The open/closed state is `EVENT_OBJECT_CLOAKED`/`UNCLOAKED` on the
+CoreWindow, delivered to that thread; the callback only sets an event, and the
+service behind it reads the cloaked attribute once. A bounded 100 ms fallback
+poll runs while a requested or just-observed transition is outstanding, so a
+missed event costs latency, not state. The one idle wake is the 100 ms
+`peerTick` heartbeat, and only while the peer is advertised.
+
 The close intent's capability is checked separately (`HideCanServeClose`): peer,
 the caller wrappers, a started worker, the **recorded** launcher thread (a Hide
 never adopts one), a window on that thread, and a callable `Dismiss`. One missing
@@ -271,13 +284,14 @@ and the confirmation probe); past it, the command cannot still be inside the
 shell, so a later landing is not served. A refused, expired or superseded answer
 for **that sequence** retires it before the pending-slot gate, which the open
 that cancelled the close has already cleared; the landing, a new close and an
-external takeover retire it explicitly. A still-open poll does not clear it: an
+external takeover retire it explicitly. A still-open state read does not clear
+it: an
 entered `Dismiss` may land at any point while the window is up. Before a landing
 may recover it reconciles an already-published `external` intent
 (`intent reconcile ... (before landing recovery)`) and applies the record it
-examined, not a second read, because the idle timer is
-waited on before the intent event and processing the takeover afterwards would
-not revoke a Show the landing had already issued.
+examined, not a second read: the cloak event and the intent event are separate
+wakes, so processing the takeover after the landing would not revoke a Show the
+landing had already issued.
 The
 click-away that the shell issues while the window is appearing (state 1/3) is
 swallowed only from the `ActiveZBand` caller (`caller=clickaway`,
@@ -295,7 +309,8 @@ visible) or `unknown` (no launcher, no state, a failed probe, or no timer). The
 Start side keeps the command identity in `g_pendingDismissConfirm` after the
 executed ack clears the pending slot, and an unconfirmed or unknown result is a
 terminal repair: ownership is released, the ticket dies by its own sequence, and
-the next poll reads the cloak. A superseded confirmation is reported separately
+the next transition reads the cloak. A superseded confirmation is reported
+separately
 and needs no repair.
 
 "Never lost" is the intent of the mechanism, not a theorem. The cases it does not
@@ -402,7 +417,7 @@ settle's first frame, mutes the contact, clears the reveal) and runs
 `BeginMirrorCloseSettle` from `TakeProgressNow()`: the open curve played
 backwards, full travel (387 ms at the current 852 DIP; 409 ms at the docked 900).
 The dismiss is scheduled at the end
-plus 30 ms. The bridge's timer runs `Dismiss`; the shell's hidden event follows
+plus 30 ms. The bridge's timer runs `Dismiss`; the shell's cloak event follows
 and the Start side logs `win close observed`, clears the direction and
 `controllerTouch`, and the next open is ready. The close is
 judged by that hidden event and the executor's `confirmed` (hidden) at its 300 ms
@@ -417,7 +432,8 @@ not because the shell's state does. The open intent takes the live panel, drops
 the local dismiss slot, cancels a pending `exec dismiss` and settles back to 1
 (`intent open cancel from=...`); the window never hides. The dismiss can already
 be inside the shell's `Dismiss` call when that press lands
-(a 1–15 ms window); the close then lands and the next poll reissues the open
+(a 1–15 ms window); the close then lands and the next transition reissues the
+open
 (`intent open recovered entry=...`), so that particular press is recovered — it is
 the one race this ticket exists for. A press during a
 shell hide (state 9/11) or with an armed executor dismiss is latched and served
@@ -444,8 +460,9 @@ ended `progress=0.91 behind=0.000 commit=1`, menu open; a contact resting at
 898 DIP through the same close left the menu closed. The auto-hidden entry is
 0.255.
 
-The suppression is what keeps the visibility poll from "healing" the panel that
-the close has retracted: without it the poll saw a shown window with the panel
+The suppression is what keeps the visibility service from "healing" the panel
+that
+the close has retracted: without it the service saw a shown window with the panel
 at 0 and started an open settle between the settle end and the dismiss
 (`win open unhealed`), a flash. `TakeCloseOwnership` now sets it for the intent
 close too.

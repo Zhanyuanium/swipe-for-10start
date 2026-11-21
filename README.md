@@ -152,6 +152,16 @@ without an Explorer restart on this build.
 - While the menu is being dragged, its contents still receive touches at their
   original positions — a known limit, along with the assumption that the touch
   panel covers the primary monitor.
+- **The mod is asleep when nothing is happening.** No periodic 5 ms timer runs:
+  one high-resolution one-shot is armed only while a gesture, a settle, a
+  scheduled close or a pending executor command needs it, and the open/closed
+  state arrives as a window event instead of a 20 ms poll. Measured with the
+  menu closed and nothing touching the screen: **9.2 wakes a second (was 190)**
+  and **no cloak queries (was 32 a second)**; the Start host's idle CPU fell
+  from 0.625 % to 0.026 % of one core. The one recurring wake is the 100 ms
+  liveness tick the Explorer half needs while the mod is serving it. If a cloak
+  event is ever missed, a slow 100 ms fallback poll lands the state inside a
+  bounded watch.
 - The full technical documentation — what was measured, what was falsified,
   and every design decision — lives in [docs/](docs/README.md), including the
   complete [known-limits list](docs/limits.md).
