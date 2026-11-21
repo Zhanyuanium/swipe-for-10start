@@ -517,7 +517,10 @@ suppressed the shell's open storyboard. `PrepareRootElement` is resolved with on
 `HookSymbols` call, and that call runs on the mod's input thread: the first
 symbol load starts Windhawk's PDB fetch, and blocking the shell's loader thread
 makes the menu host look hung to the watchdog, which restarts it and restarts the
-fetch. The `LoadLibraryExW` notification only records the returned module, and so
+fetch. The apply (`Wh_ApplyHookOperations`) is inside the same symbol-install
+lock as the resolution, so `BeforeUninit` either waits for the complete install or
+makes it refuse before `HookSymbols`; no root hook can become live after the stop.
+The `LoadLibraryExW` notification only records the returned module, and so
 do the init and AfterInit probes (`GetModuleHandleW` only): the input thread's
 first tick installs from the record, which keeps the warm case fast without any
 symbol work on a shell thread. A

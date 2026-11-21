@@ -177,7 +177,11 @@ returning success. The root hook is resolved by public symbol
 init/AfterInit probes only record the module handle (`GetModuleHandleW`), and
 the input thread runs `HookSymbols` on its first tick, because
 the first call starts Windhawk's PDB fetch and blocking the shell's loader
-thread makes the menu host look hung. A false result while the fetch runs is
+thread makes the menu host look hung. The apply (`Wh_ApplyHookOperations`) runs
+inside the same symbol-install lock, before the lock is released: `BeforeUninit`
+either waits for the complete install or takes the lock first and makes the
+install refuse before `HookSymbols`, so no root hook becomes live after the
+stop. A false result while the fetch runs is
 pending (logged with its attempt, elapsed time and the 120 s deadline) and is
 retried; only the deadline produces `unresolved`, no root hook and no peer
 service. The peer is published only once the root is attached: `PublishPeerReady`

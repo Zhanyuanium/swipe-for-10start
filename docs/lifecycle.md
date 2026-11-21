@@ -23,7 +23,10 @@ reachable.
 1. **`Wh_ModBeforeUninit`** takes the symbol-install lock and sets `g_disabled`,
    sets `g_unloading`, stops the async dismiss callback, and withdraws peer
    availability (`PublishPeerGone`: `peerState=0` plus `controllerDirection=0`
-   plus `controllerTouch=0`) before the consumer is stopped. It signals the input
+   plus `controllerTouch=0`) before the consumer is stopped. The root install
+   applies its queued hook under that same lock, so a stop here either waits for
+   a complete install or makes the next install refuse before `HookSymbols`. It
+   signals the input
    thread's stop event and posts `WM_QUIT` as a second signal for a queued
    message, then joins the thread **INFINITE**, never on that thread.
 2. The **input thread** unregisters raw input, releases the 1 ms timer period

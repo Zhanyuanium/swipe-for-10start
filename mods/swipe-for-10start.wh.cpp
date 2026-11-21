@@ -11233,8 +11233,10 @@ bool InstallStartUIHooks(HMODULE module) {
     }
 
     AcquireSRWLockExclusive(&g_startUIHookLock);
-    // Claim the image before the symbol load: two install paths must not load
-    // symbols for the same image at once.
+    // The lock is the stop barrier BeforeUninit takes, so a stop and this
+    // install cannot interleave. The claim also marks the image this call is
+    // resolving, so a refused result is retried later rather than resolved twice
+    // at once.
     HMODULE expected = nullptr;
     if (!g_startUIHookModule.compare_exchange_strong(expected, module)) {
         ReleaseSRWLockExclusive(&g_startUIHookLock);
@@ -11269,6 +11271,13 @@ bool InstallStartUIHooks(HMODULE module) {
 
     const uintptr_t rva = resolved - base;
     g_rootHookReady.store(true, std::memory_order_release);
+    // The apply belongs to this serialized install, not to the caller. A stop
+    // that takes this lock between the return and a caller-side apply would
+    // return while this thread still added the root hook. Applying here means
+    // BeforeUninit either waits for the complete install or sees g_disabled and
+    // makes this call refuse before HookSymbols.
+    Wh_ApplyHookOperations();
+    TraceLog(L"root install applied tid=%u", GetCurrentThreadId());
     ReleaseSRWLockExclusive(&g_startUIHookLock);
 
     TraceLog(L"startui root symbol resolved base=0x%llX at=0x%llX rva=0x%llX "
@@ -11339,9 +11348,7 @@ void ProbeRootSymbolFromInputThread() {
     }
 
     if (InstallStartUIHooks(module)) {
-        // The hook is queued; apply it now, from this thread (allowed until
-        // BeforeUninit returns).
-        Wh_ApplyHookOperations();
+        // The install applied its own queued hook under the lock.
         return;
     }
     if (g_rootHookReady.load(std::memory_order_acquire) ||
