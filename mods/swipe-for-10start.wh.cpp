@@ -53,8 +53,9 @@ Known limits:
 - If the launcher's private symbols or the menu layout are unavailable, the mod
   steps aside and the shell handles every press natively; the Start side also
   withdraws while the menu's root is replaced or a failed write invalidates it.
-- Tested with a bottom taskbar on one 2880x1800 display at 200%; the gesture
-  reads the taskbar's edge, but only the bottom layout has been exercised.
+- Tested on one 2880x1800 display at 200 %: the live left docked taskbar and,
+  earlier, the bottom layouts. The gesture reads the taskbar's edge rather than
+  assuming a side.
 
 The repository has the [user guide](https://github.com/Zhanyuanium/swipe-for-10start#readme)
 and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/limits.md).
