@@ -305,29 +305,41 @@ void TraceLog(const wchar_t* format, ...) {
     if (!g_traceSeeded) {
         SeedTraceLines(path);
     }
-    // FILE_WRITE_DATA is what SetEndOfFile needs; FILE_APPEND_DATA keeps the
-    // writes at the end. The cap is only reset when the truncation succeeded.
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA | FILE_WRITE_DATA,
+    // The cap is cut on its own handle: SetEndOfFile needs FILE_WRITE_DATA, and
+    // a handle that carries FILE_WRITE_DATA does not append — measured on this
+    // system, FILE_APPEND_DATA|FILE_WRITE_DATA writes at offset 0. The line is
+    // then written through an append-only handle, so one line is one append
+    // from either activation.
+    if (g_traceLines >= kTraceMaxLines) {
+        HANDLE cut = CreateFileW(path, GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD error = 0;
+        bool truncated = false;
+        if (cut != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER zero{};
+            const BOOL moved = SetFilePointerEx(cut, zero, nullptr, FILE_BEGIN);
+            truncated = moved && SetEndOfFile(cut);
+            error = truncated ? 0 : GetLastError();
+            CloseHandle(cut);
+        } else {
+            error = GetLastError();
+        }
+        if (!truncated) {
+            g_traceCapFailed.store(true, std::memory_order_relaxed);
+            ReleaseSRWLockExclusive(&g_traceLock);
+            Wh_Log(L"DiagnosticTrace stopped: the trace file could not be "
+                   L"truncated at its %u-line cap (err=%u); Wh_Log keeps "
+                   L"receiving the lines",
+                   kTraceMaxLines, error);
+            return;
+        }
+        g_traceLines = 0;
+    }
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
-        if (g_traceLines >= kTraceMaxLines) {
-            LARGE_INTEGER zero{};
-            const BOOL moved = SetFilePointerEx(file, zero, nullptr, FILE_BEGIN);
-            const BOOL cut = moved && SetEndOfFile(file);
-            if (!cut) {
-                const DWORD error = GetLastError();
-                CloseHandle(file);
-                g_traceCapFailed.store(true, std::memory_order_relaxed);
-                ReleaseSRWLockExclusive(&g_traceLock);
-                Wh_Log(L"DiagnosticTrace stopped: the trace file could not be "
-                       L"truncated at its %u-line cap (err=%u); Wh_Log keeps "
-                       L"receiving the lines",
-                       kTraceMaxLines, error);
-                return;
-            }
-            g_traceLines = 0;
-        }
         DWORD written = 0;
         WriteFile(file, utf8, static_cast<DWORD>(bytes - 1), &written, nullptr);
         WriteFile(file, "\r\n", 2, &written, nullptr);

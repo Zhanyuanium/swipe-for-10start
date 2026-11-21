@@ -27,7 +27,10 @@ line to `<mod storage>\renderer.log` or `\bridge.log` only while
 tools read. The cap is `kTraceMaxLines` (20,000 lines): the line count is seeded
 from the existing file and the next write truncates it; the counter resets only
 when the truncation succeeded, and a failure stops the file half for the session
-with one `Wh_Log` line naming the error. Formatting is truncating
+with one `Wh_Log` line naming the error. The cut has its own `FILE_WRITE_DATA`
+handle and the line is written through a `FILE_APPEND_DATA` handle: a handle
+with both bits does not append (measured: writes at offset 0). Formatting is
+truncating
 (`_vsnwprintf_s`/`_snwprintf_s` with `_TRUNCATE`) so a long setting or object
 name cannot terminate the host through the CRT invalid-parameter handler. The
 setting is read at init and on every settings change; there is no other debug

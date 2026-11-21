@@ -35,7 +35,10 @@ enabled, and it appends the same line to the role's file only while the
 `t=<GetTickCount64>` prefix the regression tools read. The file is capped at
 `kTraceMaxLines` (20,000 lines): the count is seeded from the existing file and
 the next write truncates it, and the counter is reset only when the truncation
-succeeded. A failed truncation stops the file half for the session and logs why
+succeeded. The cut uses its own `FILE_WRITE_DATA` handle and the line is then
+written through a `FILE_APPEND_DATA` handle: a handle carrying both bits does not
+append (measured: it writes at offset 0 and overwrites the trace from the start).
+A failed truncation stops the file half for the session and logs why
 once; `Wh_Log` keeps the line. Formatting is truncating
 (`_vsnwprintf_s`/`_snwprintf_s` with `_TRUNCATE`), so a long setting or object
 name can never reach the CRT invalid-parameter handler. The setting is read at
