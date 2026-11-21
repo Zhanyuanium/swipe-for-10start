@@ -7,12 +7,30 @@ pixels, by diffing each frame against a closed-menu baseline.
 .DESCRIPTION
 The mod's log can prove that a takeover happened; it cannot prove that the panel
 turned around instead of retracting to the hidden endpoint. This tool measures
-the pixels: it captures one narrow band of the panel with a reused DIB, diffs
+the pixels: it captures one thin strip across the panel with a reused DIB, diffs
 every frame against a closed-menu baseline, and reports the extreme coordinate of
 the changed region along the panel's scan axis — the panel's trailing edge, the
-side that faces away from the taskbar. On the live left docked bar (axis 0) that
-edge is vertical and the scan runs along x; the axis=1/3 branch scans along y, so
-the tool is not left-bar-only.
+side that faces away from the taskbar.
+
+The axis is the mod's own `dismiss axis` (0 left, 1 top, 2 right, 3 bottom), so
+the trailing edge and the direction of travel follow the dock:
+
+    axis 0 (left)    trailing = the panel's right edge,  the edge grows with Progress
+    axis 1 (top)     trailing = the panel's bottom edge, the edge grows with Progress
+    axis 2 (right)   trailing = the panel's left edge,   the edge shrinks with Progress
+    axis 3 (bottom)  trailing = the panel's top edge,    the edge shrinks with Progress
+
+`trail * scale` is the fully-open edge on every dock, because the trail is
+derived from the panel rectangle. The panel instead becomes *visible* at the
+bar's inner edge, which is the midpoint of the run's `band=low,high`: on a docked
+bar that midpoint equals the work area's edge, and on an auto-hidden bar the work
+area reaches the screen edge while the band's midpoint is one bar thickness
+inside it. The tool therefore derives two edges in physical pixels — `open =
+trail * scale` and `entry = band midpoint * scale` — prints both beside the work
+area's own edge, and validates the scan against them. The strip spans from that
+midpoint to just past the fully-open edge, so it stays out of the taskbar, and
+it sits 15% of the panel's extent across the scan axis, away from the injected
+finger.
 
 Geometry comes from the mod, never from this file: the axis, panel rectangle, band
 and work area are read from the newest `reveal panelTrail` line written at or
@@ -26,12 +44,15 @@ geometry is refused, never guessed.
 Progress uses the mod's own mapping (`RevealProgressDip`): the composition moves
 the trail edge by `(1 - Progress) * Dir * Distance`, so
 `Progress = 1 - (edge - trail) / (Dir * Distance)` with `Dir` -1 on a left or top
-taskbar and +1 on a right or bottom one. The mapping and its numbers are printed
-with every run.
+taskbar and +1 on a right or bottom one. The mapping, the derived edges and the
+progress at each edge are printed with every run.
 
 Timing: one DIB, no sleep between frames, and each `t` is stamped immediately
 before its `BitBlt`; the reported period is what the host delivered (the copy's
-own cost is printed as `cap=` in the summary, not in the table).
+own cost is printed as `cap=` in the summary, not in the table). The closed
+baseline is taken after `-CooldownMs`, because an auto-hidden bar can still be
+sliding down after the close: a baseline captured mid-slide is not the closed
+desktop, and the verify frame right after it sees the bar somewhere else.
 
 Triggers. `-WinTap` taps VK_LWIN to open the menu, taps again `-CloseAtMs` later,
 and samples the whole close. `-Observe` samples a window whose triggers the caller
@@ -41,11 +62,11 @@ hold, one real release) through `tools/touch_common.ps1`. In `-WinTap` the offse
 are measured from the close tap, so an offset names a moment inside the retract;
 in `-Observe` they are measured from the first sample.
 
-What it cannot prove: the hidden part of the travel (once the panel is behind the
-taskbar or the window is cloaked there are no pixels left to read), the panel's
-internal state, or anything about a frame the compositor had not presented when
-the BitBlt ran. A sample with no changed region is reported as `edge=-1`, never as
-progress 0.
+What it cannot prove: the part of the travel under the bar's own strip (below
+the band's midpoint, where the panel is behind the bar or the window is cloaked
+and no pixels of the panel are read), the panel's internal state, or anything
+about a frame the compositor had not presented when the BitBlt ran. A sample
+with no changed region is reported as `edge=-1`, never as progress 0.
 
 .PARAMETER Log
 The Start half's `renderer.log`. Default: the standard Windhawk data root under
@@ -98,8 +119,9 @@ pwsh -File tools/panel_edge_track.ps1 -WinTap -TriggerAtMs 150 -Trigger pull `
 [INPUT]: reads renderer.log's `reveal panelTrail` and `gesture geometry` lines;
          dot-sources tools/touch_common.ps1 for the pull; P/Invokes user32,
          gdi32, dwmapi and kernel32; finds the Start window by class and host PID
-[OUTPUT]: a `t=... tc=... edge=... progress=...` table, a summary, the trigger
-           lines, a RESULT line, and an optional CSV
+[OUTPUT]: a `t=... tc=... edge=... progress=...` table, the derived open/entry
+           edges with their progress, a summary, the trigger lines, a RESULT
+           line, and an optional CSV
 [POS]: the only tool that measures the panel's trailing edge pixel by pixel; it
        complements smoke.ps1 (which judges the mod's trace) and does not replace
        settle_track.ps1's release-timed bottom-edge series
@@ -166,6 +188,9 @@ if ($offsets.Count -ne $kinds.Count) {
     throw ("-TriggerAtMs and -Trigger must name the same number of actions " +
         "(got $($offsets.Count) offsets and $($kinds.Count) actions)")
 }
+# A pull is the one trigger that is meant to stop a close before the entry, so
+# the entry check below is skipped for it.
+$hasPull = @($kinds | Where-Object { $_ -eq 'pull' }).Count -gt 0
 
 $code = @'
 using System;
@@ -287,9 +312,9 @@ public static class PanelEdge
     }
 
     // Extreme coordinate of the changed region along the scan axis. A column
-    // (or row) counts when at least `majority` of the sampled lines differ, and
-    // the search runs from the far side inward for a trailing edge that grows
-    // toward the desktop, or from the taskbar outward for one that shrinks.
+    // (or row) counts when at least `majority` of the sampled lines differ.
+    // `increasing` follows AxisDirection: the trailing edge is the max changed
+    // coordinate on a left or top bar and the min on a right or bottom one.
     static int Scan()
     {
         int need = (int)Math.Ceiling(majority * Lines);
@@ -671,9 +696,10 @@ function Test-Layout {
     param($layout)
     if (-not $layout) { return 'no reveal panelTrail line at or after the run mark' }
     $missing = @()
-    if ($layout.Axis -lt 0) { $missing += 'axis' }
+    if ($layout.Axis -lt 0 -or $layout.Axis -gt 3) { $missing += 'axis' }
     if ($layout.Right -le $layout.Left -or $layout.Bottom -le $layout.Top) { $missing += 'rect' }
     if ($layout.High -le $layout.Low) { $missing += 'band' }
+    if ($layout.WorkRight -le $layout.WorkLeft -or $layout.WorkBottom -le $layout.WorkTop) { $missing += 'work' }
     if (-not ($layout.Distance -gt 0)) { $missing += 'distance' }
     if (-not ($layout.Scale -ge 1 -and $layout.Scale -le 4)) { $missing += 'scale' }
     return ($missing -join ',')
@@ -765,44 +791,94 @@ Write-Host (("LAYOUT axis={0} trail={1}dip rect={2},{3},{4},{5} band={6},{7} " +
 Write-Host "  $($layout.Line)"
 
 # ---------------------------------------------------------------------------
-# The scan: along the panel's trailing axis, a 96 px band inside the panel
+# The scan: along the panel's trailing axis, from the bar's inner edge to the
+# fully-open edge, in a strip 15% of the panel's extent across the axis
 # ---------------------------------------------------------------------------
 $s = $layout.Scale
 $horizontal = ($layout.Axis -eq 0 -or $layout.Axis -eq 2)
+# The mod's AxisDirection: -1 on a left or top bar, +1 on a right or bottom one.
 $dir = if ($layout.Axis -eq 0 -or $layout.Axis -eq 1) { -1.0 } else { 1.0 }
-$increasing = ($layout.Axis -eq 0 -or $layout.Axis -eq 1)
-$bandMidPx = [int](($layout.Low + $layout.High) / 2.0 * $s)
+# The mod's TrailEdge: the side away from the bar. The composition moves it by
+# (1 - Progress) * dir * distance, so it grows toward the desktop on a left or
+# top bar and shrinks on a right or bottom one.
+$trailing = @('right', 'bottom', 'left', 'top')[$layout.Axis]
+$increasing = ($dir -lt 0)
 $panelLeftPx = [int]($layout.Left * $s); $panelTopPx = [int]($layout.Top * $s)
 $panelRightPx = [int]($layout.Right * $s); $panelBottomPx = [int]($layout.Bottom * $s)
-$trailing = @('right', 'bottom', 'left', 'top')[$layout.Axis]
+
+# The two derived edges in physical pixels. `open` is the trailing edge at
+# Progress 1. `entry` is the band's midpoint: the bar's inner edge, the last line
+# of the panel that is not behind the bar. On a docked bar it equals the work
+# area's edge; on an auto-hidden bar the work area reaches the screen edge and
+# the midpoint is one bar thickness inside it. The work area's own edge is
+# printed beside it, because that is the geometric entry RevealEntryProgress uses.
+$openPx = [int]($layout.Trail * $s)
+$entryPx = [int](($layout.Low + $layout.High) / 2.0 * $s)
+$workEdgeDip = if ($horizontal) {
+    if ($dir -lt 0) { $layout.WorkLeft } else { $layout.WorkRight }
+} elseif ($dir -lt 0) { $layout.WorkTop } else { $layout.WorkBottom }
+$workEntryPx = [int]($workEdgeDip * $s)
+
+function Get-Progress {
+    param([double]$edgePx)
+    if ($edgePx -lt 0) { return $null }
+    $p = 1.0 - (($edgePx / $s) - $layout.Trail) / ($dir * $layout.Distance)
+    if ($p -lt 0) { return 0.0 }
+    if ($p -gt 1) { return 1.0 }
+    return $p
+}
+
+# The two edges must lie on the side of the trail that `dir` names, and their
+# distance cannot exceed the composition's own travel. A mismatch means the axis,
+# the band and the rect do not describe one panel, so the run is refused instead
+# of printing a progress with the wrong sign.
+$travelPx = $openPx - $entryPx
+if (($travelPx * $dir) -ge 0 -or
+    [Math]::Abs($travelPx) -gt [Math]::Abs($layout.Distance * $s) + 8) {
+    Write-Host (("REFUSED the derived edges do not follow dir={0}: open={1}px entry={2}px distance={3}dip") -f
+        $dir, $openPx, $entryPx, $layout.Distance)
+    exit 1
+}
 
 if ($horizontal) {
     $acrossPx = $panelBottomPx - $panelTopPx
     $bandH = [Math]::Max(32, [Math]::Min(96, [int]($acrossPx / 2)))
     $bandY = [int]($panelTopPx + 0.15 * $acrossPx)
     if ($bandY + $bandH -gt $screenH) { $bandY = $screenH - $bandH }
-    if ($layout.Axis -eq 0) {
-        $x0 = $bandMidPx; $x1 = [Math]::Min($screenW - 1, $panelRightPx + 8)
-    } else {
-        $x0 = [Math]::Max(0, $panelLeftPx - 8); $x1 = $bandMidPx
-    }
-    $capX0 = $x0; $capY0 = $bandY; $capW = $x1 - $x0 + 1; $capH = $bandH
+    # Axis 0 runs from the bar's inner edge to just past the panel's right edge;
+    # axis 2 mirrors it from just before the left edge to the bar's inner edge.
+    $farPx = if ($layout.Axis -eq 0) { [Math]::Min($screenW - 1, $openPx + 8) }
+             else { [Math]::Max(0, $openPx - 8) }
+    $capX0 = [Math]::Max(0, [Math]::Min($entryPx, $farPx))
+    $capX1 = [Math]::Min($screenW - 1, [Math]::Max($entryPx, $farPx))
+    $capY0 = $bandY; $capW = $capX1 - $capX0 + 1; $capH = $bandH
 } else {
     $acrossPx = $panelRightPx - $panelLeftPx
     $bandW = [Math]::Max(32, [Math]::Min(96, [int]($acrossPx / 2)))
     $bandX = [int]($panelLeftPx + 0.15 * $acrossPx)
     if ($bandX + $bandW -gt $screenW) { $bandX = $screenW - $bandW }
-    if ($layout.Axis -eq 1) {
-        $y0 = $bandMidPx; $y1 = [Math]::Min($screenH - 1, $panelBottomPx + 8)
-    } else {
-        $y0 = [Math]::Max(0, $panelTopPx - 8); $y1 = $bandMidPx
-    }
-    $capX0 = $bandX; $capY0 = $y0; $capW = $bandW; $capH = $y1 - $y0 + 1
+    # Axis 1 runs from the bar's inner edge down past the panel's bottom edge;
+    # axis 3 mirrors it from just above the top edge to the bar's inner edge.
+    $farPx = if ($layout.Axis -eq 1) { [Math]::Min($screenH - 1, $openPx + 8) }
+             else { [Math]::Max(0, $openPx - 8) }
+    $capX0 = $bandX; $capW = $bandW
+    $capY0 = [Math]::Max(0, [Math]::Min($entryPx, $farPx))
+    $capY1 = [Math]::Min($screenH - 1, [Math]::Max($entryPx, $farPx))
+    $capH = $capY1 - $capY0 + 1
+}
+if ($capW -lt 2 -or $capH -lt 2) {
+    Write-Host (("REFUSED the derived scan region is empty (x={0}..{1} y={2}..{3})") -f
+        $capX0, ($capX0 + $capW - 1), $capY0, ($capY0 + $capH - 1))
+    exit 1
 }
 
 Write-Host (("MAP axis={0} trailing={1} dir={2} trail={3}dip distance={4}dip " +
         "progress=1-(edge-trail)/(dir*distance)") -f
     $layout.Axis, $trailing, $dir, $layout.Trail, $layout.Distance)
+Write-Host (("EDGES open={0}px progress={1:F3} entry={2}px progress={3:F3} " +
+        "work-entry={4}px progress={5:F3} scale={6:F3}") -f
+    $openPx, (Get-Progress $openPx), $entryPx, (Get-Progress $entryPx),
+    $workEntryPx, (Get-Progress $workEntryPx), $s)
 Write-Host (("REGION x={0}..{1} y={2}..{3} lines=63 threshold={4} majority={5}") -f
     $capX0, ($capX0 + $capW - 1), $capY0, ($capY0 + $capH - 1), $Threshold, $Majority)
 
@@ -838,6 +914,10 @@ if (Get-StartState) {
     Write-Host 'REFUSED the menu is open at the baseline; nothing captured'
     exit 1
 }
+# An auto-hidden bar can still be sliding down after the close. A baseline taken
+# during that slide is not the closed desktop: the verify frame right after it
+# would see the bar at another position. Let the desktop settle before sampling.
+Start-Sleep -Milliseconds $CooldownMs
 [PanelEdge]::Baseline()
 $verify = [PanelEdge]::Frame()
 if ($verify -ne -1) {
@@ -847,7 +927,6 @@ if ($verify -ne -1) {
 }
 Write-Host 'BASELINE closed and verified (no changed column)'
 
-Start-Sleep -Milliseconds $CooldownMs
 if ($mode -eq 'wintap') {
     $planMs = $OpenAtMs + $CloseAtMs + $TailMs + 250
     [PanelEdge]::ConfigureTriggers($offsets.ToArray(), $kinds.ToArray(), $OpenAtMs, $CloseAtMs, $hostPid,
@@ -877,15 +956,6 @@ $tClose = [PanelEdge]::TClose
 $times = [PanelEdge]::Times
 $edges = [PanelEdge]::Edges
 $caps = [PanelEdge]::Caps
-
-function Get-Progress {
-    param([double]$edgePx)
-    if ($edgePx -lt 0) { return $null }
-    $p = 1.0 - (($edgePx / $s) - $layout.Trail) / ($dir * $layout.Distance)
-    if ($p -lt 0) { return 0.0 }
-    if ($p -gt 1) { return 1.0 }
-    return $p
-}
 
 Write-Host ''
 for ($i = 0; $i -lt $times.Count; $i++) {
@@ -920,20 +990,52 @@ $atClose = -1
 if ($tClose -gt 0) {
     for ($i = 0; $i -lt $times.Count; $i++) { if ($times[$i] -le $tClose) { $atClose = $edges[$i] } }
 }
-$expect = [int]($layout.Trail * $s)
+# The fully-open edge is the extreme in the direction of progress over the whole
+# run: the max on a left/top bar and the min on a right/bottom one. The entry
+# edge is the extreme on the other side of the close, so it is taken from the
+# samples after the close tap; a pull run then reports where it turned around.
+$measuredOpen = if ($increasing) { $maxEdge } else { $minEdge }
+$closeEdges = if ($tClose -gt 0) {
+    @(for ($i = 0; $i -lt $times.Count; $i++) {
+        if ($times[$i] -ge $tClose -and $edges[$i] -ge 0) { $edges[$i] }
+    })
+} else { $usable }
+if (-not $closeEdges.Count) { $closeEdges = $usable }
+$measuredEntry = if (-not $closeEdges.Count) { -1 }
+                 elseif ($increasing) { ($closeEdges | Measure-Object -Minimum).Minimum }
+                 else { ($closeEdges | Measure-Object -Maximum).Maximum }
 
 Write-Host ''
 Write-Host (("SUMMARY samples={0} usable={1} period={2:F1}ms (min {3:F1} max {4:F1}) cap={5:F1}ms " +
         "(max {6:F1}) start={7} at-close={8} end={9} min={10} max={11} missing={12}") -f
     $times.Count, $usable.Count, $period, $minGap, $maxGap, $capMean, $capMax,
     $startEdge, $atClose, $endEdge, $minEdge, $maxEdge, ($times.Count - $usable.Count))
-Write-Host (("ANCHOR tOpen={0} tClose={1} expected-open-edge={2}px measured-max={3}px") -f
+Write-Host (("ANCHOR tOpen={0} tClose={1} expected-open-edge={2}px measured-open-edge={3}px " +
+        "expected-entry-edge={4}px measured-entry-edge={5}px work-entry-edge={6}px") -f
     $(if ($tOpen -ge 0) { '{0:F1}' -f $tOpen } else { '-' }),
-    $(if ($tClose -ge 0) { '{0:F1}' -f $tClose } else { '-' }), $expect, $maxEdge)
-if ($maxEdge -ge 0 -and [Math]::Abs($maxEdge - $expect) -gt 8) {
-    Write-Host (("WARN the widest measured edge does not reach trail*scale ({0} vs {1}); the panel " +
+    $(if ($tClose -ge 0) { '{0:F1}' -f $tClose } else { '-' }),
+    $openPx, $measuredOpen, $entryPx, $measuredEntry, $workEntryPx)
+if ($measuredOpen -ge 0 -and [Math]::Abs($measuredOpen - $openPx) -gt 8) {
+    Write-Host (("WARN the measured fully-open edge does not reach trail*scale ({0} vs {1}); the panel " +
         'may not have been fully open during the capture, or the edge lies off the rect') -f
-        $maxEdge, $expect)
+        $measuredOpen, $openPx)
+}
+# The entry is only expected on an uninterrupted win-tap close: a pull is meant
+# to stop the retract before it. A series that stops short means the scan band
+# ends inside the panel or the close did not finish within -TailMs; one that runs
+# past the entry means the band reaches into the bar.
+if ($measuredEntry -ge 0 -and $mode -eq 'wintap' -and -not $hasPull) {
+    $short = if ($increasing) { $measuredEntry - $entryPx } else { $entryPx - $measuredEntry }
+    $entryTol = [Math]::Max(8, [int](0.03 * [Math]::Abs($layout.Distance) * $s))
+    if ($short -gt $entryTol) {
+        Write-Host (("WARN the visible series stops {0}px short of the entry edge ({1} vs {2}); the scan " +
+            'band ends inside the panel, or the close did not finish within -TailMs') -f
+            $short, $measuredEntry, $entryPx)
+    } elseif ($short -lt -$entryTol) {
+        Write-Host (("WARN the changed region reaches {0}px past the entry edge into the taskbar ({1} vs {2}); " +
+            'the scan band reaches into the bar') -f
+            (-$short), $measuredEntry, $entryPx)
+    }
 }
 Write-Host "CLEANUP $cleanup"
 Write-Host ("STATE at exit cloaked={0} open={1}" -f [PanelEdge]::Cloaked($hostPid), (Get-StartState))
