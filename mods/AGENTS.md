@@ -102,7 +102,10 @@ the consumer withdraws before it unregisters its devices.
   request; the preconditions and the log line stay at the callers. A band tap
   requests nothing.
 - `ActivateRevealFollow` — the live takeover at `RevealEntryProgress`; the
-  chase is `visible += clamp(mapped - visible, -rate*dt, +rate*dt)`.
+  chase is `visible += clamp(mapped - visible, -rate*dt, +rate*dt)`. The
+  candidate branch in `UpdateRevealSession` requires the same 24 DIP signed
+  inward travel (or `openClaimAttempted`), so a stationary finger on a shown
+  but off-rest panel never acquires `Progress`.
 - `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
   schedule point, not a Windows-key tap. A dismiss that cannot be published
   releases the ownership.

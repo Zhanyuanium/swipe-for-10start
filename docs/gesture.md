@@ -49,7 +49,12 @@ contact lifts.
    0.000), not at 0.
 4. **Live takeover** — at the open, `PromoteRevealContact` adopts the contact
    that began in the band if it is still down and has travelled
-   `kAdoptTravelDip` (24 DIP). The takeover starts at the entry, holds it for the
+   `kAdoptTravelDip` (24 DIP). The same test gates the candidate branch of
+   `UpdateRevealSession`: a contact that landed on a shown but off-rest panel
+   (the unhealed case) does not take `Progress` over without the 24 DIP, or
+   without having qualified earlier (`openClaimAttempted`). A stationary finger
+   on a settled open never acquires the panel. The takeover starts at the entry,
+   holds it for the
    first presentation (`kRevealEntryHoldMs`, 30 ms), then every report moves the
    visible position toward the absolute mapped position at
    `kSettleSpeedDipPerMs` (2.2 DIP/ms), never past it. The finger's own motion is

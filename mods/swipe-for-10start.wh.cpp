@@ -5547,6 +5547,19 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
         if (!StartWindowIsOpenThrottled(tickMs)) {
             return;
         }
+        // A shown window is not a takeover license by itself: a contact that
+        // landed on a panel off its rest (the unhealed case) must not acquire
+        // Progress. The same 24 DIP the open claim and the adoption use
+        // qualifies it; a contact that already qualified before keeps its
+        // claim (openClaimAttempted) even as it comes back toward the edge.
+        if (!reveal.openClaimAttempted) {
+            const float travel =
+                RevealTravelDip(geometry.axis(), reveal.edgeStartX,
+                                reveal.edgeStartY, x, y);
+            if (!(travel >= kAdoptTravelDip)) {
+                return;
+            }
+        }
         if (!ActivateRevealFollow(geometry, x, y, sampleQpc, tickMs)) {
             return;
         }
