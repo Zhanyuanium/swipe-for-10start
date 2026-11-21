@@ -393,6 +393,31 @@ surface.
 
 `tools/smoke.ps1` stays green on this build.
 
+### The one-take transfer (P2)
+
+The grab's transfer now takes the panel's position once and pins it; the follow
+binds to that same value on the same report instead of taking again, and no
+settle stands between them. Measured with the same harness on the same bar
+(`tc` 150, `panel-edge-p2-early-1.csv`): `exec cancel request target=12
+reason=pull`, one `motion sample caller=pull phase=settle p=0.930`, then
+`reveal takeover from=0.930 offset=-0.519 live=1` — no `motion sample
+caller=activate`, no `settle` between the cancel and the binding — and the edge
+reverses at 677 px and ends at 558 with the menu open. The settle that follows
+the release (`dur=160 remaining=60`) is the ordinary open settle of the lifted
+finger, not an intermediate one.
+
+A grab that loses the race refuses and is consumed: `tc` 400 on the same bar
+produced `grab=refused reason=no-close` (the report arrived after the landing),
+no `reveal reopen`, no `exec show`, and the menu stayed closed
+(`panel-edge-p2-late-1.csv`). The press path still settles the panel back
+(`intent open cancel from=...` and one `settle dir=open`), because a press has no
+finger to bind to.
+
+The `dispatch` refusal (`reason=dispatch`, a published dismiss at or past its
+deadline) is unreachable in practice on this build: past the deadline the retract
+is already at or below the entry, so `offsurface` answers first. It stays as the
+serialisation rule that makes the promise conditional.
+
 ## Artifacts
 
 The raw tables behind the Windows 11 fit are in `artifacts/`:

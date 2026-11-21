@@ -123,7 +123,9 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   line goes through `TraceLog`: `Wh_Log` always, and the role's file only
  *   while the `DiagnosticTrace` setting is on. The two interruption dates are
  *   `motion sample` — the position and slope `TakeProgressNow` reads, once per
- *   call under the composition lock — and `exec dismiss enter`, the QPC instant
+ *   call under the composition lock (a grab logs one, `caller=pull`, and its
+ *   follow binds to it without taking again) — and `exec dismiss enter`, the QPC
+ *   instant
  *   taken immediately before the launcher call and written after it returned.
  *   Wh_ModInit
  *   selects exactly one role table from the host executable name
@@ -140,11 +142,14 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   section's current generation, and zero stays valid only while no open has
  *   been published. A fresh open cancels a still-queued command at the bridge.
  *   The same cancel serves a press and a qualified pull, through one recovery
- *   ticket: a press settles the panel back from its live position, and a pull
- *   takes the retract over there — keeping the finger-to-panel offset it took
- *   over instead of starting at the open's entry — unless the dismiss already
- *   returned from the shell call with its hide unconfirmed. That refusal spends
- *   the contact's one grab opportunity and consumes it. A close consumes every
+ *   ticket: a press settles the panel back from its live position, while a pull
+ *   takes the retract over in one take — the position is pinned and the follow
+ *   binds to it on the same report, keeping the finger-to-panel offset it took
+ *   over rather than starting at the open's entry — unless the dismiss already
+ *   returned from the shell call with its hide unconfirmed, or its published
+ *   deadline has passed and the bridge may already be inside the call. Either
+ *   refusal spends the contact's one grab opportunity and consumes it, and only
+ *   the press path starts a settle. A close consumes every
  *   contact already on the glass, and a landing serves no touch open: only the
  *   independently owed press recovery reopens.
  *   A landing the cloak never reports — the
@@ -4526,6 +4531,13 @@ struct HidRevealSession {
     // the entry floor is what made an interrupted retract finish and then pop
     // back out. Set once, by CancelCloseForQualifiedPull.
     bool liveTakeover = false;
+    // The take is already done. The grab that took the retract over pinned the
+    // position on its transfer report and nothing animates over it, so the follow
+    // binds to `liveStart` instead of taking a second time: a second take would
+    // read the same value, log a second `motion sample`, and hand the follow a
+    // seam the spring had already moved. Cleared by the one activation that
+    // binds; every other start takes as it always did.
+    bool liveBound = false;
     // The chased positions of a live takeover: `liveOffset` is the finger's
     // mapping minus the panel's position at the takeover, so every later target
     // is `mapped - liveOffset` (the panel keeps the relationship it took over
@@ -5565,6 +5577,9 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
 // - the panel must still be on screen. A retract that is already at or below the
 //   entry has no live position to take over: the cancel would open the menu from
 //   an invisible start, which reads as a switch, and the close has to land anyway;
+// - a published dismiss is revocable only while its deadline is still ahead. At
+//   or past `executeAt` the bridge may already be inside the shell's `Dismiss`
+//   call, and no cancel recalls a call that has entered;
 // - something must actually be cancelled (the local gesture deadline or the
 //   executor command), otherwise there is no close to abort.
 //
@@ -5578,7 +5593,9 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
 // holds it in an armed timer. Cancelling it publishes `exec cancel` and arms the
 // same recovery ticket a press arms, because the bridge may already be inside the
 // `Dismiss` call. The pull then takes the still-open menu over from where the
-// retract left it.
+// retract left it: one take, pinned here, and the follow binds to it on the same
+// report (`liveBound`) instead of taking again. No settle stands between them, so
+// no frame of this reversal belongs to an animation the finger did not ask for.
 //
 // It must not run on contact-down: a contact that never enters the band or never
 // travels would otherwise keep a menu the user was closing.
@@ -5605,6 +5622,13 @@ const wchar_t* CancelCloseForQualifiedPull(const GestureGeometry& geometry,
         return L"offsurface";
     }
     const DismissBeforeCancel dismissed = ReadDismissBeforeCancel();
+    // The deadline is in the same tick domain as this report. At or past it the
+    // bridge dispatches, and a `Dismiss` already entered cannot be recalled: the
+    // transfer would promise a reversal nothing can deliver. The grab loses the
+    // race and is consumed; the close finishes its own dismiss.
+    if (dismissed.executeAt != 0 && tickMs >= dismissed.executeAt) {
+        return L"dispatch";
+    }
     const CloseScheduleCancel dropped = CancelCloseSchedules(L"pull");
     if (!dropped.slot && !dropped.command) {
         return L"no-schedule";
@@ -5621,6 +5645,11 @@ const wchar_t* CancelCloseForQualifiedPull(const GestureGeometry& geometry,
     // position.
     g_commitNeedsProgressReset = false;
     g_intentOpenActive.store(false, std::memory_order_relaxed);
+    // The one take of this contact, and the only one: it stops the retract and
+    // writes the value as the new base, so the first frame this path can
+    // composite is the position the retract had. Nothing settles it towards the
+    // open rest — the follow binds to this exact value on the same report
+    // (`liveBound`), and the chase starts from the finger's own next sample.
     const float live = TakeProgressNow(L"pull");
     // The takeover continues from here. The offset is the gap between the finger's
     // mapping at this report and the position the panel actually has; the follow
@@ -5629,18 +5658,9 @@ const wchar_t* CancelCloseForQualifiedPull(const GestureGeometry& geometry,
     float panelTrail = 0.0f;
     const float mapped = RevealProgressDip(geometry, distance, x, y, panelTrail);
     g_reveal.liveTakeover = true;
+    g_reveal.liveBound = true;
     g_reveal.liveStart = live;
     g_reveal.liveOffset = mapped - live;
-    if ((1.0f - live) * distance < kProgressEpsilonDip) {
-        ShowAtRest();
-    } else {
-        std::chrono::milliseconds duration{0};
-        if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
-            // No settle can run, but the menu stays on screen: the panel must not
-            // be left at the position the retract reached.
-            ShowAtRest();
-        }
-    }
     return nullptr;
 }
 
@@ -5672,9 +5692,12 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
     reveal.openClaimAttempted = true;
     if (reveal.deferred) {
         // The grab's attempt is this retract, and nothing else. A refused
-        // transfer — the retract is already off screen, or its dismiss is inside
-        // the shell — consumes the contact: it has no open right until it lifts,
-        // every later report is inert, and its release leaves no record.
+        // transfer — the retract is already off screen, its dismiss is inside the
+        // shell, its published deadline has passed, or nothing is left to cancel
+        // — consumes the contact: it has no open right until it lifts, every
+        // later report is inert, and its release leaves no record. A taken
+        // transfer pinned the position, and the follow binds to it on this same
+        // report (`liveBound`); this contact's one take is that one.
         const wchar_t* refused =
             CancelCloseForQualifiedPull(geometry, x, y, tickMs);
         if (!refused) {
@@ -5769,9 +5792,11 @@ void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
 }
 
 // Takes Progress over for a contact whose menu is now open. The panel's position
-// is taken, never the animation's target; the trail mapping is read from this
-// snapshot and every later report drives Progress from the finger. One place, so
-// the admission's first sample and the adoption's first sample cannot differ.
+// is taken once and never from the animation's target — by this call, or by the
+// grab's transfer, which took it before binding (`liveBound`) — the trail mapping
+// is read from this snapshot and every later report drives Progress from the
+// finger. One place, so the admission's first sample and the adoption's first
+// sample cannot differ.
 //
 // The follow starts where the panel becomes visible and then chases the finger.
 // The shell uncloaks the menu 60-250 ms after the pull starts (or after the
@@ -5798,8 +5823,8 @@ void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
 // The trail mapping still measures the finger for `travel`, the commit test,
 // `max=` and the end-speed window; only the value written to Progress chases. A
 // panel that was already on screen (a pull that cancels a close makes the follow
-// take a live retract over) starts at its live value, so the chase begins from
-// where it is.
+// take a live retract over) starts at the position the transfer pinned, so the
+// chase begins from where it is and the reversal never passes through a settle.
 bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
                           uint64_t sampleQpc, uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
@@ -5847,7 +5872,8 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // A cancel or dismiss animation from a previous gesture may still own
     // Progress; the follow must drive the scalar from this sample on, and the
     // takeover pins the position the panel has now so no frame between the two
-    // writes shows the old animation's target. A scheduled dismiss that is still
+    // writes shows the old animation's target. A grab already did that in its
+    // transfer, and this call binds to it. A scheduled dismiss that is still
     // ahead is not touched here: it re-checks the pull generation once, so a pull
     // that began first drops the close.
     //
@@ -5860,14 +5886,24 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // pop back out. That takeover also keeps the finger-to-panel offset it took
     // over, and its chase starts at this sample because there is nothing to
     // present.
-    const float live = TakeProgressNow(L"activate");
     float visible = 0.0f;
     if (reveal.liveTakeover) {
-        visible = std::clamp(live, 0.0f, 1.0f);
+        // The grab's transfer already took and pinned the position on its own
+        // report, and nothing has moved the panel since, so this call binds to
+        // that take: one `motion sample caller=pull` for the whole reversal. A
+        // second take would read the same value and make the follow's seam a
+        // spring nobody asked for. A live takeover that is somehow not bound
+        // still takes, as every other start does.
+        const bool bound = reveal.liveBound;
+        reveal.liveBound = false;
+        const float taken =
+            bound ? reveal.liveStart : TakeProgressNow(L"activate");
+        visible = std::clamp(taken, 0.0f, 1.0f);
         reveal.target = mapped - reveal.liveOffset;
-        reveal.activationGap = mapped - live;
+        reveal.activationGap = mapped - taken;
         reveal.chaseQpc = sampleQpc;
     } else {
+        const float live = TakeProgressNow(L"activate");
         const float entry = RevealEntryProgress(geometry);
         // A hidden panel's visible value is the entry, never the recorded open
         // rest (1) of a process that has not shown it yet; a panel already above

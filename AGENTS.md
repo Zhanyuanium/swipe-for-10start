@@ -4,7 +4,7 @@ C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
 tools/ - PowerShell probes, injectors, animation harnesses, the panel-edge tracker, the regression smoke, the store packager and the local installer (16 scripts + AGENTS.md)
-artifacts/ - captured measurements (14 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
+artifacts/ - captured measurements (16 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
 <config>
@@ -146,22 +146,27 @@ fallback and an open it performs is adopted. One attempt per contact: a refused
 request is not retried. The content settle starts at `RevealEntryProgress`, and
 the reveal takeover chases the mapped finger at 2.2 DIP/ms, then follows
 (`behind=0.000`).
-A pull that takes a live retract over does not start at the entry: it continues
-from the panel's position, keeps the finger-to-panel offset it took over
-(`reveal takeover ... live=1`) and begins its chase at that sample. That pull is
-a grab, and while a close owns the panel a down is admitted only when it lands in
-the band or on the surface the retract still shows — its mapped progress at or
-below the panel's live one, because the panel's trail edge is then at or beyond
-the point. A point in the area the retract has left is refused
+A pull that takes a live retract over does not start at the entry: the transfer
+takes the panel's position once and pins it, the follow binds to that same value
+on the same report (`reveal takeover ... live=1`, no second `motion sample`),
+keeps the finger-to-panel offset it took over and begins its chase at that
+sample. No settle stands between the cancel and the follow's first move: the
+press cancel (`intent open cancel from=...`) is the path that still settles the
+panel back from its live position, because a press has no finger to bind to. That
+pull is a grab, and while a close owns the panel a down is admitted only when it
+lands in the band or on the surface the retract still shows — its mapped progress
+at or below the panel's live one, because the panel's trail edge is then at or
+beyond the point. A point in the area the retract has left is refused
 (`reveal admit ... reason=offsurface`) and muted for its contact. The grab spends
 its one opportunity at its 24 DIP report: `CancelCloseForQualifiedPull` revokes
 both schedules (the local slot and the armed `exec dismiss`), arms the same
 recovery ticket a press arms, and takes the retract over there (`grab=taken`). A
 refused transfer — the retract already at or below the entry, the dismiss already
-inside the shell, no distance, or nothing left to cancel — consumes the contact
-(`grab=refused reason=...`): it keeps no open right until it lifts, every later
-report is inert, and its release leaves no record. A close also consumes every
-contact that was already on the glass when it started.
+inside the shell, its published dismiss at or past its deadline (the bridge may
+already be inside the call, `reason=dispatch`), no distance, or nothing left to
+cancel — consumes the contact (`grab=refused reason=...`): it keeps no open right
+until it lifts, every later report is inert, and its release leaves no record. A
+close also consumes every contact that was already on the glass when it started.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
 landing adopts no finger: after `win close observed` the controller issues no

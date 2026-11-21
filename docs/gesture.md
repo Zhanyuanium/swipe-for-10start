@@ -75,10 +75,11 @@ contact lifts.
    first presentation (`kRevealEntryHoldMs`, 30 ms), then every report moves the
    visible position toward the absolute mapped position at
    `kSettleSpeedDipPerMs` (2.2 DIP/ms), never past it. A takeover of a panel that
-   is already presented — the pull cancelled a close — starts at the panel's
-   live position, holds nothing, and chases `mapped - liveOffset`, the offset the
-   finger-to-panel pair had when the pull took the retract over. The finger's own
-   motion is the mapping; only the written position is rate-limited.
+   is already presented — the pull cancelled a close — binds to the position the
+   transfer already took (it does not take again, and holds nothing), and chases
+   `mapped - liveOffset`, the offset the finger-to-panel pair had when the pull
+   took the retract over. The finger's own motion is the mapping; only the
+   written position is rate-limited.
 5. **Follow** — once caught up, `behind=0.000`: the panel is glued (bottom
    auto-hidden `progress=0.96` at a held 300 DIP finger, the panel edge 1.8 px
    from it; `progress=0.90` at 350 DIP, 0.4 px; the bottom docked 300 DIP hold
@@ -172,15 +173,22 @@ opportunity: `CancelCloseForQualifiedPull` drops both close schedules — the ar
 local dismiss and the armed `exec dismiss` the bridge is holding for the end of
 the settle — clears the suppression, republishes the open direction, arms the
 same recovery ticket a press arms, and takes the retract over from the panel's
-live position (`grab=taken`). Every close this mod owns is cancellable that way,
-the Win key and the two Start-button primitives included: their dismiss is
-published at once but the bridge keeps it in an armed timer until its deadline.
-A refused transfer — the retract is already at or below the entry where no panel
-is on screen, its dismiss is already inside the shell, or nothing is left to
-cancel — consumes the contact (`grab=refused reason=...`): it keeps no open right
-until it lifts, every later report is inert, and its release leaves no
-late-open record. A contact that never travels leaves the close to run; a tap in
-the band was admitted as a grab and never gets there.
+live position (`grab=taken`). That take is the transfer's only one: the position
+is pinned as the frame the compositor shows, and the follow binds to it on the
+same report (`live=1`) instead of settling or taking again. Every close this mod
+owns is cancellable that way while its dismiss is still ahead — the Win key and
+the two Start-button primitives included: their dismiss is published at once but
+the bridge keeps it in an armed timer until its deadline. A published dismiss at
+or past that deadline may already be inside the shell's `Dismiss` call, so the
+transfer is refused there too (`reason=dispatch`): the grab lost the race and the
+close finishes. A refused transfer — the retract is already at or below the entry
+where no panel is on screen, its dismiss is already inside the shell, its
+deadline has passed, or nothing is left to cancel — consumes the contact
+(`grab=refused reason=...`): it keeps no open right until it lifts, every later
+report is inert, and its release leaves no late-open record. A contact that never
+travels leaves the close to run; a tap in the band was admitted as a grab and
+never gets there. Only the press cancel below (`intent open cancel from=...`)
+starts a settle; a grab's reversal never does.
 
 A press while the close runs is recovered, not guaranteed. `IntentShouldClose`
 reads the controller's phase, so a press during the retract is an open:

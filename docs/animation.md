@@ -52,9 +52,9 @@ initial slope, which is why the seam factor is a computed value, not a constant.
   2.2 DIP/ms, then follows. The rate limit is the planner's own speed; the cost
   is time (a 0.326 gap closes in ~148 ms), and the visible position never
   overshoots the finger. A pull that interrupts a close does not start at the
-  entry: the panel is already presented, so the takeover begins at its live
-  position, holds nothing, and chases the finger minus the offset the interrupted
-  retract had (`reveal takeover ... live=1`).
+  entry: the panel is already presented, so the takeover binds to the position
+  the transfer took, holds nothing, and chases the finger minus the offset the
+  interrupted retract had (`reveal takeover ... live=1`).
 
 ## The close
 
@@ -72,21 +72,32 @@ launcher's thread. The panel is therefore never hidden mid-slide.
 
 ## Interruption
 
-`TakeProgressNow()` pins the live position and stops the animation. The new
-settle starts there: a close 172 ms into an open started at `from=0.542`; a Win
-press during a held touch started the close from `progress=1.000`; a press during
-a close drops the local dismiss slot, cancels the pending executor
-command, and settles the panel back from its live position
-(`intent open cancel from=...`). A qualified pull during any close this mod still
-owns does the same thing and then hands the panel to the follow: the retract stops
-where it is, the follow takes over at that position (`live=1`) with the
-finger-to-panel offset it found, and its chase starts on the same report instead
-of waiting out the 30 ms entry hold. The one close a pull cannot take over is one
-whose `Dismiss` call has already returned and whose hide is unconfirmed; a
-retract already at or below the entry is refused for the same reason (there is no
-visible panel to take). A refused transfer consumes the contact, and the landing
-serves no touch open, so the menu stays closed until a new pull. No path
-replays from the old target.
+`TakeProgressNow()` pins the live position and stops the animation. A settle
+starts there: a close 172 ms into an open started at `from=0.542`; a Win press
+during a held touch started the close from `progress=1.000`; a press during a
+close drops the local dismiss slot, cancels the pending executor command, and
+settles the panel back from its live position (`intent open cancel from=...`).
+The press path is the only one that still starts a settle: a press has no finger
+to bind to.
+
+A qualified pull during any close this mod still owns is one take, not a take
+followed by a spring. The retract stops where it is and the position is pinned
+as the frame the compositor shows; the follow binds to that same value on the
+same report (`live=1`, no second `TakeProgressNow`) with the finger-to-panel
+offset it found, and its chase starts there instead of waiting out the 30 ms
+entry hold. The grab path therefore logs the one `motion sample caller=pull` and
+no `caller=activate`, and no `settle ... dir=open` line stands between the
+cancel and the follow's first move. The seam is the taken position itself: the
+finger's next sample moves the panel from it at the chase rate, and the panel
+never travels toward a rest it was not asked to reach.
+
+The closes a pull cannot take over: one whose `Dismiss` call has already
+returned and whose hide is unconfirmed; one whose published dismiss is at or past
+its deadline, where the bridge may already be inside the call and no cancel can
+recall it (`grab=refused reason=dispatch`); and a retract already at or below the
+entry, where no panel is on screen to take. A refused transfer consumes the
+contact, and the landing serves no touch open, so the menu stays closed until a
+new pull. No path replays from the old target.
 
 ## The coast
 
@@ -135,7 +146,9 @@ Two lines date an interruption on its two sides, one in each process.
 only that the primitive returned, never when it entered, so it cannot show
 whether a cancel or a fresh press reached the panel before or after the hide
 began. `motion sample` is the position and slope `TakeProgressNow` reads at the
-takeover, taken once under `g_compositionMutex` with the one `qpcNow` it uses.
+takeover, taken once under `g_compositionMutex` with the one `qpcNow` it uses. A
+grab has exactly one such line, `caller=pull`, at its transfer; the follow binds
+to that take and does not sample the position again.
 `phase` names the motion the value came from — `settle`, `coast`, `rest` with
 nothing recorded, `none` without a renderer — and `v` is the signed slope in
 Progress per ms, `0.000` once the curve has landed.

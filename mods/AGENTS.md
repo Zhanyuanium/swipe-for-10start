@@ -187,9 +187,13 @@ core (see [../docs/limits.md](../docs/limits.md)).
   insertion, pending open, direction, touch, show request; the preconditions and
   the log line stay at the callers. A band tap requests nothing.
 - `ActivateRevealFollow` — the live takeover. A hidden panel is met at
-  `RevealEntryProgress`; a panel a cancelled close left on screen is met where it
-  is (`liveTakeover`: no entry floor, no `max(live, entry)`), and its chase starts
-  at the takeover sample instead of after `kRevealEntryHoldMs`. The chase is
+  `RevealEntryProgress`; a panel a cancelled close left on screen is met where the
+  transfer pinned it (`liveTakeover`: no entry floor, no `max(live, entry)`), and
+  its chase starts at the takeover sample instead of after `kRevealEntryHoldMs`.
+  A grab's activation binds to that take (`liveBound`): it uses `liveStart` and
+  does not call `TakeProgressNow` again, so the reversal carries one
+  `motion sample caller=pull` and no `caller=activate`. A live takeover without
+  the binding still takes, as every other start does. The chase is
   `visible += clamp(target - visible, -rate*dt, +rate*dt)`, where `target` is the
   mapped finger for an ordinary follow and `mapped - liveOffset` for a live one:
   the interrupted retract keeps the finger-to-panel offset it took over instead of
@@ -206,13 +210,20 @@ core (see [../docs/limits.md](../docs/limits.md)).
   is the grab's one opportunity: at the 24 DIP crossing it drops both schedules
   (the local gesture deadline and the armed executor command), republishes the
   open direction, arms the same recovery ticket a press arms, and takes the
-  retract over from the panel's live position. A keyboard, Start-button,
-  click-away and gesture close are all cancellable, because each one's dismiss is
-  a command the bridge holds in an armed timer until its deadline. A refusal
-  consumes the grab: a dismiss whose call already returned with its hide
-  unconfirmed (`g_pendingDismissConfirm`), a retract already at or below the
-  entry, a layout with no distance, and a close with nothing left to cancel all
-  answer a named reason (`grab=refused reason=...`). The contact then keeps no
+  retract over from the panel's live position. That is one take: the position is
+  pinned and the follow binds to it on the same report (`liveBound`), so no settle
+  runs between the cancel and the follow's first move and the panel never passes
+  through the open spring. A keyboard, Start-button and click-away close are
+  cancellable for the whole retract, because their dismiss is a command the bridge
+  holds in an armed timer until the settle's end. A gesture close is cancellable
+  during its own settle; once that ends, its command's deadline is the instant it
+  was published, so the next crossing refuses. A refusal consumes the grab: a
+  dismiss whose call already returned with its hide
+  unconfirmed (`g_pendingDismissConfirm`), a published dismiss at or past that
+  deadline (`reason=dispatch`: the bridge may already be inside the call), a
+  retract already at or below the entry, a layout
+  with no distance, and a close with nothing left to cancel all answer a named
+  reason (`grab=refused reason=...`). The contact then keeps no
   open right until it lifts, every later report is inert, and its release leaves
   no late-open record; the landing does not revive it. Contact-down no longer
   cancels anything; a tap leaves the close alone.
