@@ -12,6 +12,13 @@ decision and executor lines the pair wrote during that step, and the last step
 fails if the run produced any error-shaped line (a non-zero HRESULT, a timeout, a
 refusal, a dropped press, a lost latch).
 
+Each row requires the pair its claim rests on, not a substring: a touch open is
+`reveal pull qualified` plus the executor's ack for the exact show sequence the
+Start side published, a touch close is the method-1 dismiss with its ack, and the
+click-away is `intent close trigger=clickaway ... method=7` in the bridge log,
+the matching method-6 dismiss with its ack, and `win close observed`. A close
+the shell performed natively cannot satisfy the click-away row.
+
 The mod writes those lines to disk only while its DiagnosticTrace setting is on
 (Wh_Log always receives them, but Windhawk's own debug logging is a separate
 switch). The script checks that one of the two files was written during the run
@@ -28,7 +35,7 @@ Three details it encodes, each learned the hard way:
   VK_LWIN tap the keyboard path uses; the Start button is a manual check.
 - A click-away is only decided once the window is past its presentation
   (state 1/3); clicking earlier is swallowed on purpose, so the step waits for the
-  executor's own `exec visible ... visible=1` confirmation before it clicks.
+  executor's own `exec visible ... visible=visible` confirmation before it clicks.
 - An injected contact is occasionally decoded as a hover rather than a touch; the
   pull and the drag are therefore retried before a step is called failed.
 
@@ -112,12 +119,17 @@ public static void Click(int x, int y) {
 [Smoke.Native]::SetDpiAware()
 
 function Mark {
-    if (-not (Test-Path -LiteralPath $Log)) { return 0 }
-    (Get-Content -LiteralPath $Log | Measure-Object -Line).Lines
+    # The trace rotates at its line cap, so a line index is not a stable cursor:
+    # a read after the rotation would skip the new file's lines. Every line
+    # carries `t=<GetTickCount64>`; a mark is that clock, and every read re-opens
+    # the file and keeps the lines at or after it.
+    return [Environment]::TickCount64
 }
-function New-Lines { param($from)
-    if (-not (Test-Path -LiteralPath $Log)) { return @() }
-    Get-Content -LiteralPath $Log | Select-Object -Skip $from
+function New-Lines { param($fromTick, [string]$Path = $Log)
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    return @(Get-Content -LiteralPath $Path | Where-Object {
+        $_ -match '^t=(\d+) ' -and [long]$Matches[1] -ge [long]$fromTick
+    })
 }
 function State {
     $out = (& pwsh -NoProfile -File $startMenu 2>&1) -join ' '
@@ -133,11 +145,29 @@ function Wait-For { param($want, $timeoutMs = 3000)
     }
     return $false
 }
-function Wait-Log { param($from, $pattern, $timeoutMs = 2500)
+function Wait-Log { param($fromTick, $pattern, $timeoutMs = 2500, [string]$Path = $Log)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
-        if (((New-Lines $from) -join "`n") -match $pattern) { return $true }
+        if (((New-Lines $fromTick $Path) -join "`n") -match $pattern) { return $true }
         Start-Sleep -Milliseconds 100
+    }
+    return $false
+}
+
+# A row's evidence is a pair, not a substring: the sequence the Start side
+# published and the executor's answer for exactly that sequence. A broad
+# `exec show` would also accept a refused command or a later row's show.
+function Test-ExecutedShow { param([string]$text)
+    foreach ($match in [regex]::Matches($text, 'exec show request seq=(\d+)')) {
+        $seq = $match.Groups[1].Value
+        if ($text -match "exec ack seq=\d+ command=$seq state=1\b") { return $true }
+    }
+    return $false
+}
+function Test-ExecutedDismiss { param([string]$text, [int]$method)
+    foreach ($match in [regex]::Matches($text, "exec dismiss request seq=(\d+) method=$method\b")) {
+        $seq = $match.Groups[1].Value
+        if ($text -match "exec ack seq=\d+ command=$seq state=(1|4)\b") { return $true }
     }
     return $false
 }
@@ -161,11 +191,13 @@ function Get-Layout {
     }
     # The scale comes from the mod's own numbers: the log's `work` rectangle is in
     # DIP and GetSystemMetrics is physical once this process is DPI-aware, so the
-    # ratio is the monitor scale without assuming a screen size.
+    # ratio is the monitor scale without assuming a screen size. Keep it
+    # fractional: 125 % and 150 % are 1.25 and 1.5, and rounding them to 1 or 2
+    # puts every injected point off the band or off the panel.
     $layout.Scale = 0
     if ($line -and $line.Line -match 'work=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
         $workWidth = [int]$Matches[3] - [int]$Matches[1]
-        if ($workWidth -gt 0) { $layout.Scale = [int][math]::Round([Smoke.Native]::GetSystemMetrics(0) / [double]$workWidth) }
+        if ($workWidth -gt 0) { $layout.Scale = [Smoke.Native]::GetSystemMetrics(0) / [double]$workWidth }
     }
     if ($layout.Scale -lt 1) { $layout.Scale = 1 }
     return $layout
@@ -233,8 +265,8 @@ for ($i = 1; $i -le 3 -and -not $opened; $i++) {
     $opened = Wait-For $true 4000
     Start-Sleep -Milliseconds 400
     $l = (New-Lines $m) -join "`n"
-    $opened = $opened -and ($l -match 'reveal (admit|takeover|reopen)') -and
-        ($l -match 'exec show|intent open recovered')
+    $opened = $opened -and ($l -match 'reveal pull qualified') -and
+        (Test-ExecutedShow $l)
     if (-not $opened) { $detail = "attempt $i"; Start-Sleep -Milliseconds 400 }
 }
 Add-Row 'touch open' $opened $detail
@@ -248,7 +280,16 @@ for ($i = 1; $i -le 3 -and -not $closed; $i++) {
     $closed = Wait-For $false 4000
     Start-Sleep -Milliseconds 400
     $l = (New-Lines $m) -join "`n"
-    $closed = $closed -and ($l -match 'exec dismiss')
+    $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
+    # An injected drag is delivered as a pointer, so the shell closes the panel
+    # through its own click-away; a real digitizer takes the HID producer. Both
+    # are the mod's own close only with the line that identifies the producer and
+    # an executed command for the exact sequence it published.
+    $hidClose = ($l -match 'close dismiss kind=') -and
+        (Test-ExecutedDismiss $l 1)
+    $clickClose = ($bridgeLines -match 'intent close trigger=clickaway[^\r\n]*method=7') -and
+        (Test-ExecutedDismiss $l 6)
+    $closed = $closed -and ($hidClose -or $clickClose)
     if (-not $closed) { $detail = "attempt $i"; Start-Sleep -Milliseconds 400 }
 }
 Add-Row 'touch close' $closed $detail
@@ -263,14 +304,22 @@ if ($SkipClickAway) {
         Add-Row 'click-away' $false 'menu did not open'
     } else {
         # The window's presentation is ~300 ms and a click inside it is swallowed on
-        # purpose. The executor's `visible=1` line is in the bridge's log, not the
-        # Start log this script reads, so the wait is time-based.
-        Start-Sleep -Milliseconds 900
+        # purpose. The executor's `visible=visible` line is in the bridge log, so
+        # wait for it; a time-based wait could click inside the uncloak.
+        $shown = Wait-Log $m 'exec visible seq=\d+ [^\r\n]*visible=visible' 3000 $BridgeLog
+        if (-not $shown) { Start-Sleep -Milliseconds 900 }
         [Smoke.Native]::Click([int]([Smoke.Native]::GetSystemMetrics(0) * 0.85), [int]([Smoke.Native]::GetSystemMetrics(1) * 0.15))
         $closed = Wait-For $false 3000
-        Start-Sleep -Milliseconds 400
-        $l = (New-Lines $m) -join "`n"
-        Add-Row 'click-away' ($closed -and ($l -match 'trigger=clickaway|method=7')) ''
+        # The landing, not just the closed state: `win close observed` is the line
+        # that says the shell hid the window and the controller saw it.
+        $landed = Wait-Log $m 'win close observed' 2500
+        $startLines = (New-Lines $m) -join "`n"
+        $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
+        # A native method-7 close is not this mod's close: it leaves no
+        # `intent close trigger=clickaway` line and this row fails.
+        $intent = $bridgeLines -match 'intent close trigger=clickaway[^\r\n]*method=7'
+        $executed = Test-ExecutedDismiss $startLines 6
+        Add-Row 'click-away' ($closed -and $landed -and $intent -and $executed) ''
     }
 }
 

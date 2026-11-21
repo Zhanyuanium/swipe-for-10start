@@ -190,14 +190,26 @@ could act, or before its confirmation could land).
 `tools/smoke.ps1` drives the four triggers through their real paths and judges
 each step by `start_menu.ps1`'s state plus the lines the two halves wrote in that
 step: a VK_LWIN tap opens (`kind=open`, `exec show`) and closes (`kind=close`,
-`exec dismiss`), an injected edge pull opens (`reveal admit|takeover`), an
-injected panel drag closes, and a desktop click closes (`trigger=clickaway`,
-`method=7`). The last step fails on any error-shaped line in the run — a non-zero
+`exec dismiss`); an injected edge pull opens only with `reveal pull qualified`
+and the executor's ack for the exact show sequence the Start side published; an
+injected panel drag closes only with its producer line (`close dismiss kind=...`
+for a real digitizer, `intent close trigger=clickaway ... method=7` for the
+injected pointer) and the executed dismiss for the sequence that producer
+requested; and a desktop click closes only with the click-away intent, the
+matching method-6 dismiss and `win close observed` — a close the shell performed
+natively fails that row. The last step fails on any error-shaped line in the run —
+a non-zero
 `hr=`, `timeout`, `refused`, a lost press or a dropped latch. Run it before
 handing the tree to a review: two of the defects fixed during the M3.3 review
 rounds were caught by it and by nothing else (a dismiss whose identity guard
 compared a generation with a tick, so every close was refused, and an ACK
 ordering that hid the answer Start needed).
+
+The trace rotates at its 20,000-line cap, so the script does not trust a line
+index: every mark is `GetTickCount64` and every read re-opens the log and keeps
+the lines at or after it. The monitor scale is kept fractional (1.25 at 125 %,
+1.5 at 150 %, 2 at 200 %), because rounding it puts every injected point off the
+band or off the panel.
 
 **The trace must be on for the run.** The mod writes the lines to disk only
 while `DiagnosticTrace` is on; `Wh_Log` always receives them, but Windhawk's own
@@ -226,7 +238,7 @@ hold a contact still through a Win close's landing: it must not reopen
 (`reveal defer released candidate=1 down=1`, no `reveal reopen`).
 
 What it does not cover, on purpose: the click-away step waits for the executor's
-`exec visible ... visible=1` because a click inside the window's presentation
+`exec visible ... visible=visible` because a click inside the window's presentation
 (state 1/3) is swallowed; the open step uses the VK_LWIN tap because the
 auto-hidden bar cannot be opened through UIA; and the **HID dismiss** path
 (`close dismiss kind=...`) is unreachable from an injection, because every
