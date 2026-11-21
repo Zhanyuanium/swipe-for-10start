@@ -127,8 +127,9 @@ so it is covered too.
 landing's identity: the landing is this mod's close when its dismiss command is
 still queued/armed or executed-unconfirmed, or when the open-cancel ticket names
 that command. Measured on this machine, close takeover → `win close observed`
-was **579–594 ms** for a maximum-duration (520 ms settle) close, so a busy
-launcher can pass 600 ms; a pull held through such a close is still released and
+was **562–593 ms over ten maximum-duration (520 ms settle) closes**, mean 578,
+so the worst sample sat 7 ms inside the window — a busy
+launcher can pass it; a pull held through such a close is still released and
 reopened (`reveal reopen after close pull=1 late=0`). A landing with no command
 of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
 for) and the pull is dropped by design.

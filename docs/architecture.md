@@ -472,9 +472,10 @@ at 0 and started an open settle between the settle end and the dismiss
 close too. The window is a *suppression* rule, not the landing's identity: the
 landing is this mod's close when its dismiss command is still queued/armed or
 executed-unconfirmed, or when the open-cancel ticket names that command. A
-maximum-duration close measured 579–594 ms from takeover to `win close
-observed`, so a 600 ms window has little margin and must not decide a pull's
-fate (see [limits.md](limits.md)).
+maximum-duration close measured 562–593 ms from takeover to `win close
+observed` over ten runs (mean 578, 7 ms inside the window at the worst), so a
+busy launcher can pass the window and must not decide a pull's fate (see
+[limits.md](limits.md)).
 
 Measured interruption (bottom auto-hidden unless named):
 

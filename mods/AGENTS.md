@@ -192,7 +192,8 @@ core (see [../docs/limits.md](../docs/limits.md)).
   itself before it acts. A landing is identified as this mod's close by its
   **command or its open-cancel ticket**, never by the 600 ms suppression window:
   a maximum-duration close plus launcher dispatch and cloak delivery measured
-  579–594 ms, and the window would drop a genuine pull held through a slower one.
+  562–593 ms over ten runs (mean 578, 7 ms inside the window at the worst), and
+  the window would drop a genuine pull held through a slower one.
   The window still governs admission and the unhealed rule. Both landing opens
   run the one `BeginLandingOpen`
   transaction; the pull keeps its precedence, and **only a still-down contact
