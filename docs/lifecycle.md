@@ -28,8 +28,11 @@ reachable.
    message, then joins the thread **INFINITE**, never on that thread.
 2. The **input thread** unregisters raw input, releases the 1 ms timer period
    (`EndContactTiming`), runs the per-activation reset, cancels the pending
-   measurement, destroys its window, unregisters its class, and exits. Its own
-   exit withdraws availability again (`reason=consumer-exit`).
+   measurement, destroys its window, unregisters its fixed class under
+   `&__ImageBase`, and exits. Its own exit withdraws availability again
+   (`reason=consumer-exit`). The unregister is checked and retried: only success
+   or `ERROR_CLASS_DOES_NOT_EXIST` lets the thread end, because the class still
+   holds this image's procedure.
 3. **`Wh_ModUninit`** posts one UI teardown turn to the captured dispatcher (or
    runs it inline when the unload already is that thread). The turn revokes the
    `Loaded`, `SizeChanged`, `LayoutUpdated` and scroller `ViewChanged` handlers,

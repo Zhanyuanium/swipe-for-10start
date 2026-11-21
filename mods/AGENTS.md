@@ -162,7 +162,10 @@ its debug switch; the root is resolved by symbol.
 role quiesces before it returns. The stop event is created before the input
 thread; `Wh_ModBeforeUninit` withdraws the peer, signals the thread and joins it
 `INFINITE` (never on that thread). The thread unregisters raw input, releases the
-1 ms timer period, destroys its window and unregisters its class before exiting.
+1 ms timer period, destroys its window and unregisters its fixed class under
+`&__ImageBase` before exiting; a failed unregister is retried, never returned as
+success. Registration is fixed-name and treats `ERROR_CLASS_ALREADY_EXISTS` as
+failure, exactly as the executor's class does.
 `Wh_ModUninit` runs one UI teardown turn on the captured dispatcher: revokes the
 XAML handlers and the settle batch, restores resting progress and the neutral
 translation, resets the scroller watches and drops the UI-owned objects

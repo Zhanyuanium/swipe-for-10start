@@ -8396,17 +8396,44 @@ void UnregisterHidUsage(USAGE usage) {
 // shell's loader thread.
 void ProbeRootSymbolFromInputThread();
 
+// Unregisters the fixed raw-input class under the instance that registered it.
+// The class belongs to this image, so a class left registered would leave a
+// window procedure pointing into an unloaded module. That is the same
+// discipline as the executor's fixed class: `ERROR_CLASS_ALREADY_EXISTS` is a
+// failure, never adopted, and a failed unregister keeps the unload trying
+// instead of returning success into an image the class still points at.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+void UnregisterHidWindowClass(HINSTANCE instance) {
+    for (;;) {
+        if (UnregisterClassW(kHidWindowClass, instance)) {
+            TraceLog(L"hid window class unregistered");
+            return;
+        }
+        const DWORD error = GetLastError();
+        if (error == ERROR_CLASS_DOES_NOT_EXIST) {
+            TraceLog(L"hid window class already gone");
+            return;
+        }
+        TraceLog(L"hid window class unregister failed err=%u", error);
+        Sleep(1000);
+    }
+}
+
 DWORD WINAPI HidInputThread(LPVOID) {
     g_hidThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = HidWindowProc;
-    windowClass.hInstance = GetModuleHandleW(nullptr);
+    // Fixed name, owned by this image. The host's instance would make the class
+    // outlive the mod, and its procedure would point into the unloaded image.
+    windowClass.hInstance = reinterpret_cast<HINSTANCE>(&__ImageBase);
     windowClass.lpszClassName = kHidWindowClass;
 
     if (!RegisterClassExW(&windowClass)) {
-        TraceLog(L"hid thread fail err=%u",
-                static_cast<unsigned>(GetLastError()));
+        // ERROR_CLASS_ALREADY_EXISTS included: a previous window of this image
+        // survived its unload, and adopting that class would hand this
+        // activation's raw input to a procedure that is about to be unmapped.
+        TraceLog(L"hid window class failed err=%u", GetLastError());
         return 0;
     }
 
@@ -8419,9 +8446,9 @@ DWORD WINAPI HidInputThread(LPVOID) {
     HWND hwnd = CreateWindowExW(0, kHidWindowClass, L"", 0, 0, 0, 0, 0, nullptr,
                                 nullptr, windowClass.hInstance, nullptr);
     if (!hwnd) {
-        TraceLog(L"hid thread fail err=%u",
+        TraceLog(L"hid window create failed err=%u",
                 static_cast<unsigned>(GetLastError()));
-        UnregisterClassW(kHidWindowClass, windowClass.hInstance);
+        UnregisterHidWindowClass(windowClass.hInstance);
         return 0;
     }
 
@@ -8623,7 +8650,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
         DestroyWindow(hwnd);
     }
     g_hidHwnd.store(nullptr, std::memory_order_relaxed);
-    UnregisterClassW(kHidWindowClass, windowClass.hInstance);
+    UnregisterHidWindowClass(windowClass.hInstance);
     g_hidThreadId.store(0, std::memory_order_relaxed);
     return 0;
 }

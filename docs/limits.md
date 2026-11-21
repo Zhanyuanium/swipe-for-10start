@@ -64,9 +64,14 @@
   measured. The executor creates its window on the thread that runs
   `OnHotkeyInvoke` / the shell's own `ShowStartView`, and refuses a window on any
   other.
-- **A reinstalled Windhawk image leaves its window class behind.** The class is
-  named after the image's WndProc, so a new activation does not inherit the old
-  image's procedure and its closed channel.
+- **A reinstalled Windhawk image does not inherit its window classes.** Both
+  fixed classes (`WindhawkLegacyStartSwipeRawInputWindow`,
+  `WindhawkSwipeFor10Start.Executor`) are registered under `&__ImageBase` and
+  unregistered under it. `ERROR_CLASS_ALREADY_EXISTS` is a failure, never
+  adopted: a surviving class from an earlier image points at an unmapped
+  procedure, so the Start input thread refuses to run and the executor refuses
+  to create its window. A failed unregister is retried instead of returning
+  success into an image the class still points at.
 - **A press that lands inside the shell's hide is a no-op show.** The bridge
   latches it (one slot, tick, the epoch the admission was decided under) and, 50 ms after the hidden event,
   serves it as the same open intent (`own press served wait=...`). The
