@@ -12123,6 +12123,7 @@ bool InstallStartUIHooks(HMODULE module) {
     }
     TraceLog(L"root install begin module=%p", module);
 
+    // StartUI_.dll
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {
             {kPrepareRootElementSymbol},
@@ -12130,9 +12131,9 @@ bool InstallStartUIHooks(HMODULE module) {
             &PrepareRootElement_Hook,
         },
     };
+    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
     const bool hooked =
         WindhawkUtils::HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));
-    const uintptr_t base = reinterpret_cast<uintptr_t>(module);
     const uintptr_t resolved =
         reinterpret_cast<uintptr_t>(PrepareRootElement_Original);
     if (!hooked || !resolved) {
@@ -14440,6 +14441,7 @@ bool InstallExplorerHooks(HMODULE module) {
     }
     TraceLog(L"exec launcher symbols begin module=%p", module);
 
+    // twinui.pcshell.dll
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {{kSymShow}, &Show_Original, &Show_Hook},
         {{kSymHideStartAndCortana}, &HideStartAndCortana_Original,
@@ -14461,7 +14463,6 @@ bool InstallExplorerHooks(HMODULE module) {
     };
     const bool hooked =
         WindhawkUtils::HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));
-
     // Every symbol is required. A partially resolved set is not installed at
     // all: a toggle that can open but not close (or a close that cannot be
     // classified) is worse than the shell's own path.
