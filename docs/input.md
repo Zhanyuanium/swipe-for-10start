@@ -46,7 +46,7 @@ state has:
 
 | Deadline | Clock | Window |
 |---|---|---|
-| coast start after the last positioned point | QPC | `kCoastStartMs`, 8 ms |
+| coast start after the last positioned point (a follow: its 50 ms guard too) | QPC | 8 ms, later for a fresh follow |
 | idle release of a dismiss session | QPC | `kIdleReleaseMs`, 18 ms |
 | band candidate's watchdog | QPC | `kCandidateIdleHoldMs`, 120 ms |
 | contact latch and tracked identity expiry | tick | the same 18 ms |
@@ -54,7 +54,7 @@ state has:
 | a show's executor budget | tick | `kBridgeAckTimeoutMs`, 400 ms |
 | a dismiss's executor budget | tick | `executeAt + 400 ms` |
 | the settled measurement's guaranteed turn | tick | `kSettledMeasureDeadlineMs`, 400 ms |
-| the scroller retry | tick | `g_scrollerRetryAt` |
+| the scroller retry (UI thread; its post re-plans) | tick | `g_scrollerRetryAt` |
 | the slow fallback under a transition | tick | `kVisibilityFallbackMs`, 100 ms |
 | the root-hook bootstrap probe | tick | `kRootProbeMs`, 100 ms |
 
@@ -62,7 +62,11 @@ state has:
 0 and the timer is disarmed. A deadline that has already passed is armed at 1 ms
 only where serving it clears the condition that produced it (a one-shot turn, a
 release, a watchdog); the coast start is armed only while it is still ahead,
-because `MaybeCoast` runs again on the release wake. A release that is held —
+because `MaybeCoast` runs again on the release wake, and a follow's start is the
+later of its 8 ms report gap and the 50 ms entry guard, so the wake is one the
+coast can actually use. The one deadline published from the UI thread (the
+scroller retry) posts a wake to the input window, so a planner that already read
+the previous value re-reads it. A release that is held —
 a touch show in flight, or a close in flight with a contact owning the panel —
 contributes nothing: its hold ends on a cloak event or an executor answer, and a
 deadline that cannot act would spin the thread.

@@ -76,11 +76,15 @@ republish that races the unload is refused by the same lock.
 **What wakes the input thread.** There is no period. The thread waits on the
 stop event, the bridge's intent and executor-ack events, the renderer event, the
 cloak event and one high-resolution one-shot timer, and `NextInputDeadlineMs`
-arms that timer for the soonest deadline only: the 8 ms coast start, the 18 ms
+arms that timer for the soonest deadline only: the 8 ms coast start (later for a
+follow, whose 50 ms entry guard cannot start one earlier), the 18 ms
 idle release, the 120 ms candidate watchdog, the 18 ms latch/identity expiry, the
 armed close tap, the show/dismiss executor budgets, the settled measurement's
 400 ms guaranteed turn, the scroller retry, the fallback watch and the root-hook
-bootstrap probe. Nothing due disarms it. A held release (a touch show in flight,
+bootstrap probe. Nothing due disarms it. The scroller retry is the one deadline
+written by the UI thread; it posts a private wake to the input window so a
+planner that already read the previous value re-reads it. A held release (a
+touch show in flight,
 a close in flight with a contact on the panel) contributes no deadline: its hold
 ends on a cloak event or an executor answer, and a deadline that could not act
 would spin. The tick-domain deadlines are armed at 1 ms when already past

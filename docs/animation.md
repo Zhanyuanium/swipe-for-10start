@@ -83,7 +83,9 @@ measured speed; the next report pins the panel at its own mapped position. The
 coast is the only animation besides the settle, and a release within it ends it
 and plans the settle from the visible value. The 8 ms start and the 200 ms end
 are both one-shot deadlines on the input thread, armed only while they are
-ahead: with nothing moving there is no tick to start a coast from.
+ahead: with nothing moving there is no tick to start a coast from. A follow's
+start is the later of its 8 ms report gap and its 50 ms entry guard, so the
+armed wake is one `MaybeCoast` can use instead of one its guard refuses.
 
 ## One wake per deadline
 

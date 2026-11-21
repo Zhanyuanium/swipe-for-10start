@@ -778,6 +778,11 @@ constexpr int kMaxLinkNodes = 64;
 constexpr int kHidPathChars = 512;
 constexpr wchar_t kHidWindowClass[] =
     L"WindhawkLegacyStartSwipeRawInputWindow";
+// The private wake the UI thread posts when it publishes a deadline the input
+// thread's planner may already have planned past (the scroller retry). The
+// message is only a nudge: the loop re-plans after it. Distinct from the
+// bridge's `kExecMessage` (WM_APP + 0x5A), which lives in the other process.
+constexpr UINT kInputWakeMessage = WM_APP + 0x61;
 
 constexpr USAGE kUsagePageGeneric = 0x01;
 constexpr USAGE kUsagePageDigitizer = 0x0D;
@@ -8183,7 +8188,14 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
                 considerQpcAhead(g_hidSession.lastSampleQpc + kCoastStartMs);
             }
             if (g_reveal.active) {
-                considerQpcAhead(g_reveal.lastSampleQpc + kCoastStartMs);
+                // The earliest time MaybeCoast can actually start a follow
+                // coast: its report gap *and* the follow's first 50 ms, which
+                // its settle guard rejects. Scheduling the gap alone armed a
+                // wake the guard refused, and a silent stream never tried the
+                // coast again.
+                considerQpcAhead(std::max(
+                    g_reveal.lastSampleQpc + kCoastStartMs,
+                    g_reveal.activeSinceQpc + kRevealCoastSettleMs));
             }
         }
         if (g_hidSession.active) {
@@ -8779,6 +8791,10 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
             return 0;
         case WM_CLOSE:
             DestroyWindow(hwnd);
+            return 0;
+        case kInputWakeMessage:
+            // A cross-thread deadline was published (the scroller retry). The
+            // loop re-plans after this batch; the message itself carries nothing.
             return 0;
         default:
             return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -10752,6 +10768,16 @@ void ScheduleScrollerRetry(uint32_t generation) {
     }
     g_scrollerRetryGeneration.store(generation, std::memory_order_relaxed);
     g_scrollerRetryAt.store(GetTickCount64() + delay, std::memory_order_relaxed);
+    // The input thread may already be waiting for a later deadline; wake it so
+    // its planner re-reads this one. The post is the whole signal: a null or
+    // already-destroyed window fails harmlessly, and the unload flag keeps this
+    // from racing a window that is being torn down.
+    if (!g_unloading.load(std::memory_order_relaxed)) {
+        HWND hwnd = g_hidHwnd.load(std::memory_order_relaxed);
+        if (hwnd) {
+            PostMessageW(hwnd, kInputWakeMessage, 0, 0);
+        }
+    }
 }
 
 // UI thread only: one line per open naming why a settled scroller pass could not
