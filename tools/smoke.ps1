@@ -25,10 +25,13 @@ switch). The script checks that one of the two files was written during the run
 and otherwise prints the one command that enables the trace and exits non-zero.
 With the trace on it needs no other switch.
 
-The injection geometry is read from the mod's own last `reveal panelTrail=...`
-line — its axis, band and panel rectangle — so the same tool works on a bottom,
-top, left or right taskbar; the coordinates it feeds are physical pixels, scaled
-from the DIP values by the primary screen's factor.
+The injection geometry is read from the mod's own lines after the warm-up open:
+one `reveal panelTrail` record of that run supplies the axis, band and panel
+rectangle, and a `dismiss` record on the same axis supplies the bar's thickness
+for the DPI scale — so the same tool works on a bottom, top, left or right
+taskbar; the coordinates it feeds are physical pixels, scaled from the DIP values
+by the primary screen's factor. A field no matching record carries is reported
+missing and the touch rows refuse to inject.
 
 Three details it encodes, each learned the hard way:
 - The auto-hidden bar cannot be opened through UIA, so the open step uses the
@@ -178,11 +181,18 @@ function Test-ExecutedDismiss { param([string]$text, [int]$method)
 #
 # The layout fields (axis, band, rectangle) must come from this run: `-Since` is
 # the run's tick mark, so a rotated trace or a previous session cannot supply
-# historical coordinates. The scale is the monitor DPI, not a layout fact, and the
-# bar's thickness in DIP is constant, so its ratio may come from the last
-# `dismiss` line in the file even when that line predates the run; every field is
-# still reported separately and the caller refuses to inject unless all four were
-# measured.
+# historical coordinates. They are taken from one record when possible — the
+# newest `reveal panelTrail` line (accepted or rejected) carries the axis, the
+# panel rectangle and the band together — and a field that has to fall back to
+# its own line is accepted only when that line carries no axis or the same axis.
+#
+# The scale is the monitor DPI, not a layout fact, so the bar rectangle may come
+# from an earlier session; but only from a `dismiss` record whose axis matches
+# the live one, and the record's own axis decides which dimension is the bar's
+# thickness. Mixing a historical bottom bar with the live left axis turned the
+# screen width into a "thickness" (a scale of ~60), and a rotated log with no
+# matching record has no scale at all. Every field is reported separately and
+# the caller refuses to inject unless all four were measured.
 function Get-Layout {
     param([long]$Since = 0)
     $allLines = @()
@@ -196,41 +206,74 @@ function Get-Layout {
         AxisKnown = $false; BandKnown = $false; RectKnown = $false; ScaleKnown = $false
         Complete = $false
     }
-    # The axis survives even when the panel rectangle was rejected (a left or
-    # right bar can put the panel off the edge the trail expects): the fallback
-    # line has the axis, the dismissal line has it too, and the rejected line
-    # still carries the measured rectangle the drag needs.
-    $axisLine = $lines | Select-String 'panelTrail=.*axis=\d|dismiss axis=\d' | Select-Object -Last 1
-    if ($axisLine -and $axisLine.Line -match 'axis=(\d)') {
-        $layout.Axis = [int]$Matches[1]; $layout.AxisKnown = $true
+    # One record that carries every shape field: the newest accepted or rejected
+    # panelTrail line of this run. Using one line keeps an old axis from being
+    # paired with a new rectangle.
+    $shapeLine = $lines | Select-String 'reveal panelTrail.*axis=\d.*rect=.*band=' |
+        Select-Object -Last 1
+    if ($shapeLine) {
+        $line = $shapeLine.Line
+        if ($line -match 'axis=(\d)') {
+            $layout.Axis = [int]$Matches[1]; $layout.AxisKnown = $true
+        }
+        if ($line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
+            $layout.Left = [int]$Matches[1]; $layout.Top = [int]$Matches[2]
+            $layout.Right = [int]$Matches[3]; $layout.Bottom = [int]$Matches[4]
+            $layout.RectKnown = $true
+        }
+        if ($line -match 'band=(-?\d+),(-?\d+)') {
+            $layout.Low = [int]$Matches[1]; $layout.High = [int]$Matches[2]
+            $layout.BandKnown = $true
+        }
     }
-    $bandLine = $lines | Select-String 'band=(-?\d+),(-?\d+)' | Select-Object -Last 1
-    if ($bandLine -and $bandLine.Line -match 'band=(-?\d+),(-?\d+)') {
-        $layout.Low = [int]$Matches[1]; $layout.High = [int]$Matches[2]
-        $layout.BandKnown = $true
+    # Fallbacks for a run whose gesture produced no panelTrail line. Each record
+    # is accepted only when it carries no axis or the axis already established;
+    # a record on another axis is not this layout's.
+    if (-not $layout.AxisKnown) {
+        $axisLine = $lines | Select-String 'panelTrail=.*axis=\d|dismiss axis=\d|reveal admit .*axis=\d' |
+            Select-Object -Last 1
+        if ($axisLine -and $axisLine.Line -match 'axis=(\d)') {
+            $layout.Axis = [int]$Matches[1]; $layout.AxisKnown = $true
+        }
     }
-    $rectLine = $lines | Select-String 'reveal .*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)' | Select-Object -Last 1
-    if ($rectLine -and $rectLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
-        $layout.Left = [int]$Matches[1]; $layout.Top = [int]$Matches[2]
-        $layout.Right = [int]$Matches[3]; $layout.Bottom = [int]$Matches[4]
-        $layout.RectKnown = $true
+    if (-not $layout.BandKnown -and $layout.AxisKnown) {
+        $bandLine = $lines | Select-String ("axis={0}\b.*band=(-?\d+),(-?\d+)" -f $layout.Axis) |
+            Select-Object -Last 1
+        if ($bandLine -and $bandLine.Line -match 'band=(-?\d+),(-?\d+)') {
+            $layout.Low = [int]$Matches[1]; $layout.High = [int]$Matches[2]
+            $layout.BandKnown = $true
+        }
     }
-    # The scale from the taskbar's own rect: the `dismiss` line prints it in
-    # physical pixels, and the band is twice the bar in DIP. Their ratio is the
-    # monitor scale without assuming a screen size or a docked bar. It stays
-    # fractional: 125 % and 150 % are 1.25 and 1.5, and rounding them puts every
-    # injected point off the band or off the panel.
-    $barLine = $allLines | Select-String 'dismiss axis=\d.*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)' | Select-Object -Last 1
+    if (-not $layout.RectKnown -and $layout.AxisKnown) {
+        $rectLine = $lines | Select-String ("reveal .*axis={0}\b.*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)" -f $layout.Axis) |
+            Select-Object -Last 1
+        if ($rectLine -and $rectLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
+            $layout.Left = [int]$Matches[1]; $layout.Top = [int]$Matches[2]
+            $layout.Right = [int]$Matches[3]; $layout.Bottom = [int]$Matches[4]
+            $layout.RectKnown = $true
+        }
+    }
+    # The scale from the taskbar's own rectangle on the live axis: the `dismiss`
+    # line prints it in physical pixels, and the band is twice the bar in DIP.
+    # Their ratio is the monitor scale without assuming a screen size or a docked
+    # bar. It stays fractional: 125 % and 150 % are 1.25 and 1.5, and rounding
+    # them puts every injected point off the band or off the panel.
     $layout.Scale = 0
     $bandDip = $layout.High - $layout.Low
-    if ($barLine -and $layout.BandKnown -and $bandDip -gt 0 -and
-        $barLine.Line -match 'rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
-        $barWidth = [int]$Matches[3] - [int]$Matches[1]
-        $barHeight = [int]$Matches[4] - [int]$Matches[2]
-        $barPhysical = if ($layout.Axis -eq 0 -or $layout.Axis -eq 2) { $barWidth } else { $barHeight }
-        if ($barPhysical -gt 0) {
-            $layout.Scale = $barPhysical / ($bandDip / 2.0)
-            $layout.ScaleKnown = $true
+    if ($layout.AxisKnown -and $layout.BandKnown -and $bandDip -gt 0) {
+        $barLine = $allLines | Select-String ("dismiss axis={0}\b.*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)" -f $layout.Axis) |
+            Select-Object -Last 1
+        if ($barLine -and $barLine.Line -match 'dismiss axis=(\d)\b.*rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
+            # The record's own axis, not the live axis, says which side is the
+            # thickness; they match by the filter above.
+            $recordAxis = [int]$Matches[1]
+            $barWidth = [int]$Matches[4] - [int]$Matches[2]
+            $barHeight = [int]$Matches[5] - [int]$Matches[3]
+            $barPhysical = if ($recordAxis -eq 0 -or $recordAxis -eq 2) { $barWidth } else { $barHeight }
+            if ($barPhysical -gt 0) {
+                $layout.Scale = $barPhysical / ($bandDip / 2.0)
+                $layout.ScaleKnown = $true
+            }
         }
     }
     if ($layout.Scale -lt 1) { $layout.Scale = 1 }
