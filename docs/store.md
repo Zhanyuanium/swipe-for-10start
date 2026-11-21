@@ -20,6 +20,18 @@ hand-edited (`dist/` is ignored), and changes only what the collection requires:
 Everything else — code, README body, version, `@include`, `@architecture` — is the
 repo source verbatim, so the submitted file and `mods/` cannot drift apart.
 
+Two source constraints come from the collection's scripts, not from Windhawk:
+
+- `.github/extract_mod_symbols.py` reads a hook entry's name only where the entry
+  carries it as a literal. A `constexpr wchar_t` constant fails the job with
+  `Symbol name is not a string`, so both hook arrays spell their names inline as
+  adjacent literals.
+- `pr_validation.py` maps a `<base>DllHooks` variable name to `<base>.dll` and
+  looks that up in the Windows file-name index. `StartUI_.dll` is not in the
+  index, so the Start array is `startuiDllHooks` (the index knows the component
+  as `startui.dll`), while the launcher array keeps the neutral `symbolHooks`
+  with `// twinui.pcshell.dll` directly above it.
+
 ## Local install
 
 The same generator has a `local` profile, because an installed mod is also
@@ -56,11 +68,17 @@ enabled.
 2. `pwsh -File tools/make_store_mods.ps1 -Profile local`, then compile the
    generated local file with `-Wall -Wextra -fsyntax-only` and no `-I`; it must
    be silent (the inlined-header pragma exists for exactly this).
-3. Run the collection's own validator against each file, from a clone of
+3. Run the extractor the collection's cache job runs:
+   `get_mod_symbols(Path('mods/<id>.wh.cpp'), [])` from
+   `.github/extract_mod_symbols.py`, with `.github` on `sys.path`. It must print
+   one name under `startui.dll` and thirteen under `twinui.pcshell.dll`. The
+   validator's single-file test mode does not run this step, and its PR mode
+   runs it only after the file checks pass.
+4. Run the collection's own validator against each file, from a clone of
    `windhawk-mods`:
    `python .github/pr_validation.py mods/<id>.wh.cpp Zhanyuanium 92024923`
    It must report zero errors and zero review items.
-4. The PR body must keep the template's `## Mod authorship` section, and the
+5. The PR body must keep the template's `## Mod authorship` section, and the
    mod's `@github` must match the PR author's login (`Zhanyuanium`).
 
 ## After opening

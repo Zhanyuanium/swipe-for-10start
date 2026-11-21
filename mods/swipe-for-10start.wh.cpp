@@ -441,19 +441,15 @@ using winrt::Windows::Foundation::Numerics::float2;
 using winrt::Windows::Foundation::Numerics::float3;
 
 // StartUI::App::PrepareRootElement(Frame^, PerFrameData^, bool) -> UIElement^,
-// a private static C++/CX function. It is resolved by its public symbol, not by
-// an address: the address moves with the build, the name does not.
+// a private static C++/CX function, is resolved by its public symbol, not by an
+// address: the address moves with the build, the name does not. The name is a
+// literal in the hook entry, because the store's symbol extractor reads a name
+// only where the entry carries it literally.
 //
-// The spelling below is the exact undecorated name, read from the reference
-// StartUI.pdb (10.0.22621.3733) with the same DIA undecorator the Windhawk
-// symbol API matches against. The decorated spelling of the same function is
+// The reference address is module + 0xAD730, and it is a test expectation: a
+// resolved address that differs is logged, not refused. The decorated spelling
+// of the same function is
 //   ?PrepareRootElement@App@StartUI@@CAPE$AAVUIElement@Xaml@UI@Windows@@PE$AAVFrame@Controls@456@PE$AAVPerFrameData@2@_N@Z
-// and the reference address is module + 0xAD730. That address is a test
-// expectation: a resolved address that differs is logged, not refused.
-constexpr wchar_t kPrepareRootElementSymbol[] =
-    L"private: static class Windows::UI::Xaml::UIElement ^ __cdecl "
-    L"StartUI::App::PrepareRootElement(class Windows::UI::Xaml::Controls::"
-    L"Frame ^,class StartUI::PerFrameData ^,bool)";
 constexpr uintptr_t kPrepareRootElementExpectedRva = 0xAD730;
 constexpr wchar_t kStartUIModuleName[] = L"StartUI_.dll";
 
@@ -12123,17 +12119,25 @@ bool InstallStartUIHooks(HMODULE module) {
     }
     TraceLog(L"root install begin module=%p", module);
 
-    // StartUI_.dll
-    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+    // The Windows 11 image is StartUI_.dll. The collection's file-name index
+    // knows the component as startui.dll, so the array carries that name and no
+    // module comment of its own.
+    //
+    // The entry's name is the exact undecorated spelling, read from the
+    // reference StartUI.pdb (10.0.22621.3733) with the same DIA undecorator the
+    // Windhawk symbol API matches against.
+    WindhawkUtils::SYMBOL_HOOK startuiDllHooks[] = {
         {
-            {kPrepareRootElementSymbol},
+            {L"private: static class Windows::UI::Xaml::UIElement ^ __cdecl "
+             L"StartUI::App::PrepareRootElement(class Windows::UI::Xaml::"
+             L"Controls::Frame ^,class StartUI::PerFrameData ^,bool)"},
             &PrepareRootElement_Original,
             &PrepareRootElement_Hook,
         },
     };
     const uintptr_t base = reinterpret_cast<uintptr_t>(module);
-    const bool hooked =
-        WindhawkUtils::HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));
+    const bool hooked = WindhawkUtils::HookSymbols(
+        module, startuiDllHooks, ARRAYSIZE(startuiDllHooks));
     const uintptr_t resolved =
         reinterpret_cast<uintptr_t>(PrepareRootElement_Original);
     if (!hooked || !resolved) {
@@ -12865,54 +12869,12 @@ void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr);
 void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                          uint32_t flags);
 
-// twinui.pcshell.dll is resolved by public symbol, not by address. Every string
-// below is the exact DIA undecorated name for 10.0.26100.9949, read from
-// twinui.pcshell.pdb with the same undecorator the Windhawk symbol API matches;
-// the expected RVA beside it is evidence in the log, never a fallback. The
-// decorated spellings are in docs/re/ and are not used.
-constexpr wchar_t kSymShow[] =
-    L"public: virtual long __cdecl CStartExperienceManager::Show(unsigned "
-    L"char,unsigned char,unsigned int)";
-constexpr wchar_t kSymHideStartAndCortana[] =
-    L"public: virtual void __cdecl "
-    L"XamlLauncherState::HideStartAndCortana(enum "
-    L"IMMERSIVELAUNCHERDISMISSMETHOD)";
-constexpr wchar_t kSymOnStartShown[] =
-    L"public: long __cdecl XamlLauncherState::OnStartShown(struct "
-    L"Windows::Internal::Shell::Experience::IStartExperienceManager *,struct "
-    L"IInspectable *)";
-constexpr wchar_t kSymOnStartHidden[] =
-    L"public: long __cdecl XamlLauncherState::OnStartHidden(struct "
-    L"Windows::Internal::Shell::Experience::IStartExperienceManager *,struct "
-    L"IInspectable *)";
-constexpr wchar_t kSymOnHotkeyInvoke[] =
-    L"private: long __cdecl XamlLauncher::OnHotkeyInvoke(enum "
-    L"IMMERSIVELAUNCHERSHOWFLAGS)";
-constexpr wchar_t kSymOnStartButtonPressed[] =
-    L"public: virtual long __cdecl "
-    L"XamlLauncher::OnStartButtonPressed(enum "
-    L"IMMERSIVELAUNCHERSHOWMETHOD,enum IMMERSIVELAUNCHERDISMISSMETHOD)";
-constexpr wchar_t kSymDismiss[] =
-    L"public: virtual long __cdecl XamlLauncher::Dismiss(enum "
-    L"IMMERSIVELAUNCHERDISMISSMETHOD)";
-constexpr wchar_t kSymShowStartView[] =
-    L"public: virtual long __cdecl XamlLauncher::ShowStartView(enum "
-    L"IMMERSIVELAUNCHERSHOWMETHOD,enum IMMERSIVELAUNCHERSHOWFLAGS)";
-constexpr wchar_t kSymLauncherSlot[] =
-    L"private: static class XamlLauncher * XamlLauncher::s_pLauncher";
-constexpr wchar_t kSymLauncherIsVisible[] =
-    L"public: virtual long __cdecl XamlLauncher::IsVisible(int *)";
-constexpr wchar_t kSymDismissStartAndCortana[] =
-    L"public: virtual void __cdecl "
-    L"XamlLauncherState::DismissStartAndCortana(enum "
-    L"IMMERSIVELAUNCHERDISMISSMETHOD)";
-constexpr wchar_t kSymDismissSynchronously[] =
-    L"public: virtual long __cdecl "
-    L"XamlLauncher::DismissSynchronouslyWithoutTransition(void)";
-constexpr wchar_t kSymActiveZBand[] =
-    L"public: virtual long __cdecl "
-    L"ImmersiveMonitorHelper::ActiveZBandChangedForMonitor(unsigned long,"
-    L"unsigned long,struct IImmersiveMonitor *,enum MODE_CHANGE_REASON)";
+// twinui.pcshell.dll is resolved by public symbol, not by address. The hook
+// array in InstallExplorerHooks carries every name inline: each is the exact
+// DIA undecorated name for 10.0.26100.9949, read from twinui.pcshell.pdb with
+// the same undecorator the Windhawk symbol API matches, and a name is a literal
+// because the store's symbol extractor reads only a literal. The decorated
+// spellings are in docs/re/ and are not used.
 
 // The reference RVAs, for the resolution log only. A different value is reported
 // and the symbol is still used: the name is the contract, the address is
@@ -14443,23 +14405,51 @@ bool InstallExplorerHooks(HMODULE module) {
 
     // twinui.pcshell.dll
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
-        {{kSymShow}, &Show_Original, &Show_Hook},
-        {{kSymHideStartAndCortana}, &HideStartAndCortana_Original,
-         &HideStartAndCortana_Hook},
-        {{kSymOnStartShown}, &OnStartShown_Original, &OnStartShown_Hook},
-        {{kSymOnStartHidden}, &OnStartHidden_Original, &OnStartHidden_Hook},
-        {{kSymOnHotkeyInvoke}, &OnHotkeyInvoke_Original, &OnHotkeyInvoke_Hook},
-        {{kSymOnStartButtonPressed}, &OnStartButtonPressed_Original,
-         &OnStartButtonPressed_Hook},
-        {{kSymDismiss}, &Dismiss_Original, &Dismiss_Hook},
-        {{kSymShowStartView}, &ShowStartView_Original, &ShowStartView_Hook},
-        {{kSymDismissStartAndCortana}, &DismissStartAndCortana_Original,
-         &DismissStartAndCortana_Hook},
-        {{kSymDismissSynchronously}, &DismissSynchronously_Original,
-         &DismissSynchronously_Hook},
-        {{kSymActiveZBand}, &ActiveZBand_Original, &ActiveZBand_Hook},
-        {{kSymLauncherSlot}, &g_launcherSlot, nullptr},
-        {{kSymLauncherIsVisible}, &g_launcherIsVisible, nullptr},
+        {{L"public: virtual long __cdecl "
+          L"CStartExperienceManager::Show(unsigned char,unsigned char,"
+          L"unsigned int)"},
+         &Show_Original, &Show_Hook},
+        {{L"public: virtual void __cdecl "
+          L"XamlLauncherState::HideStartAndCortana(enum "
+          L"IMMERSIVELAUNCHERDISMISSMETHOD)"},
+         &HideStartAndCortana_Original, &HideStartAndCortana_Hook},
+        {{L"public: long __cdecl XamlLauncherState::OnStartShown(struct "
+          L"Windows::Internal::Shell::Experience::IStartExperienceManager *,"
+          L"struct IInspectable *)"},
+         &OnStartShown_Original, &OnStartShown_Hook},
+        {{L"public: long __cdecl XamlLauncherState::OnStartHidden(struct "
+          L"Windows::Internal::Shell::Experience::IStartExperienceManager *,"
+          L"struct IInspectable *)"},
+         &OnStartHidden_Original, &OnStartHidden_Hook},
+        {{L"private: long __cdecl XamlLauncher::OnHotkeyInvoke(enum "
+          L"IMMERSIVELAUNCHERSHOWFLAGS)"},
+         &OnHotkeyInvoke_Original, &OnHotkeyInvoke_Hook},
+        {{L"public: virtual long __cdecl "
+          L"XamlLauncher::OnStartButtonPressed(enum "
+          L"IMMERSIVELAUNCHERSHOWMETHOD,enum IMMERSIVELAUNCHERDISMISSMETHOD)"},
+         &OnStartButtonPressed_Original, &OnStartButtonPressed_Hook},
+        {{L"public: virtual long __cdecl XamlLauncher::Dismiss(enum "
+          L"IMMERSIVELAUNCHERDISMISSMETHOD)"},
+         &Dismiss_Original, &Dismiss_Hook},
+        {{L"public: virtual long __cdecl XamlLauncher::ShowStartView(enum "
+          L"IMMERSIVELAUNCHERSHOWMETHOD,enum IMMERSIVELAUNCHERSHOWFLAGS)"},
+         &ShowStartView_Original, &ShowStartView_Hook},
+        {{L"public: virtual void __cdecl "
+          L"XamlLauncherState::DismissStartAndCortana(enum "
+          L"IMMERSIVELAUNCHERDISMISSMETHOD)"},
+         &DismissStartAndCortana_Original, &DismissStartAndCortana_Hook},
+        {{L"public: virtual long __cdecl "
+          L"XamlLauncher::DismissSynchronouslyWithoutTransition(void)"},
+         &DismissSynchronously_Original, &DismissSynchronously_Hook},
+        {{L"public: virtual long __cdecl "
+          L"ImmersiveMonitorHelper::ActiveZBandChangedForMonitor(unsigned "
+          L"long,unsigned long,struct IImmersiveMonitor *,"
+          L"enum MODE_CHANGE_REASON)"},
+         &ActiveZBand_Original, &ActiveZBand_Hook},
+        {{L"private: static class XamlLauncher * XamlLauncher::s_pLauncher"},
+         &g_launcherSlot, nullptr},
+        {{L"public: virtual long __cdecl XamlLauncher::IsVisible(int *)"},
+         &g_launcherIsVisible, nullptr},
     };
     const bool hooked =
         WindhawkUtils::HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));

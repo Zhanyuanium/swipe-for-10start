@@ -74,9 +74,11 @@ README.md: the map and the one shipping mod.
 store.md: how the mod reaches `ramensoftware/windhawk-mods` — the one-file-per-PR
 rule that forces `tools/make_store_mods.ps1` to inline the shared headers, what
 the `store` and `local` profiles each change (no `-I` in either; the store also
-drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage`), the local
-install flow that consumes `local`, why it is one PR, and the four checks to run
-before opening it.
+drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage`), the two
+constraints the collection's scripts impose on the source (a hook name must be a
+literal in its entry; the array variable must name a module the file-name index
+knows, or carry a module comment), the local install flow that consumes `local`,
+why it is one PR, and the five checks to run before opening it.
 
 ## Laws
 
