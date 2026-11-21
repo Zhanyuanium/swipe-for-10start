@@ -189,7 +189,12 @@ core (see [../docs/limits.md](../docs/limits.md)).
   already-published `external` intent
   (`intent reconcile ... (before landing recovery)`) because the cloak event and
   the intent event are separate wakes and the landing reads the intent record
-  itself before it acts. Both landing opens run the one `BeginLandingOpen`
+  itself before it acts. A landing is identified as this mod's close by its
+  **command or its open-cancel ticket**, never by the 600 ms suppression window:
+  a maximum-duration close plus launcher dispatch and cloak delivery measured
+  579–594 ms, and the window would drop a genuine pull held through a slower one.
+  The window still governs admission and the unhealed rule. Both landing opens
+  run the one `BeginLandingOpen`
   transaction; the pull keeps its precedence, and **only a still-down contact
   marks the touch**: a late release record reopens with `controllerTouch=0`
   (`pull=0 late=1`), because that finger is gone and the next real desktop

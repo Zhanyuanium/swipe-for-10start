@@ -122,6 +122,17 @@ run never writes that line. A band pull that the shell opens natively, without
 a show request from this mod, opens the same watch when the contact is admitted,
 so it is covered too.
 
+**A late hide costs latency, not the pull.** The 600 ms suppression window
+(`kRestoreSuppressMs`) governs admission and the unhealed rule, not the
+landing's identity: the landing is this mod's close when its dismiss command is
+still queued/armed or executed-unconfirmed, or when the open-cancel ticket names
+that command. Measured on this machine, close takeover → `win close observed`
+was **579–594 ms** for a maximum-duration (520 ms settle) close, so a busy
+launcher can pass 600 ms; a pull held through such a close is still released and
+reopened (`reveal reopen after close pull=1 late=0`). A landing with no command
+of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
+for) and the pull is dropped by design.
+
 ## The touch show
 
 - **The digitizer may go quiet during the uncloak and during a close.** The

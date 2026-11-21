@@ -7928,11 +7928,20 @@ void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         // already-published superseding intent is reconciled first, and it clears
         // the suppression and the recovery ticket as any external takeover does.
         ReconcileSupersedingIntentBeforeLanding();
-        // Whether this landing belongs to a close this mod started. It is read
-        // before this branch clears the suppression. A reconciled external
-        // takeover has cleared it above on purpose: that close is the shell's.
-        const bool closeInFlight =
-            tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+        // Whether the hide that just landed belongs to a close this mod
+        // started. The suppression *window* is not the evidence: it is 600 ms,
+        // and a maximum-duration close (520 ms settle + the 30 ms lead +
+        // launcher dispatch + cloak delivery) measured 579-594 ms, so a busy
+        // launcher can pass it and a genuine pull held through that close would
+        // be dropped as an external takeover. The command is the identity: a
+        // dismiss of ours is queued/armed, or executed and awaiting its
+        // confirmation, for exactly the menu this landing closes. Every path
+        // that revokes it (a cancel, a failure, an external intent) clears those
+        // slots first, so this cannot claim someone else's close. A close whose
+        // command an open intent revoked is added below through its ticket.
+        const bool closeCommand =
+            g_pendingDismissExec.load(std::memory_order_relaxed) != 0 ||
+            g_pendingDismissConfirm != 0;
         // An open that cancelled a close while the window still showed is owed
         // only if that close still lands, and only for the menu the cancel named.
         // The ticket is consumed here, by the landing, and by nothing else: the
@@ -7962,11 +7971,15 @@ void ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
                     ticketCurrent && !ticketLive ? 1 : 0);
         }
         g_intentCancel = CloseCancelTicket{};
+        // A close whose command an open intent revoked can still land. The
+        // ticket names that command and the menu it belongs to, so the landing
+        // is still this mod's close and its pull is released, not dropped.
+        const bool closeOurs = closeCommand || intentCancelLost;
         // The close has landed, so its suppression no longer applies. Without
         // this a Win press right after the hide opened the window with Progress
         // still at 0, and the panel was invisible until the next open.
         g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
-        if (closeInFlight) {
+        if (closeOurs) {
             // A pull that arrived during the close is the pull that opens the
             // menu this hide made room for. The landing is the one moment its
             // deferral can end: the retract is over, nothing else writes
