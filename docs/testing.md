@@ -336,6 +336,23 @@ The tool's `SUMMARY min=`/`start=` cover the whole capture, including the setup
 close that precedes the marked one, so the measured window's floor is the value
 between `at-close` and its reversal — not the summary's minimum.
 
+### The boundary: a retract already off screen
+
+`panel_edge_track.ps1` cannot read the trailing edge on the bottom bar (`axis=3`)
+yet — it warns that the widest measured edge does not reach `trail*scale` — so
+this pair is read from the mod's own lines, on the bottom auto-hidden layout
+(`distance` 852 DIP, entry 0.310), with the pull's qualification arriving at
+different depths of the same 387 ms close:
+
+| pull qualifies at | `progress` at the take | what the mod did |
+| --- | --- | --- |
+| 150 ms after the tap | 0.934 | `exec cancel request ... reason=pull`, `reveal takeover from=0.934 live=1`; no `win close observed` |
+| after the settle ended (~437 ms) | at or below the entry | no cancel; `reveal defer released candidate=1 down=1`, `win close observed`, `reveal reopen after close pull=1 late=0 entry=0.310` |
+
+The second row is why a cancel needs a panel on screen: a takeover at or below the
+entry would open the menu from an invisible start, so the close lands and the
+landing's reopen begins at the entry instead.
+
 Frames were captured at 200 % DPI with the tool's own DIB; `t` is the capture
 start, so a frame can lag its stamp by one compositor interval, and the CSV's
 `edge_dip` is the measured edge divided by the derived scale.

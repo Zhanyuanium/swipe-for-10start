@@ -5558,6 +5558,10 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
 //   returned with its hide unconfirmed, so the hide can land at any moment and
 //   there is no schedule left to drop: the pull defers to the landing instead,
 //   which is the same answer every close had before a pull could cancel one;
+// - the panel must still be on screen. A retract that is already at or below the
+//   entry has no live position to take over: the cancel would open the menu from
+//   an invisible start, which reads as a switch, and the close has to land anyway.
+//   That pull keeps the landing reopen, which starts at the entry;
 // - something must actually be cancelled (the local gesture deadline or the
 //   executor command), otherwise there is no close to abort.
 //
@@ -5574,6 +5578,21 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
 bool CancelCloseForQualifiedPull(const GestureGeometry& geometry, float x, float y,
                                  uint64_t tickMs) {
     if (!CloseInFlight(tickMs) || g_pendingDismissConfirm != 0) {
+        return false;
+    }
+    // Nothing left to reverse: the panel is at or below the entry, the first
+    // progress at which any of it is on screen, so its retract is over and only the
+    // hidden travel is left. Cancelling here would start the open from an
+    // invisible position — the menu appears to switch on — while the close has to
+    // land anyway. The close lands, and the landing's own reopen starts the pull's
+    // open at the entry, which is the honest start for a panel that is not there.
+    // Without a distance there is no mapping to take over with, so the same answer.
+    const float distance = geometry.distance();
+    if (!(distance > 0.0f)) {
+        return false;
+    }
+    const float entry = RevealEntryProgress(geometry);
+    if ((PeekProgressNow() - entry) * distance <= kProgressEpsilonDip) {
         return false;
     }
     const DismissBeforeCancel dismissed = ReadDismissBeforeCancel();
@@ -5594,22 +5613,16 @@ bool CancelCloseForQualifiedPull(const GestureGeometry& geometry, float x, float
     g_commitNeedsProgressReset = false;
     g_intentOpenActive.store(false, std::memory_order_relaxed);
     const float live = TakeProgressNow(L"pull");
-    const float distance = geometry.distance();
-    if (distance > 0.0f) {
-        // The takeover continues from here. The offset is the gap between the
-        // finger's mapping at this report and the position the panel actually
-        // has; the follow chases `mapped - offset` for the rest of the contact,
-        // so a half-closed panel is not first driven toward the finger's
-        // absolute coordinate.
-        float panelTrail = 0.0f;
-        const float mapped =
-            RevealProgressDip(geometry, distance, x, y, panelTrail);
-        g_reveal.liveTakeover = true;
-        g_reveal.liveStart = live;
-        g_reveal.liveOffset = mapped - live;
-    }
-    if (distance > 0.0f &&
-        (1.0f - live) * distance < kProgressEpsilonDip) {
+    // The takeover continues from here. The offset is the gap between the finger's
+    // mapping at this report and the position the panel actually has; the follow
+    // chases `mapped - offset` for the rest of the contact, so a half-closed panel
+    // is not first driven toward the finger's absolute coordinate.
+    float panelTrail = 0.0f;
+    const float mapped = RevealProgressDip(geometry, distance, x, y, panelTrail);
+    g_reveal.liveTakeover = true;
+    g_reveal.liveStart = live;
+    g_reveal.liveOffset = mapped - live;
+    if ((1.0f - live) * distance < kProgressEpsilonDip) {
         ShowAtRest();
     } else {
         std::chrono::milliseconds duration{0};

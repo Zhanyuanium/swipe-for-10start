@@ -197,9 +197,12 @@ core (see [../docs/limits.md](../docs/limits.md)).
   ticket a press arms, and takes the retract over from the panel's live position.
   A keyboard, Start-button, click-away and gesture close are all cancellable,
   because each one's dismiss is a command the bridge holds in an armed timer until
-  its deadline. The one close it cannot abort is a dismiss whose call already
+  its deadline. Two closes it cannot abort. One is a dismiss whose call already
   returned with its hide unconfirmed (`g_pendingDismissConfirm`): the hide can
-  land at any moment, so the pull stays deferred and the landing reopens. A
+  land at any moment, so the pull stays deferred and the landing reopens. The
+  other is a retract already at or below the entry, where no panel is on screen:
+  cancelling there would open the menu from an invisible start, so that pull keeps
+  the landing reopen and its open begins at the entry. A
   local-only cancel arms no ticket. Contact-down no longer cancels anything; a tap
   leaves the close alone.
 - `win close observed` — the landing body (`LandClosedMenu`). The cloak

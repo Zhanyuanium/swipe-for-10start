@@ -150,10 +150,13 @@ from the panel's position, keeps the finger-to-panel offset it took over
 (`reveal takeover ... live=1`) and begins its chase at that sample. The pull that
 does it aborts the close at its 24 DIP report: `CancelCloseForQualifiedPull`
 revokes both schedules (the local slot and the armed `exec dismiss`), arms the
-same recovery ticket a press arms, and takes the retract over there. The one
-close it cannot abort is a dismiss whose call already returned with its hide
-unconfirmed (`g_pendingDismissConfirm`): that hide can land at any moment, so the
-pull stays deferred and its landing reopens.
+same recovery ticket a press arms, and takes the retract over there. Two closes it
+cannot abort: a dismiss whose call already returned with its hide unconfirmed
+(`g_pendingDismissConfirm`), whose hide can land at any moment, and a retract
+already at or below the entry, where no panel is on screen — cancelling there
+would open the menu from an invisible start, so that pull keeps the landing reopen
+and its open begins at the entry. Both stay deferred and their
+landing reopens.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
 pull that is still down and qualified when a close it could not abort lands (or

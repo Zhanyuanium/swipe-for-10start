@@ -156,10 +156,14 @@ settle — clears the suppression, republishes the open direction, arms the same
 recovery ticket a press arms, and takes the retract over from the panel's live
 position. Every close this mod owns is cancellable that way, the Win key and the
 two Start-button primitives included: their dismiss is published at once but the
-bridge keeps it in an armed timer until its deadline. The one close a pull cannot
-abort is a dismiss whose call already returned with its hide still unconfirmed
-(`g_pendingDismissConfirm`); that hide can land at any moment, so the pull stays
-deferred and the landing reopens for it. A contact that never travels leaves the
+bridge keeps it in an armed timer until its deadline. Two closes a pull cannot
+abort. One is a dismiss whose call already returned with its hide still
+unconfirmed (`g_pendingDismissConfirm`); that hide can land at any moment, so the
+pull stays deferred and the landing reopens for it. The other is a retract that is
+already at or below the entry, where no panel is on screen: cancelling there would
+open the menu from an invisible start — the menu appears to switch on — while the
+close has to land anyway, so that pull keeps the landing reopen, which begins at
+the entry. A contact that never travels leaves the
 close to run; a tap that never enters the band has no candidate and cannot cancel
 anything.
 
