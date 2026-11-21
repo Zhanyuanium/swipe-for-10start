@@ -215,6 +215,9 @@ constexpr uint32_t kTraceMaxLines = 20000;
 
 SRWLOCK g_traceLock = SRWLOCK_INIT;
 std::atomic<bool> g_traceFile{false};
+// Set when the cap cannot truncate the file. The file half stops for this
+// session instead of appending past the cap; Wh_Log keeps receiving the lines.
+std::atomic<bool> g_traceCapFailed{false};
 const wchar_t* g_traceFileName = L"trace.log";
 uint32_t g_traceLines = 0;   // guarded by g_traceLock
 bool g_traceSeeded = false;  // guarded by g_traceLock
@@ -253,23 +256,27 @@ void SeedTraceLines(const wchar_t* path) {
 void RefreshTraceSetting() {
     g_traceFile.store(Wh_GetIntSetting(L"DiagnosticTrace") != 0,
                       std::memory_order_relaxed);
+    g_traceCapFailed.store(false, std::memory_order_relaxed);
     AcquireSRWLockExclusive(&g_traceLock);
     g_traceSeeded = false;
     ReleaseSRWLockExclusive(&g_traceLock);
 }
 
 // The one logging entry point. Wh_Log always sees the line; the file sees it
-// only while DiagnosticTrace is on.
+// only while DiagnosticTrace is on. Formatting is truncating: a caller-supplied
+// string (a setting, an object name) can be arbitrarily long, and a fixed-buffer
+// sprintf would call the CRT invalid-parameter handler and terminate the host.
 void TraceLog(const wchar_t* format, ...) {
     WCHAR message[900] = {};
     va_list args;
     va_start(args, format);
-    vswprintf_s(message, ARRAYSIZE(message), format, args);
+    _vsnwprintf_s(message, ARRAYSIZE(message), _TRUNCATE, format, args);
     va_end(args);
 
     Wh_Log(L"%s", message);
 
-    if (!g_traceFile.load(std::memory_order_relaxed)) {
+    if (!g_traceFile.load(std::memory_order_relaxed) ||
+        g_traceCapFailed.load(std::memory_order_relaxed)) {
         return;
     }
     WCHAR storage[MAX_PATH] = {};
@@ -277,16 +284,17 @@ void TraceLog(const wchar_t* format, ...) {
         return;
     }
     WCHAR path[MAX_PATH] = {};
-    if (swprintf_s(path, ARRAYSIZE(path), L"%s\\%s", storage, g_traceFileName) <=
-        0) {
+    if (_snwprintf_s(path, ARRAYSIZE(path), _TRUNCATE, L"%s\\%s", storage,
+                     g_traceFileName) <= 0) {
         return;
     }
     // Every file line starts with the system tick, so lines from the two
     // processes can be ordered against each other and against an injection.
     WCHAR line[1024] = {};
-    swprintf_s(line, ARRAYSIZE(line), L"t=%llu %s",
-               static_cast<unsigned long long>(GetTickCount64()), message);
-    char utf8[2048] = {};
+    _snwprintf_s(line, ARRAYSIZE(line), _TRUNCATE, L"t=%llu %s",
+                 static_cast<unsigned long long>(GetTickCount64()), message);
+    // Four bytes per wide char at most: the fixed line buffer always fits.
+    char utf8[4096] = {};
     int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8),
                                     nullptr, nullptr);
     if (bytes <= 1) {
@@ -297,13 +305,27 @@ void TraceLog(const wchar_t* format, ...) {
     if (!g_traceSeeded) {
         SeedTraceLines(path);
     }
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
+    // FILE_WRITE_DATA is what SetEndOfFile needs; FILE_APPEND_DATA keeps the
+    // writes at the end. The cap is only reset when the truncation succeeded.
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA | FILE_WRITE_DATA,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
         if (g_traceLines >= kTraceMaxLines) {
-            SetFilePointer(file, 0, nullptr, FILE_BEGIN);
-            SetEndOfFile(file);
+            LARGE_INTEGER zero{};
+            const BOOL moved = SetFilePointerEx(file, zero, nullptr, FILE_BEGIN);
+            const BOOL cut = moved && SetEndOfFile(file);
+            if (!cut) {
+                const DWORD error = GetLastError();
+                CloseHandle(file);
+                g_traceCapFailed.store(true, std::memory_order_relaxed);
+                ReleaseSRWLockExclusive(&g_traceLock);
+                Wh_Log(L"DiagnosticTrace stopped: the trace file could not be "
+                       L"truncated at its %u-line cap (err=%u); Wh_Log keeps "
+                       L"receiving the lines",
+                       kTraceMaxLines, error);
+                return;
+            }
             g_traceLines = 0;
         }
         DWORD written = 0;
@@ -9788,15 +9810,18 @@ void DescribeScrollerElement(const wux::UIElement& element,
 
     wchar_t text[kScrollerLabelChars * 2] = {};
     if (!ownName.empty() && !ownerType.empty()) {
-        swprintf_s(text, L"%s>%s", ownName.c_str(), ownerType.c_str());
+        _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, L"%s>%s",
+                     ownName.c_str(), ownerType.c_str());
     } else if (!ownName.empty()) {
-        swprintf_s(text, L"%s", ownName.c_str());
+        _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, L"%s", ownName.c_str());
     } else if (!ownerType.empty()) {
-        swprintf_s(text, L"%s", ownerType.c_str());
+        _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, L"%s",
+                     ownerType.c_str());
     } else if (!elementType.empty()) {
-        swprintf_s(text, L"%s", ShortTypeName(elementType).c_str());
+        _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, L"%s",
+                     ShortTypeName(elementType).c_str());
     } else {
-        swprintf_s(text, L"ScrollViewer");
+        _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, L"ScrollViewer");
     }
     CopyScrollerLabel(text, label);
 }

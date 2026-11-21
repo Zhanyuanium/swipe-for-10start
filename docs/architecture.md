@@ -34,9 +34,13 @@ enabled, and it appends the same line to the role's file only while the
 `<mod storage>\bridge.log` in Explorer. The file line keeps the
 `t=<GetTickCount64>` prefix the regression tools read. The file is capped at
 `kTraceMaxLines` (20,000 lines): the count is seeded from the existing file and
-the next write restarts it at the cap, so a left-on trace cannot grow without
-bound. The setting is read at init and on every settings change; with it off no
-file is opened, and it is the only debug switch.
+the next write truncates it, and the counter is reset only when the truncation
+succeeded. A failed truncation stops the file half for the session and logs why
+once; `Wh_Log` keeps the line. Formatting is truncating
+(`_vsnwprintf_s`/`_snwprintf_s` with `_TRUNCATE`), so a long setting or object
+name can never reach the CRT invalid-parameter handler. The setting is read at
+init and on every settings change; with it off no file is opened, and it is the
+only debug switch.
 
 ## The launcher read (corrected)
 

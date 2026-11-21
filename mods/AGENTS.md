@@ -25,10 +25,13 @@ decision line goes through one `TraceLog` wrapper, which always calls `Wh_Log`
 line to `<mod storage>\renderer.log` or `\bridge.log` only while
 `DiagnosticTrace` is on. The file line keeps the `t=<GetTickCount64>` prefix the
 tools read. The cap is `kTraceMaxLines` (20,000 lines): the line count is seeded
-from the existing file and the next write restarts the file at the cap, so a
-left-on trace cannot grow without bound. The setting is read at init and on
-every settings change; there is no other debug switch and no file is opened
-while it is off.
+from the existing file and the next write truncates it; the counter resets only
+when the truncation succeeded, and a failure stops the file half for the session
+with one `Wh_Log` line naming the error. Formatting is truncating
+(`_vsnwprintf_s`/`_snwprintf_s` with `_TRUNCATE`) so a long setting or object
+name cannot terminate the host through the CRT invalid-parameter handler. The
+setting is read at init and on every settings change; there is no other debug
+switch and no file is opened while it is off.
 
 The text below describes the Start half; the explorer half follows it.
 
