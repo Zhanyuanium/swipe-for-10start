@@ -179,7 +179,10 @@ could act, or before its confirmation could land).
   landing serves it or `intent recovery ticket retired ... reason=expired`
   appears after the deadline; a dismiss whose executed ack already arrived also
   arms one (`ticket_seq` = that sequence), because its call returned but its hide
-  may still land. A refused/expired/superseded answer for the
+  may still land. The same rule arms the ticket for a qualified pull that cancels
+  a published command (`ArmCloseCancelTicket`), so a keyboard close interrupted by
+  a finger shows `ticket=1` on the pull's cancel exactly as the press's does. A
+  refused/expired/superseded answer for the
   **ticket's** sequence retires it even though the pending slot was already
   cleared by the open (`intent recovery ticket retired seq=... reason=
   superseded|refused|expired`).
@@ -295,16 +298,43 @@ window is cloaked before the panel slides the last 48 DIP behind the bar, so no
 frame exists for the end of the travel. Those samples are `edge=-1`, never
 progress 0.
 
-The second row pair is the interruption baseline. The pull is admitted while the
+The second row pair is the interruption baseline as the mod behaved before a pull
+could abort a close. The pull is admitted while the
 close is in flight (`reveal admit ... reason=deferred`), qualifies at 25 DIP and
 is released inside the close. Every retract landmark of the pull runs stays within
 14 ms of the plain runs — the two plain runs alone differ by up to 13 ms from each
-other at the same landmarks — and no sample shows a plateau or a reversal. That is
-what says the pull does not interrupt the Win close: an interruption would be a
-reversal of hundreds of pixels, not a 10 ms shift. What it leaves behind is a
+other at the same landmarks — and no sample shows a plateau or a reversal. That
+was the old rule: the pull did not interrupt the Win close, because only a local
+gesture-close slot was cancellable. What it leaves behind is a
 reopen: the panel is visible again at `tc` 710 and 736, after the landing, which
 the mod logs as `reveal reopen after close pull=0 late=1` — the release record,
-not a live contact, takes the menu back.
+not a live contact, takes the menu back. These four CSV pairs stay as the
+deferred-path reference; a pull that interrupts a Win close now logs
+`reveal takeover ... live=1` in the same millisecond as the qualifying report,
+and the retract reverses there instead of reaching the landing.
+
+### The interruption, measured
+
+The same two sequences against a build where the pull and the press can abort a
+close whose dismiss is still armed, run 2026-11-21 on the left docked bar with the
+second trigger at `tc` 150:
+
+| run | retract floor | reversal back at 2105 px | the decision it logged |
+| --- | --- | --- | --- |
+| pull, `panel-edge-interrupt-pull-1.csv` | 1996 px (p 0.962) at `tc` 265-313 | `tc` 463 | `exec cancel request target=24 reason=pull`, `motion sample caller=pull p=0.962`, `reveal takeover from=0.962 offset=-0.611 live=1`, then `exec cancel seq=26 target=24` at the bridge; no `win close observed` |
+| Win tap, `panel-edge-interrupt-wintap-1.csv` | 2045 px (p 0.979) at `tc` 208 | `tc` 363 | `own toggle decide ... kind=open dir=2` 141 ms after the close tap, `exec cancel seq=38 target=36`, `intent open cancel from=0.976 ticket=1 ticket_seq=36`, `settle style=win11 dir=open vel=0.00 dur=160 remaining=34`; no `win close observed` |
+
+Both runs ended with the menu open (`STATE at exit cloaked=0 open=True`), against a
+deferred baseline that reached 98-175 px and hid. The close had retracted 38 px
+(pull) and 60 px (Win) of its 2105 before the interruption: the pull spends its own
+24 DIP before it can qualify (~130 ms of a 520 ms close) and the press was dated
+141 ms after the tap. The reversal's first visible frame lags its decision line by
+~55-70 ms because the take pins the panel and the replacement settle starts at
+zero speed; the capture's own ~13 ms period is part of that.
+
+The tool's `SUMMARY min=`/`start=` cover the whole capture, including the setup
+close that precedes the marked one, so the measured window's floor is the value
+between `at-close` and its reversal — not the summary's minimum.
 
 Frames were captured at 200 % DPI with the tool's own DIB; `t` is the capture
 start, so a frame can lag its stamp by one compositor interval, and the CSV's

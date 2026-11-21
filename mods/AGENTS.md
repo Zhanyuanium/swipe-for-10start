@@ -121,7 +121,8 @@ core (see [../docs/limits.md](../docs/limits.md)).
   suppression cleared, and one settle from `TakeProgressNow()` back to 1
   (`intent open cancel from=...`); the cancel writes the recovery ticket
   (`CloseCancelTicket`: open tick + the cancelled executor sequence + a
-  deadline) for the dismiss-won race, and arms it only for a published command
+  deadline) for the dismiss-won race, through the one helper the qualified pull
+  also uses (`ArmCloseCancelTicket`), and arms it only for a published command
   (still pending, or executed with its hide unconfirmed). If the window is closed it holds the entry
   (`RevealEntryProgress`), sets `g_intentOpenActive` and asks for `exec show`; a
   show that cannot be published is refused (`intent open refused ...
@@ -175,19 +176,32 @@ core (see [../docs/limits.md](../docs/limits.md)).
   `BeginLandingOpen`: entry, insertion, pending open, direction, touch, show
   request; the preconditions and the log line stay at the callers. A band tap
   requests nothing.
-- `ActivateRevealFollow` — the live takeover at `RevealEntryProgress`; the
-  chase is `visible += clamp(mapped - visible, -rate*dt, +rate*dt)`. The
-  candidate branch in `UpdateRevealSession` requires the same 24 DIP signed
-  inward travel (or `openClaimAttempted`), so a stationary finger on a shown
+- `ActivateRevealFollow` — the live takeover. A hidden panel is met at
+  `RevealEntryProgress`; a panel a cancelled close left on screen is met where it
+  is (`liveTakeover`: no entry floor, no `max(live, entry)`), and its chase starts
+  at the takeover sample instead of after `kRevealEntryHoldMs`. The chase is
+  `visible += clamp(target - visible, -rate*dt, +rate*dt)`, where `target` is the
+  mapped finger for an ordinary follow and `mapped - liveOffset` for a live one:
+  the interrupted retract keeps the finger-to-panel offset it took over instead of
+  being driven toward the finger's absolute coordinate. The candidate branch in
+  `UpdateRevealSession` requires the same 24 DIP signed inward travel (or
+  `openClaimAttempted`), so a stationary finger on a shown
   but off-rest panel never acquires `Progress`.
 - `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
   schedule point, not a Windows-key tap. A dismiss that cannot be published
   releases the ownership.
 - The pull cancel (`CancelCloseForQualifiedPull`, called from
-  `TryClaimRevealOpen`) is the only abort of a close this mod still owns: it
-  drops both schedules and republishes the open direction once the contact has
-  crossed 24 DIP inward. Contact-down no longer cancels anything; a tap leaves
-  the close alone.
+  `TryClaimRevealOpen`) is the only abort of a close this mod still owns: at the
+  24 DIP crossing it drops both schedules (the local gesture deadline and the
+  armed executor command), republishes the open direction, arms the same recovery
+  ticket a press arms, and takes the retract over from the panel's live position.
+  A keyboard, Start-button, click-away and gesture close are all cancellable,
+  because each one's dismiss is a command the bridge holds in an armed timer until
+  its deadline. The one close it cannot abort is a dismiss whose call already
+  returned with its hide unconfirmed (`g_pendingDismissConfirm`): the hide can
+  land at any moment, so the pull stays deferred and the landing reopens. A
+  local-only cancel arms no ticket. Contact-down no longer cancels anything; a tap
+  leaves the close alone.
 - `win close observed` — the landing body (`LandClosedMenu`). The cloak
   transition is its usual caller; the executor's confirmation is the second:
   when the probe reads hidden and the cloak agrees, and the dismiss slot still
@@ -445,12 +459,14 @@ probe or timer failure is answered `unknown`.
   controller publishes `2` in `TakeCloseOwnership` for exactly that. The
   dispatcher samples the direction once and passes it to both the decision and
   its log line, so the line cannot name a direction the decision did not use.
-- **Press latch.** One dispatch. A close still settling publishes open now when
-  no executor dismiss is armed; the Start side clears its local slot and any
-  pending command and settles the panel back from its live position. A hide in
-  flight (`InternalState` 9/11), or an executor dismiss already armed at the
-  bridge, latches the
-  press (one slot, tick, trigger, and the epoch the admission was decided under);
+- **Press latch.** One dispatch. A close still settling publishes open now: the
+  Start side clears its local slot and any pending command and settles the panel
+  back from its live position. Only a close that has left the controller's reach
+  latches the press — a hide already in flight (`InternalState` 9/11), or a
+  `Dismiss` our executor has entered (`t_execCall`) — in
+  one slot, tick, trigger, and the epoch the admission was decided under. An
+  armed-but-not-dispatched executor dismiss is revocable, so it publishes the open
+  rather than deferring it;
   the hidden event then arms a
   50 ms timer and the timer serves the same open intent off the hidden event's
   stack. A show at the hidden event's own tick was swallowed (state stuck at 3),

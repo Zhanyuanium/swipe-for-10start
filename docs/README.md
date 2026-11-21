@@ -49,16 +49,20 @@ One mod ships, in one source with two process halves (full member list in
   whole gesture, follow and animation, the controller that consumes executor
   intents and publishes executor commands, the closing direction it publishes
   before the settle's first frame, the open that cancels a close still on
-  screen, the pull-reopen at a close's landing, the one close path (a mirrored
+  screen, the qualified pull that aborts a cancellable close and takes the
+  retract over from its live position, the pull-reopen at a close's landing, the
+  one close path (a mirrored
   settle from the live position, then `dismiss`), the recovery ticket that
-  exists only for a published command, and the peer liveness
+  exists only for a published command and is armed by one helper for both the
+  press and the pull, and the peer liveness
   (intent-consumer readiness) the executor gates on.
 - The `bridge` namespace runs in `explorer.exe`; it executes
   `ShowStartView`/`Dismiss`/`IsVisible` on the launcher's own thread from a
   hidden window, turns the Win key, the Start button and the click-away into
   intents, reads the toggle direction from the controller's flags and never from
-  the shell's lagging state, latches a press that lands inside the shell's hide
-  and serves it at the landing, swallows the shell's duplicate calls and the
+  the shell's lagging state, latches a press that lands once the shell is hiding
+  or the executor's own `Dismiss` call is live, and serves it at the landing,
+  swallows the shell's duplicate calls and the
   pointer-away close of an opening window, passes every trigger when the Start
   side is not alive, and never decides a toggle itself. It reads the shell's
   state only when the controller publishes no direction: the shell's cloak and

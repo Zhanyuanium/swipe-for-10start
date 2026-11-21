@@ -51,7 +51,10 @@ initial slope, which is why the seam factor is a computed value, not a constant.
 - touch: the reveal takeover starts at the entry and chases the mapped finger at
   2.2 DIP/ms, then follows. The rate limit is the planner's own speed; the cost
   is time (a 0.326 gap closes in ~148 ms), and the visible position never
-  overshoots the finger.
+  overshoots the finger. A pull that interrupts a close does not start at the
+  entry: the panel is already presented, so the takeover begins at its live
+  position, holds nothing, and chases the finger minus the offset the interrupted
+  retract had (`reveal takeover ... live=1`).
 
 ## The close
 
@@ -72,9 +75,15 @@ launcher's thread. The panel is therefore never hidden mid-slide.
 `TakeProgressNow()` pins the live position and stops the animation. The new
 settle starts there: a close 172 ms into an open started at `from=0.542`; a Win
 press during a held touch started the close from `progress=1.000`; a press during
-a gesture close drops the local dismiss slot, cancels the pending executor
+a close drops the local dismiss slot, cancels the pending executor
 command, and settles the panel back from its live position
-(`intent open cancel from=...`). No path replays from the old target.
+(`intent open cancel from=...`). A qualified pull during any close this mod still
+owns does the same thing and then hands the panel to the follow: the retract stops
+where it is, the follow takes over at that position (`live=1`) with the
+finger-to-panel offset it found, and its chase starts on the same report instead
+of waiting out the 30 ms entry hold. The one close a pull cannot take over is one
+whose `Dismiss` call has already returned and whose hide is unconfirmed. No path
+replays from the old target.
 
 ## The coast
 
@@ -110,7 +119,11 @@ exec dismiss enter seq=7 gen=18 epoch=1 at=184223189
 ```
 
 The `remaining` in the close line is the full travel by design (the mirrored
-curve), not `(1 - start) * distance`.
+curve), not `(1 - start) * distance`. The `open follow` line gained one field
+after `commit=`: `live=0|1`, where 1 says the session took a live retract over and
+its commit reads the panel's position instead of the travel. The excerpt above was
+captured before the field existed; `reveal takeover` carries the same field, so
+the two lines of one session agree about its start rule.
 
 Two lines date an interruption on its two sides, one in each process.
 `exec dismiss enter` is written after the launcher call returned, like the

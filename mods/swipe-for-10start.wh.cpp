@@ -25,8 +25,9 @@ What it does:
   under the finger, and lifting with enough travel lets it settle open.
 - A tap on the taskbar background opens nothing; the pull must travel 24 DIP.
 - Drag the open menu back toward the taskbar to close it with the same spring.
-- A press during a close, or a pull still down when it lands, takes the menu
-  back; a menu is never left shown but empty.
+- A press during a close, or a pull during one, takes the menu back: the close
+  stops where it is and the panel reverses. A pull still down when the close
+  lands takes it back too, so a menu is never left shown but empty.
 
 What you need:
 
@@ -137,6 +138,12 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   dismiss command was stamped with — a close intent's zero is stamped with the
  *   section's current generation, and zero stays valid only while no open has
  *   been published. A fresh open cancels a still-queued command at the bridge.
+ *   The same cancel serves a press and a qualified pull, through one recovery
+ *   ticket: a press settles the panel back from its live position, and a pull
+ *   takes the retract over there — keeping the finger-to-panel offset it took
+ *   over instead of starting at the open's entry — unless the dismiss already
+ *   returned from the shell call with its hide unconfirmed, in which case the
+ *   pull waits for the landing.
  *   A landing the cloak never reports — the
  *   window was already hidden when `Dismiss` ran — is finished by the executor's
  *   own confirmation (`win close observed reason=confirmed-without-transition`),
@@ -1426,11 +1433,15 @@ std::atomic<uint64_t> g_suppressRestoreUntil{0};
 // it does for a keyboard close, and the next Windows press opens the menu. The
 // settle runs first, so the panel is off screen when the window hides.
 //
-// A new pull that starts during the settle cancels the close: the armed dismiss
-// is dropped before the bridge is asked, so no Dismiss runs and the menu stays
-// open. The pull generation is sampled at the release and checked once when the
-// dismiss would run; the cancel is published the moment the pull begins, not at
-// the dismiss deadline. This is one scheduled dismiss, not a request file.
+// A new pull that qualifies during the settle cancels the close: the armed
+// dismiss is dropped before the bridge is asked, so no Dismiss runs and the menu
+// stays open. The pull generation is sampled at the release and checked once when
+// the dismiss would run; a close that a pull interrupts is cancelled at the
+// qualified report, not at the dismiss deadline. That path serves every close this
+// mod still owns — keyboard, Start button, click-away and gesture — because every
+// one of them is a command the bridge holds in an armed timer until its deadline
+// (see CancelCloseForQualifiedPull). This is one scheduled dismiss, not a request
+// file.
 // ---------------------------------------------------------------------------
 enum class CloseKind {
     None,
@@ -1455,10 +1466,14 @@ uint32_t g_pendingTapPull = 0;
 // Reports which of the two close schedules a cancel actually dropped: the local
 // gesture deadline (`g_pendingTapTick`) and the executor dismiss command. The
 // name says what it counts; `CancelCloseSchedules` is the one caller that acts on
-// both, and the local-slot-only path is a separate operation.
+// both, and the local-slot-only path is a separate operation. `commandSeq` is the
+// revoked command's sequence: the bridge may already have read the record and be
+// inside the shell's `Dismiss` call, so the close it belongs to can still land and
+// the canceller's recovery ticket has to name it.
 struct CloseScheduleCancel {
     bool slot = false;
     bool command = false;
+    LONG64 commandSeq = 0;
 };
 
 // Clearing one schedule and cancelling both are different operations: a landing
@@ -2019,6 +2034,12 @@ const wchar_t* CloseKindName(CloseKind kind);
 // Defined with the cloaked-window cache below; the debug `state` command reads
 // the window's cloak state on demand.
 bool StartWindowIsOpen();
+
+// Defined with the reveal mapping below: the finger's absolute mapped Progress
+// and the panel trail it meets. The qualified pull reads it at the cancel report
+// to keep the retract's offset for the takeover.
+float RevealProgressDip(const GestureGeometry& geometry, float distance, float x,
+                        float y, float& panelTrailOut);
 
 // ---------------------------------------------------------------------------
 // Composition helpers
@@ -3606,6 +3627,47 @@ LONG64 CancelPendingDismiss(const wchar_t* reason) {
     return target;
 }
 
+// The two facts about a close's dismiss that a canceller must read *before* it
+// clears the slots, because the cancel is what destroys them: the deadline the
+// bridge was told to run the command at, and the command whose call already
+// returned with its hide still unconfirmed. Either one means a `Dismiss` may
+// still be inside the shell and the close can still land.
+struct DismissBeforeCancel {
+    uint64_t executeAt = 0;
+    LONG64 confirm = 0;
+};
+
+DismissBeforeCancel ReadDismissBeforeCancel() {
+    DismissBeforeCancel before;
+    before.executeAt = g_pendingDismissExecAt.load(std::memory_order_relaxed);
+    before.confirm = g_pendingDismissConfirm;
+    return before;
+}
+
+// The one close-cancel recovery rule, shared by both paths that can abort a close
+// this mod still owns: the open intent (a press) and the qualified pull. A cancel
+// cannot recall a `Dismiss` already inside the shell, so when the revoked command
+// can still hide the window, the close's landing owes this open exactly once.
+//
+// The ticket names the menu (the open tick read now) and the command, and
+// `expireAt` bounds it by that command's own deadline plus the ack budget and the
+// confirmation probe. A local-only cancel (`cancelled == 0`, no executed dismiss)
+// arms nothing: no dismiss is inside the shell, so a later hide of this same menu
+// is not this cancel's close and must not request a show.
+void ArmCloseCancelTicket(LONG64 cancelled, const DismissBeforeCancel& before) {
+    const LONG64 ticketSeq = cancelled != 0 ? cancelled : before.confirm;
+    const uint64_t now = GetTickCount64();
+    const uint64_t expireAt =
+        ticketSeq != 0
+            ? ((cancelled != 0 && before.executeAt != 0) ? before.executeAt : now) +
+                  kBridgeAckTimeoutMs + kDismissConfirmGraceMs
+            : 0;
+    g_intentCancel =
+        ticketSeq != 0
+            ? CloseCancelTicket{true, g_ipcOpenTickLow, ticketSeq, expireAt}
+            : CloseCancelTicket{};
+}
+
 // A fresh open ends every dismiss of the menu it replaced. A command still in the
 // exec slot may be queued at the bridge: cancel it through the one cancel path so
 // the bridge is not left with a command to run against the new menu. A
@@ -4451,6 +4513,23 @@ struct HidRevealSession {
     // and a refused claim is not retried on later reports. An open the shell
     // performs anyway is adopted instead.
     bool openClaimAttempted = false;
+    // The pull cancelled a close and took the retract over while the panel was
+    // still on screen. Such a takeover continues from the position the panel has,
+    // never from the entry the open reserves: the panel is already presented, and
+    // the entry floor is what made an interrupted retract finish and then pop
+    // back out. Set once, by CancelCloseForQualifiedPull.
+    bool liveTakeover = false;
+    // The chased positions of a live takeover: `liveOffset` is the finger's
+    // mapping minus the panel's position at the takeover, so every later target
+    // is `mapped - liveOffset` (the panel keeps the relationship it took over
+    // instead of being driven toward the finger's absolute coordinate), and
+    // `liveStart` is the position it took over — the release compares against it
+    // because a pull that came in to interrupt must not close on short travel.
+    // Both are read by the takeover on the same report that sets them; a takeover
+    // the throttle or a lost renderer defers would subtract an offset the panel
+    // has since left, which is a transient the landing repairs.
+    float liveOffset = 0.0f;
+    float liveStart = 0.0f;
     bool active = false;
     float edgeStartX = 0.0f;  // first report, kept for the edge-band test
     float edgeStartY = 0.0f;
@@ -4661,24 +4740,11 @@ constexpr bool g_debugEdge = false;
 // keyboard close drops the armed dismiss at its caller, the gesture close arms
 // one. The name answers only whether the close-suppression window is still open
 // (`tickMs < g_suppressRestoreUntil`); the settle owns Progress, and
-// CloseCancellableByPull() answers whether a pull may still abort the close. A
-// pull that arrives while the suppression is true is deferred, never a second
-// owner.
+// `CancelCloseForQualifiedPull` is the one abort a pull can still perform. A pull
+// that arrives while the suppression is true and the close is no longer
+// cancellable is deferred, never a second owner.
 bool CloseInFlight(uint64_t tickMs) {
     return tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
-}
-
-// Whether a pull may abort the close it lands in. Only a gesture close still has
-// a close this mod can cancel: its executor command is armed for the end of the
-// settle, so dropping it aborts the close before the bridge is asked. That is
-// the accepted cancel path, and it is one owner because the same call clears
-// the suppression and the follow takes the panel from its live position.
-// Every other close — a keyboard close, a Start-button or click-away close
-// (both arrive as the bridge's close intent), or a gesture close whose dismiss
-// already went out — has its dismiss in the shell's or the bridge's hand. A
-// pull cannot abort that, so it is deferred and the close lands first.
-bool CloseCancellableByPull() {
-    return g_pendingTapTick != 0;
 }
 
 void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
@@ -5483,16 +5549,36 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     ResetEndVelocity();
 }
 
-// A qualified pull may still abort a close this mod owns: the finger has
-// crossed kAdoptTravelDip while the close's own dismiss was still armed, so no
-// Dismiss has been requested and the menu can stay open. It must not run on
-// contact-down: a contact that never enters the band or never travels would
-// otherwise keep a menu the user was closing.
-bool CancelCloseForQualifiedPull(uint64_t tickMs) {
-    if (!CloseInFlight(tickMs) || !CloseCancellableByPull()) {
+// A qualified pull aborts the close it landed in, from the panel's live position.
+// What it may not abort is a dismiss that is already inside the shell:
+//
+// - the close must still be in flight (the suppression window is the close's own
+//   ownership state, not a timeout to judge the pull by);
+// - `g_pendingDismissConfirm` must be empty. That slot names a dismiss whose call
+//   returned with its hide unconfirmed, so the hide can land at any moment and
+//   there is no schedule left to drop: the pull defers to the landing instead,
+//   which is the same answer every close had before a pull could cancel one;
+// - something must actually be cancelled (the local gesture deadline or the
+//   executor command), otherwise there is no close to abort.
+//
+// The executor command is revocable at any point before the bridge dispatches it,
+// which is what lets a keyboard, Start-button or click-away close be interrupted:
+// its dismiss is published immediately for the end of the settle, but the bridge
+// holds it in an armed timer. Cancelling it publishes `exec cancel` and arms the
+// same recovery ticket a press arms, because the bridge may already be inside the
+// `Dismiss` call. The pull then takes the still-open menu over from where the
+// retract left it.
+//
+// It must not run on contact-down: a contact that never enters the band or never
+// travels would otherwise keep a menu the user was closing.
+bool CancelCloseForQualifiedPull(const GestureGeometry& geometry, float x, float y,
+                                 uint64_t tickMs) {
+    if (!CloseInFlight(tickMs) || g_pendingDismissConfirm != 0) {
         return false;
     }
-    if (!CancelCloseSchedules(L"pull").slot) {
+    const DismissBeforeCancel dismissed = ReadDismissBeforeCancel();
+    const CloseScheduleCancel dropped = CancelCloseSchedules(L"pull");
+    if (!dropped.slot && !dropped.command) {
         return false;
     }
     g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
@@ -5501,15 +5587,36 @@ bool CancelCloseForQualifiedPull(uint64_t tickMs) {
     // again. The direction must follow: closing with a shown menu would turn
     // the next press into a second reopen.
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
+    ArmCloseCancelTicket(dropped.commandSeq, dismissed);
+    // The menu stays on screen, so neither the restore owed by a retracted panel
+    // nor the show-in-flight entry applies any more: the follow takes the live
+    // position.
+    g_commitNeedsProgressReset = false;
+    g_intentOpenActive.store(false, std::memory_order_relaxed);
     const float live = TakeProgressNow(L"pull");
-    const float distance = ReadGestureGeometry().distance();
+    const float distance = geometry.distance();
+    if (distance > 0.0f) {
+        // The takeover continues from here. The offset is the gap between the
+        // finger's mapping at this report and the position the panel actually
+        // has; the follow chases `mapped - offset` for the rest of the contact,
+        // so a half-closed panel is not first driven toward the finger's
+        // absolute coordinate.
+        float panelTrail = 0.0f;
+        const float mapped =
+            RevealProgressDip(geometry, distance, x, y, panelTrail);
+        g_reveal.liveTakeover = true;
+        g_reveal.liveStart = live;
+        g_reveal.liveOffset = mapped - live;
+    }
     if (distance > 0.0f &&
         (1.0f - live) * distance < kProgressEpsilonDip) {
         ShowAtRest();
     } else {
         std::chrono::milliseconds duration{0};
-        if (BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
-            g_commitNeedsProgressReset = false;
+        if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
+            // No settle can run, but the menu stays on screen: the panel must not
+            // be left at the position the retract reached.
+            ShowAtRest();
         }
     }
     return true;
@@ -5545,10 +5652,12 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
     g_pullSerial++;
     g_lateRelease = RevealLateRelease{};
     // A close this mod can still abort is aborted here and only here. This is
-    // the qualified moment; contact-down must not cancel a close.
-    if (CancelCloseForQualifiedPull(tickMs)) {
+    // the qualified moment; contact-down must not cancel a close. A close whose
+    // dismiss is already inside the shell is not cancellable and keeps the pull
+    // deferred until its landing.
+    if (CancelCloseForQualifiedPull(geometry, x, y, tickMs)) {
         // The close is gone; the follow takes the still-open menu over from
-        // this report.
+        // this report, at the position the retract reached.
         reveal.deferred = false;
         return;
     }
@@ -5591,10 +5700,12 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
 // does not depend on where the finger was when the menu was first seen open. One
 // mapping for the follow's samples and for the window replayed out of the
 // contact's own reports, so the two series cannot disagree about where the
-// finger is. A live takeover starts at the visible entry and then chases this
-// value at the planner's rate, so the part of it that happened while the menu
-// was cloaked is closed over time instead of being skipped or subtracted;
-// travel, commit and the speed window keep reading the mapped value as it is.
+// finger is. A takeover of a hidden panel starts at the visible entry and then
+// chases this value at the planner's rate, so the part of it that happened while
+// the menu was cloaked is closed over time instead of being skipped or
+// subtracted; a takeover of a panel that is already presented chases it minus the
+// offset the interrupted retract had. Travel, commit and the speed window keep
+// reading the mapped value as it is.
 float RevealProgressDip(const GestureGeometry& geometry, float distance, float x,
                         float y, float& panelTrailOut) {
     const int32_t axis = geometry.axis();
@@ -5701,7 +5812,6 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     const float mapped =
         RevealProgressDip(geometry, distance, x, y, panelTrail);
     reveal.panelTrail = panelTrail;
-    reveal.target = mapped;
 
     // A cancel or dismiss animation from a previous gesture may still own
     // Progress; the follow must drive the scalar from this sample on, and the
@@ -5709,20 +5819,39 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // writes shows the old animation's target. A scheduled dismiss that is still
     // ahead is not touched here: it re-checks the pull generation once, so a pull
     // that began first drops the close.
-    const float entry = RevealEntryProgress(geometry);
+    //
+    // Two starts, because two panels meet the finger here. A hidden panel is met
+    // at `RevealEntryProgress` — the smallest progress at which any of it is on
+    // screen — and the chase begins after that entry has been held for the first
+    // presentation. A panel that is already presented is met where it is: the
+    // pull cancelled a close, so the retract stopped mid-flight, and flooring it
+    // to the entry is what made an interrupted close finish retracting and then
+    // pop back out. That takeover also keeps the finger-to-panel offset it took
+    // over, and its chase starts at this sample because there is nothing to
+    // present.
     const float live = TakeProgressNow(L"activate");
-    // A hidden panel's visible value is the entry, never the recorded open rest
-    // (1) of a process that has not shown it yet; a panel already above the entry
-    // keeps its live position, and one below it is off screen, so the entry is
-    // the honest start there too.
-    const float visible = live >= 1.0f ? entry : std::max(live, entry);
+    float visible = 0.0f;
+    if (reveal.liveTakeover) {
+        visible = std::clamp(live, 0.0f, 1.0f);
+        reveal.target = mapped - reveal.liveOffset;
+        reveal.activationGap = mapped - live;
+        reveal.chaseQpc = sampleQpc;
+    } else {
+        const float entry = RevealEntryProgress(geometry);
+        // A hidden panel's visible value is the entry, never the recorded open
+        // rest (1) of a process that has not shown it yet; a panel already above
+        // the entry keeps its live position, and one below it is off screen, so
+        // the entry is the honest start there too.
+        visible = live >= 1.0f ? entry : std::max(live, entry);
+        reveal.target = mapped;
+        reveal.activationGap = mapped - visible;
+        // The chase clock starts after the entry has been held for the first
+        // presentation, so the first visible frame is the edge and not the
+        // chase's first steps. Until then `chaseQpc` lies ahead of the sample
+        // time and the step bound is zero.
+        reveal.chaseQpc = sampleQpc + kRevealEntryHoldMs;
+    }
     reveal.visible = visible;
-    reveal.activationGap = mapped - visible;
-    // The chase clock starts after the entry has been held for the first
-    // presentation, so the first visible frame is the edge and not the chase's
-    // first steps. Until then `chaseQpc` lies ahead of the sample time and the
-    // step bound is zero.
-    reveal.chaseQpc = sampleQpc + kRevealEntryHoldMs;
     // The first frame after this call is the first one that can be composited,
     // so the visible start is written now. When nothing animated, the base was
     // already that value and this insert writes the same one; when the base was
@@ -5743,9 +5872,14 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
 
     // Diagnostic: where the follow starts and the gap it inherited. The chase
     // closes that gap at the planner's rate; the line says how much of it there
-    // was, not a value that is subtracted from every insert.
-    TraceLog(L"reveal takeover from=%.3f offset=%.3f", visible,
-            reveal.activationGap);
+    // was, not a value that is subtracted from every insert. `live=` names the
+    // start rule: the entry (0) or the position an interrupted retract had (1).
+    // The two can read the same number — the bottom docked entry is 0.348 — so
+    // the field is what tells them apart. `offset=` is the inherited chase gap for
+    // an entry start and the finger-to-panel offset for a live one, where the
+    // chase starts with no gap to close.
+    TraceLog(L"reveal takeover from=%.3f offset=%.3f live=%d", visible,
+            reveal.activationGap, reveal.liveTakeover ? 1 : 0);
     // The opening contact now owns the panel through the follow. The entry the
     // touch show reserved belongs to the reveal takeover, not to a later keyboard
     // settle. `controllerTouch` stays set for the whole contact: the shell's
@@ -5785,7 +5919,8 @@ bool ClearLocalCloseTap() {
 // both"; the local-only operation above is a different thing.
 CloseScheduleCancel CancelCloseSchedules(const wchar_t* reason) {
     CloseScheduleCancel dropped;
-    dropped.command = CancelPendingDismiss(reason) != 0;
+    dropped.commandSeq = CancelPendingDismiss(reason);
+    dropped.command = dropped.commandSeq != 0;
     dropped.slot = ClearLocalCloseTap();
     return dropped;
 }
@@ -5902,7 +6037,12 @@ void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
     const float mapped =
         RevealProgressDip(geometry, reveal.distance, x, y, panelTrail);
     reveal.panelTrail = panelTrail;
-    reveal.target = mapped;
+    // The chase target is the finger's mapped position, less the offset a live
+    // takeover kept from the interrupted retract (0 for every ordinary follow).
+    // Travel, `max=`, the commit tests and the end-speed window below keep
+    // reading `mapped` itself: they measure the finger.
+    const float follow = mapped - reveal.liveOffset;
+    reveal.target = follow;
 
     // A report ends the coast: pin where it got to, then chase from there, so the
     // panel continues from the position the coast actually reached instead of
@@ -5914,8 +6054,8 @@ void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
         reveal.visible = std::clamp(coastValue, 0.0f, 1.0f);
     }
 
-    // The visible position chases the finger's absolute position and never passes
-    // it. The bound is a speed, not a per-report distance: the same
+    // The visible position chases the finger's target and never passes it. The
+    // bound is a speed, not a per-report distance: the same
     // kSettleSpeedDipPerMs (2.2 DIP/ms) every keyboard open and every settle
     // uses, so closing a gap looks like the panel opening at the system's own
     // speed. A 600 DIP gap takes ~273 ms of chasing (30 ms more with the entry
@@ -5933,7 +6073,7 @@ void DriveRevealFollow(const GestureGeometry& geometry, float x, float y,
         const float stepLimit =
             kSettleSpeedDipPerMs * static_cast<float>(stepMs) / reveal.distance;
         const float step =
-            std::clamp(mapped - reveal.visible, -stepLimit, stepLimit);
+            std::clamp(follow - reveal.visible, -stepLimit, stepLimit);
         reveal.visible = std::clamp(reveal.visible + step, 0.0f, 1.0f);
         reveal.chaseQpc = sampleQpc;
     }
@@ -6272,15 +6412,24 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
 
     // The commit decision keeps the whole-gesture tests this mod was measured
     // against: the travel at release and the session average. Only the seam reads
-    // the end of the gesture.
+    // the end of the gesture. The one addition is the pull that interrupted a
+    // close (`liveHeld` below): it is judged on the panel it saved, not on travel
+    // it never had to make.
     const uint64_t elapsed = reveal.lastTick > reveal.startTick
                                  ? reveal.lastTick - reveal.startTick
                                  : 0;
     const float travel = std::max(0.0f, reveal.travel);
     const float distance = reveal.distance;
     const float progress = std::clamp(reveal.progress, 0.0f, 1.0f);
+    // A pull that took a live retract over came in to interrupt, not to close:
+    // its own travel can be short (it only had to cross 24 DIP), so it commits as
+    // long as the panel is at or above the position it took over. Everything
+    // else keeps the ordinary travel/average test.
+    const bool liveHeld =
+        reveal.liveTakeover && progress >= reveal.liveStart;
     const bool commit =
-        ReleaseCommits(true, travel, elapsed, distance, geometry.axis());
+        ReleaseCommits(true, travel, elapsed, distance, geometry.axis()) ||
+        liveHeld;
 
     // The release line is written after the animation starts: the file write
     // costs time on the input thread, and every millisecond before the
@@ -6307,10 +6456,10 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
         // finishes the slide instead of snapping.
         const bool started = BeginGestureOpen(from, endVelocity);
         TraceLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
-                L"offset=%.3f vel=%.2f commit=%d panel=%.0f n=%d",
+                L"offset=%.3f vel=%.2f commit=%d live=%d panel=%.0f n=%d",
                 travel, reveal.maxTravel, progress, behind,
                 reveal.activationGap, releaseSpeed, commit ? 1 : 0,
-                reveal.panelTrail, reveal.samples);
+                reveal.liveTakeover ? 1 : 0, reveal.panelTrail, reveal.samples);
         if (!started) {
             ShowAtRest();
         }
@@ -6329,9 +6478,10 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     const GestureClose close =
         BeginGestureClose(from, endVelocity, CloseKind::RevealCancel);
     TraceLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
-            L"offset=%.3f vel=%.2f commit=%d panel=%.0f n=%d",
+            L"offset=%.3f vel=%.2f commit=%d live=%d panel=%.0f n=%d",
             travel, reveal.maxTravel, progress, behind, reveal.activationGap,
-            releaseSpeed, commit ? 1 : 0, reveal.panelTrail, reveal.samples);
+            releaseSpeed, commit ? 1 : 0, reveal.liveTakeover ? 1 : 0,
+            reveal.panelTrail, reveal.samples);
     if (close.started) {
         g_commitNeedsProgressReset = true;
         return;
@@ -7471,13 +7621,10 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         TraceLog(L"intent external drop trigger=%s slot=%d command=%d", trigger,
                 dropped.slot ? 1 : 0, dropped.command ? 1 : 0);
     } else if (intent.kind == kSwipeIntentOpen) {
-        // The deadline the cancelled command was scheduled for, read before the
-        // cancel clears it, and the dismiss whose call already returned but whose
-        // hide has not been confirmed. Both are read before the cancel: either
+        // The deadline the cancelled command was scheduled for and the dismiss
+        // whose call already returned, read before the cancel clears them: either
         // one means a dismiss may be inside the shell.
-        const uint64_t dismissedAt =
-            g_pendingDismissExecAt.load(std::memory_order_relaxed);
-        const LONG64 executedDismiss = g_pendingDismissConfirm;
+        const DismissBeforeCancel dismissed = ReadDismissBeforeCancel();
         const LONG64 cancelled = CancelPendingDismiss(L"open-intent");
         // The controller owns an open from this line, whichever shape the press
         // has; the bridge reads this direction for the next toggle.
@@ -7498,35 +7645,11 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             ForgetPendingDismiss();
             // A dismiss that already entered the shell's Dismiss call cannot be
             // recalled by the cancel above; if it still hides the window, the
-            // close's landing reissues this open once. The ticket names the menu
-            // and the command, so no other landing can serve it.
-            //
-            // The ticket is armed only for a command that was published:
-            //   - `cancelled != 0`: the record was still queued or armed and may
-            //     already have entered `Dismiss`;
-            //   - `executedDismiss != 0`: the call returned, its executed ack
-            //     cleared the pending slot, and the hide may still land.
-            // A local-only cancel (`cancelled == 0`, no executed dismiss) armed
-            // nothing: no dismiss is inside the shell, so a later hide of this
-            // same menu is not this press's close and must not request Show.
-            //
-            // The deadline bounds the ticket. A still-published command can run up
-            // to its deadline, then take the ack budget and the confirmation probe;
-            // a command whose call returned is measured from this press, because
-            // its hide is imminent.
-            const LONG64 ticketSeq =
-                cancelled != 0 ? cancelled : executedDismiss;
-            const uint64_t now = GetTickCount64();
-            const uint64_t expireAt =
-                ticketSeq != 0
-                    ? ((cancelled != 0 && dismissedAt != 0) ? dismissedAt : now) +
-                          kBridgeAckTimeoutMs + kDismissConfirmGraceMs
-                    : 0;
-            g_intentCancel =
-                ticketSeq != 0
-                    ? CloseCancelTicket{true, g_ipcOpenTickLow, ticketSeq,
-                                        expireAt}
-                    : CloseCancelTicket{};
+            // close's landing reissues this open once. The ticket is armed by the
+            // one rule both cancelling paths share (ArmCloseCancelTicket): it
+            // names the menu and the command, so no other landing can serve it,
+            // and a local-only cancel arms nothing.
+            ArmCloseCancelTicket(cancelled, dismissed);
             const float live = TakeProgressNow(L"intent-open-cancel");
             std::chrono::milliseconds duration{0};
             if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
@@ -13911,7 +14034,7 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
                               trigger,         method, flags,
                               admittingEpoch};
     TraceLog(L"own press latched state=%u trigger=%s tick=%llu epoch=%u "
-            L"(hide in flight)",
+            L"(hide or dismiss call in flight)",
             own.state, PressTriggerName(trigger),
             static_cast<unsigned long long>(now), g_pressLatch.epoch);
     g_pressServeReason = L"timeout";
@@ -14082,9 +14205,14 @@ bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
             PressTriggerName(trigger), own.state, own.open ? 1 : 0,
             kind == kSwipeIntentClose ? L"close" : L"open", direction);
     if (kind == kSwipeIntentOpen &&
-        (ShellHideInFlight(own) || g_pendingDismissSeq != 0)) {
-        // The hide or the armed dismiss has already taken the window; the open
-        // is served at the landing instead of being published into a no-op show.
+        (ShellHideInFlight(own) || t_execCall > 0)) {
+        // The shell is already hiding, or our own `Dismiss` call is live on this
+        // stack (`t_execCall`): only then has the close left the controller's
+        // reach. An armed-but-not-dispatched timer is still revocable — the open
+        // published now reaches the Start side, which cancels that command and
+        // settles the panel back from its live position — so it is published, not
+        // latched. A show from either of these states is served at the landing
+        // instead of being published into a no-op.
         LatchPress(own, trigger, showMethod, flags, admittingEpoch);
         return true;
     }

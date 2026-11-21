@@ -34,7 +34,8 @@ contact lifts.
    contact even when it fails, so a refused claim is never retried report by
    report; an open the shell performs on its own is adopted instead. A claim that
    can run starts the pull generation, drops the previous release record, cancels
-   a close the shell still has scheduled, and calls `PublishOpenClaim`
+   the close's armed schedules (or takes the retract over from its live position,
+   see The close), and calls `PublishOpenClaim`
    (`controllerDirection = 1`, `controllerTouch`, the entry, `exec show`). The
    check runs before `UpdateRevealSession`: a takeover expects a window that is
    already open and would never request one (`reveal pull qualified ...`,
@@ -54,18 +55,24 @@ contact lifts.
    `UpdateRevealSession`: a contact that landed on a shown but off-rest panel
    (the unhealed case) does not take `Progress` over without the 24 DIP, or
    without having qualified earlier (`openClaimAttempted`). A stationary finger
-   on a settled open never acquires the panel. The takeover starts at the entry,
-   holds it for the
+   on a settled open never acquires the panel. A takeover of a hidden panel
+   starts at the entry, holds it for the
    first presentation (`kRevealEntryHoldMs`, 30 ms), then every report moves the
    visible position toward the absolute mapped position at
-   `kSettleSpeedDipPerMs` (2.2 DIP/ms), never past it. The finger's own motion is
-   the mapping; only the written position is rate-limited.
+   `kSettleSpeedDipPerMs` (2.2 DIP/ms), never past it. A takeover of a panel that
+   is already presented — the pull cancelled a close — starts at the panel's
+   live position, holds nothing, and chases `mapped - liveOffset`, the offset the
+   finger-to-panel pair had when the pull took the retract over. The finger's own
+   motion is the mapping; only the written position is rate-limited.
 5. **Follow** — once caught up, `behind=0.000`: the panel is glued (bottom
    auto-hidden `progress=0.96` at a held 300 DIP finger, the panel edge 1.8 px
    from it; `progress=0.90` at 350 DIP, 0.4 px; the bottom docked 300 DIP hold
    measured 2 px). A release commits on travel (half the travel) or on the
    session average, and the release speed is measured over the last 8–30 ms
-   window (freshness 30 ms).
+   window (freshness 30 ms). The one exception is a live takeover: a pull that
+   came in to interrupt a close commits when the panel is at or above the
+   position it took over, whatever its own travel (the release line prints
+   `live=1`).
 6. **Late release** — a pull that lifts before the open keeps its travel, mapped
    position and end speed in one `RevealLateRelease` record. The window it may be
    consumed in is 300 ms measured from its readiness: the release time when the
@@ -141,16 +148,24 @@ no seam speed,
 from the live position. The dismiss
 is scheduled, not immediate, so the panel is never hidden mid-slide.
 
-A touch contact that lands during a gesture close does not cancel it on the
+A touch contact that lands during a close does not cancel it on the
 down. When the same contact crosses 24 DIP inward it becomes a qualified pull:
-`CancelCloseForQualifiedPull` drops the armed local dismiss, clears the
-suppression, republishes the open direction and settles the panel back from its
-live position. A contact that never travels leaves the close to run; a tap that
-never enters the band has no candidate and cannot cancel anything.
+`CancelCloseForQualifiedPull` drops both close schedules — the armed local
+dismiss and the armed `exec dismiss` the bridge is holding for the end of the
+settle — clears the suppression, republishes the open direction, arms the same
+recovery ticket a press arms, and takes the retract over from the panel's live
+position. Every close this mod owns is cancellable that way, the Win key and the
+two Start-button primitives included: their dismiss is published at once but the
+bridge keeps it in an armed timer until its deadline. The one close a pull cannot
+abort is a dismiss whose call already returned with its hide still unconfirmed
+(`g_pendingDismissConfirm`); that hide can land at any moment, so the pull stays
+deferred and the landing reopens for it. A contact that never travels leaves the
+close to run; a tap that never enters the band has no candidate and cannot cancel
+anything.
 
 A press while the close runs is recovered, not guaranteed. `IntentShouldClose`
 reads the controller's phase, so a press during the retract is an open:
-- a gesture close still settling publishes open at once; the Start side drops
+- a close still settling publishes open at once; the Start side drops
   the local dismiss slot, cancels the pending executor command, clears the
   suppression and settles the panel back from its live position
   (`intent open cancel from=...`). If the
@@ -158,12 +173,15 @@ reads the controller's phase, so a press during the retract is an open:
   landing reissues the open (`intent open recovered entry=...`), provided the
   landing is for the same menu the cancel named and no external takeover
   arrived with it (`intent reconcile ... (before landing recovery)`);
-- an intent close has its dismiss armed for a future deadline, so the bridge
-  latches the press (one slot, tick, the epoch the admission was decided under); the hidden event arms a
-  50 ms timer and the timer serves the open after the event's stack has unwound
+- only a close that is already out of the controller's reach is latched: the
+  shell is hiding (state 9/11), or our own executor's `Dismiss` call is live on
+  the launcher thread. The bridge latches such a press (one slot, tick, the epoch
+  the admission was decided under); the hidden event arms a 50 ms timer and the
+  timer serves the open after the event's stack has unwound
   (`own press served wait=...`). A show at the hidden event's own tick was
-  swallowed (state stuck at 3), which is why the serve is deferred. A shell hide
-  in flight (state 9/11) is latched the same way.
+  swallowed (state stuck at 3), which is why the serve is deferred. An executor
+  dismiss that is only armed is still revocable, so a press then publishes the
+  open and the Start side cancels the command.
 
 The recoveries are bounded obligations, not a theorem: a newer press supersedes
 the slot, a dismissed command the shell refused or that expired invalidates it, a
@@ -186,9 +204,9 @@ A press while the open runs is a close: the `open` direction makes it a close, a
 the settle starts from the live position (`from=0.542` measured 172 ms into an
 open).
 
-A pull that is still down and qualified when the close lands (or a qualified
-release inside its readiness window — the release on a closed menu, the landing
-for a deferred record) takes the menu back: after `win close
+A pull that is still down and qualified when a close it could not abort lands
+(or a qualified release inside its readiness window — the release on a closed
+menu, the landing for a deferred record) takes the menu back: after `win close
 observed` the controller issues one fresh show (`reveal reopen after close
 pull=1 late=0 entry=...`), and the open adopts the live contact or consumes the
 release record. "Qualified" is the same signed inward travel, 24 DIP, measured
@@ -223,12 +241,13 @@ never synthesized.
 
 The idle is held through the close so the digitizer's pause during the key/hide
 does not drop the pull. Measured on the bottom docked layout: held pull at 350
-DIP, Win close, landing reopened with `reveal takeover from=0.348 offset=0.558`,
-221 reports, `progress=0.91 behind=0.000 commit=1`, menu open. A contact resting
-at
-898 DIP through the same Win close produced `reveal defer released candidate=1
-down=1` and no `reveal reopen after close`, and the menu stayed closed. The
-bottom auto-hidden entry is 0.255.
+DIP, Win close, landing reopened with `reveal takeover from=0.348 offset=0.558
+live=0`, 221 reports, `progress=0.91 behind=0.000 commit=1`, menu open. That run
+took the panel over at the landing, which is the entry start; a pull that arrives
+while the close runs takes it over before the landing instead (`live=1`). A
+contact resting at 898 DIP through the same Win close produced
+`reveal defer released candidate=1 down=1` and no `reveal reopen after close`,
+and the menu stayed closed. The bottom auto-hidden entry is 0.255.
 
 The gesture close (a touch drag with enough travel/velocity) uses its own release
 spring through `BeginGestureSettle` and schedules the same dismiss at the end of

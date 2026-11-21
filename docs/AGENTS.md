@@ -39,8 +39,10 @@ peer heartbeat) with the measured idle cost.
 
 gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admission
 and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry
-and the 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored
-settle → scheduled `exec dismiss`), the qualified pull-reopen on a closing panel,
+and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
+from the panel's position), the one close path (`TakeProgressNow` → mirrored
+settle → scheduled `exec dismiss`), the qualified pull-cancel of any close whose
+dismiss is still revocable, the qualified pull-reopen on a closing panel,
 the gates and settle ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the

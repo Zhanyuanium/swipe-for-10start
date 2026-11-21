@@ -4,7 +4,7 @@ C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
 tools/ - PowerShell probes, injectors, animation harnesses, the panel-edge tracker, the regression smoke, the store packager and the local installer (16 scripts + AGENTS.md)
-artifacts/ - captured measurements (10 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
+artifacts/ - captured measurements (12 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
 <config>
@@ -88,9 +88,12 @@ cannot be recalled; the window hides, and the landing reissues that open once
 arrived with the landing (applying the record it examined, not a second read),
 because the cloak event and the intent event are separate wakes and the landing
 reads the intent record itself. A
-shell hide in flight (`InternalState` 9/11), or an executor dismiss already armed
-at the bridge, latches the press (one slot, with its tick and **the epoch the
-admission was decided under**). The hidden event arms a 50 ms timer and the timer
+shell hide in flight (`InternalState` 9/11), or a `Dismiss` our own executor has
+already entered, latches the press (one slot, with its tick and **the epoch the
+admission was decided under**). A dismiss that is only armed is not that case: it
+is still revocable, so the press publishes the open, the Start side revokes the
+command and settles the panel back from its live position. The hidden event arms
+a 50 ms timer and the timer
 serves the same open intent after the event's stack has unwound; a show at the
 event's own tick was swallowed (state stuck at 3, no Shown). The arm is posted to
 the executor window when the event runs off the launcher thread. Supersession
@@ -142,9 +145,19 @@ press; the shell's own edge gesture (from about 20 DIP) remains the fallback and
 an open it performs is adopted. One attempt per contact: a refused request is
 not retried. The content settle starts at `RevealEntryProgress`, and the reveal
 takeover chases the mapped finger at 2.2 DIP/ms, then follows (`behind=0.000`).
+A pull that takes a live retract over does not start at the entry: it continues
+from the panel's position, keeps the finger-to-panel offset it took over
+(`reveal takeover ... live=1`) and begins its chase at that sample. The pull that
+does it aborts the close at its 24 DIP report: `CancelCloseForQualifiedPull`
+revokes both schedules (the local slot and the armed `exec dismiss`), arms the
+same recovery ticket a press arms, and takes the retract over there. The one
+close it cannot abort is a dismiss whose call already returned with its hide
+unconfirmed (`g_pendingDismissConfirm`): that hide can land at any moment, so the
+pull stays deferred and its landing reopens.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
-pull that is still down and qualified when a close lands (or that lifted within
+pull that is still down and qualified when a close it could not abort lands (or
+that lifted within
 its readiness window: the release on a closed menu, the landing for a deferred
 record) is the pull that takes the menu back: after `win close
 observed` the controller issues the same show the qualified pull would, and the

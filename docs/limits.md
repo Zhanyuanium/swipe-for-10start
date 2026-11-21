@@ -73,14 +73,20 @@
   procedure, so the Start input thread refuses to run and the executor refuses
   to create its window. A failed unregister is retried instead of returning
   success into an image the class still points at.
-- **A press that lands inside the shell's hide is a no-op show.** The bridge
-  latches it (one slot, tick, the epoch the admission was decided under) and, 50 ms after the hidden event,
+- **A press that lands inside the shell's hide is a no-op show.** Once the shell
+  is hiding (`InternalState` 9/11), or our own executor has entered its `Dismiss`
+  call, the bridge latches the press (one slot, tick, the epoch the admission was
+  decided under) and, 50 ms after the hidden event,
   serves it as the same open intent (`own press served wait=...`). The
   deferral is measured: a show at the hidden event's own tick was swallowed
-  (state stuck at 3) while a show 16 ms later opened. The shell still owns the
-  245–268 ms cloak after the serve, and a press that lands after the hide is a
-  normal open. The latch is bounded, not a guarantee: a newer press supersedes it,
-  a refused or expired dismiss invalidates it, a serve whose peer is gone or
+  (state stuck at 3) while a show 16 ms later opened. An armed-but-not-yet-run
+  dismiss is not latched: it is revocable, so the press publishes the open and the
+  Start side cancels the command. A press that lands after the dismiss returned
+  but before the hide is observed publishes the open too; if the hide then lands,
+  the Start side's recovery ticket reissues that open once. The shell still owns
+  the 245–268 ms cloak after the serve, and a press that lands after the hide is
+  a normal open. The latch is bounded, not a guarantee: a newer press supersedes
+  it, a refused or expired dismiss invalidates it, a serve whose peer is gone or
   replaced drops it, and it expires after 1200 ms. A press lost to the 600 ms
   liveness budget is served by the shell — but only if the bridge never swallowed
   it. A press already swallowed and then lost (peer or epoch changed before the
@@ -130,7 +136,10 @@ that command. Measured on this machine, close takeover → `win close observed`
 was **562–593 ms over ten maximum-duration (520 ms settle) closes**, mean 578,
 so the worst sample sat 7 ms inside the window — a busy
 launcher can pass it; a pull held through such a close is still released and
-reopened (`reveal reopen after close pull=1 late=0`). A landing with no command
+reopened (`reveal reopen after close pull=1 late=0`), but only when the close was
+past the point a pull can abort (its dismiss call already returned). A pull that
+qualifies earlier cancels the command and never reaches the landing. A landing
+with no command
 of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
 for) and the pull is dropped by design.
 
@@ -169,7 +178,11 @@ Win press opens exactly once; the transition itself is never synthesized.
 - **The chase is rate-limited at 2.2 DIP/ms.** A 0.558 inherited gap takes
   ~254 ms to close; the panel is glued only after it (`behind=0.000`). The first
   visible frame is the entry, not the finger's mapped position; this is the
-  accepted cap, not a lost frame. A held finger settles to the mapped position:
+  accepted cap, not a lost frame. A pull that takes a live retract over skips the
+  entry entirely: it starts at the panel's position and keeps the finger-to-panel
+  offset it found (`live=1`), so an interrupted close reverses from where it is
+  and a full pull still reaches 1 (the target is clamped). A held finger settles
+  to the mapped position:
   bottom auto-hidden `progress=0.96` at 300 DIP (the edge 1.8 px from the
   finger) and `progress=0.90` at 350 DIP (0.4 px); the bottom docked 300 DIP hold
   measured 2 px.

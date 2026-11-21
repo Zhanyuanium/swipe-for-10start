@@ -34,7 +34,10 @@ in StartMenuExperienceHost and the executor in Explorer.
   A press during a close is read as a reopen: while the window is still on
   screen the close is cancelled and the panel settles back from where the
   retract left it; a press inside the shell's hide is latched and served when
-  the hide lands. Recovery is best effort, not a guarantee: a press the bridge
+  the hide lands. A pull during the close does the same at 24 DIP of inward
+  travel: the armed dismiss is cancelled and the panel reverses from where the
+  retract reached instead of finishing and then popping open. Recovery is best
+  effort, not a guarantee: a press the bridge
   already swallowed has no native replay left, so a peer that dies between the
   gate and the serve loses that press. A touch pull still down when a close
   lands reopens through the controller only if it is a real pull: a finger

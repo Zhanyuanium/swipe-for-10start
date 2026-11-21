@@ -254,14 +254,17 @@ and is dropped when either moved.
 
 **A press is usually recovered — cancel, latch, or recover.** A close still
 settling has either a local dismiss slot not yet requested (a gesture close) or an
-executor dismiss armed for a future deadline (an intent close). Only the first
-shape is cancelled: the Start side clears the suppression, drops the local slot
-and, when a command is already pending, publishes `exec cancel`, then takes the
+executor dismiss armed for a future deadline (an intent close). Both are
+cancelled: the Start side clears the suppression, drops the local slot and,
+when a command is pending, publishes `exec cancel`, then takes the
 panel where the retract left it and settles it back to 1
-(`intent open cancel from=...`). A press the bridge sees while the shell is
-already hiding (`InternalState` 9/11) or while its executor dismiss is armed is
+(`intent open cancel from=...`). Only a press the bridge sees while the shell is
+already hiding (`InternalState` 9/11), or while our own `Dismiss` call is live on
+the launcher thread (`t_execCall`), is
 not published at all: it is latched in one slot (tick, trigger, method, flags,
-and the epoch the admission was decided under, not a fresh read).
+and the epoch the admission was decided under, not a fresh read). An armed
+executor dismiss is revocable, so it is not a latch condition: the press
+publishes the open and the Start side cancels that command.
 The hidden event arms a 50 ms timer and
 the timer serves the same open intent after the event's stack has unwound: a show
 at the hidden event's own tick was swallowed (same tick, `exec visible=0`, state
@@ -404,13 +407,17 @@ panel trail is 265, the Distance 852); the bottom docked layout read 0.348. A
 cold first open still reads 0.000. The first visible frame is the entry, not 0.
 
 The reveal takeover starts at the entry and chases the mapped finger at
-`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. Bottom auto-hidden, a held
+`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. A takeover of a panel that is
+already presented (a pull that cancelled a close) starts at the live position and
+chases the finger minus the offset it found (`live=1`). Bottom auto-hidden, a held
 contact (`follow_hold`, 85 reports): `reveal takeover from=0.255 offset=0.338`,
 `open follow travel=488 max=488 progress=0.90 behind=0.000 commit=1`; the panel
 edge is 350.2 DIP at the held 350 DIP finger, **0.4 px** away. The 300 DIP hold
 gives `progress=0.96` and a 299.1 DIP edge, **1.8 px** away; the bottom docked
 300 DIP hold measured 2 px. The `offset` is the inherited gap at the takeover;
-the chase closes it at 2.2 DIP/ms, and `behind=0.000` is the glued state.
+the chase closes it at 2.2 DIP/ms, and `behind=0.000` is the glued state. Those
+sample lines were captured before `live=` existed; `live=0` is what they would
+read.
 
 A digitizer that goes quiet while the shell uncloaks, or while a close is in
 flight, is not a lift: while the touch show or the close suppression is active
@@ -456,13 +463,24 @@ be inside the shell's `Dismiss` call when that press lands
 open
 (`intent open recovered entry=...`), so that particular press is recovered — it is
 the one race this ticket exists for. A press during a
-shell hide (state 9/11) or with an armed executor dismiss is latched and served
+shell hide (state 9/11) or inside our own `Dismiss` call is latched and served
 at the landing instead. Neither path is a guarantee: the recovery ticket only
 serves a landing for the menu it was taken for, the latch is bounded and
 revalidated, and a press the 600 ms gate no longer covers is the shell's — unless
 the bridge already swallowed it, in which case it is dropped.
 
-A pull that is still down and qualified when the close lands (or that lifted
+A qualified pull aborts a close the controller still holds, at its 24 DIP report:
+`CancelCloseForQualifiedPull` revokes both schedules, arms the same recovery
+ticket a press arms (one helper, `ArmCloseCancelTicket`, serves both), and hands
+the panel to the follow from its live position. That takeover keeps the
+finger-to-panel offset it found (`live=1`) instead of starting at the entry, so
+an interrupted retract reverses where it is. The one close it cannot abort is a
+dismiss whose call already returned with its hide unconfirmed
+(`g_pendingDismissConfirm`): that hide can land at any moment, so the pull stays
+deferred and the landing reopens.
+
+A pull that is still down and qualified when a close it could not abort lands (or
+that lifted
 inside its readiness window: the release on a closed menu, the landing for a
 deferred record) is the pull that takes the menu back: after
 `win close observed` the controller issues one fresh show
@@ -475,8 +493,8 @@ late-release record only exists for a pull that travelled 24 DIP. A finger
 merely resting in the band through the retract is admitted deferred and is not
 reopened (`reveal defer released candidate=1 down=1`, no `reveal reopen`).
 Measured on the bottom docked layout: the Win close during a held pull at
-`y=350 DIP`; the landing reopened, `reveal takeover from=0.348 offset=0.558`,
-the follow continued with 221 reports and
+`y=350 DIP`; the landing reopened, `reveal takeover from=0.348 offset=0.558
+live=0`, the follow continued with 221 reports and
 ended `progress=0.91 behind=0.000 commit=1`, menu open; a contact resting at
 898 DIP through the same close left the menu closed. The bottom auto-hidden
 entry is 0.255.
@@ -510,7 +528,10 @@ Measured interruption (bottom auto-hidden unless named):
   script's t0 lagged the decoded release by 266 ms (the injected contact ended on
   idle), and the log shows one cancelled and one direct. A separate 20-trial
   gesture run aimed at the settle's end gave 1 latched (94 ms), 1 cancelled, 17
-  direct, 1 t0-lag trial, 0 lost.
+  direct, 1 t0-lag trial, 0 lost. These trials ran the build that latched on an
+  armed dismiss: the presses counted as latched are the ones the current rule
+  cancels (`intent open cancel`) instead, because the timer is revocable; only a
+  press inside a hide that had already begun latches now.
 - the settle-end → dismiss window: 18 of the randomised presses landed after the
   close settle and before the dismiss had completed (Win 8, Start-button 3,
   click-away 6, gesture 1); 0 lost. The 3–4 ms cases were latched and served
