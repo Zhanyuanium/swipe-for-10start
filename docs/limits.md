@@ -13,6 +13,16 @@
   acquire it before the shell's own uncloak (measured: the window was already
   uncloaked when the ticket was obtained, `before=0`). Early uncloak is not
   attempted: it may reveal an unpainted window. This is the accepted cap.
+- **The band open is claimed only after 24 DIP of inward travel, and the shell's
+  own edge gesture opens from about 20 DIP.** The threshold is what keeps a tap
+  anywhere in the band (twice the taskbar's thickness) from requesting a show.
+  The trade is explicit: a drag between roughly 20 and 24 DIP is served by the
+  shell's gesture, not by this mod, and a drag that stops short of both never
+  opens. Measured on the docked layout: a 23 DIP drag requested nothing from this
+  mod and the native gesture opened the menu; a 25 DIP drag requested one show;
+  at 24 DIP the request is published in the crossing millisecond and reaches
+  `ShowStartView` +15 ms later, and the window uncloaks +125 ms after that call.
+  A tap on the taskbar background, the clock or the tray requests nothing.
 - **A stalled symbol fetch leaves the mod passive for that session.**
   `HookSymbols` runs on the executor worker, never on an Explorer thread, so a
   cold `twinui.pcshell.pdb` fetch cannot freeze the shell. The call itself

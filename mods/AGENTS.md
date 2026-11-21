@@ -79,12 +79,15 @@ the consumer withdraws before it unregisters its devices.
   (show: target 0) so the executor cannot read the stale record as its newest
   command. A failed show while a dismiss is pending leaves the close's ownership
   alone.
-- `StartRevealFollow` — the band show request, once per open
-  (`g_intentOpenActive`), sets `controllerTouch` so the 18 ms idle does not end
-  the contact while the shell uncloaks. The claim block is shared with
-  `BeginLandingOpen` (`PublishOpenClaim`): entry, insertion, pending open,
-  direction, touch, show request; the preconditions and the log line stay at the
-  callers.
+- `StartRevealFollow` — admission only: contact, down point and clocks. The show
+  request moved to `TryClaimRevealOpen`, which runs on the first positioned
+  report of that contact whose signed inward travel reaches `kAdoptTravelDip`
+  (24 DIP), marks the attempt per contact (a refused claim is not retried), and
+  then starts the pull generation, drops the previous release record, cancels a
+  pending close and calls `PublishOpenClaim`. The claim block is shared with
+  `BeginLandingOpen`: entry, insertion, pending open, direction, touch, show
+  request; the preconditions and the log line stay at the callers. A band tap
+  requests nothing.
 - `ActivateRevealFollow` — the live takeover at `RevealEntryProgress`; the
   chase is `visible += clamp(mapped - visible, -rate*dt, +rate*dt)`.
 - `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
@@ -96,7 +99,13 @@ the consumer withdraws before it unregisters its devices.
 - `win close observed` — after the landing, a pull still down (or a release
   inside the 300 ms window) issues one fresh show and the open adopts it:
   `reveal reopen after close pull=1 late=0 entry=...`. The pull that was under
-  the close is the pull that takes the menu back. If the ticket says an open
+  the close is the pull that takes the menu back, and it must be qualified:
+  `RevealPullQualified` applies the same 24 DIP signed inward travel at the
+  contact's last positioned report (an active follow qualifies by construction,
+  and the late-release record only exists for a qualified pull). A finger that
+  merely rests in the band through the retract is admitted deferred and does not
+  reopen it; the landing still logs `reveal defer released candidate=1 down=1`.
+  If the ticket says an open
   cancelled a close that still landed, the landing reissues that open
   (`intent open recovered entry=...`); the ticket is bound to the open tick,
   so a landing for another menu cannot serve it. The landing first reconciles an

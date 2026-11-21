@@ -132,15 +132,24 @@ left is answered `superseded menu=... now=...`; the Start side also cancels a
 record the previous activation left queued when it attaches. No scheme recalls a call
 already inside the shell; an entered dismiss is handled by the landing rules.
 
-The open runs from the band contact: one `exec show` per open, the content settle
-starts at `RevealEntryProgress`, and the reveal takeover chases the mapped finger
-at 2.2 DIP/ms, then follows (`behind=0.000`). While a touch show or a close is in
-flight the 18 ms idle release is held, because the digitizer goes quiet during
-the uncloak and during the key/hide. A pull that is still down when a close lands
-(or that lifted within the 300 ms late window) is the pull that takes the menu
-back: after `win close observed` the controller issues the same show the band
-admission would, and the open adopts the live contact or the release record
-(`reveal reopen after close pull=1 late=0`). An intent close is
+The open runs from the band contact, but only after travel: admission records the
+contact and its down point, and the one `exec show` of that contact is requested
+on the first positioned report whose signed inward travel reaches 24 DIP
+(`reveal pull qualified ...` then `reveal show request ...`). A tap anywhere in
+the band — twice the taskbar's thickness — requests nothing and stays a native
+press; the shell's own edge gesture (from about 20 DIP) remains the fallback and
+an open it performs is adopted. One attempt per contact: a refused request is
+not retried. The content settle starts at `RevealEntryProgress`, and the reveal
+takeover chases the mapped finger at 2.2 DIP/ms, then follows (`behind=0.000`).
+While a touch show or a close is in flight the 18 ms idle release is held,
+because the digitizer goes quiet during the uncloak and during the key/hide. A
+pull that is still down and qualified when a close lands (or that lifted within
+the 300 ms late window) is the pull that takes the menu back: after `win close
+observed` the controller issues the same show the qualified pull would, and the
+open adopts the live contact or the release record (`reveal reopen after close
+pull=1 late=0`). "Qualified" is the same 24 DIP at the contact's last positioned
+report; a finger merely resting in the band through the retract is not reopened.
+An intent close is
 `TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
 `Dismiss` on the launcher thread. The close suppression keeps the visibility

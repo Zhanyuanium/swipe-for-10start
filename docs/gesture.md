@@ -10,8 +10,9 @@
   0 and closes. A press on a scrolling region that can still scroll is refused
   (`dismiss deferred to scroll ...`); a press on a region at its end closes.
 - **reveal** — the contact started in the taskbar band (or the band-tail strip)
-  while the menu is closed. The first report requests the bridge show; the same
-  contact then owns `Progress` through the open.
+  while the menu is closed. Admission records it; the bridge show is requested on
+  the first report that reaches 24 DIP of inward travel, and the same contact then
+  owns `Progress` through the open.
 - **candidate** — a band contact measured but not yet active. It becomes active
   at the open's live takeover, or is released and carried in the late-release
   record if it lifts before the open.
@@ -23,44 +24,67 @@ contact lifts.
 ## The reveal
 
 1. **Band admission** — the first positioned report inside the band while the
-   window is closed. `StartRevealFollow` records the down point, starts the
-   timing, and requests `exec show` **once per open** (`g_intentOpenActive`).
-   It sets `controllerDirection` to `1` (open) and `controllerTouch`, through the
-   same `PublishOpenClaim` a landing open uses. A show request that cannot be
-   published withdraws the claim instead of leaving a controller waiting for a
-   command nobody will run (`reveal show request failed ... reason=no-executor`),
-   and the shell's own band gesture remains the opener.
-2. **Shell open** — the bridge's executor calls `ShowStartView`; the shell
+   window is closed. `StartRevealFollow` records the contact identity, its down
+   point and the clocks, and nothing else: no show request, no pull generation,
+   no dismiss cancel. A tap anywhere in the band is admitted and then released
+   without a claim.
+2. **Qualified pull** — on the first positioned report of that same contact whose
+   signed inward travel (`RevealTravelDip`) reaches `kAdoptTravelDip` (24 DIP),
+   `TryClaimRevealOpen` attempts the one open claim. It marks the attempt per
+   contact even when it fails, so a refused claim is never retried report by
+   report; an open the shell performs on its own is adopted instead. A claim that
+   can run starts the pull generation, drops the previous release record, cancels
+   a close the shell still has scheduled, and calls `PublishOpenClaim`
+   (`controllerDirection = 1`, `controllerTouch`, the entry, `exec show`). The
+   check runs before `UpdateRevealSession`: a takeover expects a window that is
+   already open and would never request one (`reveal pull qualified ...`,
+   `reveal show request ...`; a tap logs neither). Measured on the docked layout:
+   31 ms from the first positioned report to the 24 DIP crossing on a ~1 DIP/ms
+   pull, and +15 ms from the crossing to the executor's `ShowStartView`.
+3. **Shell open** — the bridge's executor calls `ShowStartView`; the shell
    uncloaks (245–268 ms worst case; the current auto-hidden Win open showed its
    first panel pixel at +82–187 ms from the key, median +115 over three runs; the
    docked run was +190 ms). The Start side starts the content settle at
    the entry (`RevealEntryProgress`; auto-hidden warm 0.255, docked 0.348, cold
    0.000), not at 0.
-3. **Live takeover** — at the open, `PromoteRevealContact` adopts the contact
+4. **Live takeover** — at the open, `PromoteRevealContact` adopts the contact
    that began in the band if it is still down and has travelled
    `kAdoptTravelDip` (24 DIP). The takeover starts at the entry, holds it for the
    first presentation (`kRevealEntryHoldMs`, 30 ms), then every report moves the
    visible position toward the absolute mapped position at
    `kSettleSpeedDipPerMs` (2.2 DIP/ms), never past it. The finger's own motion is
    the mapping; only the written position is rate-limited.
-4. **Follow** — once caught up, `behind=0.000`: the panel is glued (auto-hidden
+5. **Follow** — once caught up, `behind=0.000`: the panel is glued (auto-hidden
    `progress=0.96` at a held 300 DIP finger, the panel edge 1.8 px from it;
    `progress=0.90` at 350 DIP, 0.4 px; the docked 300 DIP hold measured 2 px). A
    release
    commits on travel (half the travel) or on the session average, and the release
    speed is measured over the last 8–30 ms window (freshness 30 ms).
-5. **Late release** — a pull that lifts before the open keeps its travel, mapped
+6. **Late release** — a pull that lifts before the open keeps its travel, mapped
    position and end speed in one `RevealLateRelease` record for 300 ms. The open
    reads it and settles from the panel's live position with that end speed. A
    live takeover, an admitted newer pull, the consumption and the window
    invalidate it; a new down does not.
-6. **Show/close in flight** — while `controllerTouch` or `g_intentOpenActive` is
+7. **Show/close in flight** — while `controllerTouch` or `g_intentOpenActive` is
    set, and while a close is in flight with a reveal candidate, the 18 ms idle
    release is skipped: the digitizer may go quiet during the shell's uncloak and
    during the key/hide, and that silence is not a lift. A real lift is a report
    and still ends the contact.
 
 The 18 ms idle still ends a contact that is truly silent, with `src=idle`.
+
+A tap must not open the menu. Measured on the docked layout, with the trace on:
+a tap on the taskbar's empty background, on the clock and on the tray's empty
+area each logged `reveal admit ... ok=1 reason=admitted` twice (the injector
+reports the same contact twice), no `reveal pull qualified`, no
+`reveal show request`, no `exec show`, and the menu stayed cloaked. A tap on the
+Start button logged no claim either; the shell's own Start-button intent produced
+one open (`exec show ... method=11`) and the band candidate was not promoted.
+The shell's own edge gesture still opens from about 20 DIP, which is the
+documented fallback: a 23 DIP drag requested nothing from this mod (the native
+gesture opened the menu), and a 25 DIP drag requested one show
+(`reveal pull qualified travel=24`, one `exec show`). The landing applies the
+same threshold (see The close).
 
 ## The open entry
 
@@ -134,14 +158,24 @@ A press while the open runs is a close: the `open` direction makes it a close, a
 the settle starts from the live position (`from=0.542` measured 172 ms into an
 open).
 
-A pull that is still down when the close lands (or that lifted inside the 300 ms
-late window) takes the menu back: after `win close observed` the controller
-issues one fresh show (`reveal reopen after close pull=1 late=0 entry=...`), and
-the open adopts the live contact or consumes the release record. The idle is
-held through the close so the digitizer's pause during the key/hide does not
-drop the pull. Measured on the docked layout: held pull at 350 DIP, Win close,
-landing reopened with `reveal takeover from=0.348 offset=0.558`, 221 reports,
-`progress=0.91 behind=0.000 commit=1`, menu open. The auto-hidden entry is 0.255.
+A pull that is still down and qualified when the close lands (or a qualified
+release inside the 300 ms late window) takes the menu back: after `win close
+observed` the controller issues one fresh show (`reveal reopen after close
+pull=1 late=0 entry=...`), and the open adopts the live contact or consumes the
+release record. "Qualified" is the same signed inward travel, 24 DIP, measured
+from the contact's own down point at its last positioned report
+(`RevealPullQualified`); an active follow qualifies by construction, and the
+late-release record only exists for a pull that travelled 24 DIP. A finger
+merely resting in the band during the retract is admitted deferred, logs `reveal
+defer released candidate=1 down=1` at the landing, and is not reopened; a
+qualified release and an independently owed Win/button recovery are unaffected.
+The idle is held through the close so the digitizer's pause during the key/hide
+does not drop the pull. Measured on the docked layout: held pull at 350 DIP, Win
+close, landing reopened with `reveal takeover from=0.348 offset=0.558`, 221
+reports, `progress=0.91 behind=0.000 commit=1`, menu open. A contact resting at
+898 DIP through the same Win close produced `reveal defer released candidate=1
+down=1` and no `reveal reopen after close`, and the menu stayed closed. The
+auto-hidden entry is 0.255.
 
 The gesture close (a touch drag with enough travel/velocity) uses its own release
 spring through `BeginGestureSettle` and schedules the same dismiss at the end of

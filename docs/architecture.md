@@ -137,7 +137,7 @@ Triggers and their decision lines:
 | Start button open | `ShowStartView` method 11 | `own toggle decide trigger=startbutton …` |
 | Start button close | `Dismiss` method 6 | `own toggle decide trigger=startbutton …` |
 | click-away | `HideStartAndCortana` method 7 | `intent close trigger=clickaway` |
-| touch | the Start side's band admission | `reveal show request` |
+| touch | the Start side's qualified band pull (24 DIP) | `reveal show request` |
 
 `IntentShouldClose` is the only toggle rule: the controller's one direction word
 decides while it owns the panel (`2` is a close in flight, so the press is an
@@ -322,8 +322,18 @@ was `key=172830139`, `exec show` +79 ms, `shown` +142 ms, first panel pixel
 executor removes the shell's 60–250 ms gesture wait. The earlier auto-hidden
 variant measured +257 ms for the same pixel.
 
-The touch show is requested once per open (`g_intentOpenActive` guards a second
-report while the window is still closed). The entry is
+The touch show is requested once per contact, and only after inward travel:
+admission records the contact, and `TryClaimRevealOpen` claims the open on the
+first positioned report whose signed inward travel reaches `kAdoptTravelDip`
+(24 DIP). `g_intentOpenActive` refuses a second claim. A tap anywhere in the band
+requests nothing; a refused claim is marked and not retried, and an open the
+shell performs on its own is adopted. Measured on the docked layout, trace on:
+31 ms from the first positioned report to the 24 DIP crossing on a ~1 DIP/ms
+pull, +15 ms from the crossing to the executor's `ShowStartView` (request
+published in the crossing millisecond), and the uncloak +125 ms with the first
+captured panel frame +141 ms after `ShowStartView`. A 23 DIP drag requested
+nothing from this mod (the shell's own edge gesture, which opens from about
+20 DIP, opened the menu); a 25 DIP drag requested one show. The entry is
 `RevealEntryProgress`; auto-hidden it reads **0.255** (warm; the panel trail is
 265, the Distance 852); the docked layout read 0.348. A cold first open still
 reads 0.000. The first visible frame is the entry, not 0.
@@ -372,14 +382,20 @@ serves a landing for the menu it was taken for, the latch is bounded and
 revalidated, and a press the 600 ms gate no longer covers is the shell's — unless
 the bridge already swallowed it, in which case it is dropped.
 
-A pull that is still down when the close lands (or that lifted inside the
-300 ms late window) is the pull that takes the menu back: after
+A pull that is still down and qualified when the close lands (or that lifted
+inside the 300 ms late window) is the pull that takes the menu back: after
 `win close observed` the controller issues one fresh show
 (`reveal reopen after close pull=1 late=0 entry=...`), and the open adopts the
-live contact or consumes the release record. Measured on the docked layout: the
+live contact or consumes the release record. Qualified is the same 24 DIP signed
+inward travel at the contact's last positioned report (`RevealPullQualified`); an
+active follow qualifies by construction, and the late-release record only exists
+for a pull that travelled 24 DIP. A finger merely resting in the band through
+the retract is admitted deferred and is not reopened (`reveal defer released
+candidate=1 down=1`, no `reveal reopen`). Measured on the docked layout: the
 Win close during a held pull at `y=350 DIP`; the landing reopened, `reveal
 takeover from=0.348 offset=0.558`, the follow continued with 221 reports and
-ended `progress=0.91 behind=0.000 commit=1`, menu open. The auto-hidden entry is
+ended `progress=0.91 behind=0.000 commit=1`, menu open; a contact resting at
+898 DIP through the same close left the menu closed. The auto-hidden entry is
 0.255.
 
 The suppression is what keeps the visibility poll from "healing" the panel that

@@ -396,8 +396,11 @@ What it does:
   pressed. A contact that started while the menu was closed, has already pulled
   24 DIP along the opening axis and finds the menu open under it is therefore
   adopted (`reveal adopt ...`); a tap is not adopted because it has no travel.
-  EP opens the menu by
-  itself once the contact passes its own edge threshold. The open transition then
+  The candidate itself asks for the window (`exec show`) on the first positioned
+  report that reaches the same 24 DIP, so a tap anywhere in the band — twice the
+  taskbar's thickness — requests nothing and stays a native press. One attempt
+  per contact: a refused request is not retried, and an open EP performs on its
+  own is adopted instead. The open transition then
   runs exactly one of three paths, in this order: a live takeover (a still-down,
   moving finger — a candidate is promoted at the open instead of waiting for a
   report it might not get, and a contact without one is adopted), the late
@@ -895,6 +898,10 @@ Diagnostics:
   as `reason=open progress=0...`; `reason=unhealed` is the admitted pull that
   lands on the shown window whose panel is not at rest; a contact outside the
   band stays silent, as it was,
+  `reveal pull qualified travel=... axis=...` when the admitted contact reaches
+  the 24 DIP threshold and attempts its one open claim; `reveal show request
+  entry=...` follows when the executor accepted it, and a tap never reaches
+  either line,
   `reveal adopt x=... y=... travel=... axis=... band=...,... gen=...` when the
   menu opened under a live pull that had no candidate and that contact took the
   follow over,
@@ -4930,6 +4937,12 @@ struct HidRevealSession {
     // Progress and leaves the close's dismiss armed, so the retract is the only
     // motion; the close's landing releases it and the open adopts it.
     bool deferred = false;
+    // The one open claim of this contact. It is set when the qualified pull
+    // first reaches kAdoptTravelDip and attempts the claim, whatever the
+    // outcome: a tap never sets it because a tap never reaches the threshold,
+    // and a refused claim is not retried on later reports. An open the shell
+    // performs anyway is adopted instead.
+    bool openClaimAttempted = false;
     bool active = false;
     float edgeStartX = 0.0f;  // first report, kept for the edge-band test
     float edgeStartY = 0.0f;
@@ -5926,15 +5939,19 @@ bool PublishOpenClaim(const GestureGeometry& geometry, bool touch,
 // Starts one reveal follow. Both entry points come through here — a contact
 // admitted on the down because it began inside the taskbar band, and a contact
 // adopted because the menu opened under it while it was already pulling — so the
-// clocks, the pull generation and the cancel tick cannot diverge. `downX/downY`
-// is the first positioned point of the contact and is what travel is measured
-// from, whatever moment the follow actually takes the panel over.
+// clocks and the release history cannot diverge. `downX/downY` is the first
+// positioned point of the contact and is what travel is measured from, whatever
+// moment the follow actually takes the panel over.
+//
+// Admission is inert: it records the contact and its down point and nothing
+// else. The window is requested by TryClaimRevealOpen, on the first positioned
+// report that reaches the travel threshold; a tap anywhere in the band never
+// gets there.
 //
 // `deferred` names a contact that arrived while a close owned the panel. It is
 // the pull that opens the *next* menu, so it changes nothing about this close:
-// it does not start a pull generation and it publishes no cancel, which is what
-// keeps the close's dismiss armed and its retract the only motion.
-// `ActivateRevealFollow`
+// it neither claims nor cancels one, which is what keeps the close's dismiss
+// armed and its retract the only motion. `ActivateRevealFollow`
 // refuses while the close is in flight, so the session stays a candidate that is
 // measured but never written.
 void StartRevealFollow(float downX, float downY, uint64_t downTick,
@@ -5951,47 +5968,64 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
     BeginContactTiming();
     // The release speed belongs to this contact only.
     ResetEndVelocity();
+}
 
-    if (deferred) {
+// The one open claim of a band contact. Admission records the contact; the
+// window is requested here, on the first positioned report whose signed inward
+// travel reaches kAdoptTravelDip. A tap anywhere in the band — twice the
+// taskbar's thickness — never requests a show, so it stays a native press.
+//
+// One attempt per contact, marked before the outcome: a refused claim means no
+// executor can present the open, and asking again on every later report would
+// turn one failed request into a stream of them. An open the shell performs
+// anyway is adopted by this same contact.
+void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
+                        uint64_t tickMs) {
+    HidRevealSession& reveal = g_reveal;
+    if (!reveal.edgeCandidate || reveal.active || reveal.deferred ||
+        reveal.openClaimAttempted) {
         return;
     }
-
-    // M3 own-show: the contact that begins in the band asks the bridge for the
-    // window now, instead of waiting for the shell's edge gesture (60-250 ms
-    // later). The controller holds the entry until the uncloak; the reveal
-    // takeover at the open then follows the finger. One request per open: a
-    // following report that still sees a closed window is the same pull, not a
-    // second show.
-    if (!StartWindowIsOpen() &&
-        !g_intentOpenActive.load(std::memory_order_relaxed)) {
-        const GestureGeometry geometry = ReadGestureGeometry();
-        float entry = 0.0f;
-        if (PublishOpenClaim(geometry, true, entry)) {
-            FileLog(L"reveal show request entry=%.3f", entry);
-        } else {
-            // No executor can present this open: the claim is withdrawn by the
-            // helper and the shell's own band gesture remains the owner of the
-            // open. The pull keeps its candidate and its release history, so an
-            // open the shell performs anyway is adopted at the next poll.
-            FileLog(L"reveal show request failed entry=%.3f reason=no-executor",
-                    entry);
-        }
+    const float travel = RevealTravelDip(geometry.axis(), reveal.edgeStartX,
+                                         reveal.edgeStartY, x, y);
+    if (!(travel >= kAdoptTravelDip)) {
+        return;
     }
-
-    // The new pull owns the panel from this report on. It starts a new pull
-    // generation; a scheduled dismiss checks it once and is skipped while this
-    // pull exists, so the shell never hides the menu the finger is pulling out.
+    reveal.openClaimAttempted = true;
+    // The cloak answers "open?": a window already showing is a panel the follow
+    // takes over on this same report, and an open this side already requested is
+    // on its way. Neither may be answered with a second show.
+    if (StartWindowIsOpen() ||
+        g_intentOpenActive.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // A close that began after admission still owns the panel: this pull waits
+    // for its landing (BeginLandingOpen) instead of publishing beside it.
+    if (CloseInFlight(tickMs)) {
+        reveal.deferred = true;
+        return;
+    }
+    FileLog(L"reveal pull qualified travel=%.0f axis=%d", travel,
+            geometry.axis());
+    // The pull owns whatever opens next: a new generation, no release record
+    // from the previous pull, and no close the shell still has scheduled. These
+    // are the admission's old ownership side effects; they run at the qualified
+    // pull so a tap leaves every one of them alone.
     g_pullSerial++;
-    // A new pull supersedes the release record of the previous one: it owns
-    // whatever opens next, and its own release will write its own record. The
-    // pull-generation check in the consumer is the same rule, kept as a guard for
-    // any path that changes one without the other.
     g_lateRelease = RevealLateRelease{};
-    // A close that armed its dismiss is cancelled the moment this pull begins:
-    // the finger on the glass is taking the menu back, and the bridge must not
-    // hide the window it is pulling out.
     if (g_pendingTapTick != 0) {
         CancelCloseSchedules(L"pull");
+    }
+    float entry = 0.0f;
+    if (PublishOpenClaim(geometry, true, entry)) {
+        FileLog(L"reveal show request entry=%.3f", entry);
+    } else {
+        // No executor can present this open: the claim is withdrawn by the
+        // helper and the shell's own band gesture remains the owner of the
+        // open. The pull keeps its candidate and its release history, so an
+        // open the shell performs anyway is adopted at the next poll.
+        FileLog(L"reveal show request failed entry=%.3f reason=no-executor",
+                entry);
     }
 }
 
@@ -7141,6 +7175,11 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
         BeginEdgeCandidate(geometry, xDip, yDip, tickMs);
     }
     if (g_reveal.edgeCandidate) {
+        // Admission only recorded the contact. The open request belongs to the
+        // first positioned report that reaches the travel threshold, and it must
+        // run before UpdateRevealSession: ActivateRevealFollow expects a window
+        // that is already open and would never request one.
+        TryClaimRevealOpen(geometry, xDip, yDip, tickMs);
         UpdateRevealSession(geometry, xDip, yDip, tickMs);
         return;
     }
@@ -7364,11 +7403,11 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     }
 
     // A touch show is in flight: the shell is uncloaking the window and the
-    // digitizer may go quiet for that whole window (the own-show starts at the
-    // band, before the shell's own gesture would have). The contact is still down
-    // as far as this mod knows — no lift report arrived — so the idle must not
-    // release the candidate the open is about to adopt. The flag is cleared at
-    // the live takeover or when the show fails.
+    // digitizer may go quiet for that whole window (the show starts at the
+    // qualified pull, before the shell's own gesture would have). The contact is
+    // still down as far as this mod knows — no lift report arrived — so the idle
+    // must not release the candidate the open is about to adopt. The flag is
+    // cleared at the live takeover or when the show fails.
     const bool touchShowInFlight =
         SwipeIpcControllerTouch(&g_ipc) ||
         g_intentOpenActive.load(std::memory_order_relaxed);
@@ -8226,6 +8265,24 @@ bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
     return true;
 }
 
+// The pull that may reopen Start when a close lands. A contact merely resting in
+// the band during the retract is not that pull: its last positioned report must
+// have moved away from the edge by kAdoptTravelDip, the same qualification the
+// open claim uses. An active follow qualifies by construction: it has driven the
+// panel. A qualified late release is a separate record and does not come through
+// here.
+bool RevealPullQualified(const GestureGeometry& geometry) {
+    if (g_reveal.active) {
+        return true;
+    }
+    if (!g_reveal.edgeCandidate || !g_contactOrigin.valid) {
+        return false;
+    }
+    return RevealTravelDip(geometry.axis(), g_reveal.edgeStartX,
+                           g_reveal.edgeStartY, g_contactOrigin.x,
+                           g_contactOrigin.y) >= kAdoptTravelDip;
+}
+
 // Two things happen here. A closed-to-open transition that no reveal owns is a
 // keyboard, Start-button or tray open: the shell slides its own storyboard and
 // the mod makes `Progress` follow from 0, so the same root slides the same way a
@@ -8494,14 +8551,14 @@ void PollRootVisibility(uint64_t tickMs) {
         PostUiOpenWatchRelease(closedGeneration, closing);
 
         // A pull that was down when this close landed is the pull that takes the
-        // menu back. The close cannot be cancelled at its landing, so the
-        // controller issues one fresh show exactly like the band admission; the
-        // open's poll then adopts the live contact (PromoteRevealContact) or
-        // consumes the release record a pull that lifted just before the landing
-        // left (ConsumeLateRevealRelease). One pull, one reopen.
+        // menu back — but only a qualified one. A finger merely resting in the
+        // band during the retract is not a pull, and the retract is not
+        // permission to reopen the menu it just closed. The qualification is the
+        // same signed inward travel the open claim uses; a release record left
+        // by a real pull (lateFresh) stays valid on its own.
         const uint64_t closeQpc = QpcMsNow();
         const bool pullDown =
-            g_contactDown && (g_reveal.edgeCandidate || g_reveal.active);
+            g_contactDown && RevealPullQualified(ReadGestureGeometry());
         const bool lateFresh =
             g_lateRelease.valid && !g_lateRelease.deferred &&
             g_lateRelease.releaseQpc != 0 &&
