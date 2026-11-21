@@ -43,9 +43,8 @@ layout.
 size 216
 ```
 
-The debug command record is **gone**: no `cmdSeq`/`cmdText`/`cmdTick`, no
-`Cmd`/`CmdWrite` objects, no parser and no `p=`/`t=`/`e=` lines. `tools/ipc.ps1`
-is read-only.
+The debug command channel is **gone**: its record, mutex, event and parser were
+deleted in 0.7.0, and `tools/ipc.ps1` is read-only.
 
 ## Seqlocks
 
@@ -242,8 +241,8 @@ mods call it at `Wh_ModInit`, never in a hook.
 
 A reinstall loads a fresh image at a fresh base; the old image is unmapped by its
 unload, and the new image opens the same section because the namespace is
-unchanged. The names no longer carry a version, so a build from before this
-commit opens its own `_v7_` section and cannot join this one at all.
+unchanged. There is no version word, so a build that predates this namespace
+opens its own older section and cannot join this one at all.
 
 ## What is not in the channel
 

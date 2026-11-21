@@ -35,13 +35,16 @@ in StartMenuExperienceHost and the executor in Explorer.
   screen the close is cancelled and the panel settles back from where the
   retract left it; a press inside the shell's hide is latched and served when
   the hide lands. The key never goes dead. A touch pull still down when a close
-  lands reopens through the controller. Win+Tab, the lock screen and a display
+  lands reopens through the controller only if it is a real pull: a finger
+  resting on the taskbar through the retract does not open the menu again.
+  Win+Tab, the lock screen and a display
   change pass through untouched, so a lock never waits. If the executor half is
   refused — the Explorer build does not match, or the launcher's public symbols
   cannot be resolved — the menu still opens and closes, but the close is instant.
   The launcher hooks are found by public symbol, not by address. While the
   symbols are being fetched, Explorer keeps working and every press runs the
-  shell's own path; the log shows `exec launcher symbols pending ...` and then
+  shell's own path; with `DiagnosticTrace` on, the log shows
+  `exec launcher symbols pending ...` and then
   `exec launcher symbols resolved ... match=1`.
 
 ## Install
@@ -83,6 +86,9 @@ without an Explorer restart on this build.
   faster, 0 always starts the animation from a standstill. A finger that was
   held still starts from rest whatever this says, and Windows-key opens always
   start from rest — this setting does not affect them.
+- **Write a diagnostic trace file** (`DiagnosticTrace`, default off) — turns on
+  the decision log described below. Leave it off for everyday use; a bug report
+  or a maintainer will ask for it.
 
 ## What works where
 
@@ -97,7 +103,10 @@ without an Explorer restart on this build.
   becomes a dismiss only once that area reaches its end.
 - A pull that starts just inside the screen edge — up to about half a taskbar's
   height, the strip the system's own swipe opens from — opens the menu, and the
-  menu follows the finger from the frame it appears. A pull that starts further
+  menu follows the finger from the frame it appears. A tap on the taskbar does
+  not open it: the mod asks for the menu only after the finger has travelled
+  24 DIP away from the edge, so a tap on a pinned app, the clock, the tray or
+  the Start button stays a native press. A pull that starts further
   in does not open it: only the taskbar edge does that.
 - Mouse drag is deliberately not enabled.
 
@@ -116,9 +125,14 @@ without an Explorer restart on this build.
 
 ## If something looks wrong
 
-- The mod logs into two files in its Windhawk storage folder, which Windhawk
-  shows on the mod's page: `renderer.log` from the Start half and `bridge.log`
-  from the Explorer half, both under `local@swipe-for-10start`.
+- The mod can write a decision log into two files in its Windhawk storage
+  folder, which Windhawk shows on the mod's page: `renderer.log` from the Start
+  half and `bridge.log` from the Explorer half, both under
+  `local@swipe-for-10start`. They are written only while **Write a diagnostic
+  trace file** (`DiagnosticTrace`) is on; turn it on once from an elevated
+  shell with
+  `windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true`
+  or from the mod's settings, then reproduce the problem.
 - After disabling and re-enabling the mod, restart
   `StartMenuExperienceHost.exe` — gestures cannot attach to the already-open
   menu window.

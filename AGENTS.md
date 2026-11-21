@@ -3,7 +3,7 @@
 C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
-tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke, the store packager and the local installer (18 scripts + AGENTS.md)
+tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke, the store packager and the local installer (15 scripts + AGENTS.md)
 artifacts/ - captured measurements (6 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
@@ -187,7 +187,7 @@ join, and a future layout changes the prefix. The records are the open
 generation, the intent and its ack, the executor command and its ack, one
 controller direction word plus the touch flag, and the liveness triple
 `peerTick` (204) / `peerState` (208) / `peerEpoch` (212). The debug command
-record (`cmdText`, `Cmd`, `CmdWrite`, the parser) is **gone**.
+channel — its record, mutex, event and parser — is **gone**.
 `tools/ipc.ps1` is read-only: `-State` reads 216 bytes and prints the records and
 the peer epoch.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
@@ -224,6 +224,10 @@ is revealed; the button test hovers the bottom edge first, then clicks physical
   recorded launcher thread.
 - The shell owns every visual transition. The mods read and request, never
   write the launcher's state.
+- The trace is a setting. Every decision line calls `Wh_Log`; the file is
+  written only while `DiagnosticTrace` is on, one file per role, capped at
+  20,000 lines. The smoke requires it and otherwise prints the one command that
+  enables it.
 - The image is not pinned. Unloading joins every owned thread, runs the UI
   teardown turn, drains the counted entries, destroys the launcher window and
   unregisters its class before the channel closes. A proof that cannot be

@@ -29,7 +29,10 @@
   cannot be cancelled or given a timeout: if the transfer stalls, the worker
   stays inside it, the 240 s deadline cannot fire, and every press runs the
   shell's own path until Explorer restarts. The same rule applies to
-  `StartUI_.dll` on the Start side. Windhawk caches a failed symbol load for
+  `StartUI_.dll` on the Start side. Windhawk caches a symbol file on disk under
+  `Symbols\<pdb name>\<GUID+age>\<pdb name>` (the PDB's own GUID and age, so a
+  Windows update is a new directory, never a stale file under the old one), and
+  it caches a failed symbol load for
   four hours for a mod loaded at startup (one minute for a mod loaded later),
   so a boot without the symbol server stays passive after the network returns;
   enabling the mod's debug logging disables that throttle for the next attempt.

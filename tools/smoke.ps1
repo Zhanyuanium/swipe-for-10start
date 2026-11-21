@@ -12,6 +12,12 @@ decision and executor lines the pair wrote during that step, and the last step
 fails if the run produced any error-shaped line (a non-zero HRESULT, a timeout, a
 refusal, a dropped press, a lost latch).
 
+The mod writes those lines to disk only while its DiagnosticTrace setting is on
+(Wh_Log always receives them, but Windhawk's own debug logging is a separate
+switch). The script checks that one of the two files was written during the run
+and otherwise prints the one command that enables the trace and exits non-zero.
+With the trace on it needs no other switch.
+
 The injection geometry is read from the mod's own last `reveal panelTrail=...`
 line — its axis, band and panel rectangle — so the same tool works on a bottom,
 top, left or right taskbar; the coordinates it feeds are physical pixels, scaled
@@ -30,6 +36,9 @@ Three details it encodes, each learned the hard way:
 The Start half's `renderer.log`. Default: the standard Windhawk data root under
 `%ProgramData%`; pass this when Windhawk keeps its data elsewhere.
 
+.PARAMETER BridgeLog
+The explorer half's `bridge.log`. Defaults to `bridge.log` beside `-Log`.
+
 .PARAMETER SkipClickAway
 Do not click the desktop. Use it when the desktop is covered by a window that
 should not lose focus.
@@ -40,15 +49,35 @@ pwsh -File tools/smoke.ps1
 [CmdletBinding()]
 param(
     [string]$Log = (Join-Path $env:ProgramData 'Windhawk\Engine\ModsWritable\mod-storage\local@swipe-for-10start\renderer.log'),
+    [string]$BridgeLog = '',
     [switch]$SkipClickAway
 )
 
 $ErrorActionPreference = 'Stop'
+$runStart = Get-Date
 
-if (-not (Test-Path -LiteralPath $Log)) {
-    throw ("no renderer log at '$Log'. Windhawk may keep its data outside " +
-        "%ProgramData%; pass -Log with the Start mod's storage path, then run the " +
-        "smoke again.")
+if (-not $BridgeLog) {
+    $BridgeLog = Join-Path (Split-Path -Parent $Log) 'bridge.log'
+}
+
+# The trace must be on for *this* run: a file left by an earlier session is
+# stale, and every row would read old lines. The files are written by the mod,
+# not by this script, so this runs after the first trigger has had a chance to
+# write (see step 1). A missing file before that is not an error: enabling the
+# trace at runtime does not write a line by itself, and the first trigger will.
+function Test-TraceFresh {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    return (Get-Item -LiteralPath $Path).LastWriteTime -ge $runStart
+}
+function Assert-TraceReady {
+    if ((Test-TraceFresh $Log) -or (Test-TraceFresh $BridgeLog)) { return }
+    Write-Host ("Neither log was written during this run (started " +
+        "$($runStart.ToString('HH:mm:ss.fff'))), so the mod's DiagnosticTrace " +
+        'setting is off.')
+    Write-Host 'Turn it on once from an elevated shell, then run the smoke again:'
+    Write-Host '  windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true'
+    exit 1
 }
 
 $startMenu = Join-Path $PSScriptRoot 'start_menu.ps1'
@@ -82,8 +111,14 @@ public static void Click(int x, int y) {
 
 [Smoke.Native]::SetDpiAware()
 
-function Mark { (Get-Content -LiteralPath $Log | Measure-Object -Line).Lines }
-function New-Lines { param($from) Get-Content -LiteralPath $Log | Select-Object -Skip $from }
+function Mark {
+    if (-not (Test-Path -LiteralPath $Log)) { return 0 }
+    (Get-Content -LiteralPath $Log | Measure-Object -Line).Lines
+}
+function New-Lines { param($from)
+    if (-not (Test-Path -LiteralPath $Log)) { return @() }
+    Get-Content -LiteralPath $Log | Select-Object -Skip $from
+}
 function State {
     $out = (& pwsh -NoProfile -File $startMenu 2>&1) -join ' '
     if ($out -match 'open=(\w+)') { return ($Matches[1] -eq 'True') }
@@ -111,7 +146,10 @@ function Wait-Log { param($from, $pattern, $timeoutMs = 2500)
 # 3 bottom), band in DIP, panel rectangle in DIP. Physical pixels are DIP times
 # the primary screen's scale, which is what InjectTouchInput expects.
 function Get-Layout {
-    $line = Get-Content -LiteralPath $Log | Select-String 'reveal panelTrail=' | Select-Object -Last 1
+    $line = $null
+    if (Test-Path -LiteralPath $Log) {
+        $line = Get-Content -LiteralPath $Log | Select-String 'reveal panelTrail=' | Select-Object -Last 1
+    }
     $layout = [pscustomobject]@{ Axis = 3; Low = 804; High = 900; Left = 236; Top = 265; Right = 1229; Bottom = 840; Scale = 2 }
     if ($line -and $line.Line -match 'panelTrail=\d+ axis=(\d) rect=(-?\d+),(-?\d+),(-?\d+),(-?\d+)') {
         $layout.Axis = [int]$Matches[1]
@@ -169,6 +207,7 @@ Add-Row 'starts closed' (Wait-For $false 3000) "state=$(State) axis=$($layout.Ax
 $m = Mark
 [Smoke.Native]::WinTap()
 $opened = Wait-For $true 3000
+Assert-TraceReady
 Start-Sleep -Milliseconds 400
 $l = (New-Lines $m) -join "`n"
 Add-Row 'win open' ($opened -and ($l -match 'kind=open') -and ($l -match 'exec show')) ''

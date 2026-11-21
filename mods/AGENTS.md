@@ -17,6 +17,19 @@ touch-first open can reach the launcher before any Win or Start-button hook ran.
 The version follows the project tag; the former Start 0.44.0 and bridge 0.25.0
 versions are gone.
 
+**Settings and logging.** Three settings: `AnimationStyle` (`Windows 11` /
+`Windows 10`, the settle's damping), `GestureStartSpeedPercent` (0-300, the
+release-speed carry), and `DiagnosticTrace` (boolean, default false). Every
+decision line goes through one `TraceLog` wrapper, which always calls `Wh_Log`
+(Windhawk's own debug logging decides whether it is stored) and writes the same
+line to `<mod storage>\renderer.log` or `\bridge.log` only while
+`DiagnosticTrace` is on. The file line keeps the `t=<GetTickCount64>` prefix the
+tools read. The cap is `kTraceMaxLines` (20,000 lines): the line count is seeded
+from the existing file and the next write restarts the file at the cap, so a
+left-on trace cannot grow without bound. The setting is read at init and on
+every settings change; there is no other debug switch and no file is opened
+while it is off.
+
 The text below describes the Start half; the explorer half follows it.
 
 ### The controller (namespace start, StartMenuExperienceHost.exe)
@@ -351,8 +364,8 @@ close. `docs/lifecycle.md` has the order and the blocking cases.
 
 ### swipe_ipc_shared.h (merged mod, 216 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**,
-and so is the debug command record (0.7.0): no `cmdText`/`cmdSeq`/`cmdTick`, no
-`Cmd`/`CmdWrite`, no parser. The records that ship are the open generation, the
+and so is the debug command channel (0.7.0): its record, mutex, event and parser
+were deleted. The records that ship are the open generation, the
 intent and its ack, the executor command and its ack, one controller direction
 word, the touch flag, and the peer liveness triple `peerTick` (204,
 GetTickCount64 low bits) / `peerState` (208, alive/gone) / `peerEpoch` (212, the

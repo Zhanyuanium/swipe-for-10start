@@ -12,1051 +12,52 @@
 
 // ==WindhawkModReadme==
 /*
-# Legacy Start swipe (reveal follow and dismiss)
+# Legacy Start Swipe
 
-One mod in two processes, for ExplorerPatcher's legacy Windows 10 Start menu.
-The controller runs in StartMenuExperienceHost.exe: a one-finger swipe from the
-taskbar edge opens the menu and makes it follow the finger; a swipe toward the
-same edge slides the menu out and dismisses it. The executor runs in
-explorer.exe: it receives the controller's intents and performs the shell's own
-open and close on the launcher's thread. The input layer reads raw HID touch and
-pen reports; it does not use XAML pointers, DirectManipulation or the pointer
-message queue.
+Touch and pen gestures for the Windows 10 Start menu that ExplorerPatcher
+restores on Windows 11. Swipe in from the taskbar edge and the menu follows
+your finger out; drag the open menu back toward that edge and it slides away.
+The Windows key, the Start button and a click away play the same animation.
 
 What it does:
 
-- Hooks `StartUI::App::PrepareRootElement` by its public symbol, captures the
-  returned root after it loads and enables Composition translation. The symbol
-  is `private: static class Windows::UI::Xaml::UIElement ^ __cdecl
-  StartUI::App::PrepareRootElement(class Windows::UI::Xaml::Controls::Frame ^,
-  class StartUI::PerFrameData ^,bool)`, the exact undecorated name in
-  `StartUI.pdb`; the known reference build resolves it to `module + 0xAD730`,
-  which is logged as evidence and not required. StartUI_ loads lazily, so the
-  `LoadLibraryExW` notification only records the module; the mod's input thread
-  resolves it, because the first symbol load starts Windhawk's PDB fetch and
-  would hang the shell's loader thread. A false result while that fetch runs is
-  `startui root symbol pending ...` and is retried for up to 120 s; then
-  `startui root symbol unresolved ...` refuses the root hook, installs nothing
-  and advertises no controller service, so the shell handles every press
-  natively. The shell keeps pumping for the whole fetch.
-- At every setup it gets the Start CoreWindow HWND via `ICoreWindowInterop` and
-  asks the taskbar which edge it is docked to. The work area cannot answer: with
-  auto-hide enabled the shell reserves nothing, so the work area equals the
-  monitor on every side. The edge comes from
-  `SHAppBarMessage(ABM_GETTASKBARPOS)` (`uEdge`, and its docked rectangle even
-  while the bar is hidden), corroborated by the `Shell_TrayWnd` /
-  `Shell_SecondaryTrayWnd` rectangle (an auto-hidden bar keeps its thickness and
-  leaves a 2 px strip on screen), and only when neither answers, from the
-  work-area inset. It logs `dismiss axis=...` with what each source said, and
-  keeps the last edge instead of guessing one when no source is conclusive. The
-  same probe yields the strip the bar reserves along that edge, which is what
-  admits the measured panel rectangle, so the axis and the panel's anchor come
-  from one measurement. The axis, the window width/height and the window bounds
-  in DIP are published for the input thread. Setup is not per open: the root is
-  reused, so the same axis is refreshed on every menu open and on every work-area
-  or display change (see below).
-- Installs a `CompositionPropertySet` with `Progress` (animatable),
-  `Distance` (window width or height), `DirX` and `DirY`, plus the
-  expression
-  `Vector3((1 - state.Progress) * state.DirX * state.Distance, (1 - state.Progress) * state.DirY * state.Distance, 0)`.
-  `Distance`, `DirX` and `DirY` are rewritten in place when the taskbar moves.
-- The scalar and its motion live in one `PanelController`: `progress`, `target`,
-  `velocity`, `phase`, the settle record and the coast line. The touch path
-  emits `Begin`/`Move`/`End` intents; the mirrored close writes the same
-  controller with `Commit`; the position, the seam speed and the phase have one
-  owner.
-- `Wh_ModAfterInit` starts one input thread. The thread owns one window and
-  registers `RAWINPUTDEVICE{0x0D, 0x04}` (touch) and `{0x0D, 0x02}` (pen) with
-  `RIDEV_INPUTSINK`, so it still receives reports while the Start menu is in
-  front. The window is hidden and top-level rather than message-only, because
-  message-only windows do not receive broadcasts: `WM_SETTINGCHANGE` with
-  `SPI_SETWORKAREA` and `WM_DISPLAYCHANGE` are the events that move the
-  taskbar.
-- A taskbar move while the menu is open is caught by those two messages: the
-  input thread logs `work area changed` and posts one UI-thread task that
-  re-reads the dismiss axis, rewrites `Distance`/`DirX`/`DirY` when either the
-  axis or the extent moved, and re-measures the panel edge. Nothing polls; a
-  layout that has settled is never re-measured.
-- The gesture geometry is refreshed on the menu's own closed-to-open
-  transition too. `StartUI::App::PrepareRootElement` does not fire on every
-  open (the XAML root is reused), so without this the axis, `Distance` and the
-  direction baked into the expression would keep the previous taskbar's layout.
-  One refresh per open writes the three scalars and logs
-  `gesture geometry updated axis=... dist=...`, or
-  `gesture geometry axis=... dist=... (unchanged)` when the values read the
-  same.
-- The geometry is measured through one request, not two triggers. The open (and
-  a work-area or display change) records a `SettledMeasureRequest`: a 64-bit
-  serial that skips zero, the root/open generation, whether no contact owned the
-  panel edge at that moment, and a 400 ms deadline. The identity is the pair
-  `{generation, id}`, so a delayed cleanup cannot match a reused id, and both
-  the check and the clear take the whole pair. Two events can complete it — the
-  second `LayoutUpdated` pass, when XAML has placed the panel, and that deadline,
-  because no second pass
-  may come while nothing moves — and the first to run ends the request, so the
-  other finds nothing to do. The turn re-reads the generation, whether a root is
-  attached and whether a gesture owns the edge at the time it runs, and the
-  publish and the scroller commit decide the request identity, the epoch, the
-  layout identity and panel ownership once more at the moment they write, and the
-  decision and the write are one critical section under the lock the epoch bump
-  and a newer request take: a request whose menu closed, or that a newer request
-  replaced, builds its candidate and publishes nothing. A close cancels only the
-  request identity it captured before the
-  deferred UI turn, so a reopen that installs its own request first keeps it.
-  Every open and close bumps the generation under that same lock, so a measurement
-  recorded for one open can never be published for the next.
-- The scroller cache has the same rule as the panel: a settled pass that finds
-  nothing scrollable records `Nothing` only when the search actually finished.
-  A traversal that threw, hit its depth limit, or ran while a contact owned the
-  panel leaves `Unknown` and is retried with a bounded backoff (100, 200, 400 ms,
-  then Unknown for the rest of that open) while the same open is still on screen;
-  `Nothing` is never inferred from an incomplete search, and no answer from an
-  earlier pass survives the pass that failed to repeat it.
-- Each device is decoded from its `RIDI_PREPARSEDDATA` blob, never by opening
-  the device. Contact collections are the `0x0D/0x05` and `0x0D/0x22` link
-  nodes, plus a pen's `0x0D/0x02` and `0x0D/0x20` nodes when the device has
-  them. A device whose input caps declare report IDs carries the ID in the
-  first byte of every raw report (HID's own layout, not `RAWINPUTHEADER.wParam`,
-  which is only `RIM_INPUT`/`RIM_INPUTSINK`); that byte selects the value caps,
-  and a device without report IDs keeps working unchanged.
-- Contact identity is decided before any coordinate is used. A report that
-  carries no contact field for any slot is an unrelated report ID: it is
-  ignored without reaching the sample path, and that is distinct from a decode
-  failure, which logs `hid decodefail` and feeds nothing. Otherwise each
-  candidate slot's Tip Switch (`0x0D/0x42`), In Range (`0x0D/0x32`), Contact
-  Identifier (`0x0D/0x51`) and X/Y are decoded, and the contact the mod follows
-  is the one the last tracked name still identifies: the Contact Identifier when
-  both the device and the tracked contact carry one, the contact-node index
-  otherwise. A device that declares the identifier per contact is logged as
-  `identity=contactid`, so a slot the device hands to another finger between two
-  reports does not transfer the drag; a device without one falls back to
-  `(device, node index)` and logs `identity=node`. When the identity is new, the
-  report's real contacts are the candidates and the nearest to the last tracked
-  raw position breaks the tie. A slot is a real contact when the report declares
-  its tip and the tip is down, or, when the report declares no tip for it, when
-  it is in range; a report that declares neither for the slot says nothing about
-  it. Only the tracked contact can move or end it: its declared tip going up or
-  its declared in-range bit clearing is the lift, so another slot's stale
-  coordinates cannot restart it and another slot's stale lift cannot end it, and
-  a report that carries no contact field for the tracked contact is not a lift
-  either. A report that names the tracked contact but carries no point refreshes
-  its liveness only when it positively asserts the contact — tip down, or in
-  range where the device has no tip — and the identifier alone is not evidence,
-  because a device whose unused slots keep or zero their ids would otherwise keep
-  a stale finger alive and every other device out; the liveness clock it moves is
-  separate from the position clock, so a status report cannot make an old
-  velocity sample look current. A tip-down report without coordinates is thus
-  not mistaken for silence and a held finger cannot expire and start a second
-  gesture. When several slots carry the same identifier, one that asserts contact
-  wins over one that merely carries the name; if two assert it, the tracked slot
-  is taken and the ambiguity is logged once. A report from another device cannot
-  move or lift it. The tracked identity has its own evidence clock: a report
-  moves it by asserting the contact or by carrying a point this decoder feeds for
-  it, never by merely naming it, and the same 18 ms idle tick that ends a contact
-  forgets an identity whose last evidence is that old, independently of the
-  contact latch. A report the decoder tracked while a layout apply refused
-  admission therefore leaves no identity behind to lock out the next finger, and
-  a device that keeps reporting an unused slot's retained identifier cannot hold
-  the tracker with reports that prove nothing. A pen report with `In Range` set
-  and `Tip Switch` clear is a hover and drives nothing, because a slot with the
-  tip up is not a contact; a pen lift ends the
-  contact even while coordinates keep arriving. The one fallback is a device that
-  exposes neither Tip Switch nor In Range: no report can then say whether a slot
-  is real, so the count/position path is used and its count and positioned
-  collections decide, exactly as the mod shipped, and there the old `(0,0)`
-  heuristic stays because a zero pair is how its lift reports look. Those two
-  rules keep applying to that device after its contact is tracked: Contact Count
-  0 ends the contact even though the position fields keep their last value, and a
-  zero pair is a no-position sample, not the screen corner. That decision
-  is made once at init and logged, not guessed per report:
-  `hid usages dev=... tip=... inrange=... count=... buttons=... reportids=...
-  coordpath=... identity=contactid|node` records which usages the device
-  exposes, whether it is on the count/position path (`coordpath=1`), and which
-  name the tracked contact uses.
-- Raw X/Y is mapped from the HID logical range to physical screen pixels with
-  `GetSystemMetrics`, then to DIP with `GetDpiForWindow(...) / 96`. The logical
-  range is the cap of the collection the point was read from, under the report's
-  own ID: the same usage in another collection of the same report is a different
-  encoding and must not scale this point.
-- The gesture state machine runs on the input thread. It begins at one
-  contact inside the Start window (4 DIP margin) while the CoreWindow is not
-  DWM-cloaked. While the finger moves it inserts
-  `Progress = 1 - delta / Distance`, and only when the change moves the panel
-  by at least 0.5 DIP (`fabs(dprogress) * Distance >= 0.5`). The filter is a
-  screen distance, not a progress fraction: a fixed 0.004 was 5.8 DIP here,
-  which is 11.5 physical px at 200% and read as a staircase.
-- The Start CoreWindow HWND outlives the menu and `IsWindowVisible` stays TRUE
-  while it is closed, so `DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED)` decides
-  whether the menu is open: 0 while shown, 2 while closed. One query runs per
-  down, after the settling check.
-- A gesture whose perpendicular travel exceeds 120 DIP, is more than 1.5x the
-  axis travel and keeps the axis travel below 60 DIP is a scroll, not a
-  dismiss: it restores `Progress = 1` without animation.
-- Release commits when the axis travel exceeds 20% of `Distance` (10% on a
-  vertical axis, where the same drag also scrolls the app list) or the average
-  velocity exceeds 0.45 DIP/ms. Both outcomes settle with the style the setting
-  selects: a commit retracts `Progress` to 0, a cancel returns it to 1. The
-  settle's initial velocity is the gesture's **end** speed, not its average: it
-  comes from two checks, and they are separate. First freshness: the newest
-  stored position must be no more than 30 ms older than the release, or the
-  answer is 0, so a finger that flicked and then only asserted its tip down
-  through a long hold does not hand the settle the speed from before the hold.
-  Then the span: 8-30 ms measured backward from that newest position, not from
-  the release, so the window may lie up to 60 ms before the release when the
-  stream paused just before the lift. The speed is the change in `Progress` (the
-  quantity the follow inserts) across that span divided by its elapsed time, the
-  time between the oldest and the newest report of the window. A contact that
-  moved the panel nowhere in the window reports 0, so a finger dragged 300 DIP,
-  held still for 1.2 s and released starts the settle from rest; the old
-  whole-gesture `travel / elapsed` reported 0.20 DIP/ms and left the seam at a
-  speed the finger did not have. The window starts at the contact's own reports,
-  not at the takeover: the shell opens the menu late when the taskbar is
-  auto-hidden (the pull first reveals the bar), so a menu that opened one or two
-  reports before the lift used to have one sample and could not be measured. Each
-  of the contact's last eight positioned reports is replayed through the same
-  trail mapping at the takeover, so the series is continuous with the first
-  inserted sample; a finger that rested before the open repeats one value and the
-  window stays flat, which is what a hold must report. The same replay measures a
-  release that ends before the open: its position and end speed are kept for
-  300 ms and the open consumes them, so a flick is never replayed from rest. The
-  speed is signed along
-  the gesture axis and
-  projected onto the settle's direction: a release still moving away from its
-  target (a pull back before letting go) contributes 0 and
-  the settle starts from rest instead of backwards. The unit is `Progress` per
-  ms, so one estimator serves both families and the settle divides by the travel
-  in the same units. The executor dismiss that closes the menu is armed for the
-  end of that settle. Every Progress animation inserts the target as the base
-  value before `StartAnimation`, which is why no interruption may read that value
-  as a position: `TakeProgressNow` answers where the panel is from the curve the
-  compositor was handed, stops it and pins the answer.
-- A vertical dismiss competes with the scroll of whatever is under the press:
-  dragging toward the taskbar is how a list scrolls back, and that drag used to
-  close the menu. One cached element was not enough, because the menu scrolls in
-  more than one place, so the survey enumerates every vertically scrollable
-  `ScrollViewer` under the root once per open — measured here: the app list
-  (`AllAppsGridListView`, `ScrollableHeight` 4065) and the tile grid's internal
-  `GridView` viewer (`TileListView`, `ScrollableHeight` 98) — and publishes each
-  one's screen rect (XAML rect plus the client origin), `VerticalOffset`,
-  `ScrollableHeight` and a label. At a press the innermost region whose rect
-  contains the point decides; no region means the drag has no content to scroll
-  and belongs to the dismiss, which is also what a press on the panel background
-  or the taskbar strip gets. The survey has the same three states, not one flag:
-  `Unknown` (no measurement speaks for this open, or only the one taken while the
-  shell still moved the window), `Nothing` (measured after the shell settled, and
-  nothing in the panel scrolls) and `Scrollable` (measured after the shell
-  settled, with the region list). Only `Unknown` defers: a press inside the panel
-  waits for the settled measurement and a press outside it passes, because the
-  first report after an open used to dismiss the menu while the user was
-  scrolling. `Nothing` allows the dismiss, so a panel that genuinely has nothing
-  scrollable is no longer undismissable from the inside. Inside a region the gate
-  keeps the end-of-list rule (offset 0 on a bottom taskbar, offset ==
-  `ScrollableHeight` on a top one, with the 24 DIP allowance a fling needs) and
-  otherwise rejects the press with
-  `dismiss deferred to scroll vo=... sh=... region=...` at most once per 500 ms,
-  naming the region. The rejection starts no session, so the same contact becomes
-  a dismiss as soon as its scrolling reaches the end; the contact latch is
-  untouched and the next down starts from a clean state. `Left`/`Right` are
-  unchanged. The survey also carries the layout identity token the rects were
-  mapped in, so a resize inside one open (the epoch does not move) invalidates it
-  for the reader instead of gating against the old rects; a `SizeChanged`
-  measures the survey again for the same reason. A remeasure starts by publishing
-  `Unknown`, so a pass that ends without an answer (a throw, the depth limit)
-  never leaves a previous `Nothing` or `Scrollable` speaking for a tree it did
-  not measure; a completed negative result also revokes the old `ViewChanged`
-  watches. Two roles that used to share one variable are separate per region:
-  the object whose registration token must still be revoked (it outlives a
-  revoke that threw) and the object the committed rect was measured from, which
-  is the only one whose handler may refresh that region's offsets. So a watch
-  whose revoke failed keeps its token and stops writing instead of writing
-  another list's numbers into the rect the gate tests. The retry that follows is
-  bounded: 100, 200 and 400 ms, then `scroller retry exhausted gen=...` and the
-  gate stays `Unknown` for that open.
-- The settle has two styles, and one setting picks the parameter set for all
-  four outcomes: the dismiss commit and cancel, the reveal commit and cancel.
-  Both styles run the same damped-spring generator in normalized travel
-  `y = (Progress - from) / (to - from)`: `y(0) = 0`, `y(inf) = 1`, and `y'(0)`
-  is the component of the end speed **toward the target**, scaled by
-  `GestureStartSpeedPercent` (default 100) and divided by the travel left. The
-  projection is what makes 100 % mean that component, not the raw release
-  vector: a pull that reversed before the lift contributes 0, and a release
-  with a sideways component hands the settle only the part that moves the panel
-  toward where it is going. The curve is then scaled by its own value at `T`
-  (below), which divides the whole motion by about 0.993 on a normal settle and
-  is why the seam is that component to within that scale. Open and close
-  therefore mirror exactly, and a release from a finger held still (`vel=0`)
-  starts the settle at zero speed instead of jumping.
-  - Windows 10: damping ratio `0.9`, the spring this mod shipped with.
-  - Windows 11 (the default): damping ratio `1.72`. Fitted on this machine to
-    the native Quick Settings flyout (`Win+A`), whose show motion this style
-    copies: mean `|y - d|` 0.034 over the 306 ms measured, and at most 0.012
-    after the first 90 ms.
-  - The duration comes from the travel, not from a fitted time. The native
-    flyout covers its 578 DIP in 262 ms, an average of 2.2 DIP/ms; the Start
-    menu is 900+ DIP and resizable, so copying the flyout's time would make the
-    larger panel move faster and change the feel with the menu size.
-    `remaining = |to - from| * Distance` is the travel in DIP and
-    `T = clamp(remaining / 2.2, 160, 520)` ms, so a 900 DIP close takes 409 ms
-    and a close from half open 205 ms.
-  - The spring's frequency is derived from `T`, not from a fixed period: omega
-    is chosen so five time constants of its slowest root land on `T`. That root
-    is `zeta*omega` while the spring oscillates, and `omega*(zeta -
-    sqrt(zeta^2 - 1))` once it is overdamped; applying `zeta*omega` to the
-    fitted Windows 11 damping of 1.72 would put 0.93 time constants in `T` and
-    leave 44% of the travel for the last frame. The style picks the shape, the
-    travel picks the timescale.
-  - The curve is sampled by 12-128 equal segments, one per 4 ms or less, so at
-    120 Hz no corner can fall inside a displayed frame. Every sample is clamped
-    to 0..1 and to the sample before it: a flick faster than the remaining
-    travel can absorb flattens at the rest position instead of translating past
-    it, and convergence stays monotonic. The analytic spring stops
-    `1 - exp(-5)`, about 0.7%, short of the target at `T`; writing the exact
-    target on one last keyframe made the panel hop that remainder (3.8 DIP on a
-    501 DIP travel, after a frame that had moved under 0.1 DIP). The whole curve
-    is therefore scaled by its own value at `T`, so the samples converge on the
-    target and the landing has no step. The keyframes are linear and no easing
-    function is attached, because the samples are the curve.
+- Pull the menu out from the taskbar edge with one finger; the panel stays
+  under the finger, and lifting with enough travel lets it settle open.
+- A tap on the taskbar never opens Start: a pull must travel 24 DIP first.
+- Drag the open menu back toward the taskbar to close it with the same spring.
+- A press during a close, or a pull still down when it lands, takes the menu
+  back; a menu is never left shown but empty.
 
-  One settle-and-arm helper serves both gesture families: it plays the
-  animation, opens the suppression window, publishes the closing direction and
-  arms the executor dismiss for the end of the settle, which is that settle's own
-  duration. A close whose settle did not start publishes no direction and arms
-  nothing. One line records each settle:
-  `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
-  frames=... zeta=...`. The settle line's `vel` is the speed toward the target
-  in DIP/ms, the same number the release line prints.
-  The gesture's release line is written after the settle started: the file
-  write costs time on the input thread, and before the animation it only made
-  the seam longer.
-- Where `Progress` is at any instant has one owner. A `Progress` animation
-  inserts its target as the base value, so the recorded value is the animation's
-  end, not the panel's position; every interruption that read it (a keyboard
-  retract during the open settle, a reveal taking a close over, one settle
-  replacing another, the close after a coast) jumped the panel to that end before
-  moving again. `TakeProgressNow` answers from the curve the compositor was
-  handed, or from the coast's linear line, stops that motion and pins the answer
-  as the new base, so the next animation starts where the panel is. With nothing
-  recorded nothing animates, and the resting value is the answer. The recorded
-  state is the start value, the start time, the duration and the sample array;
-  it is cleared when the animation stops, is replaced, or has ended. A settle
-  started from a target value is the bug this prevents.
-- The dismiss settle's batch completion only touches the state of the animation
-  that registered it. The batch and its handler are created before the settle
-  starts, the handler is registered after it with the generation that animation
-  installed, and every stop or replacement detaches that handler and advances the
-  generation, so a completion that the compositor dispatches late cannot stop a
-  newer reveal or settle or clear a newer close flag.
-- The release itself is one idle window plus one tick, so the panel stood still
-  for 20-23 ms after the last report before the retract started, and the eye
-  read that as a stop. The panel now coasts through that window: the average
-  speed of the last three reports, capped at 6 DIP/ms, continues `Progress` on
-  a 200 ms linear animation as soon as no report has arrived for 8 ms. A report
-  ends the coast, pins the interpolated value and inserts the real one, so the
-  correction is the few DIP the panel drifted; a release ends it first and
-  plans the close from where it got to, so the retract starts from a moving
-  panel. The idle tick starts the coast before it decides the release, so one
-  late or coalesced tick cannot skip the coast and release from the last
-  report. Nothing coasts while the menu is closed, inside the 600 ms
-  suppression window, or in the reveal's first 50 ms. A held finger never
-  coasts: the panel reports at ~170 Hz, so a live contact leaves no 8 ms gap.
-- A session ends when no report arrives for 18 ms (`kIdleReleaseMs`); the idle
-  tick runs every 5 ms, so the release is noticed about 18-23 ms after the
-  last report. The tick is a waitable timer created with
-  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`: measured on this build, WM_TIMER
-  stays on the 15.6 ms default tick even while the mod holds a 1 ms
-  `timeBeginPeriod(1)` request (resolved at runtime from `winmm.dll` and paired
-  with `timeEndPeriod` for the time a contact is down). Without the waitable
-  timer the release measured `relms=31`; the 1 ms request alone left it at 32.
-- A menu opened without keyboard focus keeps the foreground on `SearchHost`, so
-  the legacy menu ignores an injected `VK_ESCAPE`. Every close is the
-  controller's one path: the panel retracts with its mirrored settle, the
-  controller publishes the closing direction at the settle's start, and the bridge
-  calls `XamlLauncher::Dismiss` at the settle's end. A Win press during the
-  retract is a reopen: it cancels the close and the panel settles back from its
-  live position. A press after the hide is latched and served at the landing,
-  so no press desyncs the toggle.
-- A down that arrives while the previous commit is still settling is ignored.
-  The menu reuses one XAML root, so a commit sets a flag that makes the next
-  down stop the animation and restore `Progress = 1` before the drag starts.
-- A second contact is not the tracked finger. While the tracked contact is down,
-  a report from another slot or another device neither feeds, ends nor restarts
-  it, so a palm or an idle finger elsewhere cannot cancel the drag or make it
-  jump. When the tracked contact lifts, the release settles as usual and the
-  next report starts the following contact from scratch. A lift report is not
-  required: a session with no sample for 18 ms ends on its own.
-- Reveal follow: a contact that starts inside the taskbar's own band while the
-  menu is closed is a candidate. The band is the bar's measured strip plus one
-  bar thickness toward the desktop, published with the geometry snapshot, so an
-  auto-hidden bar keeps the same span although it reserves no work area; the
-  fixed 12 DIP strip at the screen edge is only the fallback for the first reports
-  of a process, before any snapshot has carried a band. Measured on this machine,
-  the OS's own edge gesture opens the menu from as far as 20 DIP inside the
-  screen, which the fixed strip did not cover: a pull that began there reached
-  the menu with no candidate, and the menu opened as if the Windows key had been
-  pressed. A contact that started while the menu was closed, has already pulled
-  24 DIP along the opening axis and finds the menu open under it is therefore
-  adopted (`reveal adopt ...`); a tap is not adopted because it has no travel.
-  The candidate itself asks for the window (`exec show`) on the first positioned
-  report that reaches the same 24 DIP, so a tap anywhere in the band — twice the
-  taskbar's thickness — requests nothing and stays a native press. One attempt
-  per contact: a refused request is not retried, and an open EP performs on its
-  own is adopted instead. The open transition then
-  runs exactly one of three paths, in this order: a live takeover (a still-down,
-  moving finger — a candidate is promoted at the open instead of waiting for a
-  report it might not get, and a contact without one is adopted), the late
-  release record (the pull already lifted), or the keyboard settle (nothing
-  preceded the open). The suppression test is that
-  actual takeover, never the
-  existence of an edge candidate: a contact that was refused (`reason=open`) or
-  has not started following must not take the animation away, and the follow
-  takes the keyboard settle over from its live position if it does activate. A
-  tap on the taskbar keeps the keyboard-style settle, because it has not moved.
-  A live takeover starts at the visible edge and then chases the finger. The
-  shell uncloaks the window 60-250 ms after the pull starts (or after the lift),
-  so a finger that is still down has already travelled 400-600 DIP and the
-  absolute trail mapping reads 0.76-1.00; writing that on the first visible frame
-  made the panel appear already 76-100 % open, the owner's "pause, then snap
-  open". Nothing the finger did through the cloak was displayed, so the takeover
-  starts at `RevealEntryProgress` — the smallest progress whose translated trail
-  edge sits on the work area's edge, i.e. the first progress at which any of the
-  panel is on screen. The entry is written and held for the first presentation
-  (`kRevealEntryHoldMs`, 30 ms, two frames at 60 fps), so the first visible frame
-  is the edge itself; then every report moves the visible position toward the
-  absolute mapped position at `kSettleSpeedDipPerMs` (2.2 DIP/ms) and never
-  past it: `visible += clamp(mapped - visible, -rate*dt, +rate*dt)`. That is the
-  speed every keyboard open and settle already uses, so a catch-up is the panel
-  opening at the system's own speed, and the cost is time: a 600 DIP gap closes in
-  ~303 ms (30 ms hold + 273 ms), a 100 DIP gap in ~75 ms, after which the chase
-  keeps up with any finger and the panel is glued. An earlier fixed subtraction
-  (`mapped - offset`) was rejected: it left the panel permanently behind and
-  unable to pass `1 - offset`,
-  so a finger at 450-560 DIP of travel held it at 0.25-0.27. The chase does not
-  touch the measurements: `travel`, the commit test, `max=` and the end-speed
-  window keep the finger's real motion, and only the written position is
-  rate-limited. A panel that was already on screen above the entry (a pull that
-  cancels a close takes the live retract over) starts at its live value, so the
-  chase begins from where it is. The takeover line prints the visible start and
-  the gap it inherited (`reveal takeover from=... offset=...`), and the release
-  line prints the visible progress, the gap still open (`behind=` in progress
-  units) and that inherited gap
-  (`open follow ... progress=... behind=... offset=...`).
-  A fast pull can also lift before the shell opens the menu (measured: 107-251 ms
-  later on this machine); then there is no contact left to adopt. The release keeps
-  its facts for 300 ms — the travel,
-  the mapped position the follow would have written, the end speed measured at
-  that release, and the pull generation — in `g_lateRelease`, and the
-  closed-to-open path consumes them before the keyboard settle: the ordinary
-  settle starts at the position the panel actually shows and at the recorded
-  speed (`reveal adopt late ...`), and the record is cleared, so one release is
-  consumed once. That settle is not the follow: it keeps starting at 0 because it
-  spends time crossing the hidden travel without a finger to spend, while the
-  follow spends the finger's travel and must therefore start at the entry. The
-  start is `TakeProgressNow()`, which is the off-screen rest
-  while the menu is hidden: no animation and no follow runs through a cloak, so
-  the mapped position was never on screen, and starting there made the panel
-  appear already open (measured: `pos=0.60`, a start at 0.60 while the
-  compositor held 0.000). The mapped position stays in the line as a diagnostic.
-  A new down does not
-  clear the record: the record names the pull that opened the menu, and the new
-  contact cannot be that pull; a live takeover, a newer (admitted) pull, the
-  consumption and the 300 ms window all invalidate it. The record is written
-  and read on the input thread (the report handler and the idle tick that runs the
-  visibility poll), so it needs no publication. A keyboard open with no such
-  release still plays from rest. A contact that starts inside the reveal band
-  while the menu is open is the tail of that opening pull, not a drag of the
-  menu: while it moves away from the taskbar it takes neither `Progress` nor a
-  settle of its own (`dismiss skipped band tail ...`), and reversing toward the
-  taskbar makes it a dismiss on that same sample. The follow works in absolute
-  screen DIP
-  against the panel edge that meets the finger (`panelTrail`), which the UI thread
-  maps from the largest visible child of the root that does not fill it
-  (`StartSizingFrame`) and translates by the XAML origin, the client origin of
-  the host window in DIP (`ClientToScreen`), not the work-area origin:
-  `Progress = 1 - (finger - panelTrail) / (dir * Distance)`.
-  That edge is not published on its own. Axis, `Distance`, the panel's whole
-  rectangle, the XAML origin and the work area and monitor are one
-  `GestureGeometry` snapshot behind a short writer lock: the UI thread is the
-  only writer and holds the lock exclusively for one struct assignment; the input
-  thread tries a shared acquisition per sample and answers its last whole copy on
-  contention. A seqlock alone was not enough, because its counters do not legalize
-  reading a plain struct while the writer assigns it. The snapshot carries the
-  root/open generation and a layout identity token, so a reader holding a copy
-  from before a resize can tell that it is obsolete and ask the writer again
-  instead of starting a gesture from an old rectangle. Separately published
-  atomics used to leave a rectangle from a fresh measurement beside a trail from
-  the old one, and the dismiss hit test then tested a different panel from the one
-  the follow mapped against.
-  A measurement passes only when its rectangle lies on the monitor and the side
-  against the taskbar lies inside the strip that side defines: the band the bar
-  reserves at the screen edge, extended by one bar thickness toward the desktop,
-  read from the bar itself. The work area cannot supply that band while the bar
-  is auto-hidden — an auto-hidden bar reserves nothing — so the strip comes from
-  `SHAppBarMessage(ABM_GETTASKBARPOS)` or from the bar window and falls back to
-  the work-area inset only when neither answers; the settled panel sits 12 DIP
-  from the bar's inner edge, so the strip is twice the bar's thickness and the
-  2 DIP margin only rounds it. The shell's open storyboard fails that by the
-  width of the panel: measured here, its rect is 12,-12..1005,539 where the
-  settled one is 236,289..1229,840 on a bottom taskbar. A rejected measurement
-  publishes nothing and logs `reveal panelTrail rejected ...` once per open, from
-  the first pass that sees a rejected rect; the last whole snapshot stays. The
-  snapshot is published at setup, on every root `SizeChanged`, on every menu open
-  and on the second layout pass of that open, and on every work-area or display
-  change, and the line `reveal panelTrail=...` reports the edge with the axis, its
-  rectangle, the work area, the band it was tested against and the generation:
-  once per open, and again whenever
-  the value moved by more than 1 DIP. A previous rectangle is carried into a new
-  publish only when the whole layout identity matches — axis, travel, client
-  origin, work area and monitor — and the carried rect is tested against the
-  current taskbar band again; the same travel alone is not the same panel. A
-  layout change of any kind — a `SizeChanged`, the open request, or the
-  `WM_SETTINGCHANGE`/`WM_DISPLAYCHANGE` turn — is deferred whole while a contact
-  owns the panel and is re-applied once when the contact ends, so the edge, the
-  axis, the travel and the scroller rect never move under the finger; the turn
-  that deferred it logs `gesture geometry deferred reason=panel-owned gen=...`.
-  The apply runs under one reservation: the UI thread raises it and re-reads
-  panel ownership before writing a scalar, a gesture admission claims the panel
-  and re-reads the reservation, and the two seq_cst sides cannot both miss each
-  other, so either the apply defers whole or the admission waits for the next
-  report; the XAML measurement itself runs under no lock.
-  Renderer geometry (axis and travel) is committed only after
-  the composition scalars that use it are written, and the applied distance is
-  the value those scalars really hold: a failed or skipped write does not advance
-  the cache, so a sequence of sub-epsilon moves cannot walk it away from what the
-  compositor was told. A scalar write that throws after an earlier one landed
-  marks the renderer invalid (`gesture renderer invalid until a successful
-  reapply`) and every gesture is refused until one full apply rewrites all three.
-  A panel that has never been measured has no rectangle at all: the follow then
-  uses the root-width mapping this mod shipped with, whose rest position is the
-  far screen edge minus the travel, so `Progress` still reads 0 at the taskbar
-  edge and 1 at the far one on either side, and the log says
-  `reveal panelTrail=... (fallback)`.
-  The mapped position therefore places the panel's edge under the finger at every
-  sample, and the panel is exactly off screen at the screen edge (Progress 0.269
-  for a 1052 DIP trail on a 1440 DIP root). That mapping is the target, not the
-  written value: the live takeover starts at the visible entry and then chases
-  `mapped` at the planner's rate (see above), so the panel meets the finger and
-  stays glued instead of trailing it by a constant. The
-  release decision mirrors the dismiss path: it judges the travel away from the
-  edge at release, `(finger - edgeStart) * openingSign` clamped at 0, where
-  `openingSign` is +1 for a left or top taskbar and -1 for right or bottom. A
-  release past 20% of `Distance`, or one whose session-average velocity
-  `travel / max(elapsed, 1)` exceeds 0.45 DIP/ms, settles `Progress` to 1 with
-  the selected settle style and keeps the menu. Anything else is a cancel:
-  `Progress` settles to 0 with that same style, so both close paths read the
-  same from any finger position. The settle itself starts at the gesture's end
-  speed, measured over the same 8-30 ms window as the dismiss release and
-  projected onto the settle's direction, so a pull that reversed before the lift
-  starts from rest. The executor dismiss that closes the menu is armed
-  for the end of the settle, so the panel is already off screen when the shell
-  hides it. `Progress`
-  stays 0; a later
-  open restores it, unless an edge contact is already driving that open. Pulling
-  out and pushing back therefore cancels, as it does inside the open menu. The
-  line `open follow travel=... max=... progress=... behind=... offset=... vel=...
-  commit=... panel=... n=...` is written once per reveal: `progress` is the last
-  chased value, `behind` the gap to the finger's mapped position still open at the
-  release (progress units), `offset` the gap the takeover inherited, and
-  `travel`/`max` the finger's real motion. A scheduled dismiss that runs logs
-  `close dismiss kind=reveal`; one a new pull cancels logs
-  `close dismiss cancelled kind=reveal`.
-- A close takes the panel the same way from either family. A gesture close
-  arrives from its release; a keyboard close arrives through the bridge while the
-  finger is still down, so it also ends the live dismiss session and the live
-  reveal, mutes the rest of that contact until it lifts, opens the suppression
-  window and releases the 1 ms timer period. The mute is established from the
-  contact latch and either family before either owner is cleared, so a keyboard
-  close that lands while the *reveal* owns the finger mutes it too: ending the
-  reveal's flags alone left the finger live, and its next report could start a
-  dismiss session on the reopened menu while its release settled that session
-  open. Without that state the next report
-  of the same contact dragged the panel back and its release settled the menu
-  open over a close that was already running. The helper is the same call for
-  both; the keyboard close path additionally cancels its executor command when
-  an open intent takes the panel back, because the Hide it serves would otherwise
-  close the menu again.
-- A close suppresses the panel from the moment its settle starts until the shell
-  reports the window cloaked (`win close observed`), at most 600 ms.
-  `CloseInFlight(tickMs)` answers only whether that suppression window is still
-  open; the settle owns the motion, and `CloseCancellableByPull()` answers whether
-  a pull may still abort the close. Every admission and takeover reads the
-  suppression. The reused root reports itself open until the shell has run the
-  hide behind the dismiss, and restoring `Progress = 1` in that gap flashed the
-  fully open panel while the close was in flight. One rule decides every pull
-  that lands in that window:
-  - A gesture close still has a dismiss this mod can abort. Its executor dismiss
-    is armed for the end of the settle; the first report of a contact that lands
-    during it drops the dismiss, whatever its point (the band test only admits a
-    candidate, and a pull whose first point lands above the band would otherwise
-    let the dismiss fire). No dismiss request reaches the bridge, the toggle is
-    never advanced, the suppression ends with the drop, and the panel comes back
-    from the close's live position (an open settle from where it is), because a
-    menu that stays open at `Progress` 0 has no pane. The admission names it
-    (`reveal admit ... reason=cancelled`). This is the cancel path.
-  - Every other close already has its dismiss in the shell's or the bridge's
-    hand: a keyboard close, a Start-button or click-away close (both arrive as
-    the bridge's close intent), or a gesture close whose dismiss already went
-    out. A pull that lands there is **deferred**: `reveal admit ... ok=1
-    reason=deferred`, no `Progress` write, no pull generation, no dismiss
-    cancel, no mute, and `startedOpen = 0` while the close is in flight, so a
-    pull that starts above
-    the band is adopted from its own down point once it has travelled
-    `kAdoptTravelDip` instead of staying inert. It is still measured — its down
-    point, travel, end-speed window and, if it lifts first, one `RevealLateRelease`
-    record — and the close's landing is where the deferral ends
-    (`reveal defer released candidate=... down=...`). The open the close makes
-    room for then takes over from that down point (live, at the visible entry) or
-    consumes the record (late, `from=0.000`), so the owner sees one motion: the
-    menu closes, then rises from the edge. `ActivateRevealFollow` refuses while
-    `CloseInFlight`, so no follow writes under a retract.
-  - A reveal that is already driving the panel when such a close arrives is the
-    same deferral, not a mute and not a veto: `TakeCloseOwnership` keeps its
-    candidate, down point and release history, clears only `active`, and the
-    landing releases it. An external takeover (Win+Tab, the lock/display method
-    7, a forwarded Win+Shift+S) closes the window with no request of ours, so the
-    landing sees no close in flight and **drops** the pull instead:
-    `reveal dropped (window closed by shell)`, no reopen, and the rest of the
-    contact stays inert until it lifts. The takeover owns the screen.
-- The candidate path polls the cloaked attribute at most once per 20 ms; the
-  cached answer is dropped on every lift, so each contact starts from a fresh
-  query.
-- A closed-to-open transition that no reveal owns (a Windows-key, Start-button
-  or tray open) runs the settle a gesture open runs:
-  `BeginGestureSettle(0, 1, 0, ...)` starts from rest, the travel plans the
-  duration and the style picks the damping, so a keyboard open and an edge pull
-  are one motion and there is no second curve. The settle needs the measured
-  travel: an open that lands before the first geometry publish (`Distance`
-  still 0) restores the resting value instead and lets the shell's own
-  storyboard run. `PollRootVisibility` polls the
-  cloaked attribute at most once per 20 ms on the 5 ms idle tick and sees the
-  transition. An open the shell really performs while a close was still in flight
-  is the one exception to "from rest": it logs
-  `win open during close progress=...`, drops the suppression and settles from
-  the panel's live position (`win open during close from=... dur=...`), so the
-  retract's last frame is continued, never replayed. A close the shell performs
-  by itself logs `win close observed`, leaves `Progress` where the close left it,
-  and lets the next open animate from 0.
-  The Windows-key close is an intent this mod consumes and a command it
-  publishes: the close intent runs the mirrored close from the live position,
-  publishes the closing direction before the settle's first frame, and schedules
-  `exec dismiss` at the settle's end plus 30 ms; the bridge calls `Dismiss` on
-  the launcher thread and the shell's own duplicate Hide is swallowed while the
-  controller owns the panel. The panel slides out instead of vanishing. One
-  line per transition.
-- Every gesture close runs the same path with its own release settle: the
-  release arms the executor dismiss for that settle's end, and the pull
-  generation sampled at that arm decides whether the dismiss is dropped
-  (`close dismiss cancelled`) or runs (`close dismiss`).
-- The cancel path above is the only window in which the shell can still be
-  spared a close. A pull that begins later is deferred, and the shell has to
-  open the menu for it; the mod cannot withdraw a dismiss it does not own, and
-  it never opens the menu itself.
-- The uncloaked window and the hidden panel are one state, and no path may leave
-  it standing. A close whose Hide landed, or a reopen whose settle never ran,
-  leaves the window shown with `Progress` 0: nothing of the menu is on screen
-  while `StartWindowIsOpen()` says it is open, so every pull is refused
-  `reason=open` and the band-tail mute silences the rest — the dead menu. The
-  visibility poll owns the pair: once the close's suppression has ended and no
-  settle, coast, follow or dismiss drag moves the panel, an off-screen panel is
-  logged (`win open unhealed progress=...`) and settled back up from its live
-  position. The band admission applies the same reading: `reason=open` refuses
-  only a panel at rest, and a pull that lands while the window is shown with the
-  panel anywhere else is admitted as the reveal (`reason=unhealed`), so repeated
-  pulls cannot all be muted. This poll reads the live position with
-  `PeekProgressNow`, never `TakeProgressNow`: it is also where the late-release
-  settle starts, and taking that settle at its first millisecond pinned the hidden
-  rest and was the dead state's cause.
-- The batch observer is optional; the close is not. A close publishes its
-  direction and arms its dismiss before the batch registration resolves, so a registration
-  that loses its serial (a reset or a take-over replaced the animation) or throws
-  leaves a running settle with an armed dismiss: that is `close observer lost
-  kind=dismiss`, and the close continues. Only a close that never started its
-  settle may put the panel back (`AbandonClose`), and such a close published no
-  phase and armed no dismiss, so the restore is the whole operation: it logs
-  `close abandoned kind=dismiss|reveal` and no dismiss of a later close is
-  touched. A registration exception takes the same route as a lost serial.
+What you need:
 
-What it does not do:
+- Windows 11, x86-64, with ExplorerPatcher's legacy Start
+  (`Start_ShowClassicMode=1`). Verified on build 26300.9974 with
+  ExplorerPatcher 26100.9711.
+- Windhawk 2.0 or later and a touchscreen or pen.
 
-- It does not read explorer memory or call into explorer. Every word that
-  crosses the process boundary goes through the shared section and its events.
-- It does not attach XAML pointer handlers and has no DirectManipulation
-  hook.
-- It does not touch the shell's open storyboard. The shell raises and runs it
-  itself; the mod only moves `Progress` through the composition translation, so
-  the open still slides in from the shell's own animation.
-
-Unload:
-
-- The image is not pinned and there is no instance guard. Windhawk removes the
-  hooks, calls `Wh_ModBeforeUninit`/`Wh_ModUninit` and frees the image, so this
-  role must leave no thread and no reachable callback behind before `Wh_ModUninit`
-  returns. A fresh DLL starts clean; a re-enable loads a new image with fresh
-  globals, so there is no re-init reset and no residual path.
-- `Wh_ModBeforeUninit` closes admission, withdraws the peer, signals the input
-  thread and joins it **INFINITE**, never on that thread. The thread unregisters
-  raw input, releases the 1 ms timer period, resets the activation state,
-  destroys its window and unregisters its class before it exits. A thread that
-  ignores the stop blocks the unload: that is a bug, not permission to close its
-  handles.
-- `Wh_ModUninit` runs one UI teardown turn on the captured dispatcher (or inline
-  when it already runs on that thread): revoke the XAML handlers and the settle
-  batch, stop the animations, restore resting progress and the neutral
-  translation, reset the scroller watches, and drop the UI-owned objects. The
-  turn signals completion and the uninit waits on that signal, not on a
-  registration count. Turns posted before it run first; the input thread is
-  already joined, so no new turn can be posted.
-- The counted batch completion is drained through its event: a handler the
-  compositor already dispatched keeps the count up until it returns. Only then
-  are the IPC view and the handles (input/stop/entry events) closed.
-- A failed revoke is not a successful unload: the unload logs and keeps waiting
-  for the owning delegate, because the image must not be unmapped under it. The
-  same rule covers a handler that does not return: the process must be restarted
-  rather than freeing under it.
+Install **Legacy Start Swipe** from Windhawk and enable it. One mod covers both
+processes it needs: the gesture runs in StartMenuExperienceHost and the shell
+calls run in Explorer; no companion mod is required.
 
 Settings:
 
-- `AnimationStyle` (default `Windows 11`), shown as "Menu animation style",
-  picks which damping the settle spring runs. The code compares the option
-  string itself: exactly `Windows 10` selects the shipped 0.9 spring, and
-  every other value, including the default, selects the fitted 1.72 one.
-  Both styles are the same spring generator, so a style switch changes the
-  feel and never the mechanism. The duration is not a setting: the travel
-  left divides by the flyout's 2.2 DIP/ms and clamps to 160-520 ms, so a
-  bigger menu takes longer instead of moving faster. A Windows-key open runs
-  the same settle from rest, so the style changes how a keyboard open looks
-  too. `Wh_ModInit` reads the value once into an atomic enum and logs
-  `settle style selected=... setting=...`; `Wh_ModSettingsChanged` refreshes
-  the atomic, so a change applies to the next settle and no settle performs
-  a setting lookup.
-- `GestureStartSpeedPercent` (default 100, clamped to 0-300), shown as
-  "Animation start speed (% of swipe speed)", is the settle's start speed as
-  a percentage of the estimated end speed component toward the target over the
-  travel left, in either style. 100 continues at that component, so the seam
-  has no speed step: the end speed comes from the newest 8-30 ms of reports that
-  is still fresh at the lift, projected onto the settle's direction, and the
-  curve's own end-value scale (about 0.993, see above) divides the whole motion.
-  It is not the raw release vector: a finger moving sideways or back toward
-  where it came from hands the settle only the part that moves the panel toward
-  where it is going. Higher snaps away faster; 0 starts from rest, which a
-  finger held still reports anyway. The end speed is the 8-30 ms of reports
-  ending at the newest position, and that position must be no more than 30 ms
-  older than the release: a hold before the lift reports 0 where a whole-gesture
-  average reported the drag's speed, and a finger that only asserts its tip down
-  after the motion reports 0 too. Windows-key opens and closes
-  have no finger speed and always start from rest, so this setting does not
-  change them; the style does. `Wh_ModInit` reads it once into an atomic and
-  logs `settle start speed=...`; `Wh_ModSettingsChanged` refreshes the
-  atomic, so a change applies to the next settle and no settle performs a
-  setting lookup.
+- **Menu animation style** — *Windows 11* glides like Quick Settings;
+  *Windows 10* is slower off the mark and lands firmer.
+- **Animation start speed** — how fast the menu keeps moving when you lift your
+  finger, as a percentage of the finger's speed: 0 starts from a standstill,
+  100 continues at that speed, up to 300 snaps it away. Windows-key opens and
+  closes start from rest.
+Known limits:
 
-Channel:
+- The shell owns the reveal, so the first frame can arrive about a quarter of a
+  second after the open starts.
+- If the launcher's private symbols or the menu layout are unavailable, the mod
+  steps aside and the shell handles every press natively.
+- Tested with a bottom taskbar on one 2880x1800 display at 200%; the gesture
+  reads the taskbar's edge, but only the bottom layout has been exercised.
 
-- The channel is one shared section and four auto-reset events (intent/ack,
-  exec/ack), described in `swipe_ipc_shared.h`; no file, mutex or command record
-  is involved and nothing polls. `tools/ipc.ps1 -State` reads the counters and
-  refuses a section that is not ready or not the 216-byte layout.
-- The controller publishes the open generation, the intent answer, the exec
-  command and the peer triple; the bridge publishes intents and exec answers.
-  The intent is its own event: the bridge publishes one
-  `intent(seq, kind, trigger, method, flags, open)` and this side answers on
-  `intentAck` with the state, the planned duration and the entry. An open sets
-  the entry and publishes `exec show`; a close runs the one close path and
-  publishes `exec dismiss`; a press that takes the panel back publishes
-  `exec cancel` for the dismiss sequence it supersedes, and the bridge kills its
-  timer. Open generation 0 is not a menu: `SwipeIpcReadOpen` reports
-  `ERROR_NOT_READY` instead of a snapshot, so an intent published before the
-  first open carries `open=0` and names no menu.
-- A click-away intent carries the Hide method `7` as evidence; this side maps it
-  to the executor's dismiss method `6` before publishing the command, so the
-  executor's allowlist (show 1/11/16, dismiss 1/6, cancel 0) never has to accept
-  a value this mod does not send as an execution method.
-- The section outlives either process, so both sides record the sequence numbers
-  at attach and act only on what is newer: an intent or an open generation from a
-  previous process is ignored by its sequence, never served.
-- The liveness triple is the bridge's interception precondition. `peerEpoch` is
-  claimed once per attach, before anything else this activation writes;
-  `peerState=alive` is published from the input thread only when its window and
-  its intent event exist and it is about to wait on the intents; the input thread
-  refreshes `peerTick` from its idle tick and from every positioned report at
-  most once per 100 ms. Availability is withdrawn before that thread is stopped
-  (`Wh_ModBeforeUninit`) and again as it leaves for any reason, and the
-  withdrawal resets the shared direction and touch in the same step, so a kill
-  while `closing` cannot be read as the next activation's decision. The bridge
-  creates the section, so a mapped channel never proves this side is running;
-  `gone` makes a clean disable immediate, and the tick going older than 600 ms
-  covers a killed host. That 600 ms is a detection budget, not a delivery
-  guarantee: a press taken inside it can be published after this side is gone,
-  and a few startup/shutdown presses are served natively by the shell by design.
-
-Diagnostics:
-
-- `mod init`, `settle style selected=... setting=...`,
-  `settle start speed=...%`,
-  `settle plan speed=... dip/ms dur=160..520 segment=4.0 ms frames=13..129`,
-  `settle spring win10 zeta=...`,
-  `settle spring win11 zeta=...`, `hid init`,
-  `hid stop event failed err=...`,
-  `hid thread not started (stop event unavailable)`,
-  `hid reg usage=... ok=... err=...`,
-  `hid down x=... y=... axis=... dist=...`,
-  `hid release src=idle|report|abort delta=... final=... perp=... vel=...
-  commit=... n=... relms=...` (`vel` is the end speed toward the settle's
-  target in DIP/ms, so a hold before the lift reports 0.00),
-  `settle style=win11|win10 dir=open|close vel=... dur=... remaining=...
-  frames=... zeta=...` (`vel` is that same end speed toward the target, printed
-  from the one projection the spring scales;
-  `frames` counts keyframes, so the segment count is one
-  less),
-  `win open dur=...`, `win open restore (no geometry)`,
-  `win open unhealed progress=...` (the visibility poll found the window shown
-  with the panel off it and no motion; it is logged once per second while the
-  pair stands, immediately before the settle that brings the panel back),
-  `progress take settle at=... elapsed=... dur=... caller=...` (a settle taken
-  below 5 %, naming the caller; the dead open's fingerprint),
-  `win close observed`,
-  `close dismiss kind=dismiss|reveal` (the armed executor dismiss runs at the
-  settle's end),
-  `close dismiss cancelled kind=dismiss|reveal` (a new pull took the close back
-  before that dismiss was requested),
-  `close dismiss skipped kind=... (already closed)`,
-  `close observer lost kind=dismiss` (the settle runs and its dismiss is armed;
-  only the batch observer is gone),
-  `close abandoned kind=dismiss|reveal` (no settle started, so the panel was put
-  back and nothing was armed),
-  `open follow travel=... max=... progress=... behind=... offset=... vel=...
-  commit=... panel=... n=...` (`progress` is the last chased visible value,
-  `behind` the gap to the finger's mapped position still open at the release in
-  progress units, `offset` the gap the takeover inherited (both in progress
-  units), `travel`/`max` the finger's real motion, and `vel` the end speed toward
-  the settle's target),
-  `reveal panelTrail=... axis=... rect=...,...,...,... work=...,...,...,...
-  band=...,... gen=...`
-  (once per open from the open-time turn, and again whenever the value moved by
-  more than 1 DIP), or
-  `reveal panelTrail=... axis=... (fallback)` once, when no panel has been
-  measured, or
-  `reveal panelTrail rejected ... axis=... rect=... work=... mon=... band=...`
-  once per open, when
-  the measured rect is not the panel this layout shows and the last whole snapshot
-  was kept),
-  `hid decodefail dev=... err=...` (a field that belongs to the report and
-  could not be decoded; logged once per device),
-  `hid usages dev=... tip=... inrange=... count=... buttons=... reportids=...
-  coordpath=... identity=contactid|node` (once per device, at init;
-  `coordpath=1` is the logged count/position fallback for a device with no tip
-  and no in-range usage; `identity` says whether the tracked contact is named by
-  its Contact Identifier or by its contact-node index),
-  `hid contact id=... declared down in ... slots; using=...` once per activation
-  when two slots assert the same identifier,
-  `hid identity expired slot=... latch=0` when the tracked identity's last
-  evidence is older than the idle window and no contact latch holds it — the
-  refused-admission case, which no lift and no latch cleanup could release,
-  `attached root=...`, `dismiss axis=...` (with `src=appbar|bar|work` and what
-  every source said), `dismiss axis=... kept, no source named an edge` (once per
-  undecided episode; the last edge stays in force),
-  `ipc open created=... intent=... epoch=...`,
-  `ipc open failed err=...`,
-  `ipc peer alive reason=consumer epoch=...` (the bridge may intercept),
-  `ipc peer gone reason=attach|unload|consumer-exit|uninit` (it must pass),
-  `gesture geometry updated axis=... dist=...` (or
-  `gesture geometry axis=... dist=... (unchanged)` once per open),
-  `gesture geometry deferred reason=panel-owned gen=...` (a layout change that
-  arrived while a contact owned the panel; one settled pass applies it when the
-  contact ends),
-  `gesture geometry write failed ...`, `gesture renderer invalid until a
-  successful reapply`, `gesture geometry queue err=...`,
-  `xaml size handler left attached; new registration refused`,
-  `xaml loaded handler left attached; new registration refused`,
-  `xaml layout handler left attached; new registration refused` and
-  `xaml viewchanged handler left attached; new registration refused` (a revoke
-  threw, so the token and its owner are kept instead of being overwritten),
-  `work area changed`,
-  `scroller rect=...,...,...,... vo=... sh=... name=... depth=...` (once per
-  region per open, when that region was measured, and again only if the settled
-  pass moved it; `name` is the owning list, the region's own Name when that names
-  the element, else `own>owner`, else the element's type),
-  `scroller none (measured, nothing scrolls)` once per open when the settled pass
-  found nothing scrollable,
-  `scroller retry why=origin|incomplete|not-allowed|offsets|commit gen=... try=...`
-  once per open when a settled pass could not commit and a retry or deferred pass
-  was arranged, and `scroller retry exhausted gen=...` when the bounded backoff
-  (100, 200, 400 ms) ran out and the gate stays Unknown for that open,
-  `dismiss deferred to scroll vo=... sh=... region=...` (at most once per 500 ms;
-  `region` is the scrollable area the press landed in),
-  `dismiss skipped outside panel axis=... x=... y=... rect=... trail=... gen=...`
-  (at most once per second),
-  `dismiss skipped band tail travel=...` (at most once per 500 ms) when a contact
-  that started in the reveal band and is moving away from the taskbar is the tail
-  of the pull that opened the menu: it is not a drag of the open panel, and its
-  release settles nothing,
-  `reveal admit x=... y=... axis=... band=...,... ok=... reason=... progress=...
-  restore=...` once per contact that lands in the reveal band: `ok=1
-  reason=admitted`, or the test that refused it (`renderer`, `layout`,
-  `distance`, `open`); `progress` is the live position read without taking it and
-  `restore` is the restore the state owes, so a refusal at rest reads
-  `progress=1.000` and a refusal with the panel off the window would be visible
-  as `reason=open progress=0...`; `reason=unhealed` is the admitted pull that
-  lands on the shown window whose panel is not at rest; a contact outside the
-  band stays silent, as it was,
-  `reveal pull qualified travel=... axis=...` when the admitted contact reaches
-  the 24 DIP threshold and attempts its one open claim; `reveal show request
-  entry=...` follows when the executor accepted it, and a tap never reaches
-  either line,
-  `reveal adopt x=... y=... travel=... axis=... band=...,... gen=...` when the
-  menu opened under a live pull that had no candidate and that contact took the
-  follow over,
-  `reveal takeover from=... offset=...` when a live follow takes `Progress` over:
-  `from` is the position the panel shows at that instant (the entry, the smallest
-  progress at which any of it is on screen, while the shell's window was cloaked;
-  the live position when it was already above the entry) and `offset` is the gap
-  it inherited, `mapped_at_activation - from`, which the chase closes at the
-  planner's rate; it is not subtracted from later samples,
-  `reveal adopt late travel=... vel=... age=... gen=... from=... pos=...` when
-  the pull lifted before the menu opened and the closed-to-open path consumed the
-  release record: the settle starts at `from` — the position the panel actually
-  shows, which is the off-screen rest while the menu is hidden — with the
-  finger's `vel` (DIP/ms); `age` is the milliseconds since the release and `pos`
-  is the mapped position the follow would have written, kept as a diagnostic. It
-  is read even when a new contact is already down, because that contact cannot be
-  the one that opened the menu,
-  `reveal candidate released unopened travel=... axis=... vel=... pos=...` when a
-  pull in the reveal band ended without the menu ever opening under it (a tap
-  stays silent); `vel` is the release's end speed component toward the open in
-  DIP/ms and `pos` the mapped position the follow would have written, which the
-  open logs but never starts from; the travel and the speed are what the open
-  consumes within 300 ms,
-  `vel window count=... calls=... repeats=... rel=... newest=... age=... first=...
-  firstage=... d=... raw=...` behind `g_debugVelocity` (false): the release-speed
-  window one release read, for a seam that felt like a drop,
-  `startui root symbol resolved base=... at=... rva=... expected=0xAD730
-  match=0|1` (the symbol is the contract; a different address is still used and
-  named), `startui root symbol pending attempt=... waited=...ms
-  deadline=120000ms` while Windhawk's PDB fetch runs (the shell keeps pumping;
-  the retry comes from the input thread), `startui root symbol deadline ...`
-  and `startui root symbol unresolved name=...` (the one refusal reason; no
-  root hook and no controller service),
-  `unload hid thread joined` (or `unload hid thread join failed err=...` while it
-  keeps waiting; there is no residual return),
-  `unload teardown waiting: ...` / `unload waiting for module entries=...` /
-  `unload waiting for xaml revokes=...` when a teardown proof is still owed,
-  and `ipc close` after the UI and executor teardown completed.
-- Only begin and release are logged, never individual samples or coasts. The
-  `edge` line stays in the code behind `g_debugEdge`, which is false; it measured
-  the raw edge contact and EP's own open threshold. The `coast start/stop` lines
-  are behind `g_debugCoast`, also false; they measured the coast's endpoints and
-  showed that `CompositionPropertySet.TryGetScalar` answers with the stored base
-  value while a coast younger than a compositor frame is running, which is why
-  the coast's own line, not a read-back, is what gets pinned.
-
-Known risks:
-
-- Raw input has one sink per usage per process. Another mod that registers
-  `0x0D/0x04` (the `inputprobe` diagnostic does) redirects or removes the
-  stream; `inputprobe` must stay disabled.
-- The digitizer is assumed to cover the primary screen and match the window
-  DPI. A panel on another display, a rotated panel or a non-default logical
-  range decodes to the wrong DIP point.
-- The legacy menu also receives the same touch through its normal XAML input,
-  so a drag can scroll or click a tile while the menu slides.
-- The reveal takes `Progress` over on the first report that sees the menu open,
-  so the menu drops to the computed progress at that instant (0.269 at the
-  screen edge on this layout) and then follows. The mapping needs the panel
-  trail: it is the largest visible child of the root that does not fill it. If
-  that child is missing or unlaid when a measurement runs, or the rect it names
-  is not the panel this layout shows, nothing is published and the follow uses
-  the root-width fallback (log `reveal panelTrail=... (fallback)`). A reveal
-  that starts on the very first open of a fresh process therefore lags the finger
-  until a settled pass has measured the panel once; a pass that arrives while the
-  pull owns the panel waits for the release, and every later open carries that
-  rect.
-- The first measurement of an open is taken too early to be trusted: `Setup` and
-  the root's first `SizeChanged` run while the shell's open storyboard still has
-  the frame out of place. Measured here (right taskbar), that frame is
-  12,-12..1005,539 where the settled rect is 411,163..1404,714, so its taskbar
-  edge is 387 DIP short of the taskbar band and it is rejected rather than
-  published. The request's settled pass is what publishes the real rect; a gesture
-  that begins inside those first two layout passes maps against the previous
-  open's rect (or the fallback).
-- The trail assumes the XAML coordinate space starts at the host window's client
-  origin, which is what `ClientToScreen` returns. Measured on this build with a
-  bottom taskbar: the CoreWindow sits at x=447 px while the work area starts at
-  0, so the panel's frame right of 1005 DIP is drawn at 1228.5 DIP. A host that
-  lays its content out somewhere else than its client area would move the trail
-  by that difference.
-- The snapshot is republished on every root `SizeChanged`, on every open and on
-  every work-area or display change. A panel resize during a follow would move the
-  mapping, so the whole layout change waits for the contact: while a gesture owns
-  the panel, the refresh, the rect and the scroller measurement are deferred and
-  one settled pass applies them when the finger is gone (the next open uses the
-  new layout too). A drag therefore keeps the axis and the travel it started
-  with, and its release plans against those.
-- A taskbar move is noticed only through `WM_SETTINGCHANGE`
-  (`SPI_SETWORKAREA`) or `WM_DISPLAYCHANGE`; an arrangement change that raises
-  neither keeps the old axis until the next open, which always refreshes it.
-- `Distance` is sampled at takeover. A layout change during the follow keeps
-  the old extent until the contact lifts.
-- Composition calls and the settle batch run from the input thread. The batch
-  completion arrives on the compositor's dispatcher; a completion that never
-  arrives leaves `Progress` at the settle's target, which is where the animation
-  ended anyway, and the next settle, drag or take advances the generation and
-  clears the settling flag, so no later down waits on that callback.
-- The end speed needs two reports inside 30 ms. A stream slower than about
-  33 Hz has no pair in the window, and the settle then starts from rest rather
-  than from a speed the data cannot support. The panel reports at ~170 Hz, so
-  this only affects a coarsely injected gesture.
-- A committed close retracts the panel with the mirrored settle and then asks
-  the bridge for the shell's `Dismiss`: 30 ms after the settle for a keyboard,
-  Start-button or click-away close, at the settle's end for a gesture close.
-  The shell hides the window; the next open is ready. With the explorer-side
-  bridge disabled or its hooks refused the menu stays open at the retracted
-  position, because the Start side never calls the launcher itself.
-- A pull that starts during the retract cancels the close before its dismiss is
-  requested, so the shell is never touched and the menu stays open. That check
-  runs once, when the dismiss would be requested; a pull after it is a normal
-  open of a closed menu.
-- The controller publishes the closing direction before the close's first frame. A Win press
-  during the retract is therefore an open: it drops the armed dismiss and the
-  pending executor command and settles the panel back from its live position.
-  The recovery ticket for a dismiss that was already inside the shell stays set
-  until a landing proves it (`intent open recovered`) or a new close/external
-  takeover supersedes it; the still-open polls do not clear it.
-  The shell's state is only the resync, never the direction; it still reports
-  state 5 and uncloaked while the panel retracts, until the executor's
-  `Dismiss` runs. A press after the hide is latched (one slot) and served at the
-  landing.
-- The suppression window is time based until `win close observed` clears it. A
-  reopen that lands before the shell reports the close is not animated; the
-  panel stays at the entry until the observed close clears the window and the
-  next open animates it. In practice the window is the hide delay, not the full
-  600 ms.
-- A keyboard, Start-button or click-away close is a mirrored settle and then a
-  bridge `exec dismiss` 30 ms after it, because the Start side never calls the
-  launcher. A command the bridge refuses or never answers runs one repair: the
-  direction, `controllerTouch` and the pending open entry are released
-  together and the controller state resyncs from the cloak, so the shell's own
-  path serves the next press. A dismiss expires from the deadline it was scheduled
-  for, not from the request.
-- `DwmGetWindowAttribute` is resolved at init from `dwmapi.dll`. If the export
-  is missing, no gesture starts.
-- The root hook is resolved by symbol, not by address. The exact undecorated
-  name is matched against the public symbols of `StartUI_.dll`; the known
-  reference build resolves it to `module + 0xAD730`, which is logged and not
-  required. The first load also starts Windhawk's PDB fetch (35 MB, seconds to
-  a minute on a cold cache); it runs on the mod's input thread, never on the
-  shell's loader thread, and reports `startui root symbol pending` until it
-  finishes. No PDB, a signature that no longer matches or a refused hook logs
-  one reason after the 120 s pending deadline,
-  `startui root symbol unresolved name=...`; without the root there is no
-  renderer, so no gesture starts and the controller advertises no service (the
-  shell handles every press natively). The peer is published only once a root is
-  attached: a session that missed `PrepareRootElement` during the cold symbol
-  fetch stays native until the host restarts.
-- The image is not pinned and there is no instance guard. Disabling the mod
-  stops and joins the input thread, runs the UI teardown turn, drains the counted
-  entries and closes the channel before `Wh_ModUninit` returns, so
-  `StartMenuExperienceHost.exe` can unmap the DLL and a later enable loads a
-  fresh image. A teardown proof that cannot be obtained keeps waiting; it never
-  returns success with a mod-owned callback reachable.
+The repository has the [user guide](https://github.com/Zhanyuanium/swipe-for-10start#readme)
+and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/limits.md).
 */
 // ==/WindhawkModReadme==
 
@@ -1087,6 +88,14 @@ Known risks:
     motion does not count, because only the part toward the target enters the
     motion. Neither do Windows-key opens and closes: they start from rest
     whatever you set.
+- DiagnosticTrace: false
+  $name: Write a diagnostic trace file
+  $description: >-
+    Writes the mod's decision lines to a log file in its storage folder, one
+    file per process (renderer.log in the Start menu host, bridge.log in
+    Explorer). Turn it on only when a maintainer or a bug report asks for it:
+    the trace is capped, but it is meant for diagnosis, not for everyday use.
+    Off, nothing is written to disk.
 */
 // ==/WindhawkModSettings==
 
@@ -1106,7 +115,9 @@ Known risks:
  * [OUTPUT]: the panel's Progress through the one damped-spring settle, the
  *   reveal and dismiss follows, the coast and the geometry snapshot; the hidden
  *   executor window on explorer's launcher thread that runs the one shell call
- *   per command; one decision line and one executor line per trigger. Wh_ModInit
+ *   per command; one decision line and one executor line per trigger. Every
+ *   line goes through `TraceLog`: `Wh_Log` always, and the role's file only
+ *   while the `DiagnosticTrace` setting is on. Wh_ModInit
  *   selects exactly one role table from the host executable name
  *   (start::Role or bridge::Role), and the four Windhawk entry points forward
  *   to that table.
@@ -1186,6 +197,124 @@ struct SwipeModRole {
     void (*modSettingsChanged)();
 };
 
+// ---------------------------------------------------------------------------
+// Diagnostic trace
+// ---------------------------------------------------------------------------
+//
+// Every decision line goes to Windhawk's own log through Wh_Log. That call is
+// always made; Windhawk's debug logging decides whether it is stored, and its
+// default is off. The same line is also written to one file per role when the
+// DiagnosticTrace setting is on, because the regression tools read the lines by
+// timestamp from <mod storage>\renderer.log (Start) or \bridge.log (explorer).
+//
+// The file is capped: after kTraceMaxLines lines the next write restarts it, so
+// a trace that is left on cannot grow without bound. The setting is loaded at
+// init and on every settings change; it is the only debug switch.
+
+constexpr uint32_t kTraceMaxLines = 20000;
+
+SRWLOCK g_traceLock = SRWLOCK_INIT;
+std::atomic<bool> g_traceFile{false};
+const wchar_t* g_traceFileName = L"trace.log";
+uint32_t g_traceLines = 0;   // guarded by g_traceLock
+bool g_traceSeeded = false;  // guarded by g_traceLock
+
+// The role's file name. Called once at init, before the first line and before
+// any hook can run this process's half of the mod.
+void SetTraceFileName(const wchar_t* name) {
+    g_traceFileName = name;
+}
+
+// Counts the lines already in the file. The cap bounds the read. Called with
+// g_traceLock held.
+void SeedTraceLines(const wchar_t* path) {
+    g_traceLines = 0;
+    g_traceSeeded = true;
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    char buffer[8192];
+    DWORD read = 0;
+    while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read > 0) {
+        for (DWORD i = 0; i < read; ++i) {
+            if (buffer[i] == '\n') {
+                ++g_traceLines;
+            }
+        }
+    }
+    CloseHandle(file);
+}
+
+// Reads the setting and gives the next write a fresh line count. Called from
+// each role's init and settings change, never from a hook.
+void RefreshTraceSetting() {
+    g_traceFile.store(Wh_GetIntSetting(L"DiagnosticTrace") != 0,
+                      std::memory_order_relaxed);
+    AcquireSRWLockExclusive(&g_traceLock);
+    g_traceSeeded = false;
+    ReleaseSRWLockExclusive(&g_traceLock);
+}
+
+// The one logging entry point. Wh_Log always sees the line; the file sees it
+// only while DiagnosticTrace is on.
+void TraceLog(const wchar_t* format, ...) {
+    WCHAR message[900] = {};
+    va_list args;
+    va_start(args, format);
+    vswprintf_s(message, ARRAYSIZE(message), format, args);
+    va_end(args);
+
+    Wh_Log(L"%s", message);
+
+    if (!g_traceFile.load(std::memory_order_relaxed)) {
+        return;
+    }
+    WCHAR storage[MAX_PATH] = {};
+    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
+        return;
+    }
+    WCHAR path[MAX_PATH] = {};
+    if (swprintf_s(path, ARRAYSIZE(path), L"%s\\%s", storage, g_traceFileName) <=
+        0) {
+        return;
+    }
+    // Every file line starts with the system tick, so lines from the two
+    // processes can be ordered against each other and against an injection.
+    WCHAR line[1024] = {};
+    swprintf_s(line, ARRAYSIZE(line), L"t=%llu %s",
+               static_cast<unsigned long long>(GetTickCount64()), message);
+    char utf8[2048] = {};
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8),
+                                    nullptr, nullptr);
+    if (bytes <= 1) {
+        return;
+    }
+
+    AcquireSRWLockExclusive(&g_traceLock);
+    if (!g_traceSeeded) {
+        SeedTraceLines(path);
+    }
+    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        if (g_traceLines >= kTraceMaxLines) {
+            SetFilePointer(file, 0, nullptr, FILE_BEGIN);
+            SetEndOfFile(file);
+            g_traceLines = 0;
+        }
+        DWORD written = 0;
+        WriteFile(file, utf8, static_cast<DWORD>(bytes - 1), &written, nullptr);
+        WriteFile(file, "\r\n", 2, &written, nullptr);
+        ++g_traceLines;
+        CloseHandle(file);
+    }
+    ReleaseSRWLockExclusive(&g_traceLock);
+}
+
 namespace start {
 
 
@@ -1197,49 +326,6 @@ namespace wuxh = winrt::Windows::UI::Xaml::Hosting;
 
 using winrt::Windows::Foundation::Numerics::float2;
 using winrt::Windows::Foundation::Numerics::float3;
-
-void FileLog(const wchar_t* format, ...) {
-    static SRWLOCK lock = SRWLOCK_INIT;
-
-    WCHAR storage[MAX_PATH] = {};
-    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
-        return;
-    }
-
-    WCHAR path[MAX_PATH] = {};
-    swprintf_s(path, L"%s\\renderer.log", storage);
-
-    WCHAR message[900] = {};
-    va_list args;
-    va_start(args, format);
-    vswprintf_s(message, ARRAYSIZE(message), format, args);
-    va_end(args);
-
-    // Every line starts with the system tick, so lines from the two processes
-    // can be ordered against each other and against an injected input.
-    WCHAR line[1024] = {};
-    swprintf_s(line, ARRAYSIZE(line), L"t=%llu %s",
-               static_cast<unsigned long long>(GetTickCount64()), message);
-
-    char utf8[2048] = {};
-    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8,
-                                    sizeof(utf8), nullptr, nullptr);
-    if (bytes <= 1) {
-        return;
-    }
-
-    AcquireSRWLockExclusive(&lock);
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        DWORD written = 0;
-        WriteFile(file, utf8, static_cast<DWORD>(bytes - 1), &written, nullptr);
-        WriteFile(file, "\r\n", 2, &written, nullptr);
-        CloseHandle(file);
-    }
-    ReleaseSRWLockExclusive(&lock);
-}
 
 // StartUI::App::PrepareRootElement(Frame^, PerFrameData^, bool) -> UIElement^,
 // a private static C++/CX function. It is resolved by its public symbol, not by
@@ -1827,7 +913,7 @@ void LoadAnimationStyle() {
     const SettleStyle style =
         wcscmp(value, kAnimationStyleWin10) == 0 ? SettleStyle::Win10
                                                  : SettleStyle::Win11;
-    FileLog(L"settle style selected=%s setting=%s", SettleStyleName(style),
+    TraceLog(L"settle style selected=%s setting=%s", SettleStyleName(style),
             value);
     Wh_FreeStringSetting(value);
     g_settleStyle.store(style, std::memory_order_relaxed);
@@ -1846,7 +932,7 @@ void LoadGestureStartSpeed() {
         std::clamp(Wh_GetIntSetting(L"GestureStartSpeedPercent"),
                    kGestureStartSpeedMin, kGestureStartSpeedMax);
     g_gestureStartSpeedPercent.store(percent, std::memory_order_relaxed);
-    FileLog(L"settle start speed=%d%%", percent);
+    TraceLog(L"settle start speed=%d%%", percent);
 }
 
 // ---------------------------------------------------------------------------
@@ -2963,7 +2049,7 @@ float TakeProgressNow(const wchar_t* caller) {
     if (settling && value < 0.05f) {
         const uint64_t elapsed =
             qpcNow > g_panel.startQpc ? qpcNow - g_panel.startQpc : 0;
-        FileLog(L"progress take settle at=%.3f elapsed=%llu dur=%llu caller=%s",
+        TraceLog(L"progress take settle at=%.3f elapsed=%llu dur=%llu caller=%s",
                 value, static_cast<unsigned long long>(elapsed),
                 static_cast<unsigned long long>(g_panel.durationMs), caller);
     }
@@ -3157,7 +2243,7 @@ bool StopCoast(float& value) {
     }
 
     if (g_debugCoast) {
-        FileLog(L"coast stop value=%.3f", value);
+        TraceLog(L"coast stop value=%.3f", value);
     }
     return true;
 }
@@ -3178,7 +2264,7 @@ void PanelController::Begin(const float* position) {
     if (position) {
         InsertProgress(*position);
     }
-    FileLog(L"panel intent=begin progress=%.3f source=touch",
+    TraceLog(L"panel intent=begin progress=%.3f source=touch",
             position ? std::clamp(*position, 0.0f, 1.0f)
                      : progress.load(std::memory_order_relaxed));
 }
@@ -3201,7 +2287,7 @@ void PanelController::End(float to, float endVelocity) {
         velocity = endVelocity;
         phase = PanelPhase::Settle;
     }
-    FileLog(L"panel intent=end progress=%.3f velocity=%.2f target=%.0f",
+    TraceLog(L"panel intent=end progress=%.3f velocity=%.2f target=%.0f",
             progress.load(std::memory_order_relaxed), endVelocity,
             std::clamp(to, 0.0f, 1.0f));
 }
@@ -3216,7 +2302,7 @@ void PanelController::Commit(float to) {
         velocity = 0.0f;
         phase = PanelPhase::Settle;
     }
-    FileLog(L"panel intent=commit progress=%.3f target=%.0f",
+    TraceLog(L"panel intent=commit progress=%.3f target=%.0f",
             progress.load(std::memory_order_relaxed),
             std::clamp(to, 0.0f, 1.0f));
 }
@@ -3407,7 +2493,7 @@ int BuildSpringSamples(float start, float target, float velocity,
 void LogSettle(SettleStyle style, const wchar_t* direction, float dipVelocity,
                int64_t durationMs, float remaining, int steps, double zeta,
                const float* samples, float distance) {
-    FileLog(L"settle style=%s dir=%s vel=%.2f dur=%llu remaining=%.0f "
+    TraceLog(L"settle style=%s dir=%s vel=%.2f dur=%llu remaining=%.0f "
             L"frames=%d zeta=%.2f step0=%.1f stepmid=%.1f stepend=%.1f",
             SettleStyleName(style), direction, dipVelocity,
             static_cast<unsigned long long>(durationMs), remaining, steps + 1,
@@ -3573,7 +2659,7 @@ GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
 // outcome: the missing settle line already says the close never started, and
 // this line says what the panel did instead.
 bool AbandonClose(CloseKind kind) {
-    FileLog(L"close abandoned kind=%s", CloseKindName(kind));
+    TraceLog(L"close abandoned kind=%s", CloseKindName(kind));
     return ShowAtRest();
 }
 
@@ -3678,7 +2764,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         } catch (...) {
             // Without a counted entry no handler may be registered: the unload
             // could not prove it has finished.
-            FileLog(L"close observer lost kind=dismiss");
+            TraceLog(L"close observer lost kind=dismiss");
             batch.End();
             return result;
         }
@@ -3697,7 +2783,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
             }
         }
         if (!serialLive) {
-            FileLog(L"close observer lost kind=dismiss");
+            TraceLog(L"close observer lost kind=dismiss");
             batch.End();
             return result;
         }
@@ -3774,7 +2860,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
             } catch (...) {
             }
         }
-        FileLog(L"close observer lost kind=dismiss");
+        TraceLog(L"close observer lost kind=dismiss");
         return result;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Dismiss animation failed: %08X %s", e.code(),
@@ -3926,7 +3012,7 @@ void SetPeerGone(const wchar_t* why, bool terminal) {
     logged = g_peerPublished.exchange(false, std::memory_order_relaxed);
     ReleaseSRWLockExclusive(&g_peerLock);
     if (logged) {
-        FileLog(L"ipc peer gone reason=%s terminal=%d", why, terminal ? 1 : 0);
+        TraceLog(L"ipc peer gone reason=%s terminal=%d", why, terminal ? 1 : 0);
     }
 }
 
@@ -3957,7 +3043,7 @@ bool PublishPeerReady(const wchar_t* why) {
     // swallow a native toggle for a menu this side cannot animate. The refusal
     // already logged its one reason; this is the service being withheld.
     if (!g_rootHookReady.load(std::memory_order_acquire)) {
-        FileLog(L"ipc peer not published reason=no-root-hook refused=%d",
+        TraceLog(L"ipc peer not published reason=no-root-hook refused=%d",
                 g_rootHookRefused.load(std::memory_order_acquire) ? 1 : 0);
         return false;
     }
@@ -3967,20 +3053,20 @@ bool PublishPeerReady(const wchar_t* why) {
     // session's Win close produced `win open restore (no geometry)` and left the
     // menu open. The peer is announced when the root is.
     if (!g_rendererReady.load(std::memory_order_acquire)) {
-        FileLog(L"ipc peer not published reason=no-renderer");
+        TraceLog(L"ipc peer not published reason=no-renderer");
         return false;
     }
     if (!g_ipc.intentEvent) {
         // Without the intent event the bridge can publish a decision nobody
         // wakes for. That is not a consumer, so it is not announced.
-        FileLog(L"ipc peer not published reason=no-intent-event");
+        TraceLog(L"ipc peer not published reason=no-intent-event");
         return false;
     }
     bool published = false;
     AcquireSRWLockExclusive(&g_peerLock);
     if (g_peerTerminal) {
         ReleaseSRWLockExclusive(&g_peerLock);
-        FileLog(L"ipc peer not published reason=terminal-withdrawal");
+        TraceLog(L"ipc peer not published reason=terminal-withdrawal");
         return false;
     }
     const uint64_t now = GetTickCount64();
@@ -3991,7 +3077,7 @@ bool PublishPeerReady(const wchar_t* why) {
     published = true;
     ReleaseSRWLockExclusive(&g_peerLock);
     if (published) {
-        FileLog(L"ipc peer alive reason=%s epoch=%u touch=%d pen=%d", why,
+        TraceLog(L"ipc peer alive reason=%s epoch=%u touch=%d pen=%d", why,
                 g_peerEpoch, g_touchRegistered ? 1 : 0,
                 g_penRegistered ? 1 : 0);
     }
@@ -4002,7 +3088,7 @@ void OpenIpcChannel() {
     bool created = false;
     DWORD error = 0;
     if (!SwipeIpcOpen(&g_ipc, &created, &error)) {
-        FileLog(L"ipc open failed err=%u", static_cast<unsigned>(error));
+        TraceLog(L"ipc open failed err=%u", static_cast<unsigned>(error));
         return;
     }
 
@@ -4039,11 +3125,11 @@ void OpenIpcChannel() {
     // rules handle what an entered call does.
     if (g_ipc.state) {
         SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, 0);
-        FileLog(L"exec cancel request target=0 reason=attach epoch=%u",
+        TraceLog(L"exec cancel request target=0 reason=attach epoch=%u",
                 g_peerEpoch);
     }
 
-    FileLog(L"ipc open created=%d intent=%lld epoch=%u", created ? 1 : 0,
+    TraceLog(L"ipc open created=%d intent=%lld epoch=%u", created ? 1 : 0,
             static_cast<long long>(g_lastIntentSeq), g_peerEpoch);
 }
 
@@ -4061,7 +3147,7 @@ constexpr uint64_t kDismissConfirmGraceMs = 300;
 
 bool RequestBridgeShow(uint32_t method, uint32_t flags) {
     if (!g_ipc.state || !g_ipc.execEvent) {
-        FileLog(L"exec show request skipped seq=none method=%u reason=%s",
+        TraceLog(L"exec show request skipped seq=none method=%u reason=%s",
                 method, g_ipc.state ? L"no-executor" : L"no-channel");
         return false;
     }
@@ -4072,7 +3158,7 @@ bool RequestBridgeShow(uint32_t method, uint32_t flags) {
         &g_ipc, kSwipeExecShow, static_cast<int32_t>(method),
         static_cast<int32_t>(flags), 0, 0);
     if (sequence <= 0) {
-        FileLog(L"exec show request skipped seq=none method=%u "
+        TraceLog(L"exec show request skipped seq=none method=%u "
                 L"reason=no-sequence",
                 method);
         return false;
@@ -4080,7 +3166,7 @@ bool RequestBridgeShow(uint32_t method, uint32_t flags) {
     g_pendingShowExec.store(sequence, std::memory_order_relaxed);
     g_pendingShowUntil.store(GetTickCount64() + kBridgeAckTimeoutMs,
                              std::memory_order_relaxed);
-    FileLog(L"exec show request seq=%lld method=%u flags=%u",
+    TraceLog(L"exec show request seq=%lld method=%u flags=%u",
             static_cast<long long>(sequence), method, flags);
     return true;
 }
@@ -4104,7 +3190,7 @@ uint32_t ExecDismissMethodForIntent(int32_t intentMethod) {
 
 bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
     if (!g_ipc.state || !g_ipc.execEvent) {
-        FileLog(L"exec dismiss request skipped seq=none method=%u reason=%s",
+        TraceLog(L"exec dismiss request skipped seq=none method=%u reason=%s",
                 method, g_ipc.state ? L"no-executor" : L"no-channel");
         return false;
     }
@@ -4112,7 +3198,7 @@ bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
         &g_ipc, kSwipeExecDismiss, static_cast<int32_t>(method), 0, executeAt,
         open);
     if (sequence <= 0) {
-        FileLog(L"exec dismiss request skipped seq=none method=%u "
+        TraceLog(L"exec dismiss request skipped seq=none method=%u "
                 L"reason=no-sequence",
                 method);
         return false;
@@ -4122,7 +3208,7 @@ bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
     // The new command replaces whatever confirmation an earlier dismiss still
     // owed; the bridge answers the superseded one with its own state.
     g_pendingDismissConfirm = 0;
-    FileLog(L"exec dismiss request seq=%lld method=%u executeAt=%llu open=%llu",
+    TraceLog(L"exec dismiss request seq=%lld method=%u executeAt=%llu open=%llu",
             static_cast<long long>(sequence), method,
             static_cast<unsigned long long>(executeAt),
             static_cast<unsigned long long>(open));
@@ -4142,7 +3228,7 @@ LONG64 CancelPendingDismiss(const wchar_t* reason) {
     if (g_ipc.state) {
         SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, target);
     }
-    FileLog(L"exec cancel request target=%lld reason=%s",
+    TraceLog(L"exec cancel request target=%lld reason=%s",
             static_cast<long long>(target), reason);
     return target;
 }
@@ -4238,7 +3324,7 @@ void LogDecodeFail(HidDevice& device, unsigned error) {
     }
 
     device.decodeFailLogged = true;
-    FileLog(L"hid decodefail dev=%s err=%u", device.path, error);
+    TraceLog(L"hid decodefail dev=%s err=%u", device.path, error);
 }
 
 // Reads the path, the preparsed blob, the contact collection indices and the
@@ -4276,7 +3362,7 @@ void InitHidDevice(HidDevice& device) {
     const NTSTATUS capsStatus = HidP_GetCaps(device.preparsed, &caps);
     if (capsStatus != HIDP_STATUS_SUCCESS) {
         device.decodeFailLogged = true;
-        FileLog(L"hid decodefail dev=%s err=0x%08X", device.path,
+        TraceLog(L"hid decodefail dev=%s err=0x%08X", device.path,
                 static_cast<unsigned>(capsStatus));
         return;
     }
@@ -4431,7 +3517,7 @@ void InitHidDevice(HidDevice& device) {
         device.hasContactCount = true;
         break;
     }
-    FileLog(L"hidcc dev=%s have=%d link=%u", device.path,
+    TraceLog(L"hidcc dev=%s have=%d link=%u", device.path,
             device.hasContactCount ? 1 : 0,
             static_cast<unsigned>(device.contactCountLink));
 
@@ -4441,7 +3527,7 @@ void InitHidDevice(HidDevice& device) {
     // usage the mod can read, so its count/position path is used. `identity`
     // says which contact name the tracked gesture uses: the Contact Identifier
     // when the device declares one per contact, the contact-node index otherwise.
-    FileLog(L"hid usages dev=%s tip=%d inrange=%d count=%d buttons=%u "
+    TraceLog(L"hid usages dev=%s tip=%d inrange=%d count=%d buttons=%u "
             L"reportids=%d coordpath=%d identity=%s",
             device.path, device.hasTipSwitch ? 1 : 0,
             device.hasInRange ? 1 : 0, device.hasContactCount ? 1 : 0,
@@ -4480,7 +3566,7 @@ HidDevice* GetHidDevice(HANDLE handle) {
         delete[] reinterpret_cast<BYTE*>(device->preparsed);
         if (!g_hidCacheFullLogged) {
             g_hidCacheFullLogged = true;
-            FileLog(L"hid device table recycled (was full)");
+            TraceLog(L"hid device table recycled (was full)");
         }
     }
 
@@ -5435,7 +4521,7 @@ float EndVelocityProgressPerMs(uint64_t releaseQpc) {
                 ? g_endVelocity[g_endVelocityCount - 1].progress -
                       g_endVelocity[firstIndex].progress
                 : 0.0f;
-        FileLog(L"vel window count=%d calls=%d repeats=%d rel=%llu newest=%llu "
+        TraceLog(L"vel window count=%d calls=%d repeats=%d rel=%llu newest=%llu "
                 L"age=%llu first=%d firstage=%llu d=%.5f raw=%.4f",
                 g_endVelocityCount, g_endVelocityCalls, g_endVelocityRepeats,
                 static_cast<unsigned long long>(releaseQpc),
@@ -5538,7 +4624,7 @@ void ResetActivationState() {
     g_peerTickLast = 0;
 
     EndContactTiming();
-    FileLog(L"activation state reset");
+    TraceLog(L"activation state reset");
 }
 
 // Input thread. Claims the panel for a gesture admission and re-reads the
@@ -5903,7 +4989,7 @@ bool VerticalDismissAllowed(const GestureGeometry& geometry, int32_t axis,
     if (tickMs >= g_scrollerRejectLogTick &&
         tickMs - g_scrollerRejectLogTick >= kDismissRejectLogMs) {
         g_scrollerRejectLogTick = tickMs;
-        FileLog(L"dismiss deferred to scroll vo=%.0f sh=%.0f region=%s",
+        TraceLog(L"dismiss deferred to scroll vo=%.0f sh=%.0f region=%s",
                 hit->verticalOffset, hit->scrollableHeight, hit->label);
     }
     return false;
@@ -6005,7 +5091,7 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
         reveal.deferred = true;
         return;
     }
-    FileLog(L"reveal pull qualified travel=%.0f axis=%d", travel,
+    TraceLog(L"reveal pull qualified travel=%.0f axis=%d", travel,
             geometry.axis());
     // The pull owns whatever opens next: a new generation, no release record
     // from the previous pull, and no close the shell still has scheduled. These
@@ -6018,13 +5104,13 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
     }
     float entry = 0.0f;
     if (PublishOpenClaim(geometry, true, entry)) {
-        FileLog(L"reveal show request entry=%.3f", entry);
+        TraceLog(L"reveal show request entry=%.3f", entry);
     } else {
         // No executor can present this open: the claim is withdrawn by the
         // helper and the shell's own band gesture remains the owner of the
         // open. The pull keeps its candidate and its release history, so an
         // open the shell performs anyway is adopted at the next poll.
-        FileLog(L"reveal show request failed entry=%.3f reason=no-executor",
+        TraceLog(L"reveal show request failed entry=%.3f reason=no-executor",
                 entry);
     }
 }
@@ -6187,7 +5273,7 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     // Diagnostic: where the follow starts and the gap it inherited. The chase
     // closes that gap at the planner's rate; the line says how much of it there
     // was, not a value that is subtracted from every insert.
-    FileLog(L"reveal takeover from=%.3f offset=%.3f", visible,
+    TraceLog(L"reveal takeover from=%.3f offset=%.3f", visible,
             reveal.activationGap);
     // The opening contact now owns the panel through the follow. The entry the
     // touch show reserved belongs to the reveal takeover, not to a later keyboard
@@ -6216,7 +5302,7 @@ bool ClearLocalCloseTap() {
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
-    FileLog(L"close dismiss cancelled kind=%s", CloseKindName(dropped));
+    TraceLog(L"close dismiss cancelled kind=%s", CloseKindName(dropped));
     return true;
 }
 
@@ -6311,7 +5397,7 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
     } while (false);
 
     if (inBand) {
-        FileLog(L"reveal admit x=%.0f y=%.0f axis=%d band=%.0f,%.0f ok=%d "
+        TraceLog(L"reveal admit x=%.0f y=%.0f axis=%d band=%.0f,%.0f ok=%d "
                 L"reason=%s progress=%.3f restore=%d",
                 x, y, axis, haveBand ? low : -1.0f, haveBand ? high : -1.0f,
                 admitted ? 1 : 0, reason, progress, restoreOwed ? 1 : 0);
@@ -6476,7 +5562,7 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     }
     DriveRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
                       sampleQpc);
-    FileLog(L"reveal adopt x=%.0f y=%.0f travel=%.0f axis=%d band=%.0f,%.0f gen=%u",
+    TraceLog(L"reveal adopt x=%.0f y=%.0f travel=%.0f axis=%d band=%.0f,%.0f gen=%u",
             g_contactOrigin.x, g_contactOrigin.y, travel, axis,
             haveBand ? low : -1.0f, haveBand ? high : -1.0f,
             geometry.generation);
@@ -6581,7 +5667,7 @@ bool ConsumeLateRevealRelease(const GestureGeometry& geometry) {
     // The animation owns the whole travel now, so no later path needs to restore
     // the resting value for this open.
     g_commitNeedsProgressReset = false;
-    FileLog(L"reveal adopt late travel=%.0f vel=%.2f age=%llu gen=%u from=%.3f "
+    TraceLog(L"reveal adopt late travel=%.0f vel=%.2f age=%llu gen=%u from=%.3f "
             L"pos=%.3f",
             record.travel, SpeedTowardDip(record.velocity, from, 1.0f, distance),
             static_cast<unsigned long long>(age),
@@ -6670,14 +5756,14 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
             g_lateRelease.position = position;
             g_lateRelease.velocity = velocity;
             g_lateRelease.pullSerial = g_pullSerial;
-            FileLog(L"reveal candidate released unopened travel=%.0f axis=%d "
+            TraceLog(L"reveal candidate released unopened travel=%.0f axis=%d "
                     L"vel=%.2f pos=%.2f",
                     travel, geometry.axis(),
                     SpeedTowardDip(velocity, position, 1.0f, distance), position);
         } else if (travel >= kAdoptTravelDip) {
             // A pull with no travel to map: the line still names it, but there is
             // nothing to carry across the gap.
-            FileLog(L"reveal candidate released unopened travel=%.0f axis=%d",
+            TraceLog(L"reveal candidate released unopened travel=%.0f axis=%d",
                     travel, geometry.axis());
         }
         EndContactTiming();
@@ -6721,7 +5807,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
         // Let go past the commit point: the menu stays open and the follow
         // finishes the slide instead of snapping.
         const bool started = BeginGestureOpen(from, endVelocity);
-        FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
+        TraceLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
                 L"offset=%.3f vel=%.2f commit=%d panel=%.0f n=%d",
                 travel, reveal.maxTravel, progress, behind,
                 reveal.activationGap, releaseSpeed, commit ? 1 : 0,
@@ -6743,7 +5829,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     // the shell has finished hiding the reused root.
     const GestureClose close =
         BeginGestureClose(from, endVelocity, CloseKind::RevealCancel);
-    FileLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
+    TraceLog(L"open follow travel=%.0f max=%.0f progress=%.2f behind=%.3f "
             L"offset=%.3f vel=%.2f commit=%d panel=%.0f n=%d",
             travel, reveal.maxTravel, progress, behind, reveal.activationGap,
             releaseSpeed, commit ? 1 : 0, reveal.panelTrail, reveal.samples);
@@ -6763,7 +5849,7 @@ void LogHidRelease(const HidGestureSession& session, float velocity,
     const uint64_t releaseDelay = releaseQpc > session.lastSampleQpc
                                       ? releaseQpc - session.lastSampleQpc
                                       : 0;
-    FileLog(
+    TraceLog(
         L"hid release src=%s delta=%.1f final=%.1f perp=%.1f vel=%.2f "
         L"commit=%d n=%d relms=%llu",
         source, session.maxDelta, session.curDelta, session.maxPerp, velocity,
@@ -6787,7 +5873,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
         tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
         if (tickMs > g_skipLogTick + 1000) {
             g_skipLogTick = tickMs;
-            FileLog(L"dismiss skipped settling");
+            TraceLog(L"dismiss skipped settling");
         }
         return;
     }
@@ -6796,7 +5882,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
     if (!(distance > 0.0f)) {
         if (tickMs > g_skipLogTick + 1000) {
             g_skipLogTick = tickMs;
-            FileLog(L"dismiss skipped distance=0");
+            TraceLog(L"dismiss skipped distance=0");
         }
         return;
     }
@@ -6809,7 +5895,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
         !StartWindowIsOpenThrottled(tickMs)) {
         if (tickMs > g_skipLogTick + 1000) {
             g_skipLogTick = tickMs;
-            FileLog(L"dismiss skipped closed root=%d",
+            TraceLog(L"dismiss skipped closed root=%d",
                     rendererReady ? 1 : 0);
         }
         return;
@@ -6826,7 +5912,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
     if (!PanelContainsPress(geometry, x, y)) {
         if (tickMs > g_skipLogTick + 1000) {
             g_skipLogTick = tickMs;
-            FileLog(L"dismiss skipped outside panel axis=%d x=%.0f y=%.0f "
+            TraceLog(L"dismiss skipped outside panel axis=%d x=%.0f y=%.0f "
                     L"rect=%.0f,%.0f,%.0f,%.0f trail=%.0f gen=%u",
                     axis, x, y, geometry.left, geometry.top, geometry.right,
                     geometry.bottom, GeometryTrailDip(geometry),
@@ -6844,7 +5930,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
     if (!VerticalDismissAllowed(geometry, axis, x, y, tickMs)) {
         if (tickMs > g_skipLogTick + 1000) {
             g_skipLogTick = tickMs;
-            FileLog(L"dismiss skipped vertical axis=%d x=%.0f y=%.0f", axis,
+            TraceLog(L"dismiss skipped vertical axis=%d x=%.0f y=%.0f", axis,
                     x, y);
         }
         return;
@@ -6885,7 +5971,7 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
     g_panel.Begin(&session.startProgress);
     session.lastProgress = session.startProgress;
 
-    FileLog(L"hid down x=%.1f y=%.1f axis=%d dist=%.0f", x, y, axis,
+    TraceLog(L"hid down x=%.1f y=%.1f axis=%d dist=%.0f", x, y, axis,
             distance);
 }
 
@@ -6949,7 +6035,7 @@ void ReleaseHidSession(const GestureGeometry& geometry, bool allowCommit,
     if (g_dismissSettling.load(std::memory_order_relaxed) ||
         GetTickCount64() <
             g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
-        FileLog(L"cancel animation skipped (close in flight)");
+        TraceLog(L"cancel animation skipped (close in flight)");
         return;
     }
     if (distance > 0.0f) {
@@ -7016,7 +6102,7 @@ void UpdateHidSession(const GestureGeometry& geometry, float x, float y,
     if (session.maxPerp > kScrollAbortPerp &&
         session.maxPerp > kScrollAbortRatio * session.maxDelta &&
         session.maxDelta < kScrollAbortMaxDelta) {
-        FileLog(L"dismiss aborted perpendicular perp=%.0f delta=%.0f",
+        TraceLog(L"dismiss aborted perpendicular perp=%.0f delta=%.0f",
                 session.maxPerp, session.maxDelta);
         AbortHidSession(geometry);
         return;
@@ -7206,7 +6292,7 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
         if (tickMs >= g_bandTailLogTick &&
             tickMs - g_bandTailLogTick >= kDismissRejectLogMs) {
             g_bandTailLogTick = tickMs;
-            FileLog(L"dismiss skipped band tail travel=%.0f",
+            TraceLog(L"dismiss skipped band tail travel=%.0f",
                     RevealTravelDip(geometry.axis(), g_contactOrigin.downX,
                                     g_contactOrigin.downY, xDip, yDip));
         }
@@ -7272,7 +6358,7 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
             qpcNow - g_panel.coastStartQpc >=
                 static_cast<uint64_t>(kCoastDuration.count())) {
             if (g_debugCoast) {
-                FileLog(L"coast end value=%.3f", g_panel.coastTo);
+                TraceLog(L"coast end value=%.3f", g_panel.coastTo);
             }
             g_panel.Move(g_panel.coastTo);  // ends the coast, see InsertProgress
         }
@@ -7332,7 +6418,7 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
     }
 
     if (StartCoast(from, to) && g_debugCoast) {
-        FileLog(L"coast start from=%.3f to=%.3f vel=%.2f", from, to,
+        TraceLog(L"coast start from=%.3f to=%.3f vel=%.2f", from, to,
                 velocity * distance);
     }
 }
@@ -7450,7 +6536,7 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         tickMs > g_trackedContact.lastEvidenceTick &&
         tickMs - g_trackedContact.lastEvidenceTick >= kIdleReleaseMs) {
         if (!g_contactDown) {
-            FileLog(L"hid identity expired slot=%d latch=0",
+            TraceLog(L"hid identity expired slot=%d latch=0",
                     g_trackedContact.slot);
         }
         ForgetTrackedContact();
@@ -7501,7 +6587,7 @@ void RunPendingCloseTap(uint64_t tickMs) {
     // external takeover or the shell's own close. The dismiss would only ask the
     // shell to close a window that is already closed.
     if (!StartWindowIsOpen()) {
-        FileLog(L"close dismiss skipped kind=%s (already closed)",
+        TraceLog(L"close dismiss skipped kind=%s (already closed)",
                 CloseKindName(kind));
         return;
     }
@@ -7524,11 +6610,11 @@ void RunPendingCloseTap(uint64_t tickMs) {
         // retracted panel. Give the ownership up now, and the poll's unhealed
         // rule restores the panel once the suppression window ends.
         ReleaseExecutorOwnership();
-        FileLog(L"close dismiss skipped kind=%s reason=no-executor",
+        TraceLog(L"close dismiss skipped kind=%s reason=no-executor",
                 CloseKindName(kind));
         return;
     }
-    FileLog(L"close dismiss kind=%s", CloseKindName(kind));
+    TraceLog(L"close dismiss kind=%s", CloseKindName(kind));
 }
 
 // ---------------------------------------------------------------------------
@@ -7679,7 +6765,7 @@ void RunGeometryMeasurement(const SettledMeasureRequest& request, bool settled) 
             // the one that writes the once-per-open trail line.
             g_panelTrailLogged = false;
             // One line per request: only the first of the two triggers runs it.
-            FileLog(L"gesture geometry deferred reason=panel-owned gen=%u",
+            TraceLog(L"gesture geometry deferred reason=panel-owned gen=%u",
                     request.generation);
             EndMeasureRequest(request.generation, request.id);
             return;
@@ -7752,10 +6838,10 @@ void PostGeometryMeasurement(const SettledMeasureRequest& request, bool settled)
             RunGeometryMeasurement(request, settled);
         });
     } catch (winrt::hresult_error const& e) {
-        FileLog(L"gesture geometry queue err=%08X",
+        TraceLog(L"gesture geometry queue err=%08X",
                 static_cast<unsigned>(e.code()));
     } catch (...) {
-        FileLog(L"gesture geometry queue err=unknown");
+        TraceLog(L"gesture geometry queue err=unknown");
     }
 }
 
@@ -7799,9 +6885,9 @@ void PostUiOpenWatchRelease(uint32_t closedGeneration,
             }
         });
     } catch (winrt::hresult_error const& e) {
-        FileLog(L"open watch release err=%08X", static_cast<unsigned>(e.code()));
+        TraceLog(L"open watch release err=%08X", static_cast<unsigned>(e.code()));
     } catch (...) {
-        FileLog(L"open watch release err=unknown");
+        TraceLog(L"open watch release err=unknown");
     }
 }
 
@@ -7833,7 +6919,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                    ? L"startbutton"
                    : (intent.trigger == kSwipeTriggerClickAway ? L"clickaway"
                                                                : L"override"));
-    FileLog(L"intent recv seq=%lld kind=%s trigger=%s method=%u flags=%u "
+    TraceLog(L"intent recv seq=%lld kind=%s trigger=%s method=%u flags=%u "
             L"open=%llu",
             static_cast<long long>(intent.seq), kind, trigger, intent.method,
             intent.flags, static_cast<unsigned long long>(intent.open));
@@ -7864,7 +6950,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
         SwipeIpcSetControllerTouch(&g_ipc, false);
         g_commitNeedsProgressReset = false;
-        FileLog(L"intent external drop trigger=%s slot=%d command=%d", trigger,
+        TraceLog(L"intent external drop trigger=%s slot=%d command=%d", trigger,
                 dropped.slot ? 1 : 0, dropped.command ? 1 : 0);
     } else if (intent.kind == kSwipeIntentOpen) {
         // The deadline the cancelled command was scheduled for, read before the
@@ -7928,7 +7014,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
                 ShowAtRest();
             }
-            FileLog(L"intent open cancel from=%.3f ticket=%d ticket_open=%u "
+            TraceLog(L"intent open cancel from=%.3f ticket=%d ticket_open=%u "
                     L"ticket_seq=%lld ticket_expire=%llu",
                     live, g_intentCancel.pending ? 1 : 0,
                     g_intentCancel.openTick,
@@ -7943,7 +7029,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             if (RequestBridgeShow(intent.method ? intent.method : 1,
                                   intent.flags)) {
                 ackEntry = static_cast<int32_t>(std::llround(entry * 1000.0f));
-                FileLog(L"intent open entry=%.3f", entry);
+                TraceLog(L"intent open entry=%.3f", entry);
             } else {
                 // No sequence was published, so there is nothing a timeout could
                 // repair. The panel is not claimed: the shell's own gesture (the
@@ -7953,7 +7039,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                 ReleaseExecutorOwnership();
                 ackState = kSwipeAckRefused;
                 ackHr = E_FAIL;
-                FileLog(L"intent open refused entry=%.3f reason=no-executor",
+                TraceLog(L"intent open refused entry=%.3f reason=no-executor",
                         entry);
             }
         }
@@ -7987,7 +7073,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             if (RequestBridgeDismiss(ExecDismissMethodForIntent(intent.method),
                                      executeAt, intent.open)) {
                 ackDuration = static_cast<int32_t>(duration.count());
-                FileLog(L"intent close from=%.3f dur=%lld", from,
+                TraceLog(L"intent close from=%.3f dur=%lld", from,
                         static_cast<long long>(duration.count()));
             } else {
                 // Nothing will hide this window. The settle already retracted the
@@ -7996,7 +7082,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                 ReleaseExecutorOwnership();
                 ackState = kSwipeAckRefused;
                 ackHr = E_FAIL;
-                FileLog(L"intent close refused from=%.3f reason=no-executor",
+                TraceLog(L"intent close refused from=%.3f reason=no-executor",
                         from);
             }
         }
@@ -8035,7 +7121,7 @@ void ApplyExecAck() {
     }
     // The visible word is a tri-state now; a negative value says the bridge could
     // not answer, not that the window is hidden.
-    FileLog(L"exec ack seq=%lld command=%lld state=%u hr=%08X visible=%d",
+    TraceLog(L"exec ack seq=%lld command=%lld state=%u hr=%08X visible=%d",
             static_cast<long long>(ack.seq),
             static_cast<long long>(ack.command), ack.state,
             static_cast<unsigned>(ack.hr), ack.visible);
@@ -8067,7 +7153,7 @@ void ApplyExecAck() {
                                     : (ack.state == kSwipeAckRefused
                                            ? L"refused"
                                            : L"expired");
-        FileLog(L"intent recovery ticket retired seq=%lld reason=%s",
+        TraceLog(L"intent recovery ticket retired seq=%lld reason=%s",
                 static_cast<long long>(ack.command), reason);
         g_intentCancel = CloseCancelTicket{};
     }
@@ -8084,7 +7170,7 @@ void ApplyExecAck() {
             // Returned is not hidden. The command stays identified until the
             // confirmation probe (or the landing) says what happened.
             g_pendingDismissConfirm = ack.command;
-            FileLog(L"exec dismiss executed command=%lld visible=%d "
+            TraceLog(L"exec dismiss executed command=%lld visible=%d "
                     L"(awaiting confirmation)",
                     static_cast<long long>(ack.command), ack.visible);
             return;
@@ -8094,7 +7180,7 @@ void ApplyExecAck() {
             if (wasConfirming) {
                 g_pendingDismissConfirm = 0;
             }
-            FileLog(L"exec dismiss confirmed command=%lld visible=%d",
+            TraceLog(L"exec dismiss confirmed command=%lld visible=%d",
                     static_cast<long long>(ack.command), ack.visible);
             return;
         }
@@ -8111,7 +7197,7 @@ void ApplyExecAck() {
             }
             g_pendingDismissConfirm = 0;
             ReleaseExecutorOwnership();
-            FileLog(L"exec dismiss %s command=%lld state=%u hr=%08X visible=%d",
+            TraceLog(L"exec dismiss %s command=%lld state=%u hr=%08X visible=%d",
                     unconfirmed ? L"unconfirmed" : L"failed",
                     static_cast<long long>(ack.command), ack.state,
                     static_cast<unsigned>(ack.hr), ack.visible);
@@ -8124,7 +7210,7 @@ void ApplyExecAck() {
             if (dismissConfirming) {
                 g_pendingDismissConfirm = 0;
             }
-            FileLog(L"exec dismiss superseded command=%lld",
+            TraceLog(L"exec dismiss superseded command=%lld",
                     static_cast<long long>(ack.command));
             return;
         }
@@ -8136,7 +7222,7 @@ void ApplyExecAck() {
     g_pendingShowExec.store(0, std::memory_order_relaxed);
     g_pendingShowUntil.store(0, std::memory_order_relaxed);
     if (ack.state == kSwipeAckSuperseded) {
-        FileLog(L"exec show superseded command=%lld",
+        TraceLog(L"exec show superseded command=%lld",
                 static_cast<long long>(ack.command));
         return;
     }
@@ -8148,7 +7234,7 @@ void ApplyExecAck() {
         if (g_pendingDismissExec.load(std::memory_order_relaxed) == 0) {
             ReleaseExecutorOwnership();
         }
-        FileLog(L"exec show failed command=%lld state=%u hr=%08X",
+        TraceLog(L"exec show failed command=%lld state=%u hr=%08X",
                 static_cast<long long>(ack.command), ack.state,
                 static_cast<unsigned>(ack.hr));
     }
@@ -8178,14 +7264,14 @@ void CheckExecAckTimeout(uint64_t now) {
             g_pendingDismissExec.load(std::memory_order_relaxed) != 0;
         if (!dismissPending && g_ipc.state) {
             SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, 0);
-            FileLog(L"exec cancel request target=0 reason=show-expired");
+            TraceLog(L"exec cancel request target=0 reason=show-expired");
         }
         // Same rule as a refused show: a pending close owns the panel and its
         // state is not this silence's to clear.
         if (!dismissPending) {
             ReleaseExecutorOwnership();
         }
-        FileLog(L"exec ack timeout seq=%lld kind=show open=%d (resync from "
+        TraceLog(L"exec ack timeout seq=%lld kind=show open=%d (resync from "
                 L"cloak)",
                 static_cast<long long>(show), StartWindowIsOpen() ? 1 : 0);
     }
@@ -8202,11 +7288,11 @@ void CheckExecAckTimeout(uint64_t now) {
     g_pendingDismissExecAt.store(0, std::memory_order_relaxed);
     if (g_ipc.state) {
         SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, dismiss);
-        FileLog(L"exec cancel request target=%lld reason=dismiss-expired",
+        TraceLog(L"exec cancel request target=%lld reason=dismiss-expired",
                 static_cast<long long>(dismiss));
     }
     ReleaseExecutorOwnership();
-    FileLog(L"exec ack timeout seq=%lld kind=dismiss open=%d (resync from "
+    TraceLog(L"exec ack timeout seq=%lld kind=dismiss open=%d (resync from "
             L"cloak)",
             static_cast<long long>(dismiss), StartWindowIsOpen() ? 1 : 0);
 }
@@ -8226,7 +7312,7 @@ void ReconcileSupersedingIntentBeforeLanding() {
     if (intent.kind != kSwipeIntentExternal) {
         return;
     }
-    FileLog(L"intent reconcile seq=%lld kind=external (before landing recovery)",
+    TraceLog(L"intent reconcile seq=%lld kind=external (before landing recovery)",
             static_cast<long long>(intent.seq));
     // Apply the record this function examined, not whatever the section holds by
     // the time it runs: the claim is "the external we saw was applied", and a
@@ -8252,15 +7338,15 @@ bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
         // The landing cannot present anything: the panel stays retracted with the
         // window hidden, and the controller claims nothing. The next open
         // (the shell's own or a later pull) starts from the entry again.
-        FileLog(L"landing open failed entry=%.3f pull=%d reason=no-executor",
+        TraceLog(L"landing open failed entry=%.3f pull=%d reason=no-executor",
                 entry, pullReopen ? 1 : 0);
         return false;
     }
     if (pullReopen) {
-        FileLog(L"reveal reopen after close pull=%d late=%d entry=%.3f",
+        TraceLog(L"reveal reopen after close pull=%d late=%d entry=%.3f",
                 pullDown ? 1 : 0, lateFresh ? 1 : 0, entry);
     } else {
-        FileLog(L"intent open recovered entry=%.3f", entry);
+        TraceLog(L"intent open recovered entry=%.3f", entry);
     }
     return true;
 }
@@ -8332,7 +7418,7 @@ void PollRootVisibility(uint64_t tickMs) {
         // the retract's last frame is continued rather than replayed.
         const bool openDuringClose = closeInFlight;
         if (openDuringClose) {
-            FileLog(L"win open during close progress=%.3f", PeekProgressNow());
+            TraceLog(L"win open during close progress=%.3f", PeekProgressNow());
             g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
             g_reveal.deferred = false;
         }
@@ -8416,19 +7502,19 @@ void PollRootVisibility(uint64_t tickMs) {
                     // restore the resting value for this open.
                     g_commitNeedsProgressReset = false;
                     if (intentEntry) {
-                        FileLog(L"win open intent from=%.3f dur=%llu", from,
+                        TraceLog(L"win open intent from=%.3f dur=%llu", from,
                                 static_cast<unsigned long long>(duration.count()));
                     } else if (openDuringClose) {
-                        FileLog(L"win open during close from=%.3f dur=%llu", from,
+                        TraceLog(L"win open during close from=%.3f dur=%llu", from,
                                 static_cast<unsigned long long>(duration.count()));
                     } else {
-                        FileLog(L"win open dur=%llu",
+                        TraceLog(L"win open dur=%llu",
                                 static_cast<unsigned long long>(duration.count()));
                     }
                 }
             } else {
                 ShowAtRest();
-                FileLog(L"win open restore (no geometry)");
+                TraceLog(L"win open restore (no geometry)");
             }
         }
 
@@ -8474,7 +7560,7 @@ void PollRootVisibility(uint64_t tickMs) {
             (g_intentCancel.expireAt == 0 || tickMs <= g_intentCancel.expireAt);
         const bool intentCancelLost = ticketLive;
         if (g_intentCancel.pending) {
-            FileLog(L"intent recovery ticket open=%u now=%u seq=%lld served=%d "
+            TraceLog(L"intent recovery ticket open=%u now=%u seq=%lld served=%d "
                     L"expired=%d",
                     g_intentCancel.openTick, g_ipcOpenTickLow,
                     static_cast<long long>(g_intentCancel.dismissSeq),
@@ -8495,7 +7581,7 @@ void PollRootVisibility(uint64_t tickMs) {
             // (already lifted).
             if (g_reveal.deferred) {
                 g_reveal.deferred = false;
-                FileLog(L"reveal defer released candidate=%d down=%d",
+                TraceLog(L"reveal defer released candidate=%d down=%d",
                         g_reveal.edgeCandidate ? 1 : 0,
                         g_contactOrigin.valid ? 1 : 0);
             }
@@ -8518,12 +7604,12 @@ void PollRootVisibility(uint64_t tickMs) {
             if (g_reveal.active || g_reveal.edgeCandidate ||
                 g_reveal.deferred) {
                 g_reveal = HidRevealSession{};
-                FileLog(L"reveal dropped (window closed by shell)");
+                TraceLog(L"reveal dropped (window closed by shell)");
             }
             if (g_hidSession.active) {
                 g_hidSession.active = false;
                 EndContactTiming();
-                FileLog(L"hid dropped (window closed by shell)");
+                TraceLog(L"hid dropped (window closed by shell)");
             }
             if (contactLive) {
                 g_hidSession.suppress = true;
@@ -8539,7 +7625,7 @@ void PollRootVisibility(uint64_t tickMs) {
             g_openGeneration.load(std::memory_order_relaxed);
         const SettledMeasureRequest closing = SnapshotMeasureRequest();
         AdvanceOpenGeneration();
-        FileLog(L"win close observed");
+        TraceLog(L"win close observed");
         SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
         SwipeIpcSetControllerTouch(&g_ipc, false);
         g_intentOpenActive.store(false, std::memory_order_relaxed);
@@ -8583,7 +7669,7 @@ void PollRootVisibility(uint64_t tickMs) {
         // that would belong to some later close of the same menu.
         if (g_intentCancel.pending && g_intentCancel.expireAt != 0 &&
             tickMs > g_intentCancel.expireAt) {
-            FileLog(L"intent recovery ticket retired open=%u now=%u seq=%lld "
+            TraceLog(L"intent recovery ticket retired open=%u now=%u seq=%lld "
                     L"reason=expired",
                     g_intentCancel.openTick, g_ipcOpenTickLow,
                     static_cast<long long>(g_intentCancel.dismissSeq));
@@ -8612,7 +7698,7 @@ void PollRootVisibility(uint64_t tickMs) {
             if (tickMs > g_unhealedLogTick &&
                 tickMs - g_unhealedLogTick >= 1000) {
                 g_unhealedLogTick = tickMs;
-                FileLog(L"win open unhealed progress=%.3f", live);
+                TraceLog(L"win open unhealed progress=%.3f", live);
             }
             std::chrono::milliseconds duration{0};
             if (!BeginGestureSettle(live, 1.0f, 0.0f, duration)) {
@@ -8686,7 +7772,7 @@ void FeedContactPoint(HidDevice& device, long rawX, long rawY, USHORT reportId,
     if (g_debugEdge && !g_hidSession.active && xDip < 200.0f &&
         tickMs > g_edgeLogTick + 100) {
         g_edgeLogTick = tickMs;
-        FileLog(L"edge x=%.0f y=%.0f open=%d", xDip, yDip,
+        TraceLog(L"edge x=%.0f y=%.0f open=%d", xDip, yDip,
                 StartWindowIsOpen() ? 1 : 0);
     }
 
@@ -8802,7 +7888,7 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
                 trackedSlot = assertedMatch;
                 if (assertedCount > 1 && !g_duplicateContactIdLogged) {
                     g_duplicateContactIdLogged = true;
-                    FileLog(L"hid contact id=%lu declared down in %d slots; "
+                    TraceLog(L"hid contact id=%lu declared down in %d slots; "
                             L"using=%d",
                             g_trackedContact.identifier, assertedCount,
                             trackedSlot);
@@ -8864,7 +7950,7 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
             // its declared in-range bit cleared. No other slot in this report
             // restarts it. `Unknown` never ends it: a report that carries no
             // contact field for the slot cannot speak for the contact.
-            FileLog(L"hid tracked notcontact field=%d tip=%d tipdown=%d range=%d "
+            TraceLog(L"hid tracked notcontact field=%d tip=%d tipdown=%d range=%d "
                     L"rangedown=%d id=%d count=%d coord=%d report=%u pos=%d",
                     static_cast<int>(slot.buttons.field),
                     slot.buttons.tipDeclared ? 1 : 0,
@@ -9116,7 +8202,7 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         // root and the property set.
         case WM_SETTINGCHANGE:
             if (wParam == SPI_SETWORKAREA) {
-                FileLog(L"work area changed");
+                TraceLog(L"work area changed");
                 PostGeometryMeasurement(
                     StartMeasureRequest(!g_hidSession.active &&
                                         !g_reveal.edgeCandidate),
@@ -9124,7 +8210,7 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
             }
             return 0;
         case WM_DISPLAYCHANGE:
-            FileLog(L"work area changed");
+            TraceLog(L"work area changed");
             PostGeometryMeasurement(
                 StartMeasureRequest(!g_hidSession.active &&
                                     !g_reveal.edgeCandidate),
@@ -9153,7 +8239,7 @@ void RegisterHidUsage(USAGE usage, HWND hwnd) {
     } else if (usage == kUsagePen) {
         g_penRegistered = ok != FALSE;
     }
-    FileLog(L"hid reg usage=%u ok=%d err=%u", static_cast<unsigned>(usage),
+    TraceLog(L"hid reg usage=%u ok=%d err=%u", static_cast<unsigned>(usage),
             ok ? 1 : 0, static_cast<unsigned>(error));
 }
 
@@ -9180,7 +8266,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     windowClass.lpszClassName = kHidWindowClass;
 
     if (!RegisterClassExW(&windowClass)) {
-        FileLog(L"hid thread fail err=%u",
+        TraceLog(L"hid thread fail err=%u",
                 static_cast<unsigned>(GetLastError()));
         return 0;
     }
@@ -9194,7 +8280,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     HWND hwnd = CreateWindowExW(0, kHidWindowClass, L"", 0, 0, 0, 0, 0, nullptr,
                                 nullptr, windowClass.hInstance, nullptr);
     if (!hwnd) {
-        FileLog(L"hid thread fail err=%u",
+        TraceLog(L"hid thread fail err=%u",
                 static_cast<unsigned>(GetLastError()));
         UnregisterClassW(kHidWindowClass, windowClass.hInstance);
         return 0;
@@ -9210,7 +8296,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // WM_TIMER tick stays as the fallback.
     HANDLE idleTimer = CreateIdleWaitableTimer();
     if (!idleTimer) {
-        FileLog(L"hid timer fallback err=%u",
+        TraceLog(L"hid timer fallback err=%u",
                 static_cast<unsigned>(GetLastError()));
         SetTimer(hwnd, kIdleTimerId, kIdleTimerMs, nullptr);
     }
@@ -9278,7 +8364,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
             // service waits for Setup; a session that never attaches advertises
             // nothing and every press stays native.
             rendererWaitLogged = true;
-            FileLog(L"ipc peer withheld reason=no-renderer");
+            TraceLog(L"ipc peer withheld reason=no-renderer");
         }
         // Bounded, so the stop flag is observed even if the stop event were
         // missing from the set; the event itself is object 0 and wakes this at
@@ -9335,7 +8421,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
         break;  // WAIT_FAILED: leave the loop
     }
     if (running) {
-        FileLog(L"hid wait failed err=%u",
+        TraceLog(L"hid wait failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
 
@@ -10244,7 +9330,7 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
                         g_panelTrailRejectedGeneration != rejectedGeneration) {
                         g_panelTrailRejectedLogged = true;
                         g_panelTrailRejectedGeneration = rejectedGeneration;
-                        FileLog(
+                        TraceLog(
                             L"reveal panelTrail rejected %.0f axis=%d "
                             L"rect=%.0f,%.0f,%.0f,%.0f work=%.0f,%.0f,%.0f,%.0f "
                             L"mon=%.0f,%.0f,%.0f,%.0f band=%.0f,%.0f",
@@ -10329,7 +9415,7 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
                                std::fabs(trail - previousTrail) > 1.0f;
             if (moved || !g_panelTrailLogged) {
                 g_panelTrailLogged = true;
-                FileLog(L"reveal panelTrail=%.0f axis=%d rect=%.0f,%.0f,%.0f,%.0f "
+                TraceLog(L"reveal panelTrail=%.0f axis=%d rect=%.0f,%.0f,%.0f,%.0f "
                         L"work=%.0f,%.0f,%.0f,%.0f band=%.0f,%.0f gen=%u",
                         trail, candidate.layout.axis, candidate.left,
                         candidate.top, candidate.right, candidate.bottom,
@@ -10348,7 +9434,7 @@ bool PublishPanelTrailDip(bool measurePanel, uint32_t expectedGeneration,
     // it cannot place.
     if (!g_panelTrailFallbackLogged) {
         g_panelTrailFallbackLogged = true;
-        FileLog(L"reveal panelTrail=%.0f axis=%d (fallback)",
+        TraceLog(L"reveal panelTrail=%.0f axis=%d (fallback)",
                 FallbackTrailDip(candidate.layout.axis,
                                  candidate.layout.distance),
                 candidate.layout.axis);
@@ -10435,7 +9521,7 @@ void ArmLayoutWatch(const SettledMeasureRequest& request) {
     if (g_layoutToken.value) {
         Wh_Log(L"LayoutUpdated registration survived its revoke; this open gets "
                L"no layout watch");
-        FileLog(L"xaml layout handler left attached; new registration refused");
+        TraceLog(L"xaml layout handler left attached; new registration refused");
         return;
     }
     g_layoutTicksLeft = 2;
@@ -10491,14 +9577,14 @@ void ArmLayoutWatch(const SettledMeasureRequest& request) {
         g_layoutRoot = nullptr;
         g_layoutTicksLeft = 0;
         g_layoutRequest = SettledMeasureRequest{};
-        FileLog(L"layout watch failed err=%08X", static_cast<unsigned>(e.code()));
+        TraceLog(L"layout watch failed err=%08X", static_cast<unsigned>(e.code()));
     } catch (...) {
         g_layoutToken = {};
         g_layoutWatchSerial = 0;
         g_layoutRoot = nullptr;
         g_layoutTicksLeft = 0;
         g_layoutRequest = SettledMeasureRequest{};
-        FileLog(L"layout watch failed err=unknown");
+        TraceLog(L"layout watch failed err=unknown");
     }
 }
 
@@ -10916,7 +10002,7 @@ void ScheduleScrollerRetry(uint32_t generation) {
         g_scrollerRetryGeneration.store(generation, std::memory_order_relaxed);
         if (!g_scrollerRetryExhaustedLogged) {
             g_scrollerRetryExhaustedLogged = true;
-            FileLog(L"scroller retry exhausted gen=%u", generation);
+            TraceLog(L"scroller retry exhausted gen=%u", generation);
         }
         return;
     }
@@ -10943,7 +10029,7 @@ void NoteScrollerFailure(const wchar_t* reason, uint32_t generation,
                          bool retry) {
     if (!g_scrollerRetryLogged) {
         g_scrollerRetryLogged = true;
-        FileLog(L"scroller retry why=%s gen=%u try=%u/%u", reason, generation,
+        TraceLog(L"scroller retry why=%s gen=%u try=%u/%u", reason, generation,
                 static_cast<unsigned>(g_scrollerRetryCount + 1),
                 static_cast<unsigned>(kScrollerRetryLimit));
     }
@@ -11045,7 +10131,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     // certain.
     if (survey.overflow && !g_scrollerOverflowLogged) {
         g_scrollerOverflowLogged = true;
-        FileLog(L"scroller overflow (kept %d deepest regions)",
+        TraceLog(L"scroller overflow (kept %d deepest regions)",
                 kMaxScrollRegions);
     }
     if (survey.count == 0 && !survey.complete) {
@@ -11096,7 +10182,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         }
         if (settled && !g_scrollerNoneLogged) {
             g_scrollerNoneLogged = true;
-            FileLog(L"scroller none (measured, nothing scrolls)");
+            TraceLog(L"scroller none (measured, nothing scrolls)");
         }
         return;
     }
@@ -11240,13 +10326,13 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
                     watch.token = {};
                     watch.owner = nullptr;
                     watch.viewer = nullptr;
-                    FileLog(L"scroller watch failed err=%08X",
+                    TraceLog(L"scroller watch failed err=%08X",
                             static_cast<unsigned>(e.code()));
                 } catch (...) {
                     watch.token = {};
                     watch.owner = nullptr;
                     watch.viewer = nullptr;
-                    FileLog(L"scroller watch failed err=unknown");
+                    TraceLog(L"scroller watch failed err=unknown");
                 }
                 break;
             }
@@ -11279,7 +10365,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     if (watchRefused) {
         Wh_Log(L"ViewChanged registration is still attached; this pass adds no "
                L"scroll watcher");
-        FileLog(L"xaml viewchanged handler left attached; new registration "
+        TraceLog(L"xaml viewchanged handler left attached; new registration "
                 L"refused");
     }
 
@@ -11303,7 +10389,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         g_scrollerLoggedRect[r][1] = region.top;
         g_scrollerLoggedRect[r][2] = region.right;
         g_scrollerLoggedRect[r][3] = region.bottom;
-        FileLog(L"scroller rect=%.0f,%.0f,%.0f,%.0f vo=%.0f sh=%.0f "
+        TraceLog(L"scroller rect=%.0f,%.0f,%.0f,%.0f vo=%.0f sh=%.0f "
                 L"name=%s depth=%u",
                 region.left, region.top, region.right, region.bottom,
                 region.verticalOffset, region.scrollableHeight, region.label,
@@ -11449,7 +10535,7 @@ void UpdateDismissAxis(bool logAxis) {
             log = true;
         }
         if (log) {
-            FileLog(L"dismiss axis=%d kept, no source named an edge "
+            TraceLog(L"dismiss axis=%d kept, no source named an edge "
                     L"(0=left,1=top,2=right,3=bottom) %s "
                     L"appbar=%d rc=%d,%d,%d,%d bar=%d rect=%d,%d,%d,%d "
                     L"work=%d,%d,%d,%d mon=%d,%d,%d,%d",
@@ -11474,7 +10560,7 @@ void UpdateDismissAxis(bool logAxis) {
     } else {
         g_axisKeptLogged = false;
         if (log) {
-            FileLog(L"dismiss axis=%d (0=left,1=top,2=right,3=bottom) src=%s "
+            TraceLog(L"dismiss axis=%d (0=left,1=top,2=right,3=bottom) src=%s "
                     L"appbar=%d rc=%d,%d,%d,%d bar=%d rect=%d,%d,%d,%d "
                     L"work=%d,%d,%d,%d mon=%d,%d,%d,%d",
                     g_dismissAxis, probe.source,
@@ -11564,7 +10650,7 @@ bool RefreshGestureGeometry() {
                 g_state.InsertScalar(L"DirX", dirX);
                 g_state.InsertScalar(L"DirY", dirY);
             } catch (winrt::hresult_error const& e) {
-                FileLog(L"gesture geometry write failed err=%08X",
+                TraceLog(L"gesture geometry write failed err=%08X",
                         static_cast<unsigned>(e.code()));
                 // The expression still slides by the old axis and travel, so the
                 // published snapshot must keep describing them. A half-applied
@@ -11574,13 +10660,13 @@ bool RefreshGestureGeometry() {
                 // until a later apply rewrites all three.
                 g_dismissAxis = previousAxis;
                 g_rendererInvalid.store(true, std::memory_order_release);
-                FileLog(L"gesture renderer invalid until a successful reapply");
+                TraceLog(L"gesture renderer invalid until a successful reapply");
                 return false;
             } catch (...) {
-                FileLog(L"gesture geometry write failed err=unknown");
+                TraceLog(L"gesture geometry write failed err=unknown");
                 g_dismissAxis = previousAxis;
                 g_rendererInvalid.store(true, std::memory_order_release);
-                FileLog(L"gesture renderer invalid until a successful reapply");
+                TraceLog(L"gesture renderer invalid until a successful reapply");
                 return false;
             }
         }
@@ -11610,7 +10696,7 @@ bool RefreshGestureGeometry() {
 
     // The published snapshot has to match the scalars the expression reads, so it
     // is written by the caller right after this, never on its own.
-    FileLog(changed ? L"gesture geometry updated axis=%d dist=%.0f"
+    TraceLog(changed ? L"gesture geometry updated axis=%d dist=%.0f"
                     : L"gesture geometry axis=%d dist=%.0f (unchanged)",
             g_dismissAxis, distance);
     return true;
@@ -11702,7 +10788,7 @@ bool Setup(wux::FrameworkElement const& root) {
     if (g_sizeToken.value) {
         Wh_Log(L"SizeChanged registration from the previous root is still "
                L"attached; this root gets no resize handler");
-        FileLog(L"xaml size handler left attached; new registration refused");
+        TraceLog(L"xaml size handler left attached; new registration refused");
     } else {
         const uint32_t sizeGeneration =
             g_setupGeneration.load(std::memory_order_relaxed);
@@ -11732,7 +10818,7 @@ bool Setup(wux::FrameworkElement const& root) {
                         // turn, so it is the one that writes the once-per-open
                         // trail line.
                         g_panelTrailLogged = false;
-                        FileLog(L"gesture geometry deferred "
+                        TraceLog(L"gesture geometry deferred "
                                 L"reason=panel-owned gen=%u",
                                 g_openGeneration.load(
                                     std::memory_order_relaxed));
@@ -11743,7 +10829,7 @@ bool Setup(wux::FrameworkElement const& root) {
                         g_measureDeferred.store(true,
                                                 std::memory_order_relaxed);
                         g_panelTrailLogged = false;
-                        FileLog(L"gesture geometry deferred "
+                        TraceLog(L"gesture geometry deferred "
                                 L"reason=panel-owned gen=%u",
                                 g_openGeneration.load(
                                     std::memory_order_relaxed));
@@ -11786,7 +10872,7 @@ bool Setup(wux::FrameworkElement const& root) {
     g_rendererReady.store(true, std::memory_order_release);
 
     const winrt::hstring rootClassName = winrt::get_class_name(root);
-    FileLog(L"attached root=%s size=%.0fx%.0f", rootClassName.c_str(), width,
+    TraceLog(L"attached root=%s size=%.0fx%.0f", rootClassName.c_str(), width,
             height);
 
     Wh_Log(L"Dismiss input armed; composition translation enabled "
@@ -11859,11 +10945,11 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
             // root then installs no renderer, and the log says why.
             Wh_Log(L"Loaded registration from the previous root is still "
                    L"attached; this root gets no renderer");
-            FileLog(L"xaml loaded handler left attached; new registration "
+            TraceLog(L"xaml loaded handler left attached; new registration "
                     L"refused");
         } else {
             const winrt::hstring rootClassName = winrt::get_class_name(root);
-            FileLog(L"root pending load class=%s", rootClassName.c_str());
+            TraceLog(L"root pending load class=%s", rootClassName.c_str());
 
             const uint32_t generation =
                 g_setupGeneration.load(std::memory_order_relaxed);
@@ -11967,7 +11053,7 @@ bool InstallStartUIHooks(HMODULE module) {
         ReleaseSRWLockExclusive(&g_startUIHookLock);
         return false;
     }
-    FileLog(L"root install begin module=%p", module);
+    TraceLog(L"root install begin module=%p", module);
 
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {
@@ -11993,7 +11079,7 @@ bool InstallStartUIHooks(HMODULE module) {
     g_rootHookReady.store(true, std::memory_order_release);
     ReleaseSRWLockExclusive(&g_startUIHookLock);
 
-    FileLog(L"startui root symbol resolved base=0x%llX at=0x%llX rva=0x%llX "
+    TraceLog(L"startui root symbol resolved base=0x%llX at=0x%llX rva=0x%llX "
             L"expected=0x%llX match=%d",
             static_cast<unsigned long long>(base),
             static_cast<unsigned long long>(resolved),
@@ -12082,11 +11168,11 @@ void ProbeRootSymbolFromInputThread() {
     const uint64_t waited = GetTickCount64() - g_rootProbeFirstTick;
     if (waited >= kRootPendingDeadlineMs) {
         g_rootHookRefused.store(true, std::memory_order_release);
-        FileLog(L"startui root symbol deadline attempts=%d waited=%llums "
+        TraceLog(L"startui root symbol deadline attempts=%d waited=%llums "
                 L"deadline=%llums",
                 g_rootProbeAttempts, static_cast<unsigned long long>(waited),
                 static_cast<unsigned long long>(kRootPendingDeadlineMs));
-        FileLog(L"startui root symbol unresolved name=StartUI::App::"
+        TraceLog(L"startui root symbol unresolved name=StartUI::App::"
                 L"PrepareRootElement (symbol, signature or hook refused)");
         Wh_Log(L"StartUI::App::PrepareRootElement could not be resolved in "
                L"StartUI_.dll within the %llu ms pending deadline; the root "
@@ -12095,7 +11181,7 @@ void ProbeRootSymbolFromInputThread() {
         PublishPeerGone(L"root-hook-refused");
         return;
     }
-    FileLog(L"startui root symbol pending attempt=%d waited=%llums "
+    TraceLog(L"startui root symbol pending attempt=%d waited=%llums "
             L"deadline=%llums",
             g_rootProbeAttempts, static_cast<unsigned long long>(waited),
             static_cast<unsigned long long>(kRootPendingDeadlineMs));
@@ -12123,7 +11209,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
     if (module && module == GetModuleHandleW(kStartUIModuleName)) {
         g_startUIModuleSeen.store(module, std::memory_order_release);
         if (!g_loadHookMatchLogged.exchange(true)) {
-            FileLog(L"ll hook startui returned=%p file=%s", module,
+            TraceLog(L"ll hook startui returned=%p file=%s", module,
                     fileName ? fileName : L"(null)");
         }
     }
@@ -12336,7 +11422,7 @@ void TeardownUiOnUiThread() {
             const ULONGLONG now = GetTickCount64();
             if (now >= nextReport) {
                 nextReport = now + 5000;
-                FileLog(L"unload teardown waiting: no dispatcher, entries=%d",
+                TraceLog(L"unload teardown waiting: no dispatcher, entries=%d",
                         g_moduleEntryCount.load(std::memory_order_relaxed));
             }
             Sleep(1000);
@@ -12350,7 +11436,7 @@ void TeardownUiOnUiThread() {
             const ULONGLONG now = GetTickCount64();
             if (now >= nextReport) {
                 nextReport = now + 5000;
-                FileLog(L"unload teardown waiting: no completion event");
+                TraceLog(L"unload teardown waiting: no completion event");
             }
             Sleep(1000);
         }
@@ -12368,17 +11454,17 @@ void TeardownUiOnUiThread() {
             SetEvent(done);
         });
     } catch (winrt::hresult_error const& e) {
-        FileLog(L"unload teardown queue failed: %08X %s", e.code(),
+        TraceLog(L"unload teardown queue failed: %08X %s", e.code(),
                 e.message().c_str());
         CloseHandle(done);
         for (;;) {
-            FileLog(L"unload teardown waiting: dispatch refused");
+            TraceLog(L"unload teardown waiting: dispatch refused");
             Sleep(5000);
         }
     } catch (...) {
         CloseHandle(done);
         for (;;) {
-            FileLog(L"unload teardown waiting: dispatch failed");
+            TraceLog(L"unload teardown waiting: dispatch failed");
             Sleep(5000);
         }
     }
@@ -12400,7 +11486,7 @@ void WaitForModuleEntries() {
         const ULONGLONG now = GetTickCount64();
         if (now >= nextReport) {
             nextReport = now + 5000;
-            FileLog(L"unload waiting for module entries=%d",
+            TraceLog(L"unload waiting for module entries=%d",
                     g_moduleEntryCount.load(std::memory_order_relaxed));
         }
         if (g_moduleEntriesGone) {
@@ -12412,7 +11498,9 @@ void WaitForModuleEntries() {
 }
 
 BOOL RoleInit() {
-    FileLog(L"mod init");
+    SetTraceFileName(L"renderer.log");
+    RefreshTraceSetting();
+    TraceLog(L"mod init");
     Wh_Log(L"Legacy Start Swipe 0.7.0 initializing (start role)");
 
     LoadAnimationStyle();
@@ -12421,28 +11509,28 @@ BOOL RoleInit() {
     // exists, so the unload has a signal that does not depend on the window.
     g_hidStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_hidStopEvent) {
-        FileLog(L"hid stop event failed err=%u",
+        TraceLog(L"hid stop event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
     // The completion event for the counted module entries. Created before any
     // turn or batch completion can take a lease.
     g_moduleEntriesGone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_moduleEntriesGone) {
-        FileLog(L"module entry event failed err=%u",
+        TraceLog(L"module entry event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
     // The cross-process channel: without it a gesture close still runs its
     // settle, but the dismiss command never reaches the bridge and the window
     // stays shown over the retracted panel.
     OpenIpcChannel();
-    FileLog(L"settle plan speed=%.2f dip/ms dur=%llu..%llu segment=%.1f ms "
+    TraceLog(L"settle plan speed=%.2f dip/ms dur=%llu..%llu segment=%.1f ms "
             L"frames=%d..%d",
             static_cast<double>(kSettleSpeedDipPerMs),
             static_cast<unsigned long long>(kSettleMinDuration.count()),
             static_cast<unsigned long long>(kSettleMaxDuration.count()),
             kSettleSegmentMs, kSettleMinSteps + 1, kSettleMaxFrames);
-    FileLog(L"settle spring win10 zeta=%.2f", kWin10SpringDamping);
-    FileLog(L"settle spring win11 zeta=%.2f", kWin11SpringDamping);
+    TraceLog(L"settle spring win10 zeta=%.2f", kWin10SpringDamping);
+    TraceLog(L"settle spring win11 zeta=%.2f", kWin11SpringDamping);
 
     // The open/closed signal comes from DWM. Resolve it at runtime so a build
     // without the dwmapi import library still links and loads.
@@ -12515,18 +11603,18 @@ void RoleAfterInit() {
     Wh_ApplyHookOperations();
     TryInstallFromLoadedModules(false);
 
-    FileLog(L"hid init");
+    TraceLog(L"hid init");
     if (!g_hidStopEvent) {
         // A gesture source that cannot be stopped is worse than no gesture:
         // unloading would have to hope the thread notices instead of
         // signalling it. The diagnostics above still name the reason.
-        FileLog(L"hid thread not started (stop event unavailable)");
+        TraceLog(L"hid thread not started (stop event unavailable)");
         return;
     }
     g_hidThread =
         CreateThread(nullptr, 0, HidInputThread, nullptr, 0, nullptr);
     if (!g_hidThread) {
-        FileLog(L"hid thread fail err=%u",
+        TraceLog(L"hid thread fail err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
 }
@@ -12578,12 +11666,12 @@ void RoleBeforeUninit() {
     if (g_hidThread) {
         if (GetCurrentThreadId() ==
             g_hidThreadId.load(std::memory_order_relaxed)) {
-            FileLog(L"unload hid thread join refused: called on that thread");
+            TraceLog(L"unload hid thread join refused: called on that thread");
         } else if (WaitForSingleObject(g_hidThread, INFINITE) ==
                    WAIT_OBJECT_0) {
             CloseHandle(g_hidThread);
             g_hidThread = nullptr;
-            FileLog(L"unload hid thread joined");
+            TraceLog(L"unload hid thread joined");
         } else {
             // A wait that fails on a valid handle is not expected; there is
             // still no safe return while the thread can run module code.
@@ -12592,14 +11680,14 @@ void RoleBeforeUninit() {
                 const ULONGLONG now = GetTickCount64();
                 if (now >= nextReport) {
                     nextReport = now + 5000;
-                    FileLog(L"unload hid thread join failed err=%u",
+                    TraceLog(L"unload hid thread join failed err=%u",
                             static_cast<unsigned>(GetLastError()));
                 }
                 Sleep(1000);
             }
         }
     } else {
-        FileLog(L"unload hid thread joined");
+        TraceLog(L"unload hid thread joined");
     }
 }
 
@@ -12623,7 +11711,7 @@ void RoleUninit() {
         if (WaitForSingleObject(g_hidThread, INFINITE) == WAIT_OBJECT_0) {
             CloseHandle(g_hidThread);
             g_hidThread = nullptr;
-            FileLog(L"unload hid thread joined (uninit)");
+            TraceLog(L"unload hid thread joined (uninit)");
         }
     }
 
@@ -12647,7 +11735,7 @@ void RoleUninit() {
             const ULONGLONG now = GetTickCount64();
             if (now >= nextReport) {
                 nextReport = now + 5000;
-                FileLog(L"unload waiting for xaml revokes=%d",
+                TraceLog(L"unload waiting for xaml revokes=%d",
                         g_uiRegistrationCount.load(std::memory_order_relaxed));
             }
             Sleep(1000);
@@ -12677,6 +11765,7 @@ void RoleSettingsChanged() {
     }
     LoadAnimationStyle();
     LoadGestureStartSpeed();
+    RefreshTraceSetting();
 }
 
 // The StartMenuExperienceHost half: the touch gesture, the panel's motion and
@@ -12957,49 +12046,6 @@ bool g_initialised = false;
 
 // Appends to <mod storage>\bridge.log. One line per decision or executor
 // event, never per frame.
-void FileLog(const wchar_t* format, ...) {
-    static SRWLOCK lock = SRWLOCK_INIT;
-
-    WCHAR storage[MAX_PATH] = {};
-    if (!Wh_GetModStoragePath(storage, ARRAYSIZE(storage))) {
-        return;
-    }
-
-    WCHAR path[MAX_PATH] = {};
-    swprintf_s(path, L"%s\\bridge.log", storage);
-
-    WCHAR message[900] = {};
-    va_list args;
-    va_start(args, format);
-    vswprintf_s(message, ARRAYSIZE(message), format, args);
-    va_end(args);
-
-    // Every line starts with the system tick, so lines from the two processes
-    // can be ordered against each other and against an injected input.
-    WCHAR line[1024] = {};
-    swprintf_s(line, ARRAYSIZE(line), L"t=%llu %s",
-               static_cast<unsigned long long>(GetTickCount64()), message);
-
-    char utf8[2048] = {};
-    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8,
-                                    sizeof(utf8), nullptr, nullptr);
-    if (bytes <= 1) {
-        return;
-    }
-
-    AcquireSRWLockExclusive(&lock);
-    HANDLE file = CreateFileW(path, FILE_APPEND_DATA,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE) {
-        DWORD written = 0;
-        WriteFile(file, utf8, static_cast<DWORD>(bytes - 1), &written, nullptr);
-        WriteFile(file, "\r\n", 2, &written, nullptr);
-        CloseHandle(file);
-    }
-    ReleaseSRWLockExclusive(&lock);
-}
-
 // ---------------------------------------------------------------------------
 // twinui.pcshell.dll hooks
 // ---------------------------------------------------------------------------
@@ -13011,7 +12057,7 @@ using Show_t = HRESULT (*)(void*, uint8_t, uint8_t, uint32_t);
 Show_t Show_Original = nullptr;
 
 HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
-    FileLog(L"show a=%u b=%u c=%u tid=%u", static_cast<unsigned int>(a),
+    TraceLog(L"show a=%u b=%u c=%u tid=%u", static_cast<unsigned int>(a),
             static_cast<unsigned int>(b), static_cast<unsigned int>(c),
             GetCurrentThreadId());
     // The manager's Show runs on the launcher thread. It is the touch-first
@@ -13245,7 +12291,7 @@ OwnSnapshot OwnSync(void* launcher) {
     }
 
     if (resync) {
-        FileLog(L"own state resync cached=%d shell=%d", shellOpen ? 0 : 1,
+        TraceLog(L"own state resync cached=%d shell=%d", shellOpen ? 0 : 1,
                 shellOpen ? 1 : 0);
     }
     return OwnSnapshot{true, shellOpen, internal};
@@ -13264,7 +12310,7 @@ void OwnResyncFromState(void* state) {
     const uint64_t raw =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state));
     if (!LauncherStateReady(raw)) {
-        FileLog(L"own state resync skipped reason=state-not-ready raw=0x%llX",
+        TraceLog(L"own state resync skipped reason=state-not-ready raw=0x%llX",
                 static_cast<unsigned long long>(raw));
         return;
     }
@@ -13279,7 +12325,7 @@ void OwnResyncFromState(void* state) {
         ReleaseSRWLockExclusive(&g_ownLock);
     }
     if (resync) {
-        FileLog(L"own state resync cached=%d shell=%d", shellOpen ? 0 : 1,
+        TraceLog(L"own state resync cached=%d shell=%d", shellOpen ? 0 : 1,
                 shellOpen ? 1 : 0);
     }
 }
@@ -13299,7 +12345,7 @@ void OwnEventShown() {
         ReleaseSRWLockExclusive(&g_ownLock);
     }
     if (changed) {
-        FileLog(L"own state event=shown open=1 tid=%u", GetCurrentThreadId());
+        TraceLog(L"own state event=shown open=1 tid=%u", GetCurrentThreadId());
     }
 }
 
@@ -13317,7 +12363,7 @@ void OwnEventHidden() {
         ReleaseSRWLockExclusive(&g_ownLock);
     }
     if (changed) {
-        FileLog(L"own state event=hidden open=0 tid=%u", GetCurrentThreadId());
+        TraceLog(L"own state event=hidden open=0 tid=%u", GetCurrentThreadId());
     }
 }
 
@@ -13389,24 +12435,24 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
     if (!PeerAliveNow()) {
         // No controller: the caller forwards to the shell. One line per press
         // names the trigger and says why nothing was decided.
-        FileLog(L"own pass trigger=%s reason=no-peer", trigger);
+        TraceLog(L"own pass trigger=%s reason=no-peer", trigger);
         return false;
     }
     const uint32_t epoch = PeerEpochNow();
     if (!BridgeCanServe()) {
-        FileLog(L"own pass trigger=%s reason=no-executor", trigger);
+        TraceLog(L"own pass trigger=%s reason=no-executor", trigger);
         return false;
     }
     if (NoteLauncherThread(trigger) == 0) {
         // The thread test comes before the window test, so a hook on another
         // thread cannot reach the launcher-local fields through an existing
         // window.
-        FileLog(L"own pass trigger=%s reason=wrong-thread", trigger);
+        TraceLog(L"own pass trigger=%s reason=wrong-thread", trigger);
         return false;
     }
     EnsureExecutorWindow();
     if (!ExecutorWindowOnThisThread()) {
-        FileLog(L"own pass trigger=%s reason=no-window", trigger);
+        TraceLog(L"own pass trigger=%s reason=no-window", trigger);
         return false;
     }
     if (epochOut) {
@@ -13479,11 +12525,11 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
             // window it is just presenting because the pointer is outside it.
             // That is the pointer-away check, not a user click; swallowing it is
             // what lets the requested open land.
-            FileLog(L"exec swallow hide method=7 state=%u reason=own-show",
+            TraceLog(L"exec swallow hide method=7 state=%u reason=own-show",
                     execState);
             return;
         }
-        FileLog(L"exec pass hide method=%u state=%u reason=executor", method,
+        TraceLog(L"exec pass hide method=%u state=%u reason=executor", method,
                 execState);
         callOriginal();
         OwnResyncFromState(self);
@@ -13496,7 +12542,7 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     // a Hide on an unproven thread from adopting that thread.
     const wchar_t* reason = nullptr;
     if (!HideCanServeClose(&reason)) {
-        FileLog(L"exec pass hide method=%u reason=%s", method,
+        TraceLog(L"exec pass hide method=%u reason=%s", method,
                 reason ? reason : L"unknown");
         callOriginal();
         OwnResyncFromState(self);
@@ -13508,7 +12554,7 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     // method-7 call verified in it is the click-away. Anything else reached in
     // that scope stays unclassified and passes to the shell.
     if (caller == OwnCaller::ClickAway && method != kDismissMethodClickAway) {
-        FileLog(L"intent external trigger=hide caller=unknown method=%u "
+        TraceLog(L"intent external trigger=hide caller=unknown method=%u "
                 L"reason=unexpected-method",
                 method);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
@@ -13519,7 +12565,7 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     }
     if (caller == OwnCaller::Lock || caller == OwnCaller::Unknown ||
         method == kDismissMethodWinTab || OwnTakeExternalForward(method)) {
-        FileLog(L"intent external trigger=hide caller=%s method=%u", 
+        TraceLog(L"intent external trigger=hide caller=%s method=%u", 
                 OwnCallerName(caller), method);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                             method, 0);
@@ -13548,14 +12594,14 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     const uint32_t currentState = OwnInternalState(self);
     if (method == kDismissMethodClickAway &&
         (currentState == 1 || currentState == 3)) {
-        FileLog(L"intent ignore trigger=clickaway method=%u state=%u "
+        TraceLog(L"intent ignore trigger=clickaway method=%u state=%u "
                 L"reason=opening",
                 method, currentState);
         return;
     }
     if (method == kDismissMethodClickAway &&
         SwipeIpcControllerTouch(&g_ipc)) {
-        FileLog(L"intent ignore trigger=clickaway method=%u reason=touch-owner",
+        TraceLog(L"intent ignore trigger=clickaway method=%u reason=touch-owner",
                 method);
         return;
     }
@@ -13564,7 +12610,7 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
                                 ? kSwipeTriggerClickAway
                                 : kSwipeTriggerWin;
     PublishBridgeIntent(kSwipeIntentClose, trigger, method, 0);
-    FileLog(L"intent close trigger=%s method=%u state=%u",
+    TraceLog(L"intent close trigger=%s method=%u state=%u",
             trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win", method,
             OwnInternalState(self));
 }
@@ -13636,7 +12682,7 @@ void DropPressLatch(const wchar_t* reason, const wchar_t* detail) {
     if (!g_pressLatch.pending) {
         return;
     }
-    FileLog(L"own press latch dropped reason=%s %s wait=%llu", reason, detail,
+    TraceLog(L"own press latch dropped reason=%s %s wait=%llu", reason, detail,
             static_cast<unsigned long long>(GetTickCount64() -
                                             g_pressLatch.tick));
     g_pressLatch = PressLatch{};
@@ -13668,12 +12714,12 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
     if (!window) {
         // Neither the fallback timer nor the hidden event's arm has a window to
         // run on. A slot with no guaranteed callback is not armed at all.
-        FileLog(L"own press latch dropped reason=no-window state=%u",
+        TraceLog(L"own press latch dropped reason=no-window state=%u",
                 own.state);
         return;
     }
     if (g_pressLatch.pending) {
-        FileLog(L"own press latch replaced old_tick=%llu old_wait=%llu state=%u",
+        TraceLog(L"own press latch replaced old_tick=%llu old_wait=%llu state=%u",
                 static_cast<unsigned long long>(g_pressLatch.tick),
                 static_cast<unsigned long long>(now - g_pressLatch.tick),
                 own.state);
@@ -13681,7 +12727,7 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
     g_pressLatch = PressLatch{true,            now,  kSwipeIntentOpen,
                               trigger,         method, flags,
                               admittingEpoch};
-    FileLog(L"own press latched state=%u trigger=%s tick=%llu epoch=%u "
+    TraceLog(L"own press latched state=%u trigger=%s tick=%llu epoch=%u "
             L"(hide in flight)",
             own.state, PressTriggerName(trigger),
             static_cast<unsigned long long>(now), g_pressLatch.epoch);
@@ -13690,7 +12736,7 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
         // The hidden event is a second serve point, but it is not a guaranteed
         // one: the landing may already have passed. Today the initial timer is
         // the only promise, so a latch that cannot arm it is dropped.
-        FileLog(L"own press latch timer failed err=%u", GetLastError());
+        TraceLog(L"own press latch timer failed err=%u", GetLastError());
         DropPressLatch(L"timer-failed", L"latch");
     }
 }
@@ -13712,9 +12758,9 @@ void ArmLatchedServe() {
             return;
         }
         if (!PostMessageW(window, kExecLatchMessage, kExecLatchMagic, 0)) {
-            FileLog(L"own press latch arm post failed err=%u", GetLastError());
+            TraceLog(L"own press latch arm post failed err=%u", GetLastError());
         } else {
-            FileLog(L"own press latch arm posted tid=%u owner=%u",
+            TraceLog(L"own press latch arm posted tid=%u owner=%u",
                     GetCurrentThreadId(), g_execThreadId);
         }
         return;
@@ -13770,7 +12816,7 @@ bool ServeLatchedPress(const wchar_t* reason) {
     uint64_t state = 0;
     void* launcher = LauncherNow(&state);
     if (!launcher) {
-        FileLog(L"own press serve refused reason=%s launcher=0 state=0x%llX",
+        TraceLog(L"own press serve refused reason=%s launcher=0 state=0x%llX",
                 reason, static_cast<unsigned long long>(state));
         return false;
     }
@@ -13792,7 +12838,7 @@ bool ServeLatchedPress(const wchar_t* reason) {
     const uint64_t wait = GetTickCount64() - latch.tick;
     PublishBridgeIntent(kSwipeIntentOpen, latch.trigger, latch.method,
                         latch.flags);
-    FileLog(L"own press served wait=%llu state=%u trigger=%s reason=%s "
+    TraceLog(L"own press served wait=%llu state=%u trigger=%s reason=%s "
             L"epoch=%u",
             static_cast<unsigned long long>(wait), own.state,
             PressTriggerName(latch.trigger), reason, latch.epoch);
@@ -13830,7 +12876,7 @@ void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
     // One decision line for every trigger. The method below is the one the action
     // will use, not the one the shell called with: a reopen from Dismiss(6) asks
     // for Show(11), and a close from Show(11) asks for Dismiss(6).
-    FileLog(L"own toggle decide trigger=%s state=%u open=%d kind=%s dir=%d",
+    TraceLog(L"own toggle decide trigger=%s state=%u open=%d kind=%s dir=%d",
             PressTriggerName(trigger), own.state, own.open ? 1 : 0,
             kind == kSwipeIntentClose ? L"close" : L"open", direction);
     if (kind == kSwipeIntentOpen &&
@@ -13870,14 +12916,14 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
     const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
     const bool control = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
     const bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-    FileLog(L"own win enter flags=%u shift=%d ctrl=%d alt=%d tid=%u",
+    TraceLog(L"own win enter flags=%u shift=%d ctrl=%d alt=%d tid=%u",
             flags, shift ? 1 : 0, control ? 1 : 0, alt ? 1 : 0,
             GetCurrentThreadId());
 
     if (shift || control || alt) {
         const OwnSnapshot own = OwnSync(launcher);
         if (!own.ready) {
-            FileLog(L"own win pass reason=state-not-ready flags=%u", flags);
+            TraceLog(L"own win pass reason=state-not-ready flags=%u", flags);
             return OnHotkeyInvoke_Original
                        ? OnHotkeyInvoke_Original(self, flags)
                        : S_OK;
@@ -13885,13 +12931,13 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
         if (own.open) {
             PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                                 kDismissMethodWin, flags);
-            FileLog(L"own win pass reason=external open=1 state=%u", own.state);
+            TraceLog(L"own win pass reason=external open=1 state=%u", own.state);
             OwnExternalForwardGuard guard(kDismissMethodWin);
             return OnHotkeyInvoke_Original
                        ? OnHotkeyInvoke_Original(self, flags)
                        : S_OK;
         }
-        FileLog(L"own win pass reason=external open=0 state=%u (forwarded)",
+        TraceLog(L"own win pass reason=external open=0 state=%u (forwarded)",
                 own.state);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                             kDismissMethodWin, flags);
@@ -13902,14 +12948,14 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
     if (static_cast<const uint8_t*>(self)[kHotkeyShellOpenFlagOffset] != 0) {
         // The shell's own tray reopen: not the Start toggle, and it has side
         // effects this mod does not reproduce.
-        FileLog(L"own win pass reason=shell-open-flag");
+        TraceLog(L"own win pass reason=shell-open-flag");
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
                                        : S_OK;
     }
 
     const OwnSnapshot own = OwnSync(launcher);
     if (!own.ready) {
-        FileLog(L"own win pass reason=state-not-ready flags=%u", flags);
+        TraceLog(L"own win pass reason=state-not-ready flags=%u", flags);
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
                                        : S_OK;
     }
@@ -13935,10 +12981,10 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                    : S_OK;
     }
 
-    FileLog(L"own button enter show=%u dismiss=%u", showMethod, dismissMethod);
+    TraceLog(L"own button enter show=%u dismiss=%u", showMethod, dismissMethod);
     const OwnSnapshot own = OwnSync(self);
     if (!own.ready) {
-        FileLog(L"own button pass reason=state-not-ready show=%u dismiss=%u",
+        TraceLog(L"own button pass reason=state-not-ready show=%u dismiss=%u",
                 showMethod, dismissMethod);
         return OnStartButtonPressed_Original
                    ? OnStartButtonPressed_Original(self, showMethod,
@@ -14021,7 +13067,7 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
     }
     const OwnSnapshot own = OwnSync(launcher);
     if (!own.ready) {
-        FileLog(L"exec pass dismiss method=%u reason=state-not-ready", method);
+        TraceLog(L"exec pass dismiss method=%u reason=state-not-ready", method);
         return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
     }
     // The Start button's close is a trigger, not a duplicate: it arrives through
@@ -14033,7 +13079,7 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
-        FileLog(L"exec swallow dismiss method=%u state=%u reason=owning",
+        TraceLog(L"exec swallow dismiss method=%u state=%u reason=owning",
                 method, own.state);
         return S_OK;
     }
@@ -14061,7 +13107,7 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
     }
     const OwnSnapshot own = OwnSync(launcher);
     if (!own.ready) {
-        FileLog(L"exec pass show method=%u flags=%u reason=state-not-ready",
+        TraceLog(L"exec pass show method=%u flags=%u reason=state-not-ready",
                 method, flags);
         return ShowStartView_Original
                    ? ShowStartView_Original(launcher, method, flags)
@@ -14076,7 +13122,7 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
-        FileLog(L"exec swallow show method=%u flags=%u state=%u reason=owning",
+        TraceLog(L"exec swallow show method=%u flags=%u state=%u reason=owning",
                 method, flags, own.state);
         return S_OK;
     }
@@ -14113,7 +13159,7 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
     if (module && module == GetModuleHandleW(kTwinuiModuleName)) {
         g_explorerModuleSeen.store(module, std::memory_order_release);
         if (!g_explorerLoadLogged.exchange(true)) {
-            FileLog(L"exec launcher module seen module=%p", module);
+            TraceLog(L"exec launcher module seen module=%p", module);
         }
     }
 
@@ -14175,7 +13221,7 @@ bool InstallExplorerHooks(HMODULE module) {
         ReleaseSRWLockExclusive(&g_explorerSymbolLock);
         return false;
     }
-    FileLog(L"exec launcher symbols begin module=%p", module);
+    TraceLog(L"exec launcher symbols begin module=%p", module);
 
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {{kSymShow}, &Show_Original, &Show_Hook},
@@ -14265,13 +13311,13 @@ bool InstallExplorerHooks(HMODULE module) {
             reinterpret_cast<uintptr_t>(symbol.address) - base;
         const bool match = rva == symbol.expectedRva;
         matches += match ? 1 : 0;
-        FileLog(L"exec launcher symbol label=%s rva=0x%llX expected=0x%llX "
+        TraceLog(L"exec launcher symbol label=%s rva=0x%llX expected=0x%llX "
                 L"match=%d",
                 symbol.label, static_cast<unsigned long long>(rva),
                 static_cast<unsigned long long>(symbol.expectedRva),
                 match ? 1 : 0);
     }
-    FileLog(L"exec launcher symbols resolved base=0x%llX count=%d matches=%d "
+    TraceLog(L"exec launcher symbols resolved base=0x%llX count=%d matches=%d "
             L"match=%d",
             static_cast<unsigned long long>(base),
             static_cast<int>(ARRAYSIZE(resolved)), matches,
@@ -14329,7 +13375,7 @@ void ProbeExplorerSymbolsFromWorker() {
 
     if (InstallExplorerHooks(module)) {
         Wh_ApplyHookOperations();
-        FileLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
+        TraceLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
         return;
     }
     if (g_explorerSymbolsReady.load(std::memory_order_acquire) ||
@@ -14341,12 +13387,12 @@ void ProbeExplorerSymbolsFromWorker() {
     const uint64_t waited = GetTickCount64() - g_execProbeFirstTick;
     if (waited >= kExecSymbolPendingDeadlineMs) {
         g_explorerSymbolsRefused.store(true, std::memory_order_release);
-        FileLog(L"exec launcher symbols deadline attempts=%d waited=%llums "
+        TraceLog(L"exec launcher symbols deadline attempts=%d waited=%llums "
                 L"deadline=%llums",
                 g_execProbeAttempts, static_cast<unsigned long long>(waited),
                 static_cast<unsigned long long>(
                     kExecSymbolPendingDeadlineMs));
-        FileLog(L"exec launcher symbols unresolved name=twinui.pcshell.dll "
+        TraceLog(L"exec launcher symbols unresolved name=twinui.pcshell.dll "
                 L"(symbol, signature or hook refused)");
         Wh_Log(L"twinui.pcshell.dll symbols could not be resolved within the "
                L"%llu ms pending deadline; no launcher hook is installed and "
@@ -14354,7 +13400,7 @@ void ProbeExplorerSymbolsFromWorker() {
                static_cast<unsigned long long>(kExecSymbolPendingDeadlineMs));
         return;
     }
-    FileLog(L"exec launcher symbols pending attempt=%d waited=%llums "
+    TraceLog(L"exec launcher symbols pending attempt=%d waited=%llums "
             L"deadline=%llums",
             g_execProbeAttempts, static_cast<unsigned long long>(waited),
             static_cast<unsigned long long>(kExecSymbolPendingDeadlineMs));
@@ -14486,7 +13532,7 @@ bool ExecCommandExpired(const SwipeIpcExecCommand& command, uint64_t now) {
 void ArmDismissConfirm(LONG64 sequence, ProbeVisibility visible) {
     if (g_pendingDismissConfirmSeq != 0 &&
         g_pendingDismissConfirmSeq != sequence) {
-        FileLog(L"exec dismiss superseded seq=%lld by=%lld",
+        TraceLog(L"exec dismiss superseded seq=%lld by=%lld",
                 static_cast<long long>(g_pendingDismissConfirmSeq),
                 static_cast<long long>(sequence));
         AnswerExec(g_pendingDismissConfirmSeq, kSwipeAckSuperseded, S_OK,
@@ -14496,7 +13542,7 @@ void ArmDismissConfirm(LONG64 sequence, ProbeVisibility visible) {
     g_pendingDismissConfirmVisible = ProbeVisibilityValue(visible);
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (!window) {
-        FileLog(L"exec dismiss confirm timer failed seq=%lld reason=no-window",
+        TraceLog(L"exec dismiss confirm timer failed seq=%lld reason=no-window",
                 static_cast<long long>(sequence));
         g_pendingDismissConfirmSeq = 0;
         AnswerExec(sequence, kSwipeAckUnknown, S_OK, kSwipeVisibilityUnknown);
@@ -14504,7 +13550,7 @@ void ArmDismissConfirm(LONG64 sequence, ProbeVisibility visible) {
     }
     if (SetTimer(window, kExecDismissProbeTimer,
                  static_cast<UINT>(kExecDismissConfirmMs), nullptr) == 0) {
-        FileLog(L"exec dismiss confirm timer failed seq=%lld err=%u",
+        TraceLog(L"exec dismiss confirm timer failed seq=%lld err=%u",
                 static_cast<long long>(sequence), GetLastError());
         g_pendingDismissConfirmSeq = 0;
         AnswerExec(sequence, kSwipeAckUnknown, S_OK, kSwipeVisibilityUnknown);
@@ -14540,7 +13586,7 @@ bool ExecCommandForCurrentMenu(const SwipeIpcExecCommand& command,
     if (command.open == 0 || open == 0 || command.open == open) {
         return true;
     }
-    FileLog(L"exec %s seq=%lld superseded menu=%llu now=%llu", kind,
+    TraceLog(L"exec %s seq=%lld superseded menu=%llu now=%llu", kind,
             static_cast<long long>(command.seq),
             static_cast<unsigned long long>(command.open),
             static_cast<unsigned long long>(open));
@@ -14579,7 +13625,7 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
         // cleared and its ownership released. Presenting now would open a menu no
         // controller owns, so the record is expired and the primitive is not
         // called.
-        FileLog(L"exec show seq=%lld expired age=%llu (publisher released it)",
+        TraceLog(L"exec show seq=%lld expired age=%llu (publisher released it)",
                 static_cast<long long>(command.seq),
                 static_cast<unsigned long long>(now - command.tick));
         AnswerExec(command.seq, kSwipeAckExpired,
@@ -14595,7 +13641,7 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
     // window is opening again, and the old probe would read this open. The
     // publisher is told the old confirmation will not come.
     if (g_pendingDismissConfirmSeq != 0) {
-        FileLog(L"exec dismiss confirm superseded seq=%lld reason=show",
+        TraceLog(L"exec dismiss confirm superseded seq=%lld reason=show",
                 static_cast<long long>(g_pendingDismissConfirmSeq));
         AnswerExec(g_pendingDismissConfirmSeq, kSwipeAckSuperseded, S_OK,
                    g_pendingDismissConfirmVisible);
@@ -14605,7 +13651,7 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
     void* outer = nullptr;
     void* launcher = LauncherNow(&state, &outer);
     if (!launcher) {
-        FileLog(L"exec show seq=%lld refused outer=%p launcher=%p state=0x%llX "
+        TraceLog(L"exec show seq=%lld refused outer=%p launcher=%p state=0x%llX "
                 L"reason=not-ready",
                 static_cast<long long>(command.seq), outer, launcher,
                 static_cast<unsigned long long>(state));
@@ -14617,7 +13663,7 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
     if (epoch != g_dispatchEpoch) {
         // The activation that published this record is gone. Calling Show now
         // would present a menu for a controller that has already released it.
-        FileLog(L"exec show seq=%lld superseded epoch=%u now=%u",
+        TraceLog(L"exec show seq=%lld superseded epoch=%u now=%u",
                 static_cast<long long>(command.seq), g_dispatchEpoch, epoch);
         AnswerExec(command.seq, kSwipeAckSuperseded,
                    HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
@@ -14633,7 +13679,7 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
     // confirmation is read again by the probe timer on this same thread.
     const ProbeVisibility visible = LauncherVisibleNow(launcher);
     --t_execCall;
-    FileLog(L"exec show seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
+    TraceLog(L"exec show seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
             L"visible=%s",
             static_cast<long long>(command.seq), outer, launcher,
             static_cast<unsigned long long>(state),
@@ -14651,7 +13697,7 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
         // The deadline plus the controller's budget has passed. The controller
         // cleared the sequence and released the panel, so a Dismiss now would
         // hide a window it has already stopped tracking — or a newer menu.
-        FileLog(L"exec dismiss seq=%lld expired age=%llu candidate=%lld",
+        TraceLog(L"exec dismiss seq=%lld expired age=%llu candidate=%lld",
                 static_cast<long long>(command.seq),
                 static_cast<unsigned long long>(now > command.executeAt
                                                     ? now - command.executeAt
@@ -14678,7 +13724,7 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
     void* outer = nullptr;
     void* launcher = LauncherNow(&state, &outer);
     if (!launcher) {
-        FileLog(L"exec dismiss seq=%lld refused outer=%p launcher=%p "
+        TraceLog(L"exec dismiss seq=%lld refused outer=%p launcher=%p "
                 L"state=0x%llX reason=not-ready",
                 static_cast<long long>(command.seq), outer, launcher,
                 static_cast<unsigned long long>(state));
@@ -14695,7 +13741,7 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
     // last point at which the decision is still free.
     const uint32_t epoch = PeerEpochNow();
     if (epoch != g_pendingDismissEpoch) {
-        FileLog(L"exec dismiss seq=%lld superseded epoch=%u now=%u",
+        TraceLog(L"exec dismiss seq=%lld superseded epoch=%u now=%u",
                 static_cast<long long>(command.seq), g_pendingDismissEpoch,
                 epoch);
         AnswerExec(command.seq, kSwipeAckSuperseded,
@@ -14711,7 +13757,7 @@ void ExecuteDismiss(const SwipeIpcExecCommand& command) {
     // checked again by the confirmation probe: success is not yet a hide.
     const ProbeVisibility visible = LauncherVisibleNow(launcher);
     --t_execCall;
-    FileLog(L"exec dismiss seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
+    TraceLog(L"exec dismiss seq=%lld outer=%p launcher=%p state=0x%llX hr=%08X "
             L"visible=%s",
             static_cast<long long>(command.seq), outer, launcher,
             static_cast<unsigned long long>(state),
@@ -14736,7 +13782,7 @@ bool ArmDismissTimer(uint32_t delayMs) {
         return false;
     }
     if (SetTimer(window, kExecDismissTimer, delayMs, nullptr) == 0) {
-        FileLog(L"exec dismiss timer failed err=%u", GetLastError());
+        TraceLog(L"exec dismiss timer failed err=%u", GetLastError());
         return false;
     }
     return true;
@@ -14755,7 +13801,7 @@ void ExecuteDueDismiss() {
         // Start side can repair from; silence would leave it waiting.
         if (++g_dismissReadRetries <= kExecDismissReadRetries &&
             ArmDismissTimer(kExecDismissRetryMs)) {
-            FileLog(L"exec dismiss seq=%lld read retry=%d",
+            TraceLog(L"exec dismiss seq=%lld read retry=%d",
                     static_cast<long long>(g_pendingDismissSeq),
                     g_dismissReadRetries);
             return;
@@ -14764,7 +13810,7 @@ void ExecuteDueDismiss() {
         const int retries = g_dismissReadRetries;
         g_pendingDismissSeq = 0;
         g_dismissReadRetries = 0;
-        FileLog(L"exec dismiss seq=%lld refused reason=unreadable retries=%d",
+        TraceLog(L"exec dismiss seq=%lld refused reason=unreadable retries=%d",
                 static_cast<long long>(sequence), retries);
         AnswerExec(sequence, kSwipeAckRefused, E_FAIL, 0);
         DropPressLatch(L"dismiss-refused", L"unreadable");
@@ -14773,7 +13819,7 @@ void ExecuteDueDismiss() {
     g_dismissReadRetries = 0;
     if (command.seq != g_pendingDismissSeq ||
         command.kind != kSwipeExecDismiss) {
-        FileLog(L"exec dismiss seq=%lld superseded by %lld",
+        TraceLog(L"exec dismiss seq=%lld superseded by %lld",
                 static_cast<long long>(g_pendingDismissSeq),
                 static_cast<long long>(command.seq));
         if (g_pendingDismissSeq != 0) {
@@ -14807,7 +13853,7 @@ void ExecutePendingCommand() {
     // that budget must not let the old record act on a new menu.
     g_dispatchEpoch = PeerEpochNow();
     if (!ValidExecCommand(command)) {
-        FileLog(L"exec refused seq=%lld kind=%d method=%u flags=%u target=%lld "
+        TraceLog(L"exec refused seq=%lld kind=%d method=%u flags=%u target=%lld "
                 L"reason=invalid",
                 static_cast<long long>(command.seq),
                 static_cast<int>(command.kind), command.method, command.flags,
@@ -14820,7 +13866,7 @@ void ExecutePendingCommand() {
         if (g_pendingDismissSeq != 0 &&
             (command.target == 0 || command.target == g_pendingDismissSeq)) {
             KillTimer(g_execWindow.load(), kExecDismissTimer);
-            FileLog(L"exec cancel seq=%lld target=%lld",
+            TraceLog(L"exec cancel seq=%lld target=%lld",
                     static_cast<long long>(command.seq),
                     static_cast<long long>(g_pendingDismissSeq));
             // The cancel's own answer first, the target's last. The ACK slot is
@@ -14857,7 +13903,7 @@ void ExecutePendingCommand() {
                 g_pendingDismissSeq = command.seq;
                 g_pendingDismissEpoch = g_dispatchEpoch;
                 g_dismissReadRetries = 0;
-                FileLog(L"exec dismiss seq=%lld armed in=%u ms epoch=%u",
+                TraceLog(L"exec dismiss seq=%lld armed in=%u ms epoch=%u",
                         static_cast<long long>(command.seq), delay,
                         g_pendingDismissEpoch);
                 return;
@@ -14866,7 +13912,7 @@ void ExecutePendingCommand() {
             // close that cuts its settle short is still a close, while a dismiss
             // nobody runs leaves the controller owning a panel whose window is
             // still on screen.
-            FileLog(L"exec dismiss seq=%lld armed=0 reason=no-timer",
+            TraceLog(L"exec dismiss seq=%lld armed=0 reason=no-timer",
                     static_cast<long long>(command.seq));
         }
         g_pendingDismissEpoch = g_dispatchEpoch;
@@ -14883,7 +13929,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         // longer maps. Only this activation's published window answers.
         if (wParam != kExecTeardownMagic ||
             window != g_execWindow.load(std::memory_order_acquire)) {
-            FileLog(L"exec teardown ignored hwnd=%p", window);
+            TraceLog(L"exec teardown ignored hwnd=%p", window);
             return 0;
         }
         KillTimer(window, kExecDismissTimer);
@@ -14910,7 +13956,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         if (identified) {
             g_execWindow.store(nullptr, std::memory_order_release);
         }
-        FileLog(L"exec window gone hwnd=%p identified=%d tid=%u", window,
+        TraceLog(L"exec window gone hwnd=%p identified=%d tid=%u", window,
                 identified ? 1 : 0, GetCurrentThreadId());
         return 0;
     }
@@ -14949,7 +13995,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         void* outer = nullptr;
         void* launcher = LauncherNow(&state, &outer);
         const ProbeVisibility visible = LauncherVisibleNow(launcher);
-        FileLog(L"exec visible seq=%lld launcher=%p state=0x%llX visible=%s",
+        TraceLog(L"exec visible seq=%lld launcher=%p state=0x%llX visible=%s",
                 static_cast<long long>(g_pendingShowSeq), launcher,
                 static_cast<unsigned long long>(state),
                 ProbeVisibilityName(visible));
@@ -14982,7 +14028,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                     : (visible == ProbeVisibility::Visible ? kSwipeAckUnconfirmed
                                                            : kSwipeAckUnknown);
             AnswerExec(sequence, answer, S_OK, ProbeVisibilityValue(visible));
-            FileLog(L"exec dismiss %s seq=%lld visible=%s at_call=%d after=%llu "
+            TraceLog(L"exec dismiss %s seq=%lld visible=%s at_call=%d after=%llu "
                     L"ms",
                     answer == kSwipeAckConfirmed
                         ? L"confirmed"
@@ -15034,12 +14080,12 @@ DWORD NoteLauncherThread(const wchar_t* source) {
     DWORD known = g_launcherThread.load(std::memory_order_relaxed);
     if (known == 0) {
         if (g_launcherThread.compare_exchange_strong(known, tid)) {
-            FileLog(L"exec launcher thread tid=%u source=%s", tid, source);
+            TraceLog(L"exec launcher thread tid=%u source=%s", tid, source);
             known = tid;
         }
     }
     if (known != tid) {
-        FileLog(L"exec launcher thread mismatch known=%u tid=%u source=%s",
+        TraceLog(L"exec launcher thread mismatch known=%u tid=%u source=%s",
                 known, tid, source);
         return 0;
     }
@@ -15076,7 +14122,7 @@ void EnsureExecutorWindow() {
         windowClass.hInstance = reinterpret_cast<HINSTANCE>(&__ImageBase);
         windowClass.lpszClassName = kExecClassName;
         if (!RegisterClassExW(&windowClass)) {
-            FileLog(L"exec window class failed err=%u", GetLastError());
+            TraceLog(L"exec window class failed err=%u", GetLastError());
             return;
         }
         g_execClassRegistered = true;
@@ -15086,7 +14132,7 @@ void EnsureExecutorWindow() {
                                   0, HWND_MESSAGE, nullptr,
                                   g_execClassInstance, nullptr);
     if (!window) {
-        FileLog(L"exec window create failed err=%u", GetLastError());
+        TraceLog(L"exec window create failed err=%u", GetLastError());
         return;
     }
     // The owner is written before the window is published, so the pair a reader
@@ -15097,10 +14143,10 @@ void EnsureExecutorWindow() {
     // the launcher thread, never on the thread that happened to call a hook.
     const DWORD launcherThread = g_launcherThread.load(std::memory_order_relaxed);
     if (launcherThread != 0 && launcherThread != g_execThreadId) {
-        FileLog(L"exec window thread mismatch owner=%u launcher=%u",
+        TraceLog(L"exec window thread mismatch owner=%u launcher=%u",
                 g_execThreadId, launcherThread);
     }
-    FileLog(L"exec window hwnd=%p tid=%u class=%s", window, g_execThreadId,
+    TraceLog(L"exec window hwnd=%p tid=%u class=%s", window, g_execThreadId,
             kExecClassName);
 }
 
@@ -15137,7 +14183,7 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
     HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, ExecutorThreadHook, nullptr,
                                    target);
     if (!hook) {
-        FileLog(L"exec window hook failed err=%u", GetLastError());
+        TraceLog(L"exec window hook failed err=%u", GetLastError());
         return false;
     }
     const ULONGLONG start = GetTickCount64();
@@ -15151,7 +14197,7 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
     UnhookWindowsHookEx(hook);
     const bool ready = g_execWindow.load(std::memory_order_relaxed) != nullptr;
     if (!ready) {
-        FileLog(L"exec window deferred: launcher thread %u did not pump in "
+        TraceLog(L"exec window deferred: launcher thread %u did not pump in "
                 L"%llu ms",
                 target, static_cast<unsigned long long>(timeoutMs));
     }
@@ -15184,7 +14230,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
     // reads g_disabled, which BeforeUninit sets before it signals the stop.
     if (!g_disabled.load(std::memory_order_relaxed)) {
         g_execReady.store(true, std::memory_order_release);
-        FileLog(L"exec worker ready tid=%u window=%p", GetCurrentThreadId(),
+        TraceLog(L"exec worker ready tid=%u window=%p", GetCurrentThreadId(),
                 g_execWindow.load(std::memory_order_relaxed));
     }
 
@@ -15201,7 +14247,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
             return 0;
         }
         if (wait == WAIT_FAILED) {
-            FileLog(L"exec worker wait failed err=%u", GetLastError());
+            TraceLog(L"exec worker wait failed err=%u", GetLastError());
             return 0;
         }
         if (wait == WAIT_TIMEOUT) {
@@ -15209,7 +14255,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
             continue;
         }
         if (wait != WAIT_OBJECT_0 + 1) {
-            FileLog(L"exec worker wait ended unexpectedly result=%u", wait);
+            TraceLog(L"exec worker wait ended unexpectedly result=%u", wait);
             return 0;
         }
         HWND window = g_execWindow.load(std::memory_order_relaxed);
@@ -15218,7 +14264,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
             window = g_execWindow.load(std::memory_order_relaxed);
         }
         if (!window) {
-            FileLog(L"exec command dropped: no window");
+            TraceLog(L"exec command dropped: no window");
             CreateExecutorWindowOnUiThread(500);
             window = g_execWindow.load(std::memory_order_relaxed);
             if (!window) {
@@ -15226,7 +14272,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
             }
         }
         if (!PostMessageW(window, kExecMessage, 0, 0)) {
-            FileLog(L"exec command post failed err=%u", GetLastError());
+            TraceLog(L"exec command post failed err=%u", GetLastError());
         }
     }
 }
@@ -15237,19 +14283,19 @@ void StartExecutorWorker() {
     }
     g_execStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_execStopEvent) {
-        FileLog(L"exec worker stop event failed err=%u", GetLastError());
+        TraceLog(L"exec worker stop event failed err=%u", GetLastError());
         return;
     }
     g_execWorker = CreateThread(nullptr, 0, ExecutorWorkerProc, nullptr, 0,
                                 nullptr);
     if (!g_execWorker) {
-        FileLog(L"exec worker thread failed err=%u", GetLastError());
+        TraceLog(L"exec worker thread failed err=%u", GetLastError());
         CloseHandle(g_execStopEvent);
         g_execStopEvent = nullptr;
         return;
     }
     g_execWorkerId = GetThreadId(g_execWorker);
-    FileLog(L"exec worker started tid=%u", g_execWorkerId);
+    TraceLog(L"exec worker started tid=%u", g_execWorkerId);
 }
 
 // Joins the posting worker. The stop event is already set by BeforeUninit; the
@@ -15264,7 +14310,7 @@ void JoinExecutorWorker() {
     if (WaitForSingleObject(g_execWorker, INFINITE) == WAIT_OBJECT_0) {
         CloseHandle(g_execWorker);
         g_execWorker = nullptr;
-        FileLog(L"exec worker joined tid=%u", g_execWorkerId);
+        TraceLog(L"exec worker joined tid=%u", g_execWorkerId);
         g_execWorkerId = 0;
         return;
     }
@@ -15273,7 +14319,7 @@ void JoinExecutorWorker() {
         const ULONGLONG now = GetTickCount64();
         if (now >= nextReport) {
             nextReport = now + 5000;
-            FileLog(L"exec worker join failed err=%u tid=%u", GetLastError(),
+            TraceLog(L"exec worker join failed err=%u tid=%u", GetLastError(),
                     g_execWorkerId);
         }
         Sleep(1000);
@@ -15294,7 +14340,7 @@ void DestroyExecutorWindow() {
         DestroyWindow(window);
     } else {
         if (!g_execWindowGone) {
-            FileLog(L"exec window gone event missing hwnd=%p", window);
+            TraceLog(L"exec window gone event missing hwnd=%p", window);
             for (;;) {
                 Sleep(5000);
             }
@@ -15309,7 +14355,7 @@ void DestroyExecutorWindow() {
                 const ULONGLONG now = GetTickCount64();
                 if (now >= nextReport) {
                     nextReport = now + 5000;
-                    FileLog(L"exec window teardown post failed err=%u hwnd=%p",
+                    TraceLog(L"exec window teardown post failed err=%u hwnd=%p",
                             GetLastError(), window);
                 }
                 Sleep(1000);
@@ -15321,13 +14367,13 @@ void DestroyExecutorWindow() {
                 const ULONGLONG now = GetTickCount64();
                 if (now >= nextReport) {
                     nextReport = now + 5000;
-                    FileLog(L"exec window teardown wait failed err=%u hwnd=%p",
+                    TraceLog(L"exec window teardown wait failed err=%u hwnd=%p",
                             GetLastError(), window);
                 }
                 Sleep(1000);
             }
         }
-        FileLog(L"exec window destroyed tid=%u",
+        TraceLog(L"exec window destroyed tid=%u",
                 static_cast<unsigned>(g_execThreadId));
     }
     if (g_execWindow.load(std::memory_order_acquire)) {
@@ -15339,7 +14385,7 @@ void DestroyExecutorWindow() {
             const ULONGLONG now = GetTickCount64();
             if (now >= nextReport) {
                 nextReport = now + 5000;
-                FileLog(L"exec window still published hwnd=%p tid=%u",
+                TraceLog(L"exec window still published hwnd=%p tid=%u",
                         remaining, static_cast<unsigned>(g_execThreadId));
             }
             Sleep(1000);
@@ -15357,15 +14403,15 @@ void UnregisterExecutorClass() {
     }
     for (;;) {
         if (UnregisterClassW(kExecClassName, g_execClassInstance)) {
-            FileLog(L"exec window class unregistered");
+            TraceLog(L"exec window class unregistered");
             break;
         }
         const DWORD error = GetLastError();
         if (error == ERROR_CLASS_DOES_NOT_EXIST) {
-            FileLog(L"exec window class already gone");
+            TraceLog(L"exec window class already gone");
             break;
         }
-        FileLog(L"exec window class unregister failed err=%u", error);
+        TraceLog(L"exec window class unregister failed err=%u", error);
         Sleep(1000);
     }
     g_execClassRegistered = false;
@@ -15388,7 +14434,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
     SwipeIpcReadOpen(&g_ipc, &open, &openTick);
     const LONG64 sequence =
         SwipeIpcPublishIntent(&g_ipc, kind, trigger, method, flags, open);
-    FileLog(L"intent kind=%s trigger=%s seq=%lld open=%llu method=%u flags=%u",
+    TraceLog(L"intent kind=%s trigger=%s seq=%lld open=%llu method=%u flags=%u",
             kind == kSwipeIntentOpen
                 ? L"open"
                 : (kind == kSwipeIntentClose ? L"close" : L"external"),
@@ -15404,6 +14450,8 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
 
 BOOL RoleInit() {
+    SetTraceFileName(L"bridge.log");
+    RefreshTraceSetting();
     Wh_Log(L"Legacy Start Swipe 0.7.0 initializing (explorer role)");
 
     // The channel to the Start side. Opening it here means the section and its
@@ -15420,7 +14468,7 @@ BOOL RoleInit() {
                L"serves every trigger",
                static_cast<unsigned>(ipcError));
     } else {
-        FileLog(L"ipc open created=%d", created ? 1 : 0);
+        TraceLog(L"ipc open created=%d", created ? 1 : 0);
     }
 
     // The acknowledgement event for the window's destruction. Created before
@@ -15428,7 +14476,7 @@ BOOL RoleInit() {
     // and waits on it without a deadline.
     g_execWindowGone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_execWindowGone) {
-        FileLog(L"exec window gone event failed err=%u", GetLastError());
+        TraceLog(L"exec window gone event failed err=%u", GetLastError());
     }
 
     if (g_ipc.state) {
@@ -15528,7 +14576,7 @@ void RoleUninit() {
     // The channel last: no hook path and no worker reads it after this point.
     if (g_ipc.state) {
         SwipeIpcClose(&g_ipc);
-        FileLog(L"ipc close");
+        TraceLog(L"ipc close");
     }
 
     g_initialised = false;
@@ -15537,7 +14585,12 @@ void RoleUninit() {
 
 // The explorer role reads no setting: the one settings block belongs to the
 // controller, and nothing here refreshes anything.
-void RoleSettingsChanged() {}
+void RoleSettingsChanged() {
+    if (!g_initialised) {
+        return;
+    }
+    RefreshTraceSetting();
+}
 
 // The explorer half: the launcher hooks and the executor. Selected only in
 // explorer.exe.

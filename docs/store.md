@@ -41,10 +41,10 @@ the generated one.
 
 The mod is one file that carries both halves; the controller decides and the
 executor performs inside that file, and each half is inert in the other's
-process. Submit `swipe-for-10start` as one PR, one file. The channel's version
-word refuses a section left by an incompatible build, so a user who installs it
-beside an old dev build gets the pass-through path rather than a half-driven
-menu.
+process. Submit `swipe-for-10start` as one PR, one file. The channel has no
+version word: its object namespace is the ABI identity, so a user who installs
+it beside an old development build gets the pass-through path rather than a
+half-driven menu.
 
 ## Checks before opening the PR
 

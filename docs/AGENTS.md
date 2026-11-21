@@ -9,16 +9,16 @@ architecture.md: M3.3, the shipping design. The launcher read (`s_pLauncher`
 outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`
 checked again at the post-call resync),
 the executor thread (the `OnHotkeyInvoke` thread, not the taskbar thread), the
-window-creation/shutdown protocol with the creator-before-HWND reaper order and
-the private teardown, one
+window lifetime (worker joined, the one window destroyed on its owner thread,
+the fixed class unregistered under `&__ImageBase`), one
 decision/one executor per trigger, the controller-direction toggle rule (closing
 published at the close's start), the close cancel/recovery for a press during a
 retract (the ticket only for a published command, bounded by its deadline), the
 bounded press latch for a hide in flight, the click-away guards of an
-opening window, the pull-reopen at a close's landing, the command-expiry rule
+opening window, the qualified pull-reopen at a close's landing, the command-expiry rule
 (one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
 auto-hidden timing/interruption chains (docked numbers named as historical), the
-accepted cloak cap, the v7 channel, the intent-consumer readiness/interception
+accepted cloak cap, the 216-byte channel, the intent-consumer readiness/interception
 capability precondition, and the deleted M2 mechanisms.
 
 re/: reverse-engineering records, read-only analysis of this build's shell, kept
@@ -34,10 +34,11 @@ input.md: why Raw Input; the report decode (report IDs, `TipSwitch`/`InRange`,
 contact identity and its evidence clock, the coordinate-only fallback), the
 liveness and idle rules, and the release timers.
 
-gesture.md: the `Progress` model, the dismiss/reveal sessions, the band and the
-once-per-open show request, the reveal entry and the 2.2 DIP/ms chase, the one
-close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the
-reopen on a closing panel, the gates and settle ownership.
+gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admission
+and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry
+and the 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored
+settle → scheduled `exec dismiss`), the qualified pull-reopen on a closing panel,
+the gates and settle ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
 start-speed seam, the mirrored close, the coast, and the measured lines.
@@ -56,11 +57,14 @@ join/UI-teardown/entry-drain order, the bridge worker join/window destruction/
 class unregistration order, the no-safe-success rule, and the host's unload
 boundary.
 
-testing.md: the probes/injectors and the captured measurements in `artifacts/`.
+testing.md: the probes/injectors and the captured measurements in `artifacts/`;
+the smoke's `DiagnosticTrace` precondition and the tap tests.
 
-limits.md: the measured limits — the shell cap, launcher readiness, the
-launcher thread, the touch-show idle suppression, the cold entry, the taskbar
-auto-hide state, and the hardware still owed.
+limits.md: the measured limits — the shell cap, the launcher readiness, the
+launcher thread, the 24 DIP band threshold with the native-gesture trade-off,
+the touch-show idle suppression, the cold entry, the taskbar auto-hide state,
+the engine's symbol cache layout and four-hour error cache, and the hardware
+still owed.
 
 README.md: the map and the one shipping mod.
 

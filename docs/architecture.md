@@ -25,6 +25,19 @@ One Windhawk mod, two process halves:
 The shell still performs every visual transition. The mod writes no launcher
 state.
 
+## Logging
+
+Every decision line goes through one `TraceLog` wrapper. It always calls
+`Wh_Log`, which Windhawk stores only while the mod's own debug logging is
+enabled, and it appends the same line to the role's file only while the
+`DiagnosticTrace` setting is on: `<mod storage>\renderer.log` in the Start host,
+`<mod storage>\bridge.log` in Explorer. The file line keeps the
+`t=<GetTickCount64>` prefix the regression tools read. The file is capped at
+`kTraceMaxLines` (20,000 lines): the count is seeded from the existing file and
+the next write restarts it at the cap, so a left-on trace cannot grow without
+bound. The setting is read at init and on every settings change; with it off no
+file is opened, and it is the only debug switch.
+
 ## The launcher read (corrected)
 
 `twinui.pcshell.dll + 0x948E80` holds `XamlLauncher::s_pLauncher`, the **outer**
@@ -521,8 +534,8 @@ product version word**: the ABI namespace is the identity, so an old development
 image cannot join and a future layout changes the prefix. The records are the open
 generation, the intent and its ack, the executor command and its ack, one
 controller direction word plus the touch flag, and the liveness triple
-`peerTick`/`peerState`/`peerEpoch`. The debug command record (`cmdText`, `Cmd`,
-`CmdWrite`, its parser) is gone; `tools/ipc.ps1` is read-only. The executor
+`peerTick`/`peerState`/`peerEpoch`. The debug command channel — its record,
+mutex, event and parser — is gone; `tools/ipc.ps1` is read-only. The executor
 validates every command before the launcher call (show 1/11/16 with flags under
 `0x8|0x4`, dismiss 1/6 with no flags, cancel 0) and refuses anything else instead
 of clamping it. A click-away intent keeps Hide method 7 as evidence; the Start
