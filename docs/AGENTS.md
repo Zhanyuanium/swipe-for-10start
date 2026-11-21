@@ -17,7 +17,8 @@ retract (the ticket only for a published command, bounded by its deadline), the
 bounded press latch for a hide in flight, the click-away guards of an
 opening window, the qualified pull-reopen at a close's landing, the command-expiry rule
 (one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
-auto-hidden timing/interruption chains (docked numbers named as historical), the
+auto-hidden timing/interruption chains (the bottom docked numbers are named as
+historical; the live left docked layout is a separate set), the
 accepted cloak cap, the 216-byte channel, the intent-consumer readiness/interception
 capability precondition, and the deleted M2 mechanisms.
 

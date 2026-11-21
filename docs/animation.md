@@ -19,8 +19,9 @@ The duration is planned from the travel, not a time:
 T = clamp(|target - start| * distance / 2.2 DIP/ms, 160 ms, 520 ms)
 ```
 
-A 852 DIP panel takes 387 ms (auto-hidden; the docked 900 DIP panel takes 409 ms;
-the earlier auto-hidden variant also measured 852 DIP and 387 ms). The curve is
+A 852 DIP panel takes 387 ms (bottom auto-hidden; the bottom docked 900 DIP panel
+takes 409 ms; the earlier bottom auto-hidden variant also measured 852 DIP and
+387 ms). The curve is
 generated as samples (`BuildSpringSamples`), scaled by its own value at `T`, so
 it lands exactly on the target with no step.
 The first keyframe, up to 4 ms in, shows the first segment's average speed
@@ -41,7 +42,7 @@ initial slope, which is why the seam factor is a computed value, not a constant.
 - keyboard/Start-button open: the settle from rest (`vel=0.00`) to 1, `dur=409`
   on the full travel;
 - intent open: the Start side holds the entry (`RevealEntryProgress`, warm
-  0.255 auto-hidden, 0.348 docked, cold 0.000) and starts the same
+  0.255 bottom auto-hidden, 0.348 bottom docked, cold 0.000) and starts the same
   settle from there when the shell's
   shown event arrives (`win open intent from=... dur=...`). That event is
   `EVENT_OBJECT_UNCLOAKED` for the CoreWindow, delivered to the input thread —

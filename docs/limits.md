@@ -6,22 +6,23 @@
 ## Shell-imposed
 
 - **The first visible frame is 245–268 ms after `ShowStartView` in the worst
-  case.** The shell owns the cloak. The current auto-hidden Win open showed its
+  case.** The shell owns the cloak. The bottom auto-hidden Win open showed its
   first panel pixel at **+82–187 ms** from the key (median +115 over three
-  runs); the docked keyboard open measured +190 ms. DWM attribute 13 returns
-  `E_ACCESSDENIED` without the shell's IAM ticket; the owning process cannot
-  acquire it before the shell's own uncloak (measured: the window was already
-  uncloaked when the ticket was obtained, `before=0`). Early uncloak is not
-  attempted: it may reveal an unpainted window. This is the accepted cap.
+  runs); the bottom docked keyboard open measured +190 ms. DWM attribute 13
+  returns `E_ACCESSDENIED` without the shell's IAM ticket; the owning process
+  cannot acquire it before the shell's own uncloak (measured: the window was
+  already uncloaked when the ticket was obtained, `before=0`). Early uncloak is
+  not attempted: it may reveal an unpainted window. This is the accepted cap.
 - **The band open is claimed only after 24 DIP of inward travel, and the shell's
   own edge gesture opens from about 20 DIP.** The threshold is what keeps a tap
   anywhere in the band (twice the taskbar's thickness) from requesting a show.
   The trade is explicit: a drag between roughly 20 and 24 DIP is served by the
   shell's gesture, not by this mod, and a drag that stops short of both never
-  opens. Measured on the docked layout: a 23 DIP drag requested nothing from this
-  mod and the native gesture opened the menu; a 25 DIP drag requested one show;
-  at 24 DIP the request is published in the crossing millisecond and reaches
-  `ShowStartView` +15 ms later, and the window uncloaks +125 ms after that call.
+  opens. Measured on the bottom docked layout: a 23 DIP drag requested nothing
+  from this mod and the native gesture opened the menu; a 25 DIP drag requested
+  one show; at 24 DIP the request is published in the crossing millisecond and
+  reaches `ShowStartView` +15 ms later, and the window uncloaks +125 ms after
+  that call.
   A tap on the taskbar background, the clock or the tray requests nothing.
 - **A stalled symbol fetch leaves the mod passive for that session.**
   `HookSymbols` runs on the executor worker, never on an Explorer thread, so a
@@ -132,14 +133,14 @@ so it is covered too.
   the hold ends on the cloak event or on the executor's answer.
 - **The cold entry is 0.000.** The first open after a host start has no settled
   geometry (the measurement is deferred while the panel is owned), so the settle
-  starts at 0 and the takeover chases. A warm auto-hidden open uses 0.255 (the
-  docked layout used 0.348).
+  starts at 0 and the takeover chases. A warm bottom auto-hidden open uses 0.255
+  (the bottom docked layout used 0.348).
 - **The chase is rate-limited at 2.2 DIP/ms.** A 0.558 inherited gap takes
   ~254 ms to close; the panel is glued only after it (`behind=0.000`). The first
   visible frame is the entry, not the finger's mapped position; this is the
   accepted cap, not a lost frame. A held finger settles to the mapped position:
-  current auto-hidden `progress=0.96` at 300 DIP (the edge 1.8 px from the
-  finger) and `progress=0.90` at 350 DIP (0.4 px); the docked 300 DIP hold
+  bottom auto-hidden `progress=0.96` at 300 DIP (the edge 1.8 px from the
+  finger) and `progress=0.90` at 350 DIP (0.4 px); the bottom docked 300 DIP hold
   measured 2 px.
 - **The virtual digitizer's injected reports are sparser than the real panel.**
   A glide's first reports can be 30–46 ms apart. That is no longer read as a new
@@ -158,11 +159,12 @@ so it is covered too.
   layouts are historical and their numbers are not the current ones. The smoke
   reads the axis, band, rectangle and scale from the mod's own log lines, so it
   runs on whichever edge is live.
-- The auto-hidden bar once stopped revealing after an injected-touch session
-  (`Shell_TrayWnd` stayed at `0,899,1440,947`, `ABM_GETSTATE=1`, Win+`T` did not
-  draw it); that state is historical. The Win/touch/click-away paths do not
-  depend on the bar either way.
-- The bar's 48 DIP height and the 200 % scaling are measured, not assumed.
+- The bottom auto-hidden bar once stopped revealing after an injected-touch
+  session (`Shell_TrayWnd` stayed at `0,899,1440,947`, `ABM_GETSTATE=1`, Win+`T`
+  did not draw it); that state is historical. The Win/touch/click-away paths do
+  not depend on the bar either way.
+- The bar's 48 DIP thickness (96 physical at 200 %) and the 200 % scaling are
+  measured, not assumed.
 
 ## Hardware
 

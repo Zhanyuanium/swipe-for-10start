@@ -18,9 +18,10 @@ so a cached copy from before a resize is rejected for a new gesture instead of
 starting from an old rectangle.
 
 The panel's trailing edge — the side facing away from the taskbar — is measured
-on the UI thread from the root's visible child (`StartSizingFrame`; ~1053 DIP
-on a left taskbar, the panel's top edge at about 277-289 DIP on this
-bottom-taskbar layout, 289 measured on one host and 277 on another), translated
+on the UI thread from the root's visible child (`StartSizingFrame`; ~1053 DIP on
+the live left docked taskbar, measured 2026-11-21, and the panel's top edge at
+about 277-289 DIP on the bottom auto-hidden layout, 289 measured on one host and
+277 on another), translated
 by `ClientToScreen` of the host window's client origin — not by the work-area
 origin. The trail is derived from the rect by one function, so a rect and its
 edge cannot disagree, and the hit test, the follow, the release and that
@@ -31,12 +32,15 @@ it was tested against and the generation.
 A measurement is accepted only when the rect lies on the monitor and its
 taskbar-side edge lies inside the band the taskbar itself defines: the bar's
 reserved strip at the screen edge, extended by one bar thickness toward the
-desktop. On the current bottom-taskbar layout the auto-hidden bar's own 48 DIP
-thickness gives the band `804..900` even though the work area is the whole
-screen; the settled panel sits 12 DIP inside the bar's inner edge (`840` against
-`852`), inside the band, and the open storyboard's rect is rejected whole. The
-docked layout had the same band from the reserved strip `852..900`. The same
-band is the reveal's candidate strip on the input
+desktop. The live left docked bar is 48 DIP thick, so the strip `0..48`
+extended by one thickness gives the band `0..96`; the settled panel's left edge
+is `60`, 12 DIP inside the bar's inner edge (`48`), inside the band, and the
+open storyboard's rect is rejected whole. The bottom auto-hidden layout derived
+the same band the same way: its 48 DIP thickness against the bottom edge gave
+`804..900` even though the work area was the whole screen, and the settled panel
+sat 12 DIP inside the bar's inner edge (`840` against `852`). The bottom docked
+layout had the same band from the reserved strip `852..900`. The same band is
+the reveal's candidate strip on the input
 thread, so the panel the snapshot accepts and the strip a pull may start in
 cannot disagree about where the taskbar ends. A rejection publishes nothing
 and logs `reveal panelTrail rejected ... axis=... rect=... work=... mon=...
@@ -74,7 +78,15 @@ names the axis only when it truly insets, because auto-hide makes it zero by
 design. An inconclusive probe keeps the last axis and band, logs once per
 undecided episode with what each source said (`dismiss axis=... kept, no
 source named an edge ...`), and retries on the next open or broadcast; it never
-silently means `Left`. Measured on this layout:
+silently means `Left`. Measured on the live left docked layout, 2026-11-21:
+
+```
+dismiss axis=0 (0=left,1=top,2=right,3=bottom) src=appbar appbar=0
+rc=0,0,96,1800 bar=0 rect=0,0,96,1800 work=96,0,2880,1800
+mon=0,0,2880,1800
+```
+
+The bottom auto-hidden layout (historical) measured:
 
 ```
 dismiss axis=3 (0=left,1=top,2=right,3=bottom) src=appbar appbar=3
@@ -108,9 +120,9 @@ scrolls vertically and not horizontally — each with its screen rect,
 replaces the single cached viewer of earlier builds, which made a press in the
 tile grid "outside the scrolling content" and turned it into a dismiss.
 
-Measured on this layout, the menu scrolls in two places. The rail is not one of
-them: its `ScrollableHeight` is 0. One line per region per open records each
-region, and again only when a settled pass moved its rect:
+Measured on the bottom auto-hidden layout, the menu scrolls in two places. The
+rail is not one of them: its `ScrollableHeight` is 0. One line per region per
+open records each region, and again only when a settled pass moved its rect:
 
 ```
 scroller rect=...,...,...,... vo=87 sh=98 name=TileListView depth=...
@@ -129,7 +141,10 @@ belongs to the scroll unless that region is already at the end the drag would
 scroll away from (`VerticalOffset <= 24` for a bottom taskbar, mirrored for a
 top one — the allowance a fling needs); otherwise the press is rejected with
 `dismiss deferred to scroll vo=... sh=... region=...` at most once per 500 ms,
-naming the region that took the drag. Measured on the tiles:
+naming the region that took the drag. This gate is a top/bottom-taskbar rule:
+on a left or right bar the dismiss axis is horizontal and the gate is not
+consulted at all (`VerticalDismissAllowed` answers true for a horizontal axis),
+so a vertical drag there never defers. Measured on the tiles:
 `vo=87 sh=98 region=TileListView` kept the menu open, and the same contact
 became the dismiss once they reached their end (`commit=1`,
 `close dismiss kind=dismiss`); the app list behaves as before, and a press in the
@@ -186,16 +201,22 @@ deferred there rather than dismissed.
 
 ## Measured layouts
 
-The current layout is **auto-hidden** (auto-hide on): `dismiss axis=3`,
-`Distance` 852, work `0,0,1440,900`, the bar off screen, panel
-`236,265..1229,840`, so the trail is the panel's top edge at **265 DIP** and the
-band it is tested against is `804..900` (`reveal panelTrail=265 axis=3 ...
-work=0,0,1440,900 band=804,900`). The docked layout (work `0,0,1440,852`, tray
-`0,852..1440,900`, the same panel and band, the bar 48 DIP thick) is historical.
-The earlier auto-hidden variant (panel `236,167..1229,840`, trail 167, hidden
-window at `0,1798,2880,1894`) is also historical and its numbers are not these.
+The live layout is **left, docked** (`axis=0`), measured 2026-11-21: work
+`48,0,1440,900`, the bar at `0,0..48,900` (96 physical wide), band `0..96`,
+panel `60,151..1053,726`, so the trail is the panel's right edge at **1053 DIP**
+and `Distance` is 1392 (`reveal panelTrail=1053 axis=0 rect=60,151,1053,726
+work=48,0,1440,900 band=0,96`).
 
-The survey on this layout measured two regions: the app list
+The bottom auto-hidden layout is historical: `dismiss axis=3`, `Distance` 852,
+work `0,0,1440,900`, the bar off screen, panel `236,265..1229,840`, so the trail
+is the panel's top edge at **265 DIP** and the band it was tested against is
+`804..900` (`reveal panelTrail=265 axis=3 ... work=0,0,1440,900 band=804,900`).
+The bottom docked layout (work `0,0,1440,852`, tray `0,852..1440,900`, the same
+panel and band, the bar 48 DIP thick) is historical too, and so is the earlier
+bottom auto-hidden variant (panel `236,167..1229,840`, trail 167, hidden window
+at `0,1798,2880,1894`). Their numbers are not the live ones.
+
+The survey on the bottom auto-hidden layout measured two regions: the app list
 (`AllAppsGridListView`, `sh=4065`) and the tile grid's internal viewer
 (`TileListView`, `sh=98`). Pressing in the tiles at `vo=87` deferred the dismiss
 to that region and kept the menu open; the same contact closed the menu once the

@@ -13,13 +13,15 @@ Everything here was measured, not assumed. Verified on: Windows 11 build
 26300.9974, ExplorerPatcher 26100.9711 (`Start_ShowClassicMode=1`), Windhawk
 2.0 alpha, 2880x1800 physical at 200% scaling (1440x900 DIP), ELAN2513
 touchscreen. The taskbar was on the left for the early measurements and on top
-for the vertical-path runs. **Current layout: auto-hidden** (auto-hide on): work
-`0,0,1440,900`, the bar off screen, band `804..900`, panel
-`236,265..1229,840`, trail 265, Distance 852. The docked layout (work
-`0,0,1440,852`, tray `0,852..1440,900`) and the earlier auto-hidden variant
-(panel `236,167..1229,840`, trail 167) are historical; their numbers are never
-the current ones. Where a measurement depends on the placement, the text names
-it.
+for the vertical-path runs. **Current layout: left, docked** (`axis=0`), measured
+2026-11-21: work `48,0,1440,900`, the bar at `0,0..48,900` (96 physical wide),
+band `0..96`, panel `60,151..1053,726`, trail 1053, Distance 1392. The bottom
+auto-hidden layout (work `0,0,1440,900`, the bar off screen, band `804..900`,
+panel `236,265..1229,840`, trail 265, Distance 852), the bottom docked layout
+(work `0,0,1440,852`, tray `0,852..1440,900`) and the earlier bottom auto-hidden
+variant (panel `236,167..1229,840`, trail 167) are historical; their numbers are
+never the current ones. Where a measurement depends on the placement, the text
+names it.
 
 ## Map
 

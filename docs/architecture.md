@@ -3,9 +3,12 @@
 > L3-level design record. Mod **0.7.0** (one source, two process halves),
 > channel **216 B, no version word**. The measured evidence is quoted with the build and the
 > layout it came from; everything below was run on this machine. **Layouts:**
-> *auto-hidden* = work `0,0,1440,900`, the bar off screen, band `804..900`, panel
-> `236,265..1229,840`, trail 265, Distance 852 (current). *Docked* = work
-> `0,0,1440,852`, tray `0,852..1440,900`, same panel, trail 265 (historical).
+> *left docked* (live, measured 2026-11-21) = `axis=0`, work `48,0,1440,900`,
+> the bar at `0,0..48,900` (96 physical wide), band `0..96`, panel
+> `60,151..1053,726`, trail 1053, Distance 1392. *Bottom auto-hidden*
+> (historical) = work `0,0,1440,900`, the bar off screen, band `804..900`, panel
+> `236,265..1229,840`, trail 265, Distance 852. *Bottom docked* (historical) =
+> work `0,0,1440,852`, tray `0,852..1440,900`, same panel, trail 265.
 
 ## What ships
 
@@ -263,7 +266,7 @@ stuck at 3, no Shown), while a show 16 ms after it opened normally. The arm is
 posted to the executor window when the event runs on another thread, so the slot
 and its timer stay owned by the launcher thread. A second
 press replaces the slot (`own press latch replaced ...`); the serve logs `own
-press served wait=...` (current auto-hidden medians: 219 ms Win close, 210 ms
+press served wait=...` (bottom auto-hidden medians: 219 ms Win close, 210 ms
 Start-button, 234 ms click-away; the gesture latch is rare and measured 94 ms).
 The 400 ms timer is only the fallback for a landing the event missed. Any newer
 press discards the slot through the shared dispatcher
@@ -359,9 +362,9 @@ Fallbacks, each logged once:
   `exec show|dismiss seq=... expired`, answered `kSwipeAckExpired` without a
   launcher call.
 
-## The open and the close (auto-hidden; docked numbers named)
+## The open and the close (bottom auto-hidden; bottom docked numbers named)
 
-Open (touch, docked, warm):
+Open (touch, bottom docked, warm):
 
 ```
 contact / hid usages          172817328
@@ -372,39 +375,39 @@ reveal takeover              172817437   (+109 ms)
 exec visible ... visible=1   172817640   (+312 ms)
 ```
 
-The Win open, current auto-hidden layout (three captures at `x=1200` in a
+The Win open, bottom auto-hidden layout (three captures at `x=1200` in a
 16×1600 strip, `top` counts the first panel row): key → `exec show` **+31–32 ms**
 → `own state event=shown` **+46–141 ms** → first panel pixel **+82–187 ms**
-(median +115) → `exec visible ... visible=1` **+343–344 ms**. The docked capture
-was `key=172830139`, `exec show` +79 ms, `shown` +142 ms, first panel pixel
-**+190 ms**, `visible=1` +392 ms. The shell's cloak is the dominant term; the
-executor removes the shell's 60–250 ms gesture wait. The earlier auto-hidden
-variant measured +257 ms for the same pixel.
+(median +115) → `exec visible ... visible=1` **+343–344 ms**. The bottom docked
+capture was `key=172830139`, `exec show` +79 ms, `shown` +142 ms, first panel
+pixel **+190 ms**, `visible=1` +392 ms. The shell's cloak is the dominant term;
+the executor removes the shell's 60–250 ms gesture wait. The earlier bottom
+auto-hidden variant measured +257 ms for the same pixel.
 
 The touch show is requested once per contact, and only after inward travel:
 admission records the contact, and `TryClaimRevealOpen` claims the open on the
 first positioned report whose signed inward travel reaches `kAdoptTravelDip`
 (24 DIP). `g_intentOpenActive` refuses a second claim. A tap anywhere in the band
 requests nothing; a refused claim is marked and not retried, and an open the
-shell performs on its own is adopted. Measured on the docked layout, trace on:
-31 ms from the first positioned report to the 24 DIP crossing on a ~1 DIP/ms
-pull, +15 ms from the crossing to the executor's `ShowStartView` (request
-published in the crossing millisecond), and the uncloak +125 ms with the first
-captured panel frame +141 ms after `ShowStartView`. A 23 DIP drag requested
+shell performs on its own is adopted. Measured on the bottom docked layout, with
+the trace on: 31 ms from the first positioned report to the 24 DIP crossing on
+a ~1 DIP/ms pull, +15 ms from the crossing to the executor's `ShowStartView`
+(request published in the crossing millisecond), and the uncloak +125 ms with the
+first captured panel frame +141 ms after `ShowStartView`. A 23 DIP drag requested
 nothing from this mod (the shell's own edge gesture, which opens from about
 20 DIP, opened the menu); a 25 DIP drag requested one show. The entry is
-`RevealEntryProgress`; auto-hidden it reads **0.255** (warm; the panel trail is
-265, the Distance 852); the docked layout read 0.348. A cold first open still
-reads 0.000. The first visible frame is the entry, not 0.
+`RevealEntryProgress`; the bottom auto-hidden layout read **0.255** (warm; the
+panel trail is 265, the Distance 852); the bottom docked layout read 0.348. A
+cold first open still reads 0.000. The first visible frame is the entry, not 0.
 
 The reveal takeover starts at the entry and chases the mapped finger at
-`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. Current auto-hidden, a held
+`kSettleSpeedDipPerMs` (2.2 DIP/ms), then follows. Bottom auto-hidden, a held
 contact (`follow_hold`, 85 reports): `reveal takeover from=0.255 offset=0.338`,
 `open follow travel=488 max=488 progress=0.90 behind=0.000 commit=1`; the panel
 edge is 350.2 DIP at the held 350 DIP finger, **0.4 px** away. The 300 DIP hold
-gives `progress=0.96` and a 299.1 DIP edge, **1.8 px** away; the docked 300 DIP
-hold measured 2 px. The `offset` is the inherited gap at the takeover; the chase
-closes it at 2.2 DIP/ms, and `behind=0.000` is the glued state.
+gives `progress=0.96` and a 299.1 DIP edge, **1.8 px** away; the bottom docked
+300 DIP hold measured 2 px. The `offset` is the inherited gap at the takeover;
+the chase closes it at 2.2 DIP/ms, and `behind=0.000` is the glued state.
 
 A digitizer that goes quiet while the shell uncloaks, or while a close is in
 flight, is not a lift: while the touch show or the close suppression is active
@@ -415,9 +418,9 @@ Close: a Win, Start-button or click-away intent calls `TakeCloseOwnership`
 (sets `g_suppressRestoreUntil`, publishes the closing direction before the
 settle's first frame, mutes the contact, clears the reveal) and runs
 `BeginMirrorCloseSettle` from `TakeProgressNow()`: the open curve played
-backwards, full travel (387 ms at the current 852 DIP; 409 ms at the docked 900).
-The dismiss is scheduled at the end
-plus 30 ms. The bridge's timer runs `Dismiss`; the shell's cloak event follows
+backwards, full travel (387 ms at the bottom auto-hidden 852 DIP; 409 ms at the
+bottom docked 900). The dismiss is scheduled at the end plus 30 ms.
+The bridge's timer runs `Dismiss`; the shell's cloak event follows
 and the Start side logs `win close observed`, clears the direction and
 `controllerTouch`, and the next open is ready. The close is
 judged by that hidden event and the executor's `confirmed` (hidden) at its 300 ms
@@ -453,12 +456,13 @@ active follow is not qualified by its ownership — a finger that pulled out and
 came back toward the edge fails the current-travel test at the landing too. The
 late-release record only exists for a pull that travelled 24 DIP. A finger
 merely resting in the band through the retract is admitted deferred and is not
-reopened (`reveal defer released candidate=1 down=1`, no `reveal reopen`). Measured on the docked layout: the
-Win close during a held pull at `y=350 DIP`; the landing reopened, `reveal
-takeover from=0.348 offset=0.558`, the follow continued with 221 reports and
+reopened (`reveal defer released candidate=1 down=1`, no `reveal reopen`).
+Measured on the bottom docked layout: the Win close during a held pull at
+`y=350 DIP`; the landing reopened, `reveal takeover from=0.348 offset=0.558`,
+the follow continued with 221 reports and
 ended `progress=0.91 behind=0.000 commit=1`, menu open; a contact resting at
-898 DIP through the same close left the menu closed. The auto-hidden entry is
-0.255.
+898 DIP through the same close left the menu closed. The bottom auto-hidden
+entry is 0.255.
 
 The suppression is what keeps the visibility service from "healing" the panel
 that
@@ -467,13 +471,13 @@ at 0 and started an open settle between the settle end and the dismiss
 (`win open unhealed`), a flash. `TakeCloseOwnership` now sets it for the intent
 close too.
 
-Measured interruption (current auto-hidden unless named):
+Measured interruption (bottom auto-hidden unless named):
 
 - open settle interrupted: the Win close 172 ms into the open started at
   `from=0.542` (the live position), not 1.0;
 - drag interrupted: a Win press while a touch was held at `y=399.5` ran the
   close from `progress=1.000`, hid at +437 ms, and the touch's later lift was
-  ignored (docked);
+  ignored (bottom docked);
 - press during a close, 40 randomised trials per kind, press offset random
   50–500 ms: **0 lost**. Win close: 29 latched (waits 94–359 ms, median 219), 11
   direct, 0 cancelled. Start-button close: 30 latched (median 210), 10 direct.
@@ -493,17 +497,17 @@ Measured interruption (current auto-hidden unless named):
   press arrived) is the safety net for the 1–15 ms race; it did not fire in the
   runs above.
 
-## Mixed cycles (docked)
+## Mixed cycles (bottom docked)
 
 Ten cycles across the four triggers (Win, Start button, click-away, touch) on
-the docked layout, after the latch and the opening guards: every cycle ended
-with the menu closed (`START ... open=False`), the bridge log for the series
-contains **0** `own state resync`, **0** refused commands, **0** ack timeouts
-and **0** dropped commands, and every close logged `own state event=hidden
-open=0` and the executor's `visible=0`. The Start-button cycles worked because
-the docked bar is always visible (the auto-hidden run could not re-trigger
-them). The decision/executor lines for the four triggers are in the session
-report.
+the bottom docked layout, after the latch and the opening guards: every cycle
+ended with the menu closed (`START ... open=False`), the bridge log for the
+series contains **0** `own state resync`, **0** refused commands, **0** ack
+timeouts and **0** dropped commands, and every close logged
+`own state event=hidden open=0` and the executor's `visible=0`. The
+Start-button cycles worked because the bottom docked bar is always visible (the
+bottom auto-hidden run could not re-trigger them). The decision/executor lines
+for the four triggers are in the session report.
 
 ## Deleted in M3
 
@@ -609,9 +613,9 @@ not the current layout; the asserts in `swipe_ipc_shared.h` are the contract.
 ## The accepted cap, restated
 
 The shell's first visible frame is 245–268 ms after a band show in the worst
-case. The current auto-hidden Win open showed its first panel pixel at
+case. The bottom auto-hidden Win open showed its first panel pixel at
 **+82–187 ms** from the key (median +115 over three runs; `exec show` +31–32 ms,
-`shown` +46–141 ms), and the docked capture at **+190 ms** (79 ms to
+`shown` +46–141 ms), and the bottom docked capture at **+190 ms** (79 ms to
 `exec show`, 111 ms to the first pixel). The shell owns
 that window; the early-uncloak experiment found DWM attribute 13 returns
 `E_ACCESSDENIED` without the shell's IAM ticket, and the owning process cannot
