@@ -160,6 +160,23 @@ logs `hid identity expired slot=... latch=0` when no contact latch held it, so
 a refused admission cannot strand a name and make every later finger be
 rejected as another contact.
 
+A contact a close consumed is the exception, because the digitizer's quiet
+through the hide is not a lift. While a close is in flight neither the latch nor
+the identity expires on silence at all. A consumed contact whose name can answer
+— a Contact Identifier — stays tracked until its lift report or until a report
+names a different asserted identifier; the decoder ends it there, logs
+`hid consumed ended slot=... id=... reason=new-contact`, and follows the new
+contact. Another device's asserted contact is the same evidence
+(`reason=device`), and so is a different asserted node on a device without
+Contact Identifiers. A node index
+can be handed to the next finger and the coordinate-only path has no name, so
+those two keep the idle fallbacks (the 120 ms candidate watchdog, then the
+18 ms latch) once the close has ended; its risk is a consumed finger that
+stays silent past the landing and then resumes, read as a new down. A Contact
+Identifier never expires by
+silence, so its residual is the opposite: a device that reuses an identifier
+after a lost lift makes the next finger a continuation until it lifts.
+
 ## Release detection
 
 The digitizer keeps reporting while the finger rests (measured 255 reports in a
@@ -176,8 +193,10 @@ only the fallback for a device that goes silent or a contact that leaves
 without a lift report (`src=idle`). A report that carries only a contact count,
 or no contact field for the tracked slot, says nothing about it, so a
 count-only lift no longer ends a tracked contact; the idle expiry does, with
-`src=idle`, and once no session owns the contact the same 18 ms latch clears
-the contact flag and forgets the tracked identity. A report that names the
+`src=idle`. Once no session owns the contact the same 18 ms latch clears the
+contact flag and forgets the tracked identity, except through a close: a close
+in flight suspends both, and a consumed contact with a Contact Identifier is
+never ended by silence (see Contact identity). A report that names the
 tracked contact and asserts it (`TipSwitch` down or `InRange`, or a slot state
 of Contact) but carries no point is not silence: it refreshes the liveness
 clock and the identity's evidence clock, and moves nothing.

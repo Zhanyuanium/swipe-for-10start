@@ -38,7 +38,7 @@ contact lifts.
    its mapped progress at or below the panel's live one, which is the same thing
    as the panel's trail edge being at or beyond the point, both from the run's own
    geometry (`RevealProgressDip`, `PeekProgressNow`). Anything else is
-   `reason=offsurface` and muted; a granted grab logs `reason=deferred`.
+   `reason=offsurface` and muted; a granted grab logs `reason=grab`.
 2. **Qualified pull** — on the first positioned report of that same contact whose
    signed inward travel (`RevealTravelDip`) reaches `kAdoptTravelDip` (24 DIP),
    `TryClaimRevealOpen` attempts the one open claim. It marks the attempt per
@@ -69,7 +69,7 @@ contact lifts.
    shell's own. The same test gates the candidate branch of
    `UpdateRevealSession`: a contact that landed on a shown but off-rest panel
    (the unhealed case) does not take `Progress` over without the 24 DIP, or
-   without having qualified earlier (`openClaimAttempted`). A stationary finger
+   without having qualified earlier (`claimAttempted`). A stationary finger
    on a settled open never acquires the panel. A takeover of a hidden panel
    starts at the entry, holds it for the
    first presentation (`kRevealEntryHoldMs`, 30 ms), then every report moves the
@@ -101,7 +101,19 @@ contact lifts.
    set, and while a close is in flight with a reveal candidate, the idle
    release is skipped: the digitizer may go quiet during the shell's uncloak and
    during the key/hide, and that silence is not a lift. A real lift is a report
-   and still ends the contact.
+   and still ends the contact. The same rule covers a contact a close consumed:
+   silence through the hide never ends its latch or its mute. It ends on a lift
+   report (`contacts <= 0`), or on a report that proves a new contact — another
+   device, a different asserted Contact Identifier, or a different asserted node
+   on a device that does not name contacts.
+   A Contact Identifier also keeps the mute through silence, so only evidence
+   ends it; its residual is a reused identifier after a lost lift, read as a
+   continuation until that finger lifts. A node index and the coordinate-only
+   path can prove a different contact in a report but cannot survive silence (a
+   node can be handed on), so once the close has ended they keep the idle
+   fallbacks (the candidate's 120 ms watchdog, then the 18 ms latch) as the
+   missing-lift guard; its risk is a consumed finger that stays silent past the
+   landing and then resumes, read as a new down.
 
 The 18 ms idle still ends a dismiss session that is truly silent, with
 `src=idle`. That window is armed as a one-shot deadline at the last report, so
@@ -236,7 +248,16 @@ that contact cannot interrupt the close and cannot reopen the menu. A landing
 therefore adopts no finger. After `win close observed` the controller issues no
 touch show; no hover, carried travel or release record turns the landed close
 into a `Show`; and a contact still down is inert until it lifts
-(`win close observed muted=1`). The only open a landing can still serve is the
+(`win close observed muted=1`). Silence through the hide does not end it: the
+latch and the mute stay until a lift report or a report that proves a new
+contact — another device, a different asserted Contact Identifier, or a
+different asserted node on a device that does not name contacts. A Contact
+Identifier also keeps the mute through silence; a node index and the
+coordinate-only path cannot survive silence, so
+once the close has ended they keep the idle fallbacks (the candidate's 120 ms
+watchdog, then the 18 ms latch) as the missing-lift guard.
+Its risk is a consumed finger that stays silent past the landing and then
+resumes, read as a new down. The only open a landing can still serve is the
 press obligation: an open that cancelled a close whose dismiss ran anyway
 (`intent open recovered entry=...`). A menu closed by a touch is opened again by
 a new pull, never by the finger that lost its grab.
@@ -265,8 +286,9 @@ earlier build released a held pull *at* the landing and replayed the open from
 the panel's position (`reveal takeover ... live=0`, measured on the bottom docked
 layout with a 350 DIP pull held through a Win close); that adoption is gone. A
 contact already down when the close starts is consumed by it, and a grab that
-outlives its retract is refused at its 24 DIP report and consumed; the menu stays
-closed until a new pull. The bottom auto-hidden entry is 0.255.
+outlives its retract is refused at its 24 DIP report and consumed; silence after
+the landing does not release it, and the menu stays closed until a new pull. The
+bottom auto-hidden entry is 0.255.
 
 The gesture close (a touch drag with enough travel/velocity) uses its own release
 spring through `BeginGestureSettle` and schedules the same dismiss at the end of

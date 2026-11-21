@@ -422,7 +422,12 @@ read.
 A digitizer that goes quiet while the shell uncloaks, or while a close is in
 flight, is not a lift: while the touch show or the close suppression is active
 the 18 ms idle release is held, so the grab the close is carrying survives long
-enough to spend its one transfer attempt. A real lift is a report and still ends
+enough to spend its one transfer attempt. A contact the close consumed keeps its
+latch and its mute through that quiet: while a close is in flight no idle
+expiry runs, and a Contact Identifier is never ended by silence — the lift
+report or a report naming a different identifier ends it. A node index and the
+coordinate-only path cannot prove a new contact and keep the 18 ms idle as the
+fallback once the close has ended. A real lift is a report and still ends
 the contact.
 
 Close: a Win, Start-button or click-away intent calls `TakeCloseOwnership`
@@ -478,7 +483,9 @@ the panel to the follow from its live position. That takeover keeps the
 finger-to-panel offset it found (`live=1`) instead of starting at the entry, so
 an interrupted retract reverses where it is. It is the grab's one opportunity. A
 refused transfer — a dismiss whose call already returned with its hide
-unconfirmed (`g_pendingDismissConfirm`), a retract already at or below the entry,
+unconfirmed (`g_pendingDismissConfirm`), a published dismiss at or past its
+deadline (`reason=dispatch`: the bridge may already be inside the call), a
+retract already at or below the entry,
 a layout with no distance, or nothing left to cancel — consumes the contact
 (`grab=refused reason=...`): it keeps no open right until it lifts, and its
 release leaves no record.
@@ -570,6 +577,9 @@ The M2 mechanisms that no longer exist in the shipping path:
 - the landing's finger adoption: `RevealPullQualified`, the touch branch of
   `BeginLandingOpen`, the deferral release and the release-record consumption
   (`reveal reopen after close`, `reveal defer released`);
+- the late-release deferral fields (`RevealLateRelease::deferred`,
+  `readyQpc`): the record's window is measured from its release, and a grab's
+  release leaves no record at all;
 - the `win open continued` ticket: its only stamp sat behind the same
   `CloseInFlight` early return that guards the follow, so it could never fire;
   the press cancel, the press latch and the landing's press recovery are the

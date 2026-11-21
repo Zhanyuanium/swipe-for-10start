@@ -4518,13 +4518,13 @@ struct HidRevealSession {
     // kAdoptTravelDip. A refused transfer consumes the contact: it keeps no open
     // right until it lifts, and no landing or later open revives it. A taken
     // transfer clears this flag and becomes the live follow.
-    bool deferred = false;
+    bool granted = false;
     // The one open claim of this contact. It is set when the qualified pull
     // first reaches kAdoptTravelDip and attempts the claim, whatever the
     // outcome: a tap never sets it because a tap never reaches the threshold,
     // and a refused claim is not retried on later reports. An open the shell
     // performs anyway is adopted instead.
-    bool openClaimAttempted = false;
+    bool claimAttempted = false;
     // The pull cancelled a close and took the retract over while the panel was
     // still on screen. Such a takeover continues from the position the panel has,
     // never from the entry the open reserves: the panel is already presented, and
@@ -4650,12 +4650,6 @@ void SampleOriginPoint(float x, float y, uint64_t qpcMs) {
 struct RevealLateRelease {
     bool valid = false;
     uint64_t releaseQpc = 0;  // QPC; kLateRevealWindowMs bounds the age
-    // Nothing defers a release any more. A pull that lifts while a close owns
-    // the panel is consumed by that close, and no landing consumes a release
-    // record; this field and `readyQpc` stay false/zero for the readers below
-    // until the sweep that removes them.
-    bool deferred = false;
-    uint64_t readyQpc = 0;    // QPC of the close's landing, 0 while none
     float travel = 0.0f;      // DIP away from the edge at the release
     // Mapped Progress the follow would have written; diagnostic only, never a
     // start value. The settle starts from the position the panel actually shows.
@@ -4717,6 +4711,23 @@ bool g_duplicateContactIdLogged = false;  // input thread only
 
 void ForgetTrackedContact() {
     g_trackedContact = HidContactTrack{};
+}
+
+// Ends a contact a close consumed, on evidence rather than on silence. The
+// decoder calls it when the report proves a different contact (another device,
+// a different asserted Contact Identifier, a different asserted node), before
+// it follows that new contact: the latch and the mute must not make the new
+// down a continuation of the consumed one. The lift report ends the consumed
+// contact through the ordinary `contacts <= 0` path, which clears the same
+// fields.
+void EndConsumedContact() {
+    g_hidSession.suppress = false;
+    g_contactDown = false;
+    g_contactTick = 0;
+    g_contactOrigin = HidContactOrigin{};
+    g_openCheckValid = false;
+    EndContactTiming();
+    ForgetTrackedContact();
 }
 
 // Screen size in DIP, rewritten by FeedHidReport before every state-machine
@@ -4814,7 +4825,7 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     }
 
     g_hidSession.active = false;
-    g_reveal.deferred = false;
+    g_reveal.granted = false;
     g_reveal.edgeCandidate = false;
     g_reveal.active = false;
     EndContactTiming();
@@ -5540,19 +5551,19 @@ bool PublishOpenClaim(const GestureGeometry& geometry, bool touch,
 // report that reaches the travel threshold; a tap anywhere in the band never
 // gets there.
 //
-// `deferred` names a contact that arrived while a close owned the panel: the
+// `granted` names a contact that arrived while a close owned the panel: the
 // grab the close granted. It changes nothing about this close — it neither
 // claims nor cancels one, which is what keeps the close's dismiss armed and its
 // retract the only motion — and it never activates as a plain takeover:
-// `ActivateRevealFollow` refuses while the close is in flight and the deferred
-// flag keeps the contact out after it too. Its one transfer attempt is
+// `ActivateRevealFollow` refuses while the close is in flight and the grant
+// keeps the contact out after it too. Its one transfer attempt is
 // `CancelCloseForQualifiedPull`, at the same travel threshold the open claim
 // uses.
 void StartRevealFollow(float downX, float downY, uint64_t downTick,
-                       uint64_t tickMs, bool deferred = false) {
+                       uint64_t tickMs, bool granted = false) {
     g_reveal = HidRevealSession{};
     g_reveal.edgeCandidate = true;
-    g_reveal.deferred = deferred;
+    g_reveal.granted = granted;
     g_reveal.edgeStartX = downX;
     g_reveal.edgeStartY = downY;
     g_reveal.startTick = downTick;
@@ -5585,7 +5596,7 @@ void StartRevealFollow(float downX, float downY, uint64_t downTick,
 //
 // Every refusal consumes the contact: the spent attempt leaves it with no open
 // right until it lifts, and nothing — not the landing, not a later open — gives
-// it another chance. No transfer is deferred.
+// it another chance.
 //
 // The executor command is revocable at any point before the bridge dispatches it,
 // which is what lets a keyboard, Start-button or click-away close be interrupted:
@@ -5681,7 +5692,7 @@ const wchar_t* CancelCloseForQualifiedPull(const GestureGeometry& geometry,
 void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
                         uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
-    if (!reveal.edgeCandidate || reveal.active || reveal.openClaimAttempted) {
+    if (!reveal.edgeCandidate || reveal.active || reveal.claimAttempted) {
         return;
     }
     const float travel = RevealTravelDip(geometry.axis(), reveal.edgeStartX,
@@ -5689,8 +5700,8 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
     if (!(travel >= kAdoptTravelDip)) {
         return;
     }
-    reveal.openClaimAttempted = true;
-    if (reveal.deferred) {
+    reveal.claimAttempted = true;
+    if (reveal.granted) {
         // The grab's attempt is this retract, and nothing else. A refused
         // transfer — the retract is already off screen, its dismiss is inside the
         // shell, its published deadline has passed, or nothing is left to cancel
@@ -5701,7 +5712,7 @@ void TryClaimRevealOpen(const GestureGeometry& geometry, float x, float y,
         const wchar_t* refused =
             CancelCloseForQualifiedPull(geometry, x, y, tickMs);
         if (!refused) {
-            reveal.deferred = false;
+            reveal.granted = false;
             // The pull owns whatever opens next: a new generation and no release
             // record from the previous pull.
             g_pullSerial++;
@@ -5828,7 +5839,7 @@ void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
 bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
                           uint64_t sampleQpc, uint64_t tickMs) {
     HidRevealSession& reveal = g_reveal;
-    if (reveal.deferred) {
+    if (reveal.granted) {
         // A grab is transferred only by its own qualified pull
         // (CancelCloseForQualifiedPull), which clears the flag before the follow
         // takes over. No plain takeover may start it: the menu that follows a
@@ -6058,7 +6069,7 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
             }
             StartRevealFollow(x, y, tickMs, tickMs, true);
             admitted = true;
-            reason = L"deferred";
+            reason = L"grab";
             break;
         }
         if (StartWindowIsOpenThrottled(tickMs)) {
@@ -6199,7 +6210,7 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
     reveal.lastAliveQpc = sampleQpc;
 
     if (!reveal.active) {
-        if (reveal.deferred) {
+        if (reveal.granted) {
             // This contact is a grab of a retract, and its only transfer is its
             // own qualified pull. It is measured only — no Progress, no coast,
             // no release settle — and a spent opportunity leaves it inert until
@@ -6214,8 +6225,8 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
         // landed on a panel off its rest (the unhealed case) must not acquire
         // Progress. The same 24 DIP the open claim and the adoption use
         // qualifies it; a contact that already qualified before keeps its
-        // claim (openClaimAttempted) even as it comes back toward the edge.
-        if (!reveal.openClaimAttempted) {
+        // claim (claimAttempted) even as it comes back toward the edge.
+        if (!reveal.claimAttempted) {
             const float travel =
                 RevealTravelDip(geometry.axis(), reveal.edgeStartX,
                                 reveal.edgeStartY, x, y);
@@ -6298,7 +6309,7 @@ void PromoteRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     if (g_reveal.active) {
         return;  // a follow already owns the panel
     }
-    if (g_reveal.deferred) {
+    if (g_reveal.granted) {
         // A grab is transferred only by its own qualified pull; the open this
         // transition performs is not the menu that grant was for.
         return;
@@ -6351,9 +6362,8 @@ bool ConsumeLateRevealRelease(const GestureGeometry& geometry) {
     }
 
     const uint64_t qpcNow = QpcMsNow();
-    const uint64_t ageFrom = record.readyQpc != 0 ? record.readyQpc
-                                                  : record.releaseQpc;
-    const uint64_t age = qpcNow > ageFrom ? qpcNow - ageFrom : 0;
+    const uint64_t age =
+        qpcNow > record.releaseQpc ? qpcNow - record.releaseQpc : 0;
     if (age > kLateRevealWindowMs || record.pullSerial != g_pullSerial) {
         record = RevealLateRelease{};
         return false;
@@ -6377,9 +6387,9 @@ bool ConsumeLateRevealRelease(const GestureGeometry& geometry) {
     // The same reading covers a
     // panel that was already on screen when the state was read: then it is
     // the live position, not 0. `TakeProgressNow()` is the one reader that turns
-    // an animation's recorded base into a position, and the caller already
-    // refuses the record while a close is still running, so this cannot take an
-    // animation over. The rest sentinel of a process that has not shown this
+    // an animation's recorded base into a position. A close clears the record
+    // when it takes ownership, so this cannot take a close's animation over. The
+    // rest sentinel of a process that has not shown this
     // panel yet is the off-screen rest, and `TakeVisibleProgressNow` is where that
     // rule lives. This path keeps starting at 0 while the live follow starts at
     // the entry: a settle spends time crossing the hidden travel, a follow spends
@@ -6452,9 +6462,9 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     // Whether this contact was the grab a close granted. Its one opportunity is
     // spent either way, so its release carries nothing into the next menu: no
     // late-open record, and no landing revival.
-    const bool grab = reveal.deferred;
+    const bool grab = reveal.granted;
     reveal.edgeCandidate = false;
-    reveal.deferred = false;
+    reveal.granted = false;
     // The opening contact is gone: the shell's click-away from it can no longer
     // arrive, and a real click-away is a trigger again.
     SwipeIpcSetControllerTouch(&g_ipc, false);
@@ -7187,14 +7197,11 @@ void CheckHidIdleRelease(uint64_t tickMs) {
 
     // A release record that no open consumed inside its window is dead: drop it
     // here so it cannot be read long after the gesture, and so the next keyboard
-    // open finds none. The window is measured from the release: a close no longer
-    // defers a record, and its landing no longer consumes one.
-    const uint64_t recordQpc =
-        g_lateRelease.readyQpc != 0 ? g_lateRelease.readyQpc
-                                    : g_lateRelease.releaseQpc;
-    if (g_lateRelease.valid && !g_lateRelease.deferred &&
-        (qpcNow < recordQpc ||
-         qpcNow - recordQpc > kLateRevealWindowMs)) {
+    // open finds none. The window is measured from the release; nothing extends
+    // it, and no landing consumes a record.
+    if (g_lateRelease.valid &&
+        (qpcNow < g_lateRelease.releaseQpc ||
+         qpcNow - g_lateRelease.releaseQpc > kLateRevealWindowMs)) {
         g_lateRelease = RevealLateRelease{};
     }
 
@@ -7261,14 +7268,20 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         g_reveal.edgeCandidate && qpcNow >= g_reveal.lastAliveQpc &&
         qpcNow - g_reveal.lastAliveQpc >= kCandidateIdleHoldMs;
     if (revealIdle && !held) {
+        // A granted grab is released here with the candidate, but the mute it
+        // belongs to is not this watchdog's to clear: the close consumed that
+        // contact, and only a lift report or a proven new contact ends it.
+        const bool consumed = session.suppress;
         ReleaseRevealSession(geometry);
-        // This watchdog is the missing lift (a slow digitizer is the other
-        // reading). The next report is a new down, not a continuation whose
-        // original admission point this latch still holds.
-        g_contactDown = false;
-        g_contactOrigin = HidContactOrigin{};
-        g_openCheckValid = false;
-        ForgetTrackedContact();
+        if (!consumed) {
+            // This watchdog is the missing lift (a slow digitizer is the other
+            // reading). The next report is a new down, not a continuation whose
+            // original admission point this latch still holds.
+            g_contactDown = false;
+            g_contactOrigin = HidContactOrigin{};
+            g_openCheckValid = false;
+            ForgetTrackedContact();
+        }
     }
 
     // The tracked identity carries its own evidence clock, independent of the
@@ -7282,10 +7295,23 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     // admitted or not. An identity that expires with the latch clear is the case
     // this clock exists for, and it is the one worth a line: no lift and no latch
     // cleanup could ever have released it.
+    //
+    // A consumed contact is the exception, and the reason this clock is read
+    // here: silence through a close is the shell's hide, not a lift. While a
+    // close is in flight neither clock runs at all, and a Contact Identifier
+    // never lets silence end the mute: the decoder ends it when a report names
+    // a different identifier. A node index or the coordinate-only path can end
+    // it in a report, but not through silence — the node can be handed on, and
+    // holding it after a lost lift would swallow the next swipe — so those keep
+    // the 18 ms fallback once the close has ended.
+    //
     // No session may own the contact here: a live session's reports carry the
     // points (or the asserted tip) that refresh this clock, and its own idle
     // release runs first in this tick.
-    if (!session.active && !g_reveal.edgeCandidate &&
+    const bool closeInFlight = CloseInFlight(tickMs);
+    const bool holdLatch =
+        closeInFlight || (session.suppress && g_trackedContact.hasIdentifier);
+    if (!session.active && !g_reveal.edgeCandidate && !holdLatch &&
         g_trackedContact.slot >= 0 &&
         tickMs > g_trackedContact.lastEvidenceTick &&
         tickMs - g_trackedContact.lastEvidenceTick >= kIdleReleaseMs) {
@@ -7296,14 +7322,16 @@ void CheckHidIdleRelease(uint64_t tickMs) {
         ForgetTrackedContact();
     }
 
-    // A contact that holds no session is not tracked per report, so the same
-    // silence that ends a gesture ends the "this contact already started"
-    // latch. Without it a lost lift would swallow the next edge swipe. The
-    // mute a keyboard close installed belongs to that contact too: with the
-    // contact gone there is nothing left to suppress, and the next contact must
-    // start normally instead of being ignored until some later lift.
-    if (!session.active && !g_reveal.edgeCandidate && g_contactDown &&
-        tickMs > g_contactTick && tickMs - g_contactTick >= kIdleReleaseMs) {
+    // A contact that holds no session is not tracked per report, so silence is
+    // the only evidence that its lift was lost; without this expiry that lost
+    // lift would swallow the next edge swipe. It does not run through a close
+    // (the digitizer's quiet is the shell's hide) and it does not run for a
+    // consumed contact whose name can prove the next one — that report ends the
+    // mute in the decoder, with its own line. On a device that cannot prove it,
+    // this is the fallback the next swipe has.
+    if (!session.active && !g_reveal.edgeCandidate && !holdLatch &&
+        g_contactDown && tickMs > g_contactTick &&
+        tickMs - g_contactTick >= kIdleReleaseMs) {
         g_contactDown = false;
         g_contactOrigin = HidContactOrigin{};
         session.suppress = false;
@@ -7327,7 +7355,7 @@ void RunPendingCloseTap(uint64_t tickMs) {
     const uint32_t pull = g_pendingTapPull;
 
     if (g_pullSerial != pull || g_reveal.active ||
-        (g_reveal.edgeCandidate && !g_reveal.deferred)) {
+        (g_reveal.edgeCandidate && !g_reveal.granted)) {
         CancelCloseSchedules(L"superseded");
         return;
     }
@@ -8290,7 +8318,7 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
             g_contactDown || g_hidSession.active || g_reveal.active ||
             g_reveal.edgeCandidate;
         if (g_reveal.active || g_reveal.edgeCandidate ||
-            g_reveal.deferred) {
+            g_reveal.granted) {
             g_reveal = HidRevealSession{};
             TraceLog(L"reveal dropped (window closed by shell)");
         }
@@ -8319,7 +8347,7 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     // retract. It is never adopted, so a landing can no longer log a touch
     // reopen.
     const int muted =
-        (g_hidSession.suppress || (g_reveal.deferred && g_reveal.edgeCandidate))
+        (g_hidSession.suppress || (g_reveal.granted && g_reveal.edgeCandidate))
             ? 1
             : 0;
     if (reason) {
@@ -8697,8 +8725,15 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
             considerQpc(g_reveal.lastAliveQpc + kCandidateIdleHoldMs);
         }
         // The latch and the identity clocks expire on the same 18 ms silence as
-        // a session, and only while no session owns the contact.
-        if (!g_hidSession.active && !g_reveal.edgeCandidate) {
+        // a session, and only while no session owns the contact. They are not
+        // armed while they could not act: a close in flight holds both (the
+        // quiet is the shell's hide), and a consumed contact whose name can
+        // prove the next one is ended by that report, not by a clock. A deadline
+        // that cannot act would spin the thread at the timer's smallest delay.
+        const bool holdLatch =
+            CloseInFlight(nowTick) ||
+            (g_hidSession.suppress && g_trackedContact.hasIdentifier);
+        if (!g_hidSession.active && !g_reveal.edgeCandidate && !holdLatch) {
             if (g_contactDown) {
                 considerTick(g_contactTick + kIdleReleaseMs);
             }
@@ -8855,6 +8890,65 @@ void FeedContactPoint(HidDevice& device, long rawX, long rawY, USHORT reportId,
     g_hidSession.lastRawY = rawY;
 }
 
+// Whether this report asserts a real contact at all. A button device asserts it
+// per slot; the coordinate-only fallback has only its Contact Count or a
+// non-origin position to say so. A hover (in range, tip up) asserts nothing.
+bool ReportAssertsContact(const HidDevice& device, const HidContactSlot* slots,
+                          int slotCount, HidField countField,
+                          ULONG topLevelCount) {
+    if (device.coordinatePath) {
+        if (countField == HidField::Ok) {
+            return topLevelCount > 0;
+        }
+        for (int i = 0; i < slotCount; ++i) {
+            if (slots[i].hasPosition && !slots[i].atOrigin) {
+                return true;
+            }
+        }
+        return false;
+    }
+    for (int i = 0; i < slotCount; ++i) {
+        if (SlotContactState(slots[i]) == HidContactState::Contact) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether a report that does not name the tracked contact proves a different
+// one. This is the evidence that ends a contact a close consumed: silence is
+// the shell's hide, not a lift, so the decoder cannot wait for the idle window
+// there. Another device cannot be the consumed contact. On the same device a
+// different asserted Contact Identifier, or a different asserted node when the
+// report names none of the tracked contact, is a new contact by the decoder's
+// own identity rule. This evidence ends the mute in a report; it does not let
+// the mute survive silence, because a node can be handed to the next finger.
+bool ReportProvesNewContact(const HidDevice& device, const HidContactSlot* slots,
+                            int slotCount, HidField countField,
+                            ULONG topLevelCount) {
+    if (!ReportAssertsContact(device, slots, slotCount, countField,
+                              topLevelCount)) {
+        return false;
+    }
+    if (g_trackedContact.device != device.handle) {
+        return true;
+    }
+    if (!g_trackedContact.hasIdentifier) {
+        // The node was not named (the caller decided that); an asserted node is
+        // a different one.
+        return true;
+    }
+    for (int i = 0; i < slotCount; ++i) {
+        if (SlotContactState(slots[i]) == HidContactState::Contact &&
+            slots[i].hasIdentifier) {
+            // The tracked identifier was not named (the caller decided that);
+            // this is a different one.
+            return true;
+        }
+    }
+    return false;
+}
+
 void FeedHidReport(HidDevice& device, const BYTE* report,
                    ULONG reportLength, uint64_t tickMs) {
     if (!device.ready || !device.preparsed) {
@@ -8921,158 +9015,186 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
     // fields finds nothing declared here and is dropped, instead of feeding a
     // zero that would synthesize a lift.
     if (g_trackedContact.slot >= 0) {
-        if (g_trackedContact.device != device.handle) {
-            return;
-        }
+        do {
+            if (g_trackedContact.device != device.handle) {
+                // A consumed contact ends on evidence, and another device's
+                // asserted contact is evidence: this report cannot be the finger
+                // the close consumed. A hover on the other device is not.
+                if (!g_hidSession.suppress ||
+                    !ReportProvesNewContact(device, slots, slotCount, countField,
+                                            topLevelCount)) {
+                    return;
+                }
+                TraceLog(L"hid consumed ended slot=%d id=%lu reason=device",
+                        g_trackedContact.slot, g_trackedContact.identifier);
+                EndConsumedContact();
+                break;
+            }
 
-        int trackedSlot = -1;
-        if (g_trackedContact.hasIdentifier) {
-            // The identifier decides: a slot that now carries a different one is
-            // another contact, even at the index the tracked contact last used.
-            // An unused slot can keep or zero its identifier, so a slot that
-            // positively asserts contact wins over one that merely carries the
-            // name; when two assert it, the tracked slot is the one taken and the
-            // ambiguity is logged once.
-            int firstMatch = -1;
-            int trackedMatch = -1;
-            int assertedMatch = -1;
-            int assertedCount = 0;
-            for (int i = 0; i < slotCount; ++i) {
-                if (!slots[i].hasIdentifier ||
-                    slots[i].identifier != g_trackedContact.identifier) {
-                    continue;
-                }
-                if (firstMatch < 0) {
-                    firstMatch = i;
-                }
-                if (i == g_trackedContact.slot) {
-                    trackedMatch = i;
-                }
-                if (SlotContactState(slots[i]) == HidContactState::Contact) {
-                    assertedCount++;
-                    if (assertedMatch < 0 || i == g_trackedContact.slot) {
-                        assertedMatch = i;
+            int trackedSlot = -1;
+            if (g_trackedContact.hasIdentifier) {
+                // The identifier decides: a slot that now carries a different one is
+                // another contact, even at the index the tracked contact last used.
+                // An unused slot can keep or zero its identifier, so a slot that
+                // positively asserts contact wins over one that merely carries the
+                // name; when two assert it, the tracked slot is the one taken and the
+                // ambiguity is logged once.
+                int firstMatch = -1;
+                int trackedMatch = -1;
+                int assertedMatch = -1;
+                int assertedCount = 0;
+                for (int i = 0; i < slotCount; ++i) {
+                    if (!slots[i].hasIdentifier ||
+                        slots[i].identifier != g_trackedContact.identifier) {
+                        continue;
+                    }
+                    if (firstMatch < 0) {
+                        firstMatch = i;
+                    }
+                    if (i == g_trackedContact.slot) {
+                        trackedMatch = i;
+                    }
+                    if (SlotContactState(slots[i]) == HidContactState::Contact) {
+                        assertedCount++;
+                        if (assertedMatch < 0 || i == g_trackedContact.slot) {
+                            assertedMatch = i;
+                        }
                     }
                 }
-            }
-            if (assertedMatch >= 0) {
-                trackedSlot = assertedMatch;
-                if (assertedCount > 1 && !g_duplicateContactIdLogged) {
-                    g_duplicateContactIdLogged = true;
-                    TraceLog(L"hid contact id=%lu declared down in %d slots; "
-                            L"using=%d",
-                            g_trackedContact.identifier, assertedCount,
-                            trackedSlot);
+                if (assertedMatch >= 0) {
+                    trackedSlot = assertedMatch;
+                    if (assertedCount > 1 && !g_duplicateContactIdLogged) {
+                        g_duplicateContactIdLogged = true;
+                        TraceLog(L"hid contact id=%lu declared down in %d slots; "
+                                L"using=%d",
+                                g_trackedContact.identifier, assertedCount,
+                                trackedSlot);
+                    }
+                } else {
+                    // Nothing asserts contact: the tracked slot is the best evidence
+                    // left, else the first slot that carries the name.
+                    trackedSlot = trackedMatch >= 0 ? trackedMatch : firstMatch;
                 }
-            } else {
-                // Nothing asserts contact: the tracked slot is the best evidence
-                // left, else the first slot that carries the name.
-                trackedSlot = trackedMatch >= 0 ? trackedMatch : firstMatch;
             }
-        }
-        if (trackedSlot < 0 && g_trackedContact.slot < slotCount &&
-            slots[g_trackedContact.slot].declared) {
-            // No identifier names the contact in this report: the node index it
-            // was last seen in is the only name left. A slot that does declare a
-            // different identifier is another contact, not a silent return of
-            // this one.
-            const HidContactSlot& candidate = slots[g_trackedContact.slot];
-            const bool namesAnother =
-                g_trackedContact.hasIdentifier && candidate.hasIdentifier &&
-                candidate.identifier != g_trackedContact.identifier;
-            if (!namesAnother) {
-                trackedSlot = g_trackedContact.slot;
+            if (trackedSlot < 0 && g_trackedContact.slot < slotCount &&
+                slots[g_trackedContact.slot].declared) {
+                // No identifier names the contact in this report: the node index it
+                // was last seen in is the only name left. A slot that does declare a
+                // different identifier is another contact, not a silent return of
+                // this one.
+                const HidContactSlot& candidate = slots[g_trackedContact.slot];
+                const bool namesAnother =
+                    g_trackedContact.hasIdentifier && candidate.hasIdentifier &&
+                    candidate.identifier != g_trackedContact.identifier;
+                if (!namesAnother) {
+                    trackedSlot = g_trackedContact.slot;
+                }
             }
-        }
-        if (trackedSlot < 0) {
-            if (g_trackedContact.slot >= slotCount) {
-                // The device table recycled this handle into a device with fewer
-                // contact nodes: the index the contact was last seen on cannot
-                // name anything in this report any more.
+            if (trackedSlot < 0) {
+                // A consumed contact is the one case where this report may be the
+                // next down rather than silence about this one: its own name is
+                // the evidence that ends it. A report that names nothing stays
+                // inert, and the idle fallback in CheckHidIdleRelease covers a
+                // device whose name cannot answer.
+                if (g_hidSession.suppress &&
+                    ReportProvesNewContact(device, slots, slotCount, countField,
+                                           topLevelCount)) {
+                    TraceLog(L"hid consumed ended slot=%d id=%lu "
+                            L"reason=new-contact",
+                            g_trackedContact.slot,
+                            g_trackedContact.identifier);
+                    EndConsumedContact();
+                    break;
+                }
+                if (g_trackedContact.slot >= slotCount) {
+                    // The device table recycled this handle into a device with fewer
+                    // contact nodes: the index the contact was last seen on cannot
+                    // name anything in this report any more.
+                    ForgetTrackedContact();
+                }
+                // This report says nothing about the tracked contact. It is not a
+                // lift: only the contact's own declared tip-up or in-range clear is,
+                // and the idle window ends a contact that really went away.
+                return;
+            }
+
+            const HidContactSlot& slot = slots[trackedSlot];
+            // A name is not evidence. This report names the tracked contact, but it
+            // may carry neither a point nor an asserted tip, and such a report must
+            // not hold the tracker: after a refused admission the latch is clear, so
+            // no lift and no latch cleanup could ever release this identity.
+            // `lastEvidenceTick` therefore moves only where the report proves the
+            // contact — an asserting tip or in-range bit below, or a point this path
+            // feeds — and a name-only report updates the slot and the name
+            // (diagnostics, and the identity the expiry line prints) and nothing
+            // else.
+            // A contact the report names is named by that name from here on, so a
+            // later slot reassignment cannot transfer the gesture.
+            if (slot.hasIdentifier) {
+                g_trackedContact.hasIdentifier = true;
+                g_trackedContact.identifier = slot.identifier;
+            }
+            g_trackedContact.slot = trackedSlot;
+
+            const HidContactState state = SlotContactState(slot);
+            if (state == HidContactState::NotContact) {
+                // The tracked contact ended: its declared tip went up (a pen lift) or
+                // its declared in-range bit cleared. No other slot in this report
+                // restarts it. `Unknown` never ends it: a report that carries no
+                // contact field for the slot cannot speak for the contact.
+                TraceLog(L"hid tracked notcontact field=%d tip=%d tipdown=%d range=%d "
+                        L"rangedown=%d id=%d count=%d coord=%d report=%u pos=%d",
+                        static_cast<int>(slot.buttons.field),
+                        slot.buttons.tipDeclared ? 1 : 0,
+                        slot.buttons.tipDown ? 1 : 0,
+                        slot.buttons.inRangeDeclared ? 1 : 0,
+                        slot.buttons.inRangeDown ? 1 : 0,
+                        slot.hasIdentifier ? 1 : 0,
+                        countField == HidField::Ok ? topLevelCount : -1,
+                        device.coordinatePath ? 1 : 0, reportId,
+                        slot.hasPosition ? 1 : 0);
                 ForgetTrackedContact();
+                OnHidSample(0, 0.0f, 0.0f, tickMs);
+                return;
             }
-            // This report says nothing about the tracked contact. It is not a
-            // lift: only the contact's own declared tip-up or in-range clear is,
-            // and the idle window ends a contact that really went away.
-            return;
-        }
-
-        const HidContactSlot& slot = slots[trackedSlot];
-        // A name is not evidence. This report names the tracked contact, but it
-        // may carry neither a point nor an asserted tip, and such a report must
-        // not hold the tracker: after a refused admission the latch is clear, so
-        // no lift and no latch cleanup could ever release this identity.
-        // `lastEvidenceTick` therefore moves only where the report proves the
-        // contact — an asserting tip or in-range bit below, or a point this path
-        // feeds — and a name-only report updates the slot and the name
-        // (diagnostics, and the identity the expiry line prints) and nothing
-        // else.
-        // A contact the report names is named by that name from here on, so a
-        // later slot reassignment cannot transfer the gesture.
-        if (slot.hasIdentifier) {
-            g_trackedContact.hasIdentifier = true;
-            g_trackedContact.identifier = slot.identifier;
-        }
-        g_trackedContact.slot = trackedSlot;
-
-        const HidContactState state = SlotContactState(slot);
-        if (state == HidContactState::NotContact) {
-            // The tracked contact ended: its declared tip went up (a pen lift) or
-            // its declared in-range bit cleared. No other slot in this report
-            // restarts it. `Unknown` never ends it: a report that carries no
-            // contact field for the slot cannot speak for the contact.
-            TraceLog(L"hid tracked notcontact field=%d tip=%d tipdown=%d range=%d "
-                    L"rangedown=%d id=%d count=%d coord=%d report=%u pos=%d",
-                    static_cast<int>(slot.buttons.field),
-                    slot.buttons.tipDeclared ? 1 : 0,
-                    slot.buttons.tipDown ? 1 : 0,
-                    slot.buttons.inRangeDeclared ? 1 : 0,
-                    slot.buttons.inRangeDown ? 1 : 0,
-                    slot.hasIdentifier ? 1 : 0,
-                    countField == HidField::Ok ? topLevelCount : -1,
-                    device.coordinatePath ? 1 : 0, reportId,
-                    slot.hasPosition ? 1 : 0);
-            ForgetTrackedContact();
-            OnHidSample(0, 0.0f, 0.0f, tickMs);
-            return;
-        }
-        // A coordinate-only device cannot assert its contact, so the old
-        // fallback's lift rule decides here too, even after the contact is
-        // tracked: Contact Count 0 is the lift (the position fields often keep
-        // their last value), and a zero pair is the no-position report its lift
-        // looks like, not a point at the screen corner.
-        if (device.coordinatePath && countField == HidField::Ok &&
-            topLevelCount == 0) {
-            ForgetTrackedContact();
-            OnHidSample(0, 0.0f, 0.0f, tickMs);
-            return;
-        }
-        if (!slot.hasPosition) {
-            // A contact that is asserted but carries no point in this report is
-            // still down. It refreshes the liveness clock without feeding a
-            // position: silence used to end a contact that was being asserted,
-            // and the same finger could then start a second gesture. The
-            // identifier alone is not evidence: a device whose unused slots keep
-            // or zero their ids would keep a stale finger alive and every other
-            // device out.
-            if (state == HidContactState::Contact) {
-                g_trackedContact.lastEvidenceTick = tickMs;  // asserted, not named
-                NoteContactAlive(tickMs);
+            // A coordinate-only device cannot assert its contact, so the old
+            // fallback's lift rule decides here too, even after the contact is
+            // tracked: Contact Count 0 is the lift (the position fields often keep
+            // their last value), and a zero pair is the no-position report its lift
+            // looks like, not a point at the screen corner.
+            if (device.coordinatePath && countField == HidField::Ok &&
+                topLevelCount == 0) {
+                ForgetTrackedContact();
+                OnHidSample(0, 0.0f, 0.0f, tickMs);
+                return;
             }
+            if (!slot.hasPosition) {
+                // A contact that is asserted but carries no point in this report is
+                // still down. It refreshes the liveness clock without feeding a
+                // position: silence used to end a contact that was being asserted,
+                // and the same finger could then start a second gesture. The
+                // identifier alone is not evidence: a device whose unused slots keep
+                // or zero their ids would keep a stale finger alive and every other
+                // device out.
+                if (state == HidContactState::Contact) {
+                    g_trackedContact.lastEvidenceTick = tickMs;  // asserted, not named
+                    NoteContactAlive(tickMs);
+                }
+                return;
+            }
+            if (device.coordinatePath && slot.atOrigin) {
+                // A zero pair on the count/position path is its no-position report:
+                // there is no point to feed and therefore none to count as evidence.
+                return;
+            }
+            // A point this path is about to feed is the other half of the evidence
+            // rule; it is written before the feed, so a feed that ends the contact
+            // cannot leave a clock behind on a forgotten identity.
+            g_trackedContact.lastEvidenceTick = tickMs;
+            FeedContactPoint(device, slot.rawX, slot.rawY, reportId,
+                             collections[trackedSlot], tickMs);
             return;
-        }
-        if (device.coordinatePath && slot.atOrigin) {
-            // A zero pair on the count/position path is its no-position report:
-            // there is no point to feed and therefore none to count as evidence.
-            return;
-        }
-        // A point this path is about to feed is the other half of the evidence
-        // rule; it is written before the feed, so a feed that ends the contact
-        // cannot leave a clock behind on a forgotten identity.
-        g_trackedContact.lastEvidenceTick = tickMs;
-        FeedContactPoint(device, slot.rawX, slot.rawY, reportId,
-                         collections[trackedSlot], tickMs);
-        return;
+        } while (false);
     }
 
     if (!anyDeclared) {
@@ -9136,7 +9258,9 @@ void FeedHidReport(HidDevice& device, const BYTE* report,
         }
         // This fallback has only positions, so the contact is named by its node
         // index: an identifier with nothing asserting the contact would name a
-        // stale one.
+        // stale one. A node can be handed to the next finger on this path, so the
+        // name cannot prove a new contact; a consumed contact ends on the idle
+        // fallback instead.
         g_trackedContact.device = device.handle;
         g_trackedContact.slot = chosen;
         g_trackedContact.hasIdentifier = false;

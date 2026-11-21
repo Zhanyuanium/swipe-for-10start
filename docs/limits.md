@@ -172,6 +172,21 @@ Win press opens exactly once; the transition itself is never synthesized.
   report and still ends the gesture with `src=report`; a genuine silence after
   those windows ends it with `src=idle`. A held release arms no deadline at all:
   the hold ends on the cloak event or on the executor's answer.
+- **Silence is not a lift for a contact a close consumed.** The latch and the
+  dismiss mute survive the quiet through the hide: while a close is in flight no
+  idle expiry runs at all. A consumed contact ends on its lift report or on a
+  report that proves a new contact (another device, a different asserted
+  identifier, or a different asserted node on a device that names no contacts;
+  `hid consumed ended ... reason=new-contact|device`). One with a Contact
+  Identifier also survives silence. A node index can be
+  handed to the next finger and the coordinate-only path has no name, so those
+  two fall back to the idle fallbacks once the close has ended (the 120 ms
+  candidate watchdog, then the 18 ms latch). Its risk is the
+  original defect, narrowed to those devices: a consumed finger that stays
+  silent past the landing and then resumes is read as a new down. On a Contact
+  Identifier the mute holds until evidence, so the residual there is the other
+  way: a device that reuses an identifier after a lost lift makes the next
+  finger a continuation until it lifts.
 - **The cold entry is 0.000.** The first open after a host start has no settled
   geometry (the measurement is deferred while the panel is owned), so the settle
   starts at 0 and the takeover chases. A warm bottom auto-hidden open uses 0.255
@@ -224,6 +239,13 @@ Win press opens exactly once; the transition itself is never synthesized.
   finger's panel drag is its only producer, but no `close dismiss kind=…` excerpt
   was captured. Take one the next time the mod is touched: that line is the only
   evidence separating the HID producer from the click-away one.
+- **Still owed:** a consumed finger that is silent through a landing and then
+  resumes. The virtual digitizer cannot deliver it (an injected contact that stops
+  moving decays and answers `InjectTouchInput failed: 1460`), so the rule is
+  supported by the decode path and the mute, not by a capture: a report that names
+  the consumed contact is inert, and only a proven different contact ends the
+  mute (`hid consumed ended ... reason=new-contact|device`). A real finger resting
+  through a Win close and then moving is the one run that closes it.
 
 ## Not attempted
 

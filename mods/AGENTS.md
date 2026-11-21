@@ -173,7 +173,7 @@ core (see [../docs/limits.md](../docs/limits.md)).
   be inside the band. During a close the point is hit-tested against the surface
   the retract still shows — its mapped progress
   (`RevealProgressDip`) at or above the panel's live one (`PeekProgressNow`) — or
-  the band: a granted grab logs `reason=deferred`, and a point in the area the
+  the band: a granted grab logs `reason=grab`, and a point in the area the
   retract has left, or one that cannot be judged (no renderer, stale layout, no
   distance), logs `reason=offsurface` or its own refusal and is muted for the
   rest of the contact. The show request moved to `TryClaimRevealOpen`, which runs
@@ -198,9 +198,9 @@ core (see [../docs/limits.md](../docs/limits.md)).
   mapped finger for an ordinary follow and `mapped - liveOffset` for a live one:
   the interrupted retract keeps the finger-to-panel offset it took over instead of
   being driven toward the finger's absolute coordinate. A grab never activates
-  here; only the transfer that clears its deferral hands it the panel. The
+  here; only the transfer that clears its grant hands it the panel. The
   candidate branch in `UpdateRevealSession` requires the same 24 DIP signed inward
-  travel (or `openClaimAttempted`), so a stationary finger on a shown
+  travel (or `claimAttempted`), so a stationary finger on a shown
   but off-rest panel never acquires `Progress`.
 - `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
   schedule point, not a Windows-key tap. A dismiss that cannot be published
@@ -267,8 +267,18 @@ core (see [../docs/limits.md](../docs/limits.md)).
   The window still governs admission and the unhealed rule.
 - The 18 ms idle is a one-shot deadline armed at the last report, and it is held
   through a touch show and through a close in flight, so
-  the digitizer's pause during the key/hide cannot drop the contact. A band
-  candidate has its own watchdog (`kCandidateIdleHoldMs`, 120 ms): a sparse
+  the digitizer's pause during the key/hide cannot drop the contact. A contact
+  the close consumed keeps its latch and its mute through that pause: no idle
+  expiry runs while a close is in flight, and a consumed contact ends only on
+  its lift report or on a report that proves a new contact (another device, a
+  different identifier, or a different asserted node on a device that names no
+  contacts; the decoder logs
+  `hid consumed ended ... reason=new-contact|device`). One with a Contact
+  Identifier also survives silence. A node index can be
+  handed to the next finger and the coordinate-only path has no name, so those
+  keep the idle fallbacks (the candidate's 120 ms watchdog, then the 18 ms
+  latch) once the close has ended. A
+  band candidate has its own watchdog (`kCandidateIdleHoldMs`, 120 ms): a sparse
   report stream must not expire an admitted flick before it reaches 24 DIP, and
   its release clears the latch, the origin, the open-check cache and the
   tracked identity. `newContact` is `!g_contactDown` in both sample handlers: a
@@ -280,7 +290,10 @@ machinery, the `win open continued` ticket (its stamp sat behind the follow's
 own `CloseInFlight` guard, so it never fired) and the two-curve style switch.
 The landing's finger adoption went with them: `RevealPullQualified`, the touch
 branch of `BeginLandingOpen`, the landing's deferral release and release-record
-consumption (`reveal reopen after close`, `reveal defer released`). A close
+consumption (`reveal reopen after close`, `reveal defer released`). The
+late-release record lost its `deferred` and `readyQpc` fields with the same
+rule: its window is measured from the release, and no landing consumes a record.
+A close
 consumes every contact on the glass, and a grab gets one transfer attempt.
 The remaining close scheduler is the one dismiss path. 0.7.0 also deletes the
 fixed-address gate (the file-version compare, the executable-range check, both

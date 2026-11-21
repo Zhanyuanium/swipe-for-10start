@@ -43,8 +43,8 @@ and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry
 and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
 from the panel's position), the one close path (`TakeProgressNow` → mirrored
 settle → scheduled `exec dismiss`), the grab's down hit-test and its one
-transfer attempt (a refusal consumes the contact and the landing adopts no
-finger), the gates and settle ownership.
+transfer attempt (a refusal consumes the contact, the landing adopts no finger,
+and silence never releases a consumed contact), the gates and settle ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
 start-speed seam, the mirrored close, the coast, and the measured lines.

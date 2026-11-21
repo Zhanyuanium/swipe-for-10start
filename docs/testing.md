@@ -251,7 +251,7 @@ Start button must log one shell open (`exec show ... method=11`) and no band
 claim. Then pull 23 DIP and 25 DIP and lift: the first requests nothing from this
 mod (the shell's own gesture may open it), the second requests one show. Finally
 hold a contact still in the band through a Win close: its down is admitted as a
-grab (`reveal admit ... reason=deferred`), it never reaches 24 DIP, and the
+grab (`reveal admit ... reason=grab`), it never reaches 24 DIP, and the
 landing consumes it (`win close observed ... muted=1`) with no `exec show`. A
 grab that does reach 24 DIP after the retract has passed the entry logs
 `reveal pull qualified ... grab=refused reason=offsurface` and opens nothing; the
@@ -305,7 +305,8 @@ progress 0.
 
 The second row pair is the interruption baseline as the mod behaved before a pull
 could abort a close. The pull is admitted while the
-close is in flight (`reveal admit ... reason=deferred`), qualifies at 25 DIP and
+close is in flight (`reveal admit ... reason=deferred`; that build's name for
+the grant, now `reason=grab`), qualifies at 25 DIP and
 is released inside the close. Every retract landmark of the pull runs stays within
 14 ms of the plain runs — the two plain runs alone differ by up to 13 ms from each
 other at the same landmarks — and no sample shows a plateau or a reversal. That
@@ -314,7 +315,7 @@ gesture-close slot was cancellable. What it leaves behind is a
 reopen: the panel is visible again at `tc` 710 and 736, after the landing, which
 that build logged as `reveal reopen after close pull=0 late=1` — the release
 record, not a live contact, took the menu back. These four CSV pairs stay as the
-deferred-path reference; a pull that interrupts a Win close now logs
+grab-path reference; a pull that interrupts a Win close now logs
 `reveal takeover ... live=1` in the same millisecond as the qualifying report,
 and the retract reverses there instead of reaching the landing. The delayed
 reopen itself is gone: under the current rule a grab that the close outruns is
@@ -333,7 +334,7 @@ second trigger at `tc` 150:
 | Win tap, `panel-edge-interrupt-wintap-1.csv` | 2045 px (p 0.979) at `tc` 208 | `tc` 363 | `own toggle decide ... kind=open dir=2` 141 ms after the close tap, `exec cancel seq=38 target=36`, `intent open cancel from=0.976 ticket=1 ticket_seq=36`, `settle style=win11 dir=open vel=0.00 dur=160 remaining=34`; no `win close observed` |
 
 Both runs ended with the menu open (`STATE at exit cloaked=0 open=True`), against a
-deferred baseline that reached 98-175 px and hid. The close had retracted 38 px
+pre-interrupt baseline that reached 98-175 px and hid. The close had retracted 38 px
 (pull) and 60 px (Win) of its 2105 before the interruption: the pull spends its own
 24 DIP before it can qualify (~130 ms of a 520 ms close) and the press was dated
 141 ms after the tap. The reversal's first visible frame lags its decision line by
@@ -391,6 +392,10 @@ The hit test compares the down's mapped progress with the panel's live one: at o
 below it, the panel's trail edge is at or beyond the point, so the point is on the
 surface.
 
+The P1 rows above were captured on the build that named the grant
+`reason=deferred`; P3 renamed the same line to `reason=grab` and the flag to
+`granted`. The measured text is kept as captured.
+
 `tools/smoke.ps1` stays green on this build.
 
 ### The one-take transfer (P2)
@@ -417,6 +422,23 @@ The `dispatch` refusal (`reason=dispatch`, a published dismiss at or past its
 deadline) is unreachable in practice on this build: past the deadline the retract
 is already at or below the entry, so `offsurface` answers first. It stays as the
 serialisation rule that makes the promise conditional.
+
+### A consumed contact and silence (P3)
+
+A contact the close consumed keeps its mute through the digitizer's quiet: silence
+never ends it while a close is in flight, and a contact with a Contact Identifier
+never ends by silence at all. Measured through the hide with a live band finger: a
+Win close during the pull landed with `win close observed muted=1`, and the finger
+produced no `reveal admit`, no `exec show` and no reopen while it stayed down.
+
+The remaining case — a consumed finger that is *silent* through the landing and
+then resumes — cannot be reproduced with the virtual digitizer: an injected
+contact that stops moving decays and answers `InjectTouchInput failed: 1460` when
+it is touched again, so the instrument cannot deliver the report that would
+matter. On this build such a report is inert when it names the consumed contact
+(same Contact Identifier) and ends the mute only when it proves another one
+(`hid consumed ended ... reason=new-contact|device`). A real digitizer is the
+authority for that sequence, and it stays on the hardware list.
 
 ## Artifacts
 

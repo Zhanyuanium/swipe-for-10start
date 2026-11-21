@@ -169,7 +169,17 @@ until it lifts, every later report is inert, and its release leaves no record. A
 close also consumes every contact that was already on the glass when it started.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
-landing adopts no finger: after `win close observed` the controller issues no
+contact the close consumed keeps its latch and its mute through that quiet:
+silence never ends them. While a close is in flight no idle expiry runs at all,
+and a consumed contact ends only on its lift report or on a report that proves a
+new contact (another device, a different identifier, or a different asserted node
+on a device that names no contacts;
+`hid consumed ended ... reason=new-contact|device`). One with a Contact
+Identifier also survives silence. A node index
+can be handed to the next finger and the coordinate-only path has no name, so
+those keep the idle fallbacks (the candidate's 120 ms watchdog, then the 18 ms
+latch) once the close has ended.
+A landing adopts no finger: after `win close observed` the controller issues no
 touch show, and no hover, carried travel or release record turns a landed close
 into a Show; a contact still down is inert until it lifts (`win close observed
 ... muted=1`). The only open a landing still serves is the explicit, independently
@@ -201,12 +211,15 @@ quoted.
 
 Deleted in M3: the `VK_LWIN` tap, the close record and its publishes, the retract
 request/answer and its cancel answer, the arbitration hold, the deferred
-candidate **as an arbitration mechanism**, and the reveal claim. The deferred
-candidate still has one live use, and it is not arbitration:
-`BeginEdgeCandidate` (the down's admission) calls `StartRevealFollow`
-with `deferred=true` while `CloseInFlight`, so a grab is tracked without writing
-`Progress`; its one transfer attempt is the pull cancel, and a refused transfer
-consumes it — the landing no longer releases it. `CloseInFlight` remains only as
+candidate **as an arbitration mechanism**, and the reveal claim. The one live
+use the old candidate left is not arbitration: `BeginEdgeCandidate` (the down's
+admission) calls `StartRevealFollow` with `granted=true` while `CloseInFlight`,
+so a grab is tracked without writing `Progress`; its one transfer attempt is the
+pull cancel, and a refused transfer consumes it — the landing no longer releases
+it. The reveal flag that says so is `granted` (not `deferred`), and the claim
+attempt is `claimAttempted`. The late-release record's `deferred` and `readyQpc`
+fields are deleted: its window is measured from the release, and no landing
+consumes a record. `CloseInFlight` remains only as
 the suppression-window predicate: the settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
 `CloseInFlight` early return that guards the follow, so it could never fire; the
@@ -236,15 +249,24 @@ the peer epoch.
 
 Windows 11 10.0.26100.9949, ExplorerPatcher legacy Start
 (`Start_ShowClassicMode=1`), 2880x1800 physical at 200 % (1440x900 DIP).
-**Current layout: left, docked** (`axis=0`): work `48,0,1440,900`, the bar at
-`0,0..48,900` (96 physical wide), band `0..96`, panel `60,151..1053,726`, trail
-1053, Distance 1392; measured 2026-11-21. The bottom docked layout (work
-`0,0,1440,852`, tray `0,852..1440,900`, band `804..900`, Distance 852), the
-bottom auto-hidden layout (work `0,0,1440,900`, band `804..900`, panel
-`236,265..1229,840`, trail 265) and the earlier bottom auto-hidden variant (panel
-`236,167..1229,840`, trail 167) are historical; their numbers are not the current
-ones. The smoke reads the axis, band, panel rectangle and scale from the mod's own
-log lines, so it runs on whichever edge is live.
+**The bar is not pinned to an edge.** The controller derives the axis, band, panel
+rectangle, `Distance` and scale from the live geometry on every read, and the
+tools read the same numbers from the mod's own lines (`reveal panelTrail`,
+`gesture geometry`, the `dismiss` bar thickness), so the mod, the smoke and the
+edge tracker run on whichever edge the user docks to. Measured on this machine,
+each on the layout it names:
+
+| layout | axis | work | band | panel rect | trail | Distance | measured |
+|---|---|---|---|---|---|---|---|
+| left, docked | 0 | `48,0,1440,900` | `0..96` | `60,151..1053,726` | 1053 | 1392 | 2026-11-21 |
+| bottom, docked | 3 | `0,0,1440,852` | `804..900` | `236,265..1229,840` | 265 | 852 | 2026-11-20 |
+| bottom, auto-hidden | 3 | `0,0,1440,900` | `804..900` | `236,279..1229,840` | 279 | 900 | 2026-11-22 |
+
+The bottom auto-hidden entry is 0.310 at the work edge and 0.363 at the bar's
+inner edge; an earlier auto-hidden run measured panel `236,167..1229,840` with
+trail 167, and its numbers are historical. Top (`axis=1`) and right (`axis=2`)
+are implemented and **unverified on this machine**: the code path is the same
+`TrailEdge`/`AxisDirection` mapping, but no run has measured them.
 
 ## Rules
 
