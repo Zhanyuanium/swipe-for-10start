@@ -120,6 +120,13 @@ travel (387 ms at the current 852 DIP; 409 at the docked 900), no seam speed,
 from the live position. The dismiss
 is scheduled, not immediate, so the panel is never hidden mid-slide.
 
+A touch contact that lands during a gesture close does not cancel it on the
+down. When the same contact crosses 24 DIP inward it becomes a qualified pull:
+`CancelCloseForQualifiedPull` drops the armed local dismiss, clears the
+suppression, republishes the open direction and settles the panel back from its
+live position. A contact that never travels leaves the close to run; a tap that
+never enters the band has no candidate and cannot cancel anything.
+
 A press while the close runs is recovered, not guaranteed. `IntentShouldClose`
 reads the controller's phase, so a press during the retract is an open:
 - a gesture close still settling publishes open at once; the Start side drops

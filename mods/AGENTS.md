@@ -106,9 +106,11 @@ the consumer withdraws before it unregisters its devices.
 - `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
   schedule point, not a Windows-key tap. A dismiss that cannot be published
   releases the ownership.
-- The pull cancel (`OnHidSampleStep`, a new contact while the dismiss is armed)
-  drops both schedules and republishes the open direction, so a menu that stays
-  open is an owned open again.
+- The pull cancel (`CancelCloseForQualifiedPull`, called from
+  `TryClaimRevealOpen`) is the only abort of a close this mod still owns: it
+  drops both schedules and republishes the open direction once the contact has
+  crossed 24 DIP inward. Contact-down no longer cancels anything; a tap leaves
+  the close alone.
 - `win close observed` — after the landing, a pull still down (or a release
   inside the 300 ms window) issues one fresh show and the open adopts it:
   `reveal reopen after close pull=1 late=0 entry=...`. The pull that was under
