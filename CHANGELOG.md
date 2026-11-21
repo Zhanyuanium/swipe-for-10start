@@ -1,13 +1,13 @@
 # Changelog
 
-A tag is the release: it names the pair of mods that shipped together. Each mod
-carries its own Windhawk `@version`, shown in Windhawk's mod list, and the two
-numbers move independently of the tag. Install both mods from the same tag: the
-shared-memory channel version refuses a mismatched pair, and the bridge then
-serves nothing.
+A tag is the release. Up to `v0.6.2` it named a pair of mods, each with its own
+Windhawk `@version`; from `v0.7.0` it names one mod whose `@version` is the tag
+without the `v`. The Start/Bridge columns below are historical: they describe the
+pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
+| `v0.7.0` | 0.7.0 | — | 216 B | one mod, two processes: the collection's review answered (symbol hooks, no pin, deadline-driven wakeups, tap rejection, lean channel) |
 | `v0.6.2` | 0.44.0 | 0.25.0 | v7 | M3.3: one controller, one executor |
 | `v0.6.1` | 0.40.0 | 0.21.0 | v4 | intent direction from the controller state; no press lost after a gesture close |
 | `v0.6.0` | 0.39.0 | 0.20.0 | v4 | `PanelController` owns the toggle; the bridge executes `Show`/`Dismiss`; presses latched through a hide |
@@ -20,6 +20,41 @@ serves nothing.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.7.0 — one mod, two processes
+
+Windhawk `@version` 0.7.0. The pair is replaced by one mod, installed once and
+loaded into both `explorer.exe` and `StartMenuExperienceHost.exe`; the role is
+picked at init from the process image name, so the halves can never be installed
+or updated separately.
+
+Answers to the collection's review of the two submissions:
+
+- **Symbols instead of addresses.** `StartUI::App::PrepareRootElement` and the
+  thirteen `twinui.pcshell.dll` functions are resolved by public symbol on the
+  mod's own threads, so the PDB fetch never blocks a host. When the private
+  launcher layout does not match the reference image, the offset-dependent
+  capability stays off and presses run natively.
+- **No image pin.** Unloading joins every owned thread, runs the UI teardown turn,
+  destroys the launcher and raw-input windows, and unregisters both fixed classes
+  before the channel closes; there is no "residual" success.
+- **No periodic tick.** Deadlines arm a single one-shot and the open/close state is
+  a WinEvent with a bounded fallback. Idle with the menu closed measures about 9
+  wakes/s and no DWM queries, down from about 190 wakes/s and 32 queries/s.
+- **A tap does not open Start.** An in-band contact only records a candidate; the
+  show is requested after 24 DIP of inward travel. The shell's own edge gesture
+  remains the fallback.
+- **A lean channel.** Five named objects and a 216-byte record; the version word is
+  gone (the namespace is the ABI identity) and so is the debug command channel.
+- **A user-facing store page.** The README block describes the gesture, the two
+  settings and the limits; the design notes stay in this repository.
+- **Close identity.** A landing is bound to its dismiss command and open
+  generation; a confirmation that disagrees with the cloak sample is retained for
+  the transition within a bounded wait, and a fresh open retires it.
+
+The trace file is no longer written by default: every decision line goes to
+`Wh_Log`, and the per-role file is written only while the `DiagnosticTrace`
+setting is on (capped at 20,000 lines).
 
 ## v0.6.2 — M3.3
 
