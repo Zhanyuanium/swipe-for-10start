@@ -293,13 +293,18 @@ void TraceLog(const wchar_t* format, ...) {
     WCHAR line[1024] = {};
     _snwprintf_s(line, ARRAYSIZE(line), _TRUNCATE, L"t=%llu %s",
                  static_cast<unsigned long long>(GetTickCount64()), message);
-    // Four bytes per wide char at most: the fixed line buffer always fits.
-    char utf8[4096] = {};
-    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8),
+    // Four bytes per wide char at most: 4096 for the text, two for the CRLF.
+    char utf8[4098] = {};
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8) - 2,
                                     nullptr, nullptr);
     if (bytes <= 1) {
         return;
     }
+    // One WriteFile per line, CRLF included: a single append is atomic against
+    // the other activation's lines, two calls could interleave and tear both.
+    utf8[bytes - 1] = '\r';
+    utf8[bytes] = '\n';
+    const DWORD lineBytes = static_cast<DWORD>(bytes + 1);
 
     AcquireSRWLockExclusive(&g_traceLock);
     if (!g_traceSeeded) {
@@ -341,8 +346,7 @@ void TraceLog(const wchar_t* format, ...) {
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
-        WriteFile(file, utf8, static_cast<DWORD>(bytes - 1), &written, nullptr);
-        WriteFile(file, "\r\n", 2, &written, nullptr);
+        WriteFile(file, utf8, lineBytes, &written, nullptr);
         ++g_traceLines;
         CloseHandle(file);
     }
