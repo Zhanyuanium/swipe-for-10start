@@ -8910,6 +8910,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // iteration.
     bool timerArmed = false;
     bool fallbackArmed = false;
+    DWORD fallbackPeriod = 0;
     bool timerFailLogged = false;
     // The consumer is ready here: the window exists, both raw-input usages have
     // been registered (a refused registration is logged and leaves the intent
@@ -8968,48 +8969,61 @@ DWORD WINAPI HidInputThread(LPVOID) {
         // from the plan and its arm is undone here, not in each handler.
         const uint64_t nowTick = GetTickCount64();
         const uint64_t deadlineMs = NextInputDeadlineMs(nowTick, QpcMsNow());
-        if (deadlineTimer) {
-            if (deadlineMs != 0) {
-                const bool armed = ArmDeadlineTimer(deadlineTimer, deadlineMs);
-                if (!armed && !timerFailLogged) {
-                    timerFailLogged = true;
-                    TraceLog(L"hid timer arm failed err=%u",
-                            static_cast<unsigned>(GetLastError()));
-                }
-                timerArmed = armed;
-            } else if (timerArmed) {
-                DisarmDeadlineTimer(deadlineTimer);
-                timerArmed = false;
+        if (deadlineTimer && deadlineMs != 0) {
+            const bool armed = ArmDeadlineTimer(deadlineTimer, deadlineMs);
+            if (!armed && !timerFailLogged) {
+                timerFailLogged = true;
+                TraceLog(L"hid timer arm failed err=%u",
+                        static_cast<unsigned>(GetLastError()));
             }
-        } else if (deadlineMs != 0) {
-            // The fallback's own period is the deadline: a WM_TIMER cannot go
-            // faster than the system quantum, so a sub-quantum deadline arrives
-            // late (the release then lands at 31-34 ms) but it still arrives.
-            fallbackArmed =
-                SetTimer(hwnd, kIdleTimerId, static_cast<UINT>(deadlineMs),
-                         nullptr) != 0;
+            timerArmed = armed;
+        } else if (timerArmed) {
+            DisarmDeadlineTimer(deadlineTimer);
+            timerArmed = false;
+        }
+        // The message timer is the fallback whenever the one-shot is not armed —
+        // a missing handle and a failed SetWaitableTimer are the same condition.
+        // It cannot go faster than the system quantum, so a sub-quantum deadline
+        // arrives late (the release then lands at 31-34 ms) but it still arrives;
+        // before this, a failed arm left no fallback at all and a bootstrap
+        // deadline could wait forever.
+        if (!timerArmed && deadlineMs != 0) {
+            const DWORD period = static_cast<DWORD>(
+                deadlineMs < 0x7FFFFFFF ? deadlineMs : 0x7FFFFFFF);
+            // Re-arm only when the period changes: SetTimer with the same id
+            // restarts the timer, and a report stream faster than the period
+            // would keep pushing it out.
+            if (!fallbackArmed || fallbackPeriod != period) {
+                fallbackArmed =
+                    SetTimer(hwnd, kIdleTimerId, period, nullptr) != 0;
+                fallbackPeriod = fallbackArmed ? period : 0;
+            }
         } else if (fallbackArmed) {
             KillTimer(hwnd, kIdleTimerId);
             fallbackArmed = false;
+            fallbackPeriod = 0;
         }
 
-        // Nothing due: wait on the events. The only clock left is the peer
-        // heartbeat, a wait timeout rather than a timer, and it exists only while
-        // this activation advertises a service to keep alive. The one other state
-        // that keeps it is waiting for a root to attach, which the renderer event
-        // announces — the timeout there is the net under that event, and it ends
-        // at the attach. With the peer withheld or gone and no root in reach the
-        // wait is INFINITE: no timer, no poll, no wake.
-        const bool heartbeat = g_peerPublished.load(std::memory_order_relaxed);
-        const bool waitingForRenderer =
-            !peerAnnounced && g_rootHookReady.load(std::memory_order_acquire) &&
-            !RendererReady();
-        const DWORD wait = MsgWaitForMultipleObjects(
-            waitCount, waits, FALSE,
-            (heartbeat || waitingForRenderer)
-                ? static_cast<DWORD>(kPeerHeartbeatMs)
-                : INFINITE,
-            QS_ALLINPUT);
+        // Nothing armed for the deadline means nothing will wake this thread at
+        // it: no event, no timer. That includes the root bootstrap, which has
+        // neither a peer heartbeat nor a renderer wait yet. Bound the wait by the
+        // deadline itself; a successfully armed timer keeps the pure event wait.
+        DWORD waitMs = (g_peerPublished.load(std::memory_order_relaxed) ||
+                        (!peerAnnounced &&
+                         g_rootHookReady.load(std::memory_order_acquire) &&
+                         !RendererReady()))
+                           ? static_cast<DWORD>(kPeerHeartbeatMs)
+                           : INFINITE;
+        if (deadlineMs != 0 && !timerArmed) {
+            const DWORD due = static_cast<DWORD>(
+                deadlineMs < 0x7FFFFFFF ? deadlineMs : 0x7FFFFFFF);
+            if (waitMs == INFINITE || due < waitMs) {
+                waitMs = due;
+            }
+        }
+        const DWORD wait =
+            MsgWaitForMultipleObjects(waitCount, waits, FALSE, waitMs,
+                                      QS_ALLINPUT);
         if (wait == WAIT_TIMEOUT) {
             if (g_hidStopEvent &&
                 WaitForSingleObject(g_hidStopEvent, 0) == WAIT_OBJECT_0) {
