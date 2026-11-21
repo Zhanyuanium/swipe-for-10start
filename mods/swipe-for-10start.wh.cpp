@@ -684,79 +684,31 @@ What it does not do:
 
 Unload:
 
-- `void Wh_ModUninit` cannot veto the unload and the mod holds no reference on
-  its own image, so returning from it means Windhawk calls `FreeLibrary` and the
-  image may be unmapped while a worker thread is still inside it. The image is
-  therefore pinned before the first thread exists:
-  `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-  GET_MODULE_HANDLE_EX_FLAG_PIN)` on an address in this module. A pinned image
-  cannot be unmapped, so a thread that resumes after `Wh_ModUninit` returns still
-  runs mapped code and reads mapped globals. The cost is that the module leaks
-  until the process terminates, by design: only that makes a late resume safe.
-  The pin is logged (`mod pin image=... pinned=1`).
-- One instance per process. Windhawk loads a DLL per version, so a pinned
-  instance that could not unload can coexist with a new one in the same process.
-  `Wh_ModInit` first pins the image and then takes a process-local named mutex,
-  `Local\WindhawkLegacyStartSwipe.instance.<pid>`, before it opens the channel,
-  creates the stop event or starts any thread. Both acquisitions are
-  prerequisites: a failed pin, a guard that cannot be created, or a name already
-  taken all make `Wh_ModInit` return FALSE and install nothing — no hook, no
-  thread, no channel. An existing holder is refused with `instance guard
-  refused: another instance is live in this process` without touching the state
-  that live activation owns; a pin that succeeded stays for the process lifetime,
-  which is harmless, and a failed guard does not pretend otherwise. A held guard
-  logs `instance guard held name=...`. Only a clean
-  unload closes the handle, and only a clean unload can, because a residual
-  unload returns with every resource in place.
-- A joined thread handle is kept when its wait times out: `g_hidThread` stays set
-  on the residual path, so a later attempt can still join
-  that thread instead of losing the only handle on it.
-- One stop event ends the input thread, and the thread's wait sees it even when
-  the thread has not published its window yet. The stop event is a prerequisite:
-  if it cannot be created at init, the input thread is not started at all
-  (`hid thread not started (stop event unavailable)`), because a gesture source
-  that cannot be stopped is worse than none. Every wait on the input thread is
-  bounded or watches that event, so the stop is
-  observed within one short wait. `Wh_ModBeforeUninit` sets the stop event and
-  posts the close
-  message as a second signal for a queued message that wins the wait, and waits
-  10 s for the input thread. `Wh_ModUninit` then revokes every XAML delegate on
-  the UI thread and waits for that turn, detaches the settle batch's `Completed`
-  handler, and drains every counted entry into module code before it releases the
-  composition state and the IPC view. Every registration keeps its
-  own revoke token and its own try block
-  (root `Loaded` and `SizeChanged`, the layout watch, the scroller's
-  `ViewChanged`, the settle batch's `Completed`), so removing one cannot lose the
-  others if it throws. A revoke that throws keeps its object and its token: the
-  token is the only handle on a handler that can still run, and the unload treats
-  it as a residual instead of dropping it. A new registration refuses to
-  overwrite a surviving token (`xaml layout handler left attached; new
-  registration refused`, the same for `viewchanged`), and the layout watch and
-  the scroller watch carry the request or element they were created for, so an
-  old callback can neither advance nor revoke a newer watch; the scroller's
-  handler is authorized by the cache's identity, not by its registration, so a
-  watch that survived its revoke cannot write the offsets of a rect it does not
-  own.
-- Every entry into module code from the compositor or the dispatcher is counted
-  from before it can run. The settle batch's `Completed` registration takes a
-  counted entry before the batch is ended, and every UI turn that touches module
-  state (the geometry measurement, the open-watch release, the debug translation)
-  takes one when it is posted. The count is held by the queued callable or the
-  running handler and falls when the last reference is gone, so a handler the
-  unload revoked before it ever ran releases its entry, and one that is still
-  running keeps it up. The unload's drain is that count reaching zero; a thread
-  or a callback that does not finish in time leaves every resource in place and
-  logs which one (`unload hid thread still running; ipc view leaked`,
-  `unload residual=...; process must restart to finish unloading`): unmapping the
-  section or dropping the composition objects under running module code would
-  crash it, and a late delegate sees `g_unloading` on entry. The module is then
-  not gone; the process must restart to finish the unload.
-- A pinned image can be initialised a second time in the same process: after a
-  clean unload the module is still mapped, so a later enable loads that image and
-  calls `Wh_ModInit` on it again. `ResetReinitState` clears every lifecycle flag
-  the previous instance left behind (disabled, unloading, the stop flags, the
-  hook latches, the counts and the thread handles). A residual instance never
-  reaches it: the instance guard refuses the second init.
+- The image is not pinned and there is no instance guard. Windhawk removes the
+  hooks, calls `Wh_ModBeforeUninit`/`Wh_ModUninit` and frees the image, so this
+  role must leave no thread and no reachable callback behind before `Wh_ModUninit`
+  returns. A fresh DLL starts clean; a re-enable loads a new image with fresh
+  globals, so there is no re-init reset and no residual path.
+- `Wh_ModBeforeUninit` closes admission, withdraws the peer, signals the input
+  thread and joins it **INFINITE**, never on that thread. The thread unregisters
+  raw input, releases the 1 ms timer period, resets the activation state,
+  destroys its window and unregisters its class before it exits. A thread that
+  ignores the stop blocks the unload: that is a bug, not permission to close its
+  handles.
+- `Wh_ModUninit` runs one UI teardown turn on the captured dispatcher (or inline
+  when it already runs on that thread): revoke the XAML handlers and the settle
+  batch, stop the animations, restore resting progress and the neutral
+  translation, reset the scroller watches, and drop the UI-owned objects. The
+  turn signals completion and the uninit waits on that signal, not on a
+  registration count. Turns posted before it run first; the input thread is
+  already joined, so no new turn can be posted.
+- The counted batch completion is drained through its event: a handler the
+  compositor already dispatched keeps the count up until it returns. Only then
+  are the IPC view and the handles (input/stop/entry events) closed.
+- A failed revoke is not a successful unload: the unload logs and keeps waiting
+  for the owning delegate, because the image must not be unmapped under it. The
+  same rule covers a handler that does not return: the process must be restarted
+  rather than freeing under it.
 
 Settings:
 
@@ -794,24 +746,15 @@ Settings:
   atomic, so a change applies to the next settle and no settle performs a
   setting lookup.
 
-Debug channel (kept in the build):
+Channel:
 
-- The channel is one shared section plus the command, intent/ack and exec/ack
-  events and the command mutex, described in `swipe_ipc_shared.h`; no file is
-  involved and nothing polls. `tools/ipc.ps1` writes a command and reads the
-  counters:
-  - `pwsh -File tools\ipc.ps1 p=0.5` inserts `Progress`, clamped to 0..1.
-  - `pwsh -File tools\ipc.ps1 t=-300,0,0` sets `UIElement.Translation` on the UI
-    thread.
-  - `pwsh -File tools\ipc.ps1 e=-300,0` sets `Properties["Offset"]` and
-    `Visual.Offset` on the visual.
-  - `pwsh -File tools\ipc.ps1 -State` prints the counters: the command sequence,
-    the open generation, the intent and its ack, the executor command and its
-    ack, and the controller flags.
-  The command event wakes the raw input thread, so a command runs within
-  milliseconds instead of waiting for a poll. The event is manual-reset and this
-  side resets it, so a command published while one is running is not lost.
-- The intent is its own event, not a command: the bridge publishes one
+- The channel is one shared section and four auto-reset events (intent/ack,
+  exec/ack), described in `swipe_ipc_shared.h`; no file, mutex or command record
+  is involved and nothing polls. `tools/ipc.ps1 -State` reads the counters and
+  refuses a section that is not ready or not the 216-byte layout.
+- The controller publishes the open generation, the intent answer, the exec
+  command and the peer triple; the bridge publishes intents and exec answers.
+  The intent is its own event: the bridge publishes one
   `intent(seq, kind, trigger, method, flags, open)` and this side answers on
   `intentAck` with the state, the planned duration and the entry. An open sets
   the entry and publishes `exec show`; a close runs the one close path and
@@ -820,22 +763,20 @@ Debug channel (kept in the build):
   timer. Open generation 0 is not a menu: `SwipeIpcReadOpen` reports
   `ERROR_NOT_READY` instead of a snapshot, so an intent published before the
   first open carries `open=0` and names no menu.
+- A click-away intent carries the Hide method `7` as evidence; this side maps it
+  to the executor's dismiss method `6` before publishing the command, so the
+  executor's allowlist (show 1/11/16, dismiss 1/6, cancel 0) never has to accept
+  a value this mod does not send as an execution method.
 - The section outlives either process, so both sides record the sequence numbers
-  at attach and act only on what is newer: an intent, a command or an open
-  generation from a previous process is ignored by its sequence, never served.
-- The v7 section is 744 bytes: the command, the open generation, the intent and
-  its ack, the executor command and its ack, the controller direction and touch
-  flag, and the peer liveness triple. Every record is a seqlock, so the bridge
-  never reads a half-written intent, command or open generation, and this side
-  never reads half a command. The command record is also serialised by a named
-  mutex, because more than one tool can publish into it.
+  at attach and act only on what is newer: an intent or an open generation from a
+  previous process is ignored by its sequence, never served.
 - The liveness triple is the bridge's interception precondition. `peerEpoch` is
   claimed once per attach, before anything else this activation writes;
   `peerState=alive` is published from the input thread only when its window and
-  its raw-input registrations exist and it is about to wait on the intents; the
-  input thread refreshes `peerTick` from its idle tick and from every positioned
-  report at most once per 100 ms. Availability is withdrawn before that thread is
-  stopped (`Wh_ModBeforeUninit`) and again as it leaves for any reason, and the
+  its intent event exist and it is about to wait on the intents; the input thread
+  refreshes `peerTick` from its idle tick and from every positioned report at
+  most once per 100 ms. Availability is withdrawn before that thread is stopped
+  (`Wh_ModBeforeUninit`) and again as it leaves for any reason, and the
   withdrawal resets the shared direction and touch in the same step, so a kill
   while `closing` cannot be read as the next activation's decision. The bridge
   creates the section, so a mapped channel never proves this side is running;
@@ -843,18 +784,10 @@ Debug channel (kept in the build):
   covers a killed host. That 600 ms is a detection budget, not a delivery
   guarantee: a press taken inside it can be published after this side is gone,
   and a few startup/shutdown presses are served natively by the shell by design.
-- The files this channel replaced (`debug.txt`, `close-mode.txt`,
-  `retract-plan.txt`) are deleted at init; they are transport, not state, and a
-  leftover would invite a reader that no longer exists.
 
 Diagnostics:
 
-- `mod init`, `mod init refused: ...; no hook, no channel and no thread
-  installed`, `mod pin image=... pinned=1` (or `mod pin failed err=...`),
-  `instance guard refused: another instance is live in this process` (or
-  `instance guard unavailable err=...`), `instance guard held name=...`,
-  `activation state reset`,
-  `settle style selected=... setting=...`,
+- `mod init`, `settle style selected=... setting=...`,
   `settle start speed=...%`,
   `settle plan speed=... dip/ms dur=160..520 segment=4.0 ms frames=13..129`,
   `settle spring win10 zeta=...`,
@@ -917,10 +850,9 @@ Diagnostics:
   refused-admission case, which no lift and no latch cleanup could release,
   `attached root=...`, `dismiss axis=...` (with `src=appbar|bar|work` and what
   every source said), `dismiss axis=... kept, no source named an edge` (once per
-  undecided episode; the last edge stays in force), `debug p=...`, `debug t=...`,
-  `debug e=...`,
-  `ipc open created=... cmd=... intent=... epoch=...`,
-  `ipc open failed err=...`, `ipc legacy files removed=...`,
+  undecided episode; the last edge stays in force),
+  `ipc open created=... intent=... epoch=...`,
+  `ipc open failed err=...`,
   `ipc peer alive reason=consumer epoch=...` (the bridge may intercept),
   `ipc peer gone reason=attach|unload|consumer-exit|uninit` (it must pass),
   `gesture geometry updated axis=... dist=...` (or
@@ -996,12 +928,11 @@ Diagnostics:
   the retry comes from the input thread), `startui root symbol deadline ...`
   and `startui root symbol unresolved name=...` (the one refusal reason; no
   root hook and no controller service),
-  `unload hid thread stopped` (or
-  `unload hid thread still running; ipc view leaked` and
-  `unload hid thread wait=... ms timed out`),
-  `unload entries outstanding=...` when the module-entry drain times out,
-  and `unload residual=...; process must restart to finish unloading` naming the
-  resource left in place.
+  `unload hid thread joined` (or `unload hid thread join failed err=...` while it
+  keeps waiting; there is no residual return),
+  `unload teardown waiting: ...` / `unload waiting for module entries=...` /
+  `unload waiting for xaml revokes=...` when a teardown proof is still owed,
+  and `ipc close` after the UI and executor teardown completed.
 - Only begin and release are logged, never individual samples or coasts. The
   `edge` line stays in the code behind `g_debugEdge`, which is false; it measured
   the raw edge contact and EP's own open threshold. The `coast start/stop` lines
@@ -1113,13 +1044,12 @@ Known risks:
   shell handles every press natively). The peer is published only once a root is
   attached: a session that missed `PrepareRootElement` during the cold symbol
   fetch stays native until the host restarts.
-- The instance guard's name is process local:
-  `Local\WindhawkLegacyStartSwipe.instance.<pid>`. A residual instance holds it
-  for the life of the process, so re-enabling the mod there is refused with one
-  line and nothing else runs. A clean unload releases it.
-- The image is pinned, so the module stays mapped until
-  `StartMenuExperienceHost.exe` exits: disabling the mod does not reclaim its
-  pages. That is the price of a late thread resuming safely.
+- The image is not pinned and there is no instance guard. Disabling the mod
+  stops and joins the input thread, runs the UI teardown turn, drains the counted
+  entries and closes the channel before `Wh_ModUninit` returns, so
+  `StartMenuExperienceHost.exe` can unmap the DLL and a later enable loads a
+  fresh image. A teardown proof that cannot be obtained keeps waiting; it never
+  returns success with a mod-owned callback reachable.
 */
 // ==/WindhawkModReadme==
 
@@ -1159,13 +1089,13 @@ Known risks:
  *   (PrepareRootElement and the root it returns), Raw Input (RegisterRawInputDevices/
  *   GetRawInputData/GetRawInputDeviceInfoW) for the digitizer, the window, DWM
  *   and taskbar APIs for geometry and layout, the composition Visual/Element
- *   APIs for Progress, and swipe_ipc_shared.h v7 for the intents, executor
+ *   APIs for Progress, and swipe_ipc_shared.h for the intents, executor
  *   commands and acks, the open generation, the controller direction and peer
  *   liveness. In explorer.exe (namespace bridge): twinui.pcshell.dll
  *   10.0.26100.9949 (the launcher singleton, ShowStartView, Dismiss, IsVisible,
  *   XamlLauncher::OnHotkeyInvoke, XamlLauncherState::OnStartShown/
  *   OnStartHidden/HideStartAndCortana, CStartExperienceManager::Show), the same
- *   v7 channel from the other end.
+ *   channel from the other end.
  * [OUTPUT]: the panel's Progress through the one damped-spring settle, the
  *   reveal and dismiss follows, the coast and the geometry snapshot; the hidden
  *   executor window on explorer's launcher thread that runs the one shell call
@@ -1203,6 +1133,7 @@ Known risks:
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -1215,10 +1146,20 @@ Known risks:
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "swipe_ipc_shared.h"
+
+// Process termination may skip Wh_ModUninit. These WinRT/Composition projections
+// must not run their destructors during that teardown; ordinary unload clears
+// them explicitly.
+#if defined(__clang__)
+#define NO_DESTROY [[clang::no_destroy]]
+#else
+#define NO_DESTROY
+#endif
 
 // ---------------------------------------------------------------------------
 // Roles
@@ -1779,35 +1720,40 @@ std::atomic<bool> g_stopDismissCallback{false};
 // ---------------------------------------------------------------------------
 // Module lifetime
 //
-// `void Wh_ModUninit` cannot veto Windhawk's unload and the mod holds no module
-// reference of its own: returning from it means the engine calls FreeLibrary and
-// the image can be unmapped while a worker thread is still inside it. Every
-// "leak the resource and log it" path in the unload was therefore a promise the
-// loader does not keep. Two lifetime facts fix that, and both are taken before
-// the first thread exists:
+// The image is not pinned. Windhawk removes the hooks, calls Wh_ModUninit and
+// frees the image, so this role must leave no thread and no reachable callback
+// behind before that call returns. A fresh DLL starts clean: there is no
+// re-init state to reset and no process instance guard to carry across
+// activations.
 //
-// - The image is pinned. `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN)`
-//   makes the loader keep this module mapped until the process terminates, so a
-//   thread that resumes after Wh_ModUninit returns still runs mapped code and
-//   still reads mapped globals. It also means the module leaks until process
-//   exit by design; only that makes a late resume safe.
-// - One instance per process. Windhawk loads a DLL per version, so a pinned
-//   instance that could not unload can coexist with a new one. A process-local
-//   named mutex refuses the second instance before it opens a channel, starts a
-//   thread or installs a hook.
+// Unload order:
+//   1. BeforeUninit closes admission, withdraws the peer, stops the input
+//      thread and joins it INFINITE. The unload never runs on that thread.
+//   2. Uninit runs one UI teardown turn: revoke the XAML handlers and the
+//      settle batch, stop the animations, restore resting progress and neutral
+//      translation, drop the UI-owned objects. The turn signals completion and
+//      the wait is on that signal, not on a registration count.
+//   3. The counted module entries (a batch completion already dispatched) are
+//      drained through their event. Only then are the IPC view and the handles
+//      closed.
+//
+// A failed revoke is not a successful unload: the wait stays in teardown until
+// the owning source is demonstrably gone. A diagnostic repeats; it never
+// returns early.
 // ---------------------------------------------------------------------------
-HMODULE g_modulePin = nullptr;
-HANDLE g_instanceGuard = nullptr;
-std::atomic<bool> g_secondInstance{false};
-// Set when Wh_ModInit refused its prerequisites (the pin or the guard). No hook,
-// channel or thread exists then, and every later entry point returns at once.
-std::atomic<bool> g_initRefused{false};
 
-// The root of the guard's name. The PID is appended so the guard is process
-// local: the mutex lives in the session namespace but only this process can name
-// it. The name is part of the mod's contract and is documented in the header.
-constexpr wchar_t kInstanceGuardPrefix[] =
-    L"Local\\WindhawkLegacyStartSwipe.instance.";
+// Set at the end of RoleInit. A fresh image starts false; every later callback
+// returns at once until the role actually initialised.
+bool g_initialised = false;
+
+// Signalled when the counted entry count reaches zero. Created before the first
+// lease, waited on at unload. See ModuleEntryLease.
+HANDLE g_moduleEntriesGone = nullptr;
+
+// The id of the input thread, published by the thread itself. The unload checks
+// it before joining so a teardown that somehow ran on that thread cannot wait
+// on itself.
+std::atomic<DWORD> g_hidThreadId{0};
 
 // ---------------------------------------------------------------------------
 // Counted entries into module code
@@ -1831,7 +1777,12 @@ class ModuleEntryLease {
         g_moduleEntryCount.fetch_add(1, std::memory_order_seq_cst);
     }
     ~ModuleEntryLease() {
-        g_moduleEntryCount.fetch_sub(1, std::memory_order_seq_cst);
+        if (g_moduleEntryCount.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+            g_moduleEntriesGone) {
+            // The last entry is leaving. The unload waits on this event instead
+            // of polling the count, so the release is observable at once.
+            SetEvent(g_moduleEntriesGone);
+        }
     }
 
     ModuleEntryLease(const ModuleEntryLease&) = delete;
@@ -1905,15 +1856,15 @@ void LoadGestureStartSpeed() {
 constexpr float kProgressRest = 1.0f;
 
 std::mutex g_compositionMutex;
-wuc::Compositor g_compositor{nullptr};
-wuc::CompositionPropertySet g_state{nullptr};
-wuc::ExpressionAnimation g_translationExpression{nullptr};
-wuc::Visual g_visual{nullptr};
-wuc::CompositionScopedBatch g_dismissBatch{nullptr};
+NO_DESTROY wuc::Compositor g_compositor{nullptr};
+NO_DESTROY wuc::CompositionPropertySet g_state{nullptr};
+NO_DESTROY wuc::ExpressionAnimation g_translationExpression{nullptr};
+NO_DESTROY wuc::Visual g_visual{nullptr};
+NO_DESTROY wuc::CompositionScopedBatch g_dismissBatch{nullptr};
 // The Completed registration of that batch, kept so the handler can be removed
 // before the module goes away. Written under g_compositionMutex. A revoke that
 // throws keeps both the batch and the token: the token is the only handle on a
-// handler that can still run, and the unload treats that as a residual.
+// handler that can still run, and the unload keeps waiting for it.
 winrt::event_token g_dismissBatchToken{};
 // The counted entry of that registration. The handler's closure holds a second
 // reference while it is queued or running, so the count falls only when the
@@ -1985,12 +1936,12 @@ struct PanelController {
 
 PanelController g_panel;
 
-wux::FrameworkElement g_root{nullptr};  // UI thread only
+NO_DESTROY wux::FrameworkElement g_root{nullptr};  // UI thread only
 // Guarded by g_compositionMutex: Setup writes it on the UI thread, the input
 // thread copies it into a local before posting, and the unload revoke copies it
 // the same way. A CoreDispatcher copy is a COM reference-counted pointer, so it
 // must never be read on one thread while another overwrites it.
-wucore::CoreDispatcher g_dispatcher{nullptr};
+NO_DESTROY wucore::CoreDispatcher g_dispatcher{nullptr};
 std::atomic<DWORD> g_uiThreadId{0};
 std::atomic<uint32_t> g_setupGeneration{0};
 
@@ -2007,7 +1958,7 @@ winrt::event_token g_layoutToken{};
 uint32_t g_layoutTicksLeft = 0;
 // The element the layout token was registered on, so its revoke does not depend
 // on g_root still pointing at it.
-wux::FrameworkElement g_layoutRoot{nullptr};
+NO_DESTROY wux::FrameworkElement g_layoutRoot{nullptr};
 // Identity of the armed watch. The callback captures the value it was created
 // with and acts only while that value is still current, so a handler whose
 // revoke failed can never advance or revoke a watch armed later. The mint skips
@@ -2115,7 +2066,18 @@ struct ScrollerWatch {
     wuxc::ScrollViewer viewer{nullptr};
     winrt::event_token token{};
 };
-ScrollerWatch g_scrollerWatches[kMaxScrollRegions];
+NO_DESTROY std::optional<std::array<ScrollerWatch, kMaxScrollRegions>>
+    g_scrollerWatches;
+
+// UI thread only. The watches are emplaced on the first committed region and
+// reset by the unload teardown, so the process-exit path never runs their
+// WinRT destructors.
+std::array<ScrollerWatch, kMaxScrollRegions>& ScrollerWatches() {
+    if (!g_scrollerWatches) {
+        g_scrollerWatches.emplace();
+    }
+    return *g_scrollerWatches;
+}
 // The rect lines speak once per open per region, not once per measurement: the
 // open transition and the settled pass both measure the same elements, and only
 // a rect that actually moved is worth a second line. The `scroller none` line is
@@ -2141,8 +2103,8 @@ winrt::event_token g_sizeToken{};
 // The tokens belong to the objects they were registered on, and a Setup that
 // never finished leaves g_root null while a Loaded handler is still attached.
 // These keep the exact element so the revoke can run unconditionally.
-wux::FrameworkElement g_loadedRoot{nullptr};   // UI thread only
-wux::FrameworkElement g_sizeRoot{nullptr};     // UI thread only
+NO_DESTROY wux::FrameworkElement g_loadedRoot{nullptr};   // UI thread only
+NO_DESTROY wux::FrameworkElement g_sizeRoot{nullptr};     // UI thread only
 
 std::atomic<bool> g_dismissSettling{false};
 std::atomic<uint32_t> g_dismissSerial{0};
@@ -2722,7 +2684,7 @@ void InvalidateDismissBatchLocked() {
 //
 // Returns false when the revoke threw. The batch, its token and its counted
 // entry are then all kept: the token is the only handle on a handler that can
-// still run, and the unload must treat that as a residual instead of freeing the
+// still run, and the unload must keep waiting instead of freeing the
 // objects the handler uses.
 bool RevokeDismissBatchLocked() {
     if (!g_dismissBatch || !g_dismissBatchToken.value) {
@@ -3844,9 +3806,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_v7_Cmd     p=, t=, e=   (tools -> here)
-//   Local\SwipeFor10Start_v7_Intent  kind, trigger, method, flags, open (bridge)
-//   Local\SwipeFor10Start_v7_Exec    show, dismiss, cancel               (here)
+//   Local\SwipeFor10Start_SingleMod_Intent  kind, trigger, method, flags, open
+//                                           (bridge -> here)
+//   Local\SwipeFor10Start_SingleMod_Exec    show, dismiss, cancel (here -> bridge)
 //   ..._State.openSeq                "this is a new menu"               (here)
 //   ..._State.peerTick/peerState     "a controller is here"             (here)
 //   ..._State.peerEpoch              "which activation answers"         (here)
@@ -3934,9 +3896,8 @@ void PublishPeerTick(uint64_t tickMs) {
 // `closing` (or `touch=1`) as a decision it may act on.
 //
 // It is the last word of a controller that served its last intent: it goes before
-// the view is released, and it also goes on a residual unload, when the view is
-// kept for a thread that is still inside it. The bridge must pass every trigger
-// from then on, whether or not this process finishes unloading.
+// the view is released. The bridge must pass every trigger from then on, whether
+// or not this process finishes unloading.
 //
 // `terminal` means this activation will not answer again: the flag is set under
 // the same lock PublishPeerReady takes, so a startup publication that is already
@@ -4058,7 +4019,7 @@ void OpenIpcChannel() {
     g_ipcOpenTickLow = 0;
     // The activation identity goes before anything this activation publishes. A
     // bridge decision that was latched against the previous activation can then
-    // see that a different one answers, even though both run the same pinned
+    // see that a different one answers, even though both run the same image.
     // image.
     g_peerEpoch = SwipeIpcBeginPeerActivation(&g_ipc);
 
@@ -5477,7 +5438,7 @@ float EndVelocityProgressPerMs(uint64_t releaseQpc) {
 // One activation's input state
 // ---------------------------------------------------------------------------
 //
-// This is the complete list of what one activation of this pinned image leaves
+// This is the complete list of what one activation of this image leaves
 // behind in the input layer. Every start and every stop of an activation calls
 // it, so a field added later has one obvious home:
 //
@@ -9154,6 +9115,7 @@ void UnregisterHidUsage(USAGE usage) {
 void ProbeRootSymbolFromInputThread();
 
 DWORD WINAPI HidInputThread(LPVOID) {
+    g_hidThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = HidWindowProc;
@@ -9338,7 +9300,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     UnregisterHidUsage(kUsagePen);
 
     // One per-activation reset, the same function Wh_ModInit calls, so a clean
-    // re-enable of this pinned image starts from the state the first activation
+    // fresh image starts from the state the first activation
     // did. Nothing a gesture left behind survives: the tracked identity, the
     // latch, the sessions, the close mute, the deferred layout, the dismiss
     // slot, the coast and the debug switches.
@@ -9347,11 +9309,16 @@ DWORD WINAPI HidInputThread(LPVOID) {
     CancelMeasureRequest();
     FreeHidDevices();
 
+    // The 1 ms period is per-contact; a contact still down when the unload
+    // arrives would otherwise leave the request held process-wide. This thread
+    // owns the flag, so the release belongs here, before it exits.
+    EndContactTiming();
     if (IsWindow(hwnd)) {
         DestroyWindow(hwnd);
     }
     g_hidHwnd.store(nullptr, std::memory_order_relaxed);
     UnregisterClassW(kHidWindowClass, windowClass.hInstance);
+    g_hidThreadId.store(0, std::memory_order_relaxed);
     return 0;
 }
 
@@ -10751,7 +10718,7 @@ void RevokeScrollerWatch(int slot) {
     if (slot < 0 || slot >= kMaxScrollRegions) {
         return;
     }
-    ScrollerWatch& watch = g_scrollerWatches[slot];
+    ScrollerWatch& watch = ScrollerWatches()[slot];
     wuxc::ScrollViewer owner = watch.owner;
     if (watch.token.value) {
         if (!owner) {
@@ -10791,7 +10758,7 @@ void RefreshScrollerOffsets(wuxc::ScrollViewer const& watched) {
 
     int slot = -1;
     for (int i = 0; i < kMaxScrollRegions; ++i) {
-        if (g_scrollerWatches[i].viewer == watched) {
+        if (ScrollerWatches()[i].viewer == watched) {
             slot = i;
             break;
         }
@@ -11167,7 +11134,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     // and the old handler is not authorized for this cache anyway, so it writes
     // nothing even though it still fires.
     for (int i = 0; i < kMaxScrollRegions; ++i) {
-        ScrollerWatch& watch = g_scrollerWatches[i];
+        ScrollerWatch& watch = ScrollerWatches()[i];
         if (!watch.owner) {
             continue;
         }
@@ -11188,15 +11155,15 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         const wuxc::ScrollViewer viewer = answerViewers[r];
         int slot = -1;
         for (int i = 0; i < kMaxScrollRegions; ++i) {
-            if (g_scrollerWatches[i].owner == viewer &&
-                g_scrollerWatches[i].token.value) {
+            if (ScrollerWatches()[i].owner == viewer &&
+                ScrollerWatches()[i].token.value) {
                 slot = i;  // the same element this slot already watches
                 break;
             }
         }
         if (slot < 0) {
             for (int i = 0; i < kMaxScrollRegions; ++i) {
-                ScrollerWatch& watch = g_scrollerWatches[i];
+                ScrollerWatch& watch = ScrollerWatches()[i];
                 if (watch.owner || watch.token.value) {
                     continue;  // a survivor: its slot cannot be reused
                 }
@@ -11235,7 +11202,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
             watchRefused = true;
             continue;
         }
-        g_scrollerWatches[slot].viewer = viewer;
+        ScrollerWatches()[slot].viewer = viewer;
         answer.regions[r].watchSlot = slot;
     }
     {
@@ -11295,7 +11262,7 @@ void ReleaseScrollableElement() {
         RevokeScrollerWatch(i);
         // The cache is emptied below, so its viewer is gone too: no surviving
         // handler may write offsets into a region that describes no element.
-        g_scrollerWatches[i].viewer = nullptr;
+        ScrollerWatches()[i].viewer = nullptr;
     }
     g_scrollerLogged = false;
     g_scrollerNoneLogged = false;
@@ -11673,8 +11640,8 @@ bool Setup(wux::FrameworkElement const& root) {
     //
     // A registration that survived its revoke keeps its token and its owner:
     // overwriting them would lose the only handle on a handler that can still
-    // fire. This root then gets no resize handler, and the unload reports the
-    // residual instead of pretending it is gone.
+    // fire. This root then gets no resize handler, and the unload waits for it
+    // instead of pretending it is gone.
     if (g_sizeToken.value) {
         Wh_Log(L"SizeChanged registration from the previous root is still "
                L"attached; this root gets no resize handler");
@@ -11831,7 +11798,7 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
             // The previous Loaded registration survived its revoke. Its token is
             // the only handle on a handler that can still fire, so it is kept:
             // overwriting it would lose that handle for the rest of the process,
-            // and the unload would report a residual it can never clear. This
+            // and the unload would wait on a handler it cannot clear. This
             // root then installs no renderer, and the log says why.
             Wh_Log(L"Loaded registration from the previous root is still "
                    L"attached; this root gets no renderer");
@@ -11902,7 +11869,7 @@ std::atomic<bool> g_loadHookMatchLogged{false};
 // cache; a false result before it finishes is `pending`, not a refusal. 120 s is
 // two full downloads at the measured ~600 KB/s for the 35 MB reference PDB, plus
 // the symbol parse, and still bounded before a user concludes the feature is
-// broken. Input thread only; ResetReinitState clears them before it exists.
+// broken. Input thread only; a fresh image starts them at zero.
 constexpr uint64_t kRootProbeMs = 100;
 constexpr uint64_t kRootPendingDeadlineMs = 120000;
 uint64_t g_rootProbeNextTick = 0;
@@ -12175,93 +12142,12 @@ void RevokeHandlers() {
     g_root = nullptr;
 }
 
-// How long the unload waits for its threads, its UI turn and its counted module
-// entries before it stops freeing anything. The threads observe the stop signal
-// within one short wait; 10 s therefore means a stuck thread, not a slow one.
-constexpr DWORD kUnloadThreadWaitMs = 10000;
-constexpr DWORD kUnloadUiRevokeWaitMs = 10000;
-constexpr DWORD kUnloadCallbackDrainMs = 2000;
-
-// Waits until no counted entry into module code can still run. The count is taken
-// when a settle completion is registered or a UI turn is posted, so it covers a
-// callback the compositor already dispatched and cannot be revoked, and a
-// completion whose delegate was revoked before it ever ran. Only when it reaches
-// zero may the composition state, the XAML root and the IPC view go away.
-bool WaitForModuleEntryDrain(DWORD timeoutMs) {
-    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
-    while (g_moduleEntryCount.load(std::memory_order_acquire) != 0) {
-        if (GetTickCount64() >= deadline) {
-            return false;
-        }
-        Sleep(1);
-    }
-    return true;
-}
-
-bool RevokeHandlersOnUiThread() {
-    if (g_uiRegistrationCount.load(std::memory_order_acquire) == 0) {
-        return true;  // nothing was ever registered
-    }
-
-    const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
-    if (uiThread != 0 && uiThread == GetCurrentThreadId()) {
-        RevokeHandlers();
-        return g_uiRegistrationCount.load(std::memory_order_acquire) == 0;
-    }
-
-    wucore::CoreDispatcher dispatcher = CopyDispatcher();
-    if (!dispatcher) {
-        // A registration exists but Setup never got as far as capturing the
-        // dispatcher. There is no UI thread to post to, and touching XAML from
-        // this one would be worse.
-        Wh_Log(L"No CoreDispatcher captured; XAML handlers left attached");
-        return false;
-    }
-
-    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!done) {
-        return false;
-    }
-
-    try {
-        dispatcher.RunAsync(wucore::CoreDispatcherPriority::Normal,
-                            [done]() {
-                                try {
-                                    RevokeHandlers();
-                                } catch (...) {
-                                    // Never let an exception escape the
-                                    // dispatcher callback.
-                                }
-                                SetEvent(done);
-                            });
-    } catch (winrt::hresult_error const& e) {
-        Wh_Log(L"Dispatcher.RunAsync failed: %08X %s", e.code(),
-               e.message().c_str());
-        CloseHandle(done);
-        return false;
-    } catch (...) {
-        CloseHandle(done);
-        return false;
-    }
-
-    if (WaitForSingleObject(done, kUnloadUiRevokeWaitMs) == WAIT_OBJECT_0) {
-        CloseHandle(done);
-        return g_uiRegistrationCount.load(std::memory_order_acquire) == 0;
-    }
-
-    // The queued callback may still signal the event; leaking one handle is
-    // safer than closing a handle it will use later. The caller must not free
-    // what that callback can still touch.
-    Wh_Log(L"Timed out waiting for the UI thread to revoke XAML handlers");
-    return false;
-}
-
 void ResetComposition() {
     // The batch's handler is a delegate like any other: remove it before the
     // batch and the state it closes over go away. Takes the mutex itself, so it
     // runs before the lock below. A revoke that threw keeps the batch, its token
-    // and its counted entry: the handler can still run, and the unload reports
-    // that as a residual instead of freeing under it.
+    // and its counted entry: the handler can still run, and the unload waits
+    // for it instead of freeing under it.
     const bool batchRevoked = RevokeDismissBatch();
 
     std::lock_guard lock(g_compositionMutex);
@@ -12340,150 +12226,137 @@ void ResetRenderer() {
 // Module lifetime
 // ---------------------------------------------------------------------------
 
-// Any address in this module identifies the image that must stay mapped. The
-// function is never called; only its address is taken.
-void ModulePinAnchor() {}
-
-// Pins this image until the process terminates. Runs before the first thread
-// exists, so no worker can ever resume in unmapped code: Windhawk's unload frees
-// its own reference, and the pin keeps the image mapped anyway. The cost is a
-// module that leaks for the life of the process, which is the point.
-//
-// False means the image is not pinned, and no thread may ever start: a worker
-// that outlives the unload would resume in unmapped code. The caller refuses the
-// whole initialisation then.
-bool PinThisModule() {
-    if (g_modulePin) {
-        return true;  // a re-init of the same pinned image
-    }
-    HMODULE module = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_PIN,
-                           reinterpret_cast<LPCWSTR>(&ModulePinAnchor),
-                           &module)) {
-        g_modulePin = module;
-        FileLog(L"mod pin image=%p pinned=1", reinterpret_cast<void*>(module));
-        return true;
-    }
-    FileLog(L"mod pin failed err=%u (a thread that outlives the unload would "
-            L"resume in unmapped code)",
-            static_cast<unsigned>(GetLastError()));
-    return false;
+// Runs on the UI thread, or directly when the unload already runs there.
+// Revokes every delegate first, then restores the panel and drops the
+// UI-owned objects. The counted batch entry (if one was already dispatched)
+// keeps module code alive until it returns; the caller drains it below.
+void TeardownUi() {
+    // The input thread is joined, so nothing posts a new turn. The XAML
+    // handlers go first: a Loaded/SizeChanged/ViewChanged delegate must not
+    // survive the root it closes over.
+    RevokeHandlers();
+    // The settle batch's Completed handler is the one delegate the compositor
+    // may have dispatched already. Revoking removes the registration; the
+    // lease count proves an in-flight call is gone.
+    RevokeDismissBatch();
+    // Stops the animations, restores resting progress and the neutral
+    // translation, and nulls the composition projections. Every user takes the
+    // composition mutex, so a late handler sees null and returns.
+    ResetComposition();
+    g_scrollerWatches.reset();
+    g_root = nullptr;
+    g_loadedRoot = nullptr;
+    g_sizeRoot = nullptr;
+    g_layoutRoot = nullptr;
+    g_dispatcher = nullptr;
+    g_uiThreadId.store(0, std::memory_order_relaxed);
+    std::lock_guard lock(g_compositionMutex);
+    g_settleLease.reset();
 }
 
-// Takes the one-instance guard for this process. The mutex is named after the
-// process, so a second instance in this process is the only thing that can
-// collide with it: a *residual* instance whose unload left resources in place
-// keeps its handle, and a new instance (a new DLL, loaded by a newer Windhawk
-// version) finds the name taken and stands down before it opens a channel,
-// starts a thread or installs a hook.
-//
-// The guard is a prerequisite, not a nicety: without it two instances can write
-// the same IPC records. Both failures answer false and the caller refuses the
-// initialisation.
-bool AcquireInstanceGuard() {
-    WCHAR name[128] = {};
-    swprintf_s(name, L"%s%lu", kInstanceGuardPrefix,
-               static_cast<unsigned long>(GetCurrentProcessId()));
-
-    SetLastError(0);
-    HANDLE guard = CreateMutexW(nullptr, FALSE, name);
-    if (!guard) {
-        // No exclusion is available: the pin keeps code mapped but says nothing
-        // about a second writer. Install nothing.
-        FileLog(L"instance guard unavailable err=%u",
-                static_cast<unsigned>(GetLastError()));
-        return false;
+// Posts the one teardown turn and waits for its completion, or runs it inline
+// when the unload already runs on the captured UI thread. The dispatcher is
+// kept through this turn. A missing dispatcher with registrations still live
+// has no safe answer: the loop reports and keeps waiting rather than freeing a
+// delegate that can still run.
+void TeardownUiOnUiThread() {
+    const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
+    if (uiThread == 0 || uiThread == GetCurrentThreadId()) {
+        TeardownUi();
+        return;
     }
 
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        // A live activation owns the name. Its state is its own: nothing is
-        // reset, opened or started here.
-        CloseHandle(guard);
-        g_secondInstance.store(true, std::memory_order_relaxed);
-        FileLog(L"instance guard refused: another instance is live in this "
-                L"process");
-        Wh_Log(L"Another Legacy Start Swipe instance is still alive in this "
-               L"process; this instance starts no input thread and uses no "
-               L"channel. Restart the process to finish unloading the "
-               L"previous one");
-        return false;
+    wucore::CoreDispatcher dispatcher = CopyDispatcher();
+    if (!dispatcher) {
+        const bool anythingRegistered =
+            g_uiRegistrationCount.load(std::memory_order_acquire) != 0 ||
+            g_dismissBatchToken.value != 0;
+        if (!anythingRegistered) {
+            return;
+        }
+        ULONGLONG nextReport = 0;
+        for (;;) {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= nextReport) {
+                nextReport = now + 5000;
+                FileLog(L"unload teardown waiting: no dispatcher, entries=%d",
+                        g_moduleEntryCount.load(std::memory_order_relaxed));
+            }
+            Sleep(1000);
+        }
     }
 
-    g_instanceGuard = guard;
-    FileLog(L"instance guard held name=%s", name);
-    return true;
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!done) {
+        ULONGLONG nextReport = 0;
+        for (;;) {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= nextReport) {
+                nextReport = now + 5000;
+                FileLog(L"unload teardown waiting: no completion event");
+            }
+            Sleep(1000);
+        }
+    }
+
+    try {
+        dispatcher.RunAsync(wucore::CoreDispatcherPriority::Normal, [done]() {
+            try {
+                TeardownUi();
+            } catch (...) {
+                // Never let an exception escape the dispatcher callback. The
+                // event still releases the unload, which then waits for the
+                // counted entries.
+            }
+            SetEvent(done);
+        });
+    } catch (winrt::hresult_error const& e) {
+        FileLog(L"unload teardown queue failed: %08X %s", e.code(),
+                e.message().c_str());
+        CloseHandle(done);
+        for (;;) {
+            FileLog(L"unload teardown waiting: dispatch refused");
+            Sleep(5000);
+        }
+    } catch (...) {
+        CloseHandle(done);
+        for (;;) {
+            FileLog(L"unload teardown waiting: dispatch failed");
+            Sleep(5000);
+        }
+    }
+
+    WaitForSingleObject(done, INFINITE);
+    CloseHandle(done);
 }
 
-// A pinned image can be initialised a second time in the same process: after a
-// clean unload the module is still mapped, so the next enable loads that same
-// image and Windhawk calls Wh_ModInit on it again. Every lifecycle flag the
-// previous instance left behind is cleared here, so the second init starts from
-// the state the first one did. The guard has already proved that no thread of
-// the previous instance is still running; a residual instance never reaches this
-// function.
-void ResetReinitState() {
-    // The guard has just been taken, so this instance is the live one: a refusal
-    // left in the flag by an earlier load of this same pinned image must not
-    // suppress this instance's hooks and threads.
-    g_initRefused.store(false, std::memory_order_relaxed);
-    g_secondInstance.store(false, std::memory_order_relaxed);
-    g_disabled.store(false, std::memory_order_relaxed);
-    g_unloading.store(false, std::memory_order_relaxed);
-    g_stopDismissCallback.store(false, std::memory_order_relaxed);
-    g_afterInit.store(false, std::memory_order_relaxed);
-    g_rootHookReady.store(false, std::memory_order_relaxed);
-    g_rootHookRefused.store(false, std::memory_order_relaxed);
-    g_startUIHookModule.store(nullptr, std::memory_order_relaxed);
-    g_startUIModuleSeen.store(nullptr, std::memory_order_relaxed);
-    g_loadHookMatchLogged.store(false, std::memory_order_relaxed);
-    g_rootProbeNextTick = 0;
-    g_rootProbeFirstTick = 0;
-    g_rootProbeAttempts = 0;
-    g_hidThreadLeaked.store(false, std::memory_order_relaxed);
-    g_hidThread = nullptr;
-    g_hidStopEvent = nullptr;
-    g_uiRegistrationCount.store(0, std::memory_order_relaxed);
-    g_moduleEntryCount.store(0, std::memory_order_relaxed);
-    // The input state of the previous activation, in the same function the
-    // input thread calls as it stops. No thread is running now, so this is the
-    // one place both activations meet.
-    ResetActivationState();
-    {
-        std::lock_guard lock(g_compositionMutex);
-        g_settleLease.reset();
+// Waits until no counted module entry can still run. The event is set by the
+// last lease release, so this is completion signalling, not a poll for zero.
+// The wait has no deadline: returning under a live delegate would free the
+// image its code still runs in.
+void WaitForModuleEntries() {
+    ULONGLONG nextReport = 0;
+    for (;;) {
+        if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= nextReport) {
+            nextReport = now + 5000;
+            FileLog(L"unload waiting for module entries=%d",
+                    g_moduleEntryCount.load(std::memory_order_relaxed));
+        }
+        if (g_moduleEntriesGone) {
+            WaitForSingleObject(g_moduleEntriesGone, 1000);
+        } else {
+            Sleep(1000);
+        }
     }
 }
-
 
 BOOL RoleInit() {
     FileLog(L"mod init");
     Wh_Log(L"Legacy Start Swipe 0.7.0 initializing (start role)");
-
-    // Both acquisitions are prerequisites, and both run before any thread: the
-    // pin keeps a late worker's code mapped, the guard keeps a second instance
-    // out of the same channel. Whichever fails, nothing is installed: no hook,
-    // no channel, no thread.
-    if (!PinThisModule()) {
-        g_initRefused.store(true, std::memory_order_relaxed);
-        FileLog(L"mod init refused: the image could not be pinned; no hook, no "
-                L"channel and no thread installed");
-        return FALSE;
-    }
-    if (!AcquireInstanceGuard()) {
-        g_initRefused.store(true, std::memory_order_relaxed);
-        if (g_secondInstance.load(std::memory_order_relaxed)) {
-            FileLog(L"mod init refused: the instance guard is held by a live "
-                    L"activation; no hook, no channel and no thread installed");
-        } else {
-            // The pin already succeeded here. It stays for the process
-            // lifetime, which is harmless: it maps code and nothing else.
-            FileLog(L"mod init refused: no instance guard; the image stays "
-                    L"pinned and no hook, no channel and no thread installed");
-        }
-        return FALSE;
-    }
-    ResetReinitState();
 
     LoadAnimationStyle();
     LoadGestureStartSpeed();
@@ -12492,6 +12365,13 @@ BOOL RoleInit() {
     g_hidStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_hidStopEvent) {
         FileLog(L"hid stop event failed err=%u",
+                static_cast<unsigned>(GetLastError()));
+    }
+    // The completion event for the counted module entries. Created before any
+    // turn or batch completion can take a lease.
+    g_moduleEntriesGone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_moduleEntriesGone) {
+        FileLog(L"module entry event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
     // The cross-process channel: without it a gesture close still runs its
@@ -12563,16 +12443,12 @@ BOOL RoleInit() {
     // window, and this is the attempt that installs the root hook.
     TryInstallFromLoadedModules(false);
 
+    g_initialised = true;
     return TRUE;
 }
 
 void RoleAfterInit() {
-    if (g_initRefused.load(std::memory_order_relaxed)) {
-        // Wh_ModInit refused its prerequisites: no hook was installed, no
-        // channel was opened, and no thread starts.
-        return;
-    }
-    if (g_secondInstance.load(std::memory_order_relaxed)) {
+    if (!g_initialised) {
         return;
     }
     g_afterInit = true;
@@ -12585,8 +12461,8 @@ void RoleAfterInit() {
     FileLog(L"hid init");
     if (!g_hidStopEvent) {
         // A gesture source that cannot be stopped is worse than no gesture:
-        // unloading would have to hope the thread notices instead of signalling
-        // it. The diagnostics above still name the reason.
+        // unloading would have to hope the thread notices instead of
+        // signalling it. The diagnostics above still name the reason.
         FileLog(L"hid thread not started (stop event unavailable)");
         return;
     }
@@ -12599,8 +12475,7 @@ void RoleAfterInit() {
 }
 
 void RoleBeforeUninit() {
-    if (g_initRefused.load(std::memory_order_relaxed) ||
-        g_secondInstance.load(std::memory_order_relaxed)) {
+    if (!g_initialised) {
         return;
     }
 
@@ -12616,22 +12491,18 @@ void RoleBeforeUninit() {
 
     // Stop the asynchronous dismiss-settle callback from touching state once
     // the module starts to unload. The handler reads this before it takes any
-    // lock, so a callback the compositor dispatches after this point touches no
-    // shared state; its counted entry is what the drain below waits for.
+    // lock; its counted entry is what the drain waits for.
     g_stopDismissCallback = true;
 
-    // Withdraw availability first, before anything is stopped or joined. This is
-    // the step that makes a shutdown press the shell's: the moment the input
-    // thread is told to stop it can no longer serve an intent, so the bridge must
-    // not intercept one. The same write resets the shared direction and touch, so
-    // a disable in the middle of a close cannot leave `closing` readable as the
-    // next activation's decision.
+    // Withdraw availability first, before anything is stopped or joined. The
+    // moment the input thread is told to stop it can no longer serve an intent,
+    // so the bridge must not intercept one. The same write resets the shared
+    // direction and touch, so a disable in the middle of a close cannot leave
+    // `closing` readable as the next activation's decision.
     PublishPeerGone(L"unload");
 
     // 1. Stop the input thread. The event does not depend on the window: the
-    //    thread may still be between CreateThread and publishing the HWND, and
-    //    a WM_QUIT aimed at a window that does not exist yet reaches nobody.
-    //    Availability was already withdrawn above.
+    //    thread may still be between CreateThread and publishing the HWND.
     if (g_hidStopEvent) {
         SetEvent(g_hidStopEvent);
     }
@@ -12643,134 +12514,108 @@ void RoleBeforeUninit() {
         PostMessageW(hwnd, WM_QUIT, 0, 0);
     }
 
-    // 2. Wait for it. Nothing it touches may be freed before this returns.
+    // 2. Join it INFINITE, off its own thread. Nothing it touches may be freed
+    //    before this returns, and the image is about to be unmapped: a thread
+    //    that ignores the stop is a bug that blocks the unload, never a reason
+    //    to close its handles or return success.
     if (g_hidThread) {
-        const DWORD waitResult =
-            WaitForSingleObject(g_hidThread, kUnloadThreadWaitMs);
-        if (waitResult == WAIT_OBJECT_0) {
+        if (GetCurrentThreadId() ==
+            g_hidThreadId.load(std::memory_order_relaxed)) {
+            FileLog(L"unload hid thread join refused: called on that thread");
+        } else if (WaitForSingleObject(g_hidThread, INFINITE) ==
+                   WAIT_OBJECT_0) {
             CloseHandle(g_hidThread);
             g_hidThread = nullptr;
-            FileLog(L"unload hid thread stopped");
+            FileLog(L"unload hid thread joined");
         } else {
-            // It is still inside module code: its window procedure, its globals
-            // and the IPC view are all live. Nothing may be released under it,
-            // and the handle stays open so a later attempt can still join this
-            // thread.
-            g_hidThreadLeaked.store(true, std::memory_order_relaxed);
-            FileLog(L"unload hid thread still running; ipc view leaked");
-            FileLog(L"unload hid thread wait=%u ms timed out",
-                    static_cast<unsigned>(kUnloadThreadWaitMs));
+            // A wait that fails on a valid handle is not expected; there is
+            // still no safe return while the thread can run module code.
+            ULONGLONG nextReport = 0;
+            for (;;) {
+                const ULONGLONG now = GetTickCount64();
+                if (now >= nextReport) {
+                    nextReport = now + 5000;
+                    FileLog(L"unload hid thread join failed err=%u",
+                            static_cast<unsigned>(GetLastError()));
+                }
+                Sleep(1000);
+            }
         }
     } else {
-        FileLog(L"unload hid thread stopped");
+        FileLog(L"unload hid thread joined");
     }
 }
 
 void RoleUninit() {
-    if (g_initRefused.load(std::memory_order_relaxed)) {
-        // Wh_ModInit installed nothing. A pinned image with no guard has
-        // nothing to close and no thread to join; the pin is the process's.
-        Wh_Log(L"Refused instance uninitialized");
-        return;
-    }
-    if (g_secondInstance.load(std::memory_order_relaxed)) {
-        // Nothing was installed by this instance, so there is nothing to free
-        // and no guard to release: this instance never took one.
-        Wh_Log(L"Refused instance uninitialized");
+    if (!g_initialised) {
         return;
     }
 
     // The bridge's interception precondition fails here, before anything below
-    // can return as a residual: from this point no intent is consumed, so no
-    // trigger may be swallowed for one. The withdrawal already ran in
-    // Wh_ModBeforeUninit, before the consumer was stopped; this repeat covers an
-    // uninit that skipped it, and writes only the two words.
+    // is freed: from this point no intent is consumed, so no trigger may be
+    // swallowed for one. The withdrawal already ran in BeforeUninit, before the
+    // consumer was stopped; this repeat covers an uninit that skipped it.
     PublishPeerGone(L"uninit");
 
-    // A thread that BeforeUninit did not stop is a residual: every resource it
-    // can touch stays alive, the handle stays open for a later join, and the log
-    // names it. The module is then not honestly gone; the process must restart.
-    // The leaked flags are set where the timeout happens, so this only promotes
-    // an uninit that skipped BeforeUninit.
-    if (g_hidThread && !g_hidThreadLeaked.load(std::memory_order_relaxed)) {
-        g_hidThreadLeaked.store(true, std::memory_order_relaxed);
-        FileLog(L"unload hid thread still running; ipc view leaked");
+    // An uninit that skipped BeforeUninit still has the thread. Join it here
+    // before touching what it runs on; the join has no deadline by design.
+    if (g_hidThread) {
+        if (g_hidStopEvent) {
+            SetEvent(g_hidStopEvent);
+        }
+        if (WaitForSingleObject(g_hidThread, INFINITE) == WAIT_OBJECT_0) {
+            CloseHandle(g_hidThread);
+            g_hidThread = nullptr;
+            FileLog(L"unload hid thread joined (uninit)");
+        }
     }
 
-    const bool hidLeaked =
-        g_hidThreadLeaked.load(std::memory_order_relaxed);
-    if (hidLeaked) {
-        FileLog(L"unload residual=hid thread; process must restart to finish "
-                L"unloading");
-        Wh_Log(L"Unload left resources in place: a worker thread is still "
-               L"running; restart StartMenuExperienceHost to finish unloading");
-        return;
+    // 3. One UI teardown turn: revoke the XAML handlers and the settle batch,
+    //    restore resting progress and neutral translation, drop the UI-owned
+    //    objects. Waiting for the turn is the proof the revokes ran.
+    TeardownUiOnUiThread();
+
+    // 4. Wait for a batch completion the compositor had already dispatched.
+    //    The count is the proof its code is gone; the IPC view and handles stay
+    //    until it returns.
+    WaitForModuleEntries();
+
+    // 5. A XAML revoke that failed leaves a delegate attached to the root it
+    //    closes over. There is no safe free of that root or of this image, so
+    //    the unload reports and keeps waiting; it never returns success with a
+    //    mod-owned callback still reachable.
+    {
+        ULONGLONG nextReport = 0;
+        while (g_uiRegistrationCount.load(std::memory_order_acquire) != 0) {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= nextReport) {
+                nextReport = now + 5000;
+                FileLog(L"unload waiting for xaml revokes=%d",
+                        g_uiRegistrationCount.load(std::memory_order_relaxed));
+            }
+            Sleep(1000);
+        }
     }
 
-    // 3. The input thread can no longer post. Revoke every XAML delegate on the
-    //    UI thread and wait for that turn: a queued revocation must be shown to
-    //    have run before the objects it holds are dropped.
-    if (!RevokeHandlersOnUiThread()) {
-        FileLog(L"unload residual=xaml handlers; process must restart to finish "
-                L"unloading");
-        Wh_Log(L"Unload left resources in place: the UI thread did not revoke "
-               L"the XAML handlers; restart StartMenuExperienceHost to finish "
-               L"unloading");
-        return;
-    }
-
-    // 4. Detach the settle batch's Completed handler. A failed revoke keeps the
-    //    batch, its token and its counted entry: the handler can still run, so
-    //    nothing it touches may be freed.
-    if (!RevokeDismissBatch()) {
-        FileLog(L"unload residual=dismiss completion; process must restart to "
-                L"finish unloading");
-        Wh_Log(L"Unload left resources in place: the settle completion handler "
-               L"could not be revoked; restart StartMenuExperienceHost to finish "
-               L"unloading");
-        return;
-    }
-
-    // 5. Wait for every counted entry: a completion the compositor already
-    //    dispatched, and every UI turn that was posted before the input thread
-    //    stopped. Only after the count reaches zero may the objects they touch
-    //    go away.
-    if (!WaitForModuleEntryDrain(kUnloadCallbackDrainMs)) {
-        FileLog(L"unload residual=dismiss completion; process must restart to "
-                L"finish unloading");
-        FileLog(L"unload entries outstanding=%d",
-                g_moduleEntryCount.load(std::memory_order_relaxed));
-        Wh_Log(L"Unload left resources in place: a module entry is still "
-               L"running; restart StartMenuExperienceHost to finish unloading");
-        return;
-    }
-
-    // 6. Only now free what the thread's leftovers would touch: the batch
-    //    handler, the composition state and the shared section.
-    ResetComposition();
     ClearScrollerRetry();
-
     SwipeIpcClose(&g_ipc);
 
     if (g_hidStopEvent) {
         CloseHandle(g_hidStopEvent);
         g_hidStopEvent = nullptr;
     }
-
-    // A clean unload releases the instance guard: a later enable in this process
-    // may start again. A residual unload returns above with the guard still held,
-    // which is what refuses the second instance.
-    if (g_instanceGuard) {
-        CloseHandle(g_instanceGuard);
-        g_instanceGuard = nullptr;
+    if (g_moduleEntriesGone) {
+        CloseHandle(g_moduleEntriesGone);
+        g_moduleEntriesGone = nullptr;
     }
+    g_initialised = false;
     Wh_Log(L"Legacy Start Swipe uninitialized (start role)");
 }
 
 // A settings change only refreshes the atomics: the next settle reads them, no
 // renderer state and no cached curve is touched.
 void RoleSettingsChanged() {
-    if (g_secondInstance.load(std::memory_order_relaxed)) {
+    if (!g_initialised) {
         return;
     }
     LoadAnimationStyle();
@@ -12902,21 +12747,8 @@ constexpr uint32_t kExecDismissMethodStartButton = 6;
 // timer) is retired too: the live reopen path is the press latch and the Start
 // side's own cancel/recovery.
 
-// The hide waits in 10 ms steps, so the wait can end early when the mod is being
-// disabled under it.
-constexpr DWORD kHidePollMs = 10;
-
-// Where an unload that is still waiting first says so. Diagnostic only: reaching
-// this mark grants nothing, and no mark ends the wait.
-constexpr DWORD kIpcUnloadMarkMs = 500;
-
-// How often a stalled unload repeats itself while it keeps waiting. Nothing else
-// happens on that path: no close, no return, no handle left behind.
-constexpr DWORD kIpcUnloadStallReportMs = 10000;
-
 // The cross-process channel (swipe_ipc_shared.h). Opened once at init. Its
-// handles are closed by RoleUninit once no close can still be inside them; see
-// the drain there.
+// handles are closed by RoleUninit once the executor and its window are gone.
 SwipeIpcChannel g_ipc;
 
 // M3 executor: one hidden window on explorer's launcher thread. The hooks post a
@@ -12932,31 +12764,19 @@ thread_local int t_execCall = 0;
 HANDLE g_execStopEvent = nullptr;
 HANDLE g_execWorker = nullptr;
 DWORD g_execWorkerId = 0;
-// Window creation and window shutdown are one protocol, not two independent
-// checks. A creator reserves `g_execCreating`, then asks admission, then
-// publishes the HWND and releases the reservation; the stop path closes
-// admission, drains the reservation, and then snapshots the HWND. A creator
-// therefore either published before that snapshot or is refused after it, which
-// is what closes the race in which a creator passed the disabled check before
-// the stop saw a null HWND and published afterwards.
-std::atomic<bool> g_execAdmissionOpen{true};
-std::atomic<bool> g_execCreating{false};
-// The window a shutdown owes. Set when the stop snapshots a live window and
-// cleared by that window's own WM_NCDESTROY, so a later enable can tell "the
-// destruction completed while nothing was waiting" from "the old window still
-// runs". Only this exact HWND satisfies the wait: WM_NCDESTROY of any other
-// window signals nothing.
-std::atomic<HWND> g_execStopTarget{nullptr};
-// How long the stop waits for a creator to leave CreateWindowExW. A creator
-// that does not leave in this budget makes the teardown outstanding: the channel
-// and the handles stay, and the next enable refuses.
-constexpr DWORD kExecCreatorDrainMs = 500;
+// The fixed window class. It is registered under this image's `&__ImageBase`,
+// owned by this activation, and unregistered only after the window is gone. A
+// surviving class from an earlier image is a failure, never adopted.
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+constexpr wchar_t kExecClassName[] = L"WindhawkSwipeFor10Start.Executor";
+bool g_execClassRegistered = false;
+HINSTANCE g_execClassInstance = nullptr;
 constexpr UINT kExecMessage = WM_APP + 0x5A;
 // The private shutdown and latch messages. A generic WM_CLOSE says only "some
-// window should close"; the teardown is a request this activation made about one
-// identified window, and the WndProc answers it only when that window is the
-// recorded target. The latch message moves the hidden event's arm onto the
-// executor's owner thread, where the timer and the slot live.
+// window should close"; the teardown is a request this activation made about
+// its own window, and the WndProc answers it only for the published HWND. The
+// latch message moves the hidden event's arm onto the executor's owner thread,
+// where the timer and the slot live.
 constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
 constexpr UINT kExecLatchMessage = WM_APP + 0x5C;
 constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
@@ -12985,16 +12805,11 @@ constexpr UINT kExecDismissConfirmMs = 300;
 // dismiss that never comes. A failed worker startup leaves it false and the
 // shell's own path serves every trigger.
 std::atomic<bool> g_execReady{false};
-// Set by WM_NCDESTROY on the launcher thread when the destroyed window is the
-// one this activation recorded. StopExecutorWorker waits on it, so the window and
-// its timers are gone before the channel closes. It is never closed: a stop that
-// timed out leaves it for the teardown a later enable reaps.
+// Set by WM_NCDESTROY on the launcher thread when the published window is
+// destroyed. The unload resets it before posting the teardown and waits on it
+// without a deadline, so the window and its timers are gone before the class is
+// unregistered and the channel closed.
 HANDLE g_execWindowGone = nullptr;
-// How long the unload waits for the worker to join and for the window to be
-// destroyed. A timeout keeps every resource the outstanding participant still
-// uses (the worker's handles, the channel), makes the unload defer, and makes
-// the next activation refuse until the matching join or destruction completed.
-constexpr DWORD kExecJoinWaitMs = 2000;
 // The hidden event does not publish the latched open from its own stack. A show
 // that ran at the hidden event's own tick was swallowed by the completing hide
 // (measured on the auto-hidden layout: `own state event=hidden`, show and
@@ -13062,8 +12877,8 @@ std::atomic<bool> g_disabled{false};
 // before it sets g_disabled, so a fetch that is still running either finishes
 // first or the install sees the stop and adds nothing.
 SRWLOCK g_explorerSymbolLock = SRWLOCK_INIT;
-// The worker's retry schedule. Worker thread only; ResetReinitState clears these
-// before that thread exists. The deadline covers the 33 MB twinui.pcshell.pdb
+// The worker's retry schedule. Worker thread only; a fresh image starts these at
+// zero. The deadline covers the 33 MB twinui.pcshell.pdb
 // (the measured download took 180 s) and one retry after a failed parse; it is
 // printed on every pending line.
 constexpr uint64_t kExecSymbolProbeMs = 100;
@@ -13074,42 +12889,10 @@ int g_execProbeAttempts = 0;
 // Set only after Wh_SetFunctionHook accepted the close-decision hook, so no
 // close is ever arbitrated on a build where that hook was refused.
 std::atomic<bool> g_closeHookEnabled{false};
-// Close-hook frames currently inside, entry to exit: the decision hook's
-// HideStartAndCortana. Wh_ModUninit closes the
-// v7 channel only when this is zero, and Wh_ModInit refuses to re-activate this
-// image while it is not. It is a lifetime guard for that channel, not a barrier
-// between two closes: it answers "is a close still inside", never "this close
-// runs after that one".
-std::atomic<int> g_closeCalls{0};
 
-// Set when Wh_ModInit refused to install anything, so the later lifecycle
-// callbacks leave the live activation's channel and count alone. Wh_ModInit's
-// FALSE already tells the host not to call them; this makes a host that calls
-// them anyway harmless.
-std::atomic<bool> g_initRefused{false};
-
-// Counts one close-hook frame for as long as that frame is inside the hook, the
-// original call included. The lease is taken before the hook reads anything and
-// released on every exit, including unwinding, so no path can leave the count
-// stranded.
-//
-// Two closes on different threads hold a lease at the same time, and a
-// re-entrant close on one thread holds one lease per frame, so it balances by
-// itself. The count reaching zero is `drained`, and it is the only condition on
-// which Wh_ModUninit closes the channel or returns; because the lease spans the
-// original call it also settles the trampoline question for every counted
-// frame: a frame that is still about to call the original holds a lease, so the
-// unload does not return under it and no timeout may stand in for the count. The
-// one window the count cannot see is an entry that has not yet run the
-// constructor below; the pinned image keeps that frame's own code and the
-// destructor mapped, and its trampoline use is the host's unload to cover.
-struct CloseCallLease {
-    CloseCallLease() { g_closeCalls.fetch_add(1, std::memory_order_acq_rel); }
-    ~CloseCallLease() { g_closeCalls.fetch_sub(1, std::memory_order_acq_rel); }
-
-    CloseCallLease(const CloseCallLease&) = delete;
-    CloseCallLease& operator=(const CloseCallLease&) = delete;
-};
+// Set at the end of RoleInit; a fresh image starts false. The later callbacks
+// return at once until the role actually initialised.
+bool g_initialised = false;
 
 // ---------------------------------------------------------------------------
 // Logging (state transitions only, never per frame)
@@ -13506,10 +13289,8 @@ uint32_t PeerEpochNow() {
 // thread to run it.
 bool BridgeCanServe() {
     return g_ipc.state != nullptr &&
-           g_execAdmissionOpen.load(std::memory_order_acquire) &&
            g_execReady.load(std::memory_order_acquire) &&
-           !g_disabled.load(std::memory_order_relaxed) &&
-           !g_initRefused.load(std::memory_order_relaxed);
+           !g_disabled.load(std::memory_order_relaxed);
 }
 
 // The window this activation dispatches through, on the calling thread. A window
@@ -13623,7 +13404,6 @@ bool HideCanServeClose(const wchar_t** reason) {
 // method in edx, writes the transient state at [self+0x28] and calls the
 // manager's Hide through [self+0x38]; it returns nothing.
 void HideStartAndCortana_Hook(void* self, uint32_t method) {
-    const CloseCallLease closeCall;
     auto callOriginal = [self, method]() {
         if (HideStartAndCortana_Original) {
             HideStartAndCortana_Original(self, method);
@@ -14019,7 +13799,6 @@ OnHotkeyInvoke_t OnHotkeyInvoke_Original = nullptr;
 // forwarded passes through as an external takeover; one that cannot be
 // recognised falls back to the ordinary close, which may animate it.
 HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
-    const CloseCallLease closeCall;
     uint32_t admittingEpoch = 0;
     if (!g_ownWinEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) ||
@@ -14089,7 +13868,6 @@ OnStartButtonPressed_t OnStartButtonPressed_Original = nullptr;
 // there is no combination to gate.
 HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                                   uint32_t dismissMethod) {
-    const CloseCallLease closeCall;
     uint32_t admittingEpoch = 0;
     if (!g_ownButtonEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) ||
@@ -14126,7 +13904,6 @@ OnStartShown_t OnStartShown_Original = nullptr;
 // `self + 0x18` and its InternalState is `[self + 0x40]`, which is the same
 // dword the interface reads at +0x28.
 HRESULT OnStartShown_Hook(void* self, void* manager, void* inspectable) {
-    const CloseCallLease closeCall;
     const HRESULT hr = OnStartShown_Original
                            ? OnStartShown_Original(self, manager, inspectable)
                            : S_OK;
@@ -14144,7 +13921,6 @@ OnStartHidden_t OnStartHidden_Original = nullptr;
 // Runs after the original, so the state is already the settled closed value and
 // the latch's ShowStartView cannot be overwritten by this transition again.
 HRESULT OnStartHidden_Hook(void* self, void* manager, void* inspectable) {
-    const CloseCallLease closeCall;
     const HRESULT hr = OnStartHidden_Original
                            ? OnStartHidden_Original(self, manager, inspectable)
                            : S_OK;
@@ -14178,7 +13954,6 @@ using DismissHook_t = HRESULT (*)(void*, uint32_t);
 DismissHook_t Dismiss_Original = nullptr;
 
 HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
-    const CloseCallLease closeCall;
     uint32_t admittingEpoch = 0;
     if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) || t_execCall > 0) {
@@ -14215,7 +13990,6 @@ using ShowStartViewHook_t = HRESULT (*)(void*, uint32_t, uint32_t);
 ShowStartViewHook_t ShowStartView_Original = nullptr;
 
 HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
-    const CloseCallLease closeCall;
     uint32_t admittingEpoch = 0;
     if (!g_ownPrimitivesEnabled.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) || t_execCall > 0) {
@@ -14532,138 +14306,6 @@ void ProbeExplorerSymbolsFromWorker() {
 // ---------------------------------------------------------------------------
 // Module lifetime
 // ---------------------------------------------------------------------------
-
-// Any address in this module identifies the image that must stay mapped. The
-// function is never called; only its address is taken.
-void ModulePinAnchor() {}
-
-// The pinned image, once per process. A re-init of the same image keeps it.
-HMODULE g_modulePin = nullptr;
-
-// Pins this image until the process terminates. A close-hook frame that returns
-// after Wh_ModUninit still needs its own return address and the CloseCallLease
-// destructor to be valid, and a hook-only mod cannot wait for its caller the way
-// a threaded mod can. The pin covers exactly that: this image's code, its
-// globals and the lease destructor.
-//
-// It does not cover the MinHook trampoline. That allocation belongs to the host,
-// which removes hooks and frees trampolines only after Wh_ModUninit, following
-// its ThreadsCallStackWaitForRegions(..., 200, 400) scan; the scan is bounded and
-// its result is discarded, so a frame it sees is a frame it waited on, and a
-// frame it does not see is one nothing covered. "The scan saw the frame" and
-// "the frame exited before removal" are two claims, and only the first follows
-// from that scan. The counted frames are covered instead by the drain, which
-// returns only when the count has reached zero.
-//
-// A failure is a refusal, not a warning: Wh_ModInit returns FALSE and installs
-// nothing. A shell-owned thread that resumes in an unmapped image is the crash
-// this pin exists to prevent, and "the mod owns no thread" says nothing about a
-// thread the shell owns. The success is logged once; a re-enable of the same
-// image runs Wh_ModInit again and finds g_modulePin already set.
-bool PinThisModule() {
-    if (g_modulePin) {
-        return true;  // a re-init of the same pinned image
-    }
-    HMODULE module = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_PIN,
-                           reinterpret_cast<LPCWSTR>(&ModulePinAnchor),
-                           &module)) {
-        g_modulePin = module;
-        FileLog(L"mod pin image=%p pinned=1", reinterpret_cast<void*>(module));
-        return true;
-    }
-    FileLog(L"mod pin failed err=%u", static_cast<unsigned>(GetLastError()));
-    return false;
-}
-
-// A pinned image is initialised a second time in the same process: after a
-// clean unload the module is still mapped, so the next enable runs Wh_ModInit
-// on that same image and the loader initialises nothing. Every lifecycle flag
-// the previous activation left behind is cleared here, so the second init
-// installs its hooks again instead of believing they are still there.
-//
-// Wh_ModInit calls this only when g_closeCalls is zero: a close from the previous
-// activation that is still inside would otherwise see g_disabled cleared and the
-// globals re-pointed under it. A refused activation never reaches this function.
-// A drained unload returns at zero, so that refusal is reachable only through the
-// entry window the count cannot see; g_closeCalls itself is still deliberately not
-// touched, because such a frame owns its lease and that count must say so.
-void ResetReinitState() {
-    g_initRefused.store(false, std::memory_order_relaxed);
-    g_disabled.store(false, std::memory_order_relaxed);
-    g_afterInit.store(false, std::memory_order_relaxed);
-    g_explorerSymbolsReady.store(false, std::memory_order_relaxed);
-    g_explorerSymbolsRefused.store(false, std::memory_order_relaxed);
-    g_explorerModuleSeen.store(nullptr, std::memory_order_relaxed);
-    g_explorerSymbolClaim.store(nullptr, std::memory_order_relaxed);
-    g_explorerLoadLogged.store(false, std::memory_order_relaxed);
-    g_execProbeNextTick = 0;
-    g_execProbeFirstTick = 0;
-    g_execProbeAttempts = 0;
-    g_closeHookEnabled.store(false, std::memory_order_relaxed);
-    // The decision layer's per-activation state: a re-enable starts with no
-    // cached toggle, no latch, no forwarded mark and no primitives from the
-    // previous activation. The executor's state belongs here too: a pending
-    // command, a latch or a thread id inherited from the previous activation
-    // would post into a window that no longer exists, or create the next one on
-    // the wrong thread. The worker and the window were joined and destroyed by
-    // the unload; a timeout there refuses the re-enable instead of clearing them.
-    g_ownWinEnabled.store(false, std::memory_order_relaxed);
-    g_ownButtonEnabled.store(false, std::memory_order_relaxed);
-    g_ownEventsEnabled.store(false, std::memory_order_relaxed);
-    g_ownPrimitivesEnabled.store(false, std::memory_order_relaxed);
-    g_callersVerified.store(false, std::memory_order_relaxed);
-    g_dismiss = nullptr;
-    g_showStartView = nullptr;
-    g_launcherSlot = nullptr;
-    g_launcherIsVisible = nullptr;
-    // The hook originals point into the previous activation's trampolines, which
-    // Windhawk frees when it removes the hooks. A re-enable resolves them again;
-    // until it does, a null original means "not installed", not "call freed
-    // code".
-    Show_Original = nullptr;
-    HideStartAndCortana_Original = nullptr;
-    OnStartShown_Original = nullptr;
-    OnStartHidden_Original = nullptr;
-    OnHotkeyInvoke_Original = nullptr;
-    OnStartButtonPressed_Original = nullptr;
-    Dismiss_Original = nullptr;
-    ShowStartView_Original = nullptr;
-    DismissStartAndCortana_Original = nullptr;
-    DismissSynchronously_Original = nullptr;
-    ActiveZBand_Original = nullptr;
-    LoadLibraryExW_Original = nullptr;
-    g_execReady.store(false, std::memory_order_relaxed);
-    g_execWindow.store(nullptr, std::memory_order_relaxed);
-    g_execThreadId = 0;
-    g_launcherThread.store(0, std::memory_order_relaxed);
-    g_execAcceptedSeq = 0;
-    g_pendingDismissSeq = 0;
-    g_pendingShowSeq = 0;
-    g_dismissReadRetries = 0;
-    g_pendingDismissConfirmSeq = 0;
-    g_pendingDismissConfirmVisible = 0;
-    g_pendingDismissConfirmTick = 0;
-    g_pendingDismissEpoch = 0;
-    g_dispatchEpoch = 0;
-    g_pressLatch = PressLatch{};
-    g_pressServeReason = L"timeout";
-    t_ownExternalMethod = 0;
-    // The executor's lifetime protocol, which the refusal checks above have
-    // proved complete: no worker, no identified window, no creator. Only now is
-    // admission reopened; a stop that did not complete left it closed and the
-    // refusal above kept this function out. The creator reservation is NOT set
-    // here: a flag cleared by the reaper would be a proof it did not obtain.
-    g_execAdmissionOpen.store(true, std::memory_order_release);
-    g_execStopTarget.store(nullptr, std::memory_order_release);
-    g_execWorkerId = 0;
-    AcquireSRWLockExclusive(&g_ownLock);
-    g_ownOpen = false;
-    ReleaseSRWLockExclusive(&g_ownLock);
-}
-
-
 
 // ---------------------------------------------------------------------------
 // M3 executor: hidden window, launcher read, commands
@@ -15177,23 +14819,14 @@ void ExecutePendingCommand() {
 
 LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                                     LPARAM lParam) {
-    // Every dispatch that can reach the launcher or the channel holds a lease.
-    // Wh_ModUninit waits for the count to reach zero before it closes the
-    // channel, so no command can run against a closed section.
-    const CloseCallLease dispatch;
     if (message == kExecTeardownMessage) {
         // The owner-thread shutdown. This is a private request, not a generic
         // WM_CLOSE: the one-shot timers would otherwise outlive the window, and a
-        // timer that fires after Wh_ModUninit would read a session the channel no
-        // longer maps. Only the identified target answers: a recycled HWND that
-        // now belongs to another window never reaches this procedure, and a
-        // window of this image that this activation did not name refuses, which
-        // is what makes the handle a statement about this window.
-        const bool identified =
-            g_execStopTarget.load(std::memory_order_acquire) == window;
-        if (wParam != kExecTeardownMagic || !identified) {
-            FileLog(L"exec teardown ignored hwnd=%p identified=%d",
-                    window, identified ? 1 : 0);
+        // timer that fires after the unload would read a session the channel no
+        // longer maps. Only this activation's published window answers.
+        if (wParam != kExecTeardownMagic ||
+            window != g_execWindow.load(std::memory_order_acquire)) {
+            FileLog(L"exec teardown ignored hwnd=%p", window);
             return 0;
         }
         KillTimer(window, kExecDismissTimer);
@@ -15201,40 +14834,37 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         KillTimer(window, kPressLatchTimer);
         KillTimer(window, kExecDismissProbeTimer);
         DestroyWindow(window);
+        // The acknowledgement is set after DestroyWindow returns, not from
+        // WM_NCDESTROY inside it: the class's window count is decremented when
+        // the call completes, and the unload must not unregister the class
+        // between the two.
+        if (g_execWindowGone) {
+            SetEvent(g_execWindowGone);
+        }
         return 0;
     }
     if (message == WM_NCDESTROY) {
-        // The acknowledgement names the window it is for. A stop waits on one
-        // identified HWND; any other window's destruction (an old activation's,
-        // a class the shell recreated) must not answer for it.
-        bool identified = false;
-        if (g_execWindow.load(std::memory_order_acquire) == window) {
+        // The destructor of the one published window. Any other window of this
+        // class (there is none: the class is owned and unregistered) must not
+        // answer for it. The class acknowledgement is set by the teardown above
+        // after DestroyWindow returns.
+        const bool identified =
+            g_execWindow.load(std::memory_order_acquire) == window;
+        if (identified) {
             g_execWindow.store(nullptr, std::memory_order_release);
-            identified = true;
-        }
-        if (g_execStopTarget.load(std::memory_order_acquire) == window) {
-            g_execStopTarget.store(nullptr, std::memory_order_release);
-            identified = true;
-        }
-        if (identified && g_execWindowGone) {
-            SetEvent(g_execWindowGone);
         }
         FileLog(L"exec window gone hwnd=%p identified=%d tid=%u", window,
                 identified ? 1 : 0, GetCurrentThreadId());
         return 0;
     }
     // A window this activation did not publish is not a dispatcher. A survivor
-    // from a previous activation has this image's procedure and would otherwise
-    // see this activation's globals and channel; its timers are the sharper
-    // edge, because a dismiss armed for an old menu would fire into a new one.
-    // The teardown above is the only message such a window answers.
+    // from an earlier image is impossible (the class is owned and unregistered),
+    // but the test keeps a stray message from reaching this activation's state.
     if (window != g_execWindow.load(std::memory_order_acquire)) {
         return DefWindowProcW(window, message, wParam, lParam);
     }
     if (!g_execReady.load(std::memory_order_acquire) ||
-        !g_execAdmissionOpen.load(std::memory_order_acquire) ||
-        g_disabled.load(std::memory_order_relaxed) ||
-        g_initRefused.load(std::memory_order_relaxed)) {
+        g_disabled.load(std::memory_order_relaxed)) {
         // An unload is in flight: no command and no timer may touch the launcher
         // or the channel after this point.
         return DefWindowProcW(window, message, wParam, lParam);
@@ -15374,56 +15004,30 @@ void EnsureExecutorOnLauncherThread(const wchar_t* source) {
 }
 
 void EnsureExecutorWindow() {
-    // One creator at a time. The reservation is what a shutdown drains: a creator
-    // that is inside CreateWindowExW must publish before the stop reads the HWND,
-    // and a creator that arrives after admission closed must not publish at all.
-    // The admission test sits after the reservation, not before it, so those two
-    // cases are the only two a stop can see.
-    bool expected = false;
-    if (!g_execCreating.compare_exchange_strong(expected, true,
-                                                std::memory_order_acq_rel)) {
-        return;  // another creator holds it; its outcome is this call's outcome
-    }
-    struct CreatorDone {
-        ~CreatorDone() {
-            g_execCreating.store(false, std::memory_order_release);
-        }
-    } creatorDone;
-
-    if (!g_execAdmissionOpen.load(std::memory_order_acquire) ||
-        g_disabled.load(std::memory_order_relaxed) ||
-        g_initRefused.load(std::memory_order_relaxed) ||
+    if (g_disabled.load(std::memory_order_relaxed) ||
         g_execWindow.load(std::memory_order_relaxed)) {
         return;
     }
-    // The class is unique per activation. A Windhawk reinstall maps a new image
-    // at a new base while the old one stays pinned; a fixed class name would
-    // return ERROR_CLASS_ALREADY_EXISTS and CreateWindowEx would use the old
-    // image's WndProc, whose channel and globals belong to the previous
-    // activation. Naming the class by this image's WndProc address keeps every
-    // activation's window on its own procedure.
-    static wchar_t className[64] = L"";
-    if (!className[0]) {
-        swprintf_s(className, L"WindhawkSwipeExecutor_%p",
-                   reinterpret_cast<void*>(&ExecutorWindowProc));
-    }
-    static bool registered = false;
-    if (!registered) {
+    // The class is fixed and owned by this image. `ERROR_CLASS_ALREADY_EXISTS`
+    // is a failure: it means a previous window of this image survived its
+    // unload, and adopting that class would hand this activation's channel to a
+    // procedure whose module is about to be unmapped.
+    if (!g_execClassRegistered) {
         WNDCLASSEXW windowClass{};
         windowClass.cbSize = sizeof(windowClass);
         windowClass.lpfnWndProc = ExecutorWindowProc;
-        windowClass.hInstance = GetModuleHandleW(nullptr);
-        windowClass.lpszClassName = className;
-        if (!RegisterClassExW(&windowClass) &&
-            GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        windowClass.hInstance = reinterpret_cast<HINSTANCE>(&__ImageBase);
+        windowClass.lpszClassName = kExecClassName;
+        if (!RegisterClassExW(&windowClass)) {
             FileLog(L"exec window class failed err=%u", GetLastError());
             return;
         }
-        registered = true;
+        g_execClassRegistered = true;
+        g_execClassInstance = windowClass.hInstance;
     }
-    HWND window = CreateWindowExW(0, className, L"", 0, 0, 0, 0,
+    HWND window = CreateWindowExW(0, kExecClassName, L"", 0, 0, 0, 0,
                                   0, HWND_MESSAGE, nullptr,
-                                  GetModuleHandleW(nullptr), nullptr);
+                                  g_execClassInstance, nullptr);
     if (!window) {
         FileLog(L"exec window create failed err=%u", GetLastError());
         return;
@@ -15440,7 +15044,7 @@ void EnsureExecutorWindow() {
                 g_execThreadId, launcherThread);
     }
     FileLog(L"exec window hwnd=%p tid=%u class=%s", window, g_execThreadId,
-            className);
+            kExecClassName);
 }
 
 LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
@@ -15458,8 +15062,7 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
     if (g_execWindow.load(std::memory_order_relaxed)) {
         return true;
     }
-    if (!g_execAdmissionOpen.load(std::memory_order_acquire) ||
-        g_disabled.load(std::memory_order_relaxed)) {
+    if (g_disabled.load(std::memory_order_relaxed)) {
         return false;  // a shutdown owns the lifetime now
     }
     const DWORD target = g_launcherThread.load(std::memory_order_relaxed);
@@ -15482,6 +15085,9 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
     }
     const ULONGLONG start = GetTickCount64();
     while (!g_execWindow.load(std::memory_order_relaxed) &&
+           !g_disabled.load(std::memory_order_relaxed) &&
+           !(g_execStopEvent &&
+             WaitForSingleObject(g_execStopEvent, 0) == WAIT_OBJECT_0) &&
            GetTickCount64() - start < timeoutMs) {
         Sleep(5);
     }
@@ -15514,15 +15120,12 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
     // is created there and that thread's loop dispatches its messages.
     CreateExecutorWindowOnUiThread(2000);
 
-    // Availability is published HERE, not by the thread that called CreateThread.
-    // The new thread can run (and exit) before CreateThread returns; a creator's
-    // store of `true` after the exit guard's `false` would leave the gate open for
-    // a worker that no longer exists. The positive publication, the exit
-    // withdrawal and the stop therefore all belong to this thread, and the gate
-    // also requires admission, which the stop closes first.
-    if (g_execAdmissionOpen.load(std::memory_order_acquire) &&
-        !g_disabled.load(std::memory_order_relaxed) &&
-        !g_initRefused.load(std::memory_order_relaxed)) {
+    // Availability is published HERE, not by the thread that called
+    // CreateThread. The new thread can run (and exit) before CreateThread
+    // returns; a creator's store of `true` after the exit guard's `false` would
+    // leave the gate open for a worker that no longer exists. The gate also
+    // reads g_disabled, which BeforeUninit sets before it signals the stop.
+    if (!g_disabled.load(std::memory_order_relaxed)) {
         g_execReady.store(true, std::memory_order_release);
         FileLog(L"exec worker ready tid=%u window=%p", GetCurrentThreadId(),
                 g_execWindow.load(std::memory_order_relaxed));
@@ -15571,33 +15174,9 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
     }
 }
 
-// Closes the worker's two handles and clears its identity. Only called when the
-// thread has been joined, because a handle a live thread still waits on must
-// never be closed: the next enable would otherwise hand that thread a recycled
-// value for its wait.
-void ReapExecutorWorker() {
-    if (!g_execWorker) {
-        return;
-    }
-    CloseHandle(g_execWorker);
-    g_execWorker = nullptr;
-    if (g_execStopEvent) {
-        CloseHandle(g_execStopEvent);
-        g_execStopEvent = nullptr;
-    }
-    FileLog(L"exec worker joined tid=%u", g_execWorkerId);
-    g_execWorkerId = 0;
-}
-
 void StartExecutorWorker() {
     if (g_execWorker || !g_ipc.execEvent) {
         return;
-    }
-    if (!g_execWindowGone) {
-        g_execWindowGone = CreateEventW(nullptr, TRUE, TRUE, nullptr);
-        if (!g_execWindowGone) {
-            FileLog(L"exec window gone event failed err=%u", GetLastError());
-        }
     }
     g_execStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_execStopEvent) {
@@ -15616,253 +15195,124 @@ void StartExecutorWorker() {
     FileLog(L"exec worker started tid=%u", g_execWorkerId);
 }
 
-// Proves that no creator of this activation is still between CreateWindowExW and
-// its publication. Admission must already be closed: a creator that arrives
-// after this proof cannot start, so `false` here is a durable statement and not
-// one moment of an interleaving. A timeout is returned, never repaired by
-// clearing the reservation: a flag cleared by the reaper would let the same
-// window publish behind the snapshot it was cleared for.
-bool DrainExecutorCreator(const wchar_t* why) {
-    const ULONGLONG deadline = GetTickCount64() + kExecCreatorDrainMs;
-    while (g_execCreating.load(std::memory_order_acquire) &&
-           GetTickCount64() < deadline) {
-        Sleep(1);  // a creator is inside CreateWindowExW; its publish is next
+// Joins the posting worker. The stop event is already set by BeforeUninit; the
+// worker never synchronously calls the launcher and never waits for an owner
+// callback, so this join cannot be held up by the launcher thread's own work.
+// A worker that does not exit is a bug that blocks the unload; there is no safe
+// return while it can still post into module code.
+void JoinExecutorWorker() {
+    if (!g_execWorker) {
+        return;
     }
-    if (g_execCreating.load(std::memory_order_acquire)) {
-        FileLog(L"exec creator still inside (%s)", why);
-        return false;
+    if (WaitForSingleObject(g_execWorker, INFINITE) == WAIT_OBJECT_0) {
+        CloseHandle(g_execWorker);
+        g_execWorker = nullptr;
+        FileLog(L"exec worker joined tid=%u", g_execWorkerId);
+        g_execWorkerId = 0;
+        return;
     }
-    return true;
+    ULONGLONG nextReport = 0;
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= nextReport) {
+            nextReport = now + 5000;
+            FileLog(L"exec worker join failed err=%u tid=%u", GetLastError(),
+                    g_execWorkerId);
+        }
+        Sleep(1000);
+    }
 }
 
-// The private shutdown. A generic WM_CLOSE would only say "close some window";
-// this request names the window this activation is tearing down, and the
-// procedure answers it only when that window is the recorded target.
-bool PostExecutorTeardown(HWND window) {
-    return PostMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0) !=
-           FALSE;
-}
-
-// The one window shutdown. Returns true only when no worker and no window of this
-// activation can run a command any more. False means an outstanding participant
-// still uses the channel, the stop event or the window's message loop: the caller
-// keeps all of them and the next activation refuses until the matching join or
-// destruction has completed.
-//
-// The order is the fix for a same-image re-enable. Admission closes first, so no
-// creator can publish a window behind the snapshot and no command can be served;
-// the creator reservation is drained, so a creation that already passed admission
-// finishes and is seen. Then the worker is joined, and only then is the
-// identified window destroyed — directly when this call already runs on its owner
-// thread, otherwise with the private teardown the owner acknowledges from
-// WM_NCDESTROY.
-bool StopExecutorWorker() {
-    // Admission first, readiness second: the worker publishes its own readiness
-    // and the window's procedure requires admission, so a late positive
-    // publication from a worker that has not yet noticed the stop is never
-    // readable as a service.
-    g_execAdmissionOpen.store(false, std::memory_order_release);
-    g_execReady.store(false, std::memory_order_release);
-
-    const bool creatorDrained = DrainExecutorCreator(L"stop");
-    if (!creatorDrained) {
-        FileLog(L"exec window creator did not leave in %u ms",
-                static_cast<unsigned>(kExecCreatorDrainMs));
-    }
-
-    // A window that was already published belongs to this activation even when
-    // its creator has not released the reservation yet; a window that is still
-    // null under a live creator is not a snapshot this stop may record. The
-    // re-enable proves the creator out first and takes the window then.
+// Destroys the one published window on its owner thread and waits for
+// WM_NCDESTROY. Called after the worker is joined, so no new post can arrive.
+// DestroyWindow is asynchronous only across threads: the teardown message makes
+// the owner run it, and WM_NCDESTROY signals the event. On the owner thread it
+// runs inline. A window that does not go away has no safe successful unload.
+void DestroyExecutorWindow() {
     HWND window = g_execWindow.load(std::memory_order_acquire);
-    if (window) {
-        g_execStopTarget.store(window, std::memory_order_release);
-        if (g_execWindow.load(std::memory_order_acquire) != window) {
-            // The window was destroyed between the snapshot and the target store,
-            // so its WM_NCDESTROY could not see the target and cleared nothing. A
-            // stale target here would refuse every later enable forever.
-            g_execStopTarget.store(nullptr, std::memory_order_release);
-            FileLog(L"exec window already gone hwnd=%p", window);
-            window = nullptr;
-        }
+    if (!window) {
+        return;
     }
-
-    bool workerStopped = true;
-    if (g_execWorker) {
-        SetEvent(g_execStopEvent);
-        const DWORD joined = WaitForSingleObject(g_execWorker, kExecJoinWaitMs);
-        if (joined == WAIT_OBJECT_0) {
-            ReapExecutorWorker();
-        } else {
-            // The worker still waits on both handles and on the channel's Exec
-            // event. Closing either would hand it a recycled handle, and closing
-            // the channel would unmap the event it is waiting on; all three stay
-            // with the pinned image, and the next enable refuses until this join
-            // has actually completed.
-            workerStopped = false;
-            FileLog(L"exec worker join timeout tid=%u (handles and channel kept)",
-                    g_execWorkerId);
-        }
-    }
-
-    bool windowStopped = true;
-    if (window) {
-        if (g_execThreadId == GetCurrentThreadId()) {
-            // Already on the owner thread: destroy directly, no post and no ack.
-            DestroyWindow(window);
-            windowStopped = g_execWindow.load(std::memory_order_acquire) == nullptr;
-            if (windowStopped) {
-                FileLog(L"exec window destroyed directly tid=%u",
-                        static_cast<unsigned>(g_execThreadId));
-            } else {
-                FileLog(L"exec window destroy refused tid=%u",
-                        static_cast<unsigned>(g_execThreadId));
+    if (g_execThreadId == GetCurrentThreadId()) {
+        DestroyWindow(window);
+    } else {
+        if (!g_execWindowGone) {
+            FileLog(L"exec window gone event missing hwnd=%p", window);
+            for (;;) {
+                Sleep(5000);
             }
-        } else {
-            if (!g_execWindowGone) {
-                g_execWindowGone = CreateEventW(nullptr, TRUE, TRUE, nullptr);
-                if (!g_execWindowGone) {
-                    FileLog(L"exec window gone event failed err=%u",
-                            GetLastError());
+        }
+        ResetEvent(g_execWindowGone);
+        if (!PostMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0)) {
+            if (!g_execWindow.load(std::memory_order_acquire)) {
+                return;  // it died before the message
+            }
+            ULONGLONG nextReport = 0;
+            for (;;) {
+                const ULONGLONG now = GetTickCount64();
+                if (now >= nextReport) {
+                    nextReport = now + 5000;
+                    FileLog(L"exec window teardown post failed err=%u hwnd=%p",
+                            GetLastError(), window);
                 }
-            }
-            if (!g_execWindowGone) {
-                // Nothing can acknowledge the destruction, and leaving the
-                // window is not a stop. Keep it and make the teardown
-                // outstanding rather than pretending it completed.
-                windowStopped = false;
-                FileLog(L"exec window close unacknowledged tid=%u (no event)",
-                        static_cast<unsigned>(g_execThreadId));
-            } else if (g_execStopTarget.load(std::memory_order_acquire) !=
-                       window) {
-                // The owner destroyed it while the worker was being joined; its
-                // acknowledgement was already consumed (or could not name this
-                // target yet). Nothing is left to wait for.
-                FileLog(L"exec window gone before the close hwnd=%p", window);
-            } else {
-                ResetEvent(g_execWindowGone);
-                if (!PostExecutorTeardown(window)) {
-                    FileLog(L"exec window teardown post failed err=%u",
-                            GetLastError());
-                    windowStopped = false;
-                } else if (WaitForSingleObject(g_execWindowGone,
-                                               kExecJoinWaitMs) ==
-                           WAIT_OBJECT_0) {
-                    FileLog(L"exec window destroyed tid=%u",
-                            static_cast<unsigned>(g_execThreadId));
-                } else {
-                    // The teardown kills the timers and destroys the window; the
-                    // ack is WM_NCDESTROY's, and it has not come. The dispatch
-                    // gate keeps the surviving window harmless, but the
-                    // activation is not gone and nothing is closed under it.
-                    FileLog(L"exec window close timeout tid=%u",
-                            static_cast<unsigned>(g_execThreadId));
-                    windowStopped = false;
-                }
+                Sleep(1000);
             }
         }
+        if (WaitForSingleObject(g_execWindowGone, INFINITE) != WAIT_OBJECT_0) {
+            ULONGLONG nextReport = 0;
+            for (;;) {
+                const ULONGLONG now = GetTickCount64();
+                if (now >= nextReport) {
+                    nextReport = now + 5000;
+                    FileLog(L"exec window teardown wait failed err=%u hwnd=%p",
+                            GetLastError(), window);
+                }
+                Sleep(1000);
+            }
+        }
+        FileLog(L"exec window destroyed tid=%u",
+                static_cast<unsigned>(g_execThreadId));
     }
-    if (windowStopped) {
-        g_execStopTarget.store(nullptr, std::memory_order_release);
+    if (g_execWindow.load(std::memory_order_acquire)) {
+        // DestroyWindow refused or the owner never published the destruction.
+        // Freeing the class or the image under it is not an option.
+        HWND remaining = g_execWindow.load(std::memory_order_acquire);
+        ULONGLONG nextReport = 0;
+        for (;;) {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= nextReport) {
+                nextReport = now + 5000;
+                FileLog(L"exec window still published hwnd=%p tid=%u",
+                        remaining, static_cast<unsigned>(g_execThreadId));
+            }
+            Sleep(1000);
+        }
     }
-    return creatorDrained && workerStopped && windowStopped;
 }
 
-// Answers whether a teardown that a previous activation left outstanding has
-// completed since. It is also the second half of the creation race: a creator
-// that was inside CreateWindowExW when the stop ran its drain can publish a
-// window after that stop returned, so the window found here is destroyed exactly
-// as the unload would have destroyed it. A worker that has exited is joined and
-// its handles closed. True means nothing of that activation is left, which is the
-// one state a re-enable may inherit.
-//
-// The two moments of the old version are the bug this order removes. It read the
-// published HWND and then the creator reservation: a creator that publishes and
-// releases between those two reads was seen as "no HWND" and "no creator", and
-// the enable cleared the HWND that had just been written — the exact window the
-// reaper existed to destroy, still running with this image's procedure and a new
-// activation's channel. With admission closed, the reservation is drained FIRST;
-// the publish happens before the release, so a null HWND read after the drain is
-// a durable answer. The reservation is never cleared to look quiescent.
-bool ReapExecutorTeardown() {
-    if (g_execWorker) {
-        if (WaitForSingleObject(g_execWorker, 0) == WAIT_OBJECT_0) {
-            ReapExecutorWorker();
-        } else {
-            FileLog(L"exec reinit refused: the previous worker is still running "
-                    L"tid=%u",
-                    g_execWorkerId);
-            return false;
+// Unregisters the fixed class under the instance that registered it. The window
+// is gone by now, so no procedure can still run. A failure other than "already
+// gone" leaves the WndProc reachable through the class, so the unload keeps
+// trying instead of returning into an image the class still points at.
+void UnregisterExecutorClass() {
+    if (!g_execClassRegistered) {
+        return;
+    }
+    for (;;) {
+        if (UnregisterClassW(kExecClassName, g_execClassInstance)) {
+            FileLog(L"exec window class unregistered");
+            break;
         }
-    }
-    if (!DrainExecutorCreator(L"reinit")) {
-        FileLog(L"exec reinit refused: a window creation from the previous "
-                L"activation is still inside");
-        return false;
-    }
-    HWND target = g_execStopTarget.load(std::memory_order_acquire);
-    if (!target) {
-        target = g_execWindow.load(std::memory_order_acquire);
-        if (target) {
-            // A window nobody was waiting for: the stop timed out on its creator.
-            // From here it is the identified target, and the creator proof above
-            // is what makes it the only one this activation can have.
-            g_execStopTarget.store(target, std::memory_order_release);
-            FileLog(L"exec teardown found a surviving window hwnd=%p", target);
+        const DWORD error = GetLastError();
+        if (error == ERROR_CLASS_DOES_NOT_EXIST) {
+            FileLog(L"exec window class already gone");
+            break;
         }
+        FileLog(L"exec window class unregister failed err=%u", error);
+        Sleep(1000);
     }
-    if (target) {
-        if (!IsWindow(target)) {
-            g_execWindow.store(nullptr, std::memory_order_release);
-            g_execStopTarget.store(nullptr, std::memory_order_release);
-            FileLog(L"exec teardown cleared a dead window hwnd=%p", target);
-        } else {
-            // Finish the stop here rather than refusing forever: the window is
-            // this image's, so its own teardown path destroys it and
-            // acknowledges. The event is reset for this target, never read as an
-            // acknowledgement left by an earlier stop. IsWindow alone is not the
-            // identity test — a recycled handle would answer it — which is why
-            // the request carries the private message and the owner checks it
-            // against the recorded target before destroying.
-            if (!g_execWindowGone) {
-                g_execWindowGone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-                if (!g_execWindowGone) {
-                    FileLog(L"exec reinit refused: no acknowledgement event for "
-                            L"the surviving window hwnd=%p",
-                            target);
-                    return false;
-                }
-            }
-            ResetEvent(g_execWindowGone);
-            bool destroyed = false;
-            if (g_execThreadId == GetCurrentThreadId()) {
-                DestroyWindow(target);
-                destroyed = !IsWindow(target);
-            } else if (PostExecutorTeardown(target) &&
-                       WaitForSingleObject(g_execWindowGone, kExecJoinWaitMs) ==
-                           WAIT_OBJECT_0) {
-                destroyed = true;
-            }
-            if (!destroyed) {
-                FileLog(L"exec reinit refused: the previous window still exists "
-                        L"hwnd=%p",
-                        target);
-                return false;
-            }
-            g_execWindow.store(nullptr, std::memory_order_release);
-            g_execStopTarget.store(nullptr, std::memory_order_release);
-            FileLog(L"exec teardown completed late hwnd=%p", target);
-        }
-    }
-    if (g_execCreating.load(std::memory_order_acquire)) {
-        // Cannot happen with admission closed and the drain above; kept as the
-        // refusal that would hold if a future path reopened admission early.
-        FileLog(L"exec reinit refused: a window creation appeared after the "
-                L"creator proof");
-        return false;
-    }
-    FileLog(L"exec teardown reaped hwnd=%p", static_cast<void*>(target));
-    return true;
+    g_execClassRegistered = false;
+    g_execClassInstance = nullptr;
 }
 
 void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
@@ -15899,56 +15349,6 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 BOOL RoleInit() {
     Wh_Log(L"Legacy Start Swipe 0.7.0 initializing (explorer role)");
 
-    // A disable/enable cycle re-initialises this same image, because the pin
-    // keeps it mapped. Nothing in it was re-initialised by the loader, so the
-    // previous activation's lifecycle flags must be cleared explicitly — but
-    // only once nothing of that activation is still running. A drained unload
-    // returns at zero, so a close can still be inside only through the entry
-    // window the count cannot see; clearing g_disabled and re-pointing the
-    // globals under that frame would hand it a half-reset module, so this
-    // activation refuses and leaves the previous state exactly as the unload
-    // left it. The next enable tries again.
-    const bool reinit = g_modulePin != nullptr;
-    if (reinit) {
-        // A re-enable takes the executor's lifetime over with admission closed.
-        // The proof in ReapExecutorTeardown is only durable while no creator can
-        // start, and ResetReinitState is the one place that reopens it.
-        g_execAdmissionOpen.store(false, std::memory_order_release);
-    }
-    if (reinit && g_closeCalls.load(std::memory_order_acquire) != 0) {
-        g_initRefused.store(true, std::memory_order_relaxed);
-        FileLog(L"mod init refused: a close from the previous activation is "
-                L"still inside; no hook, no channel and no thread installed");
-        return FALSE;
-    }
-    if (reinit && !ReapExecutorTeardown()) {
-        // A stop that timed out leaves the worker's handles, the window and the
-        // channel in place. Clearing the HWND, the owner TID and the watermark
-        // here would hand a surviving window this activation's channel, so the
-        // enable refuses instead. A later enable reaps the completion, because
-        // the acknowledgement names the window it waited for.
-        g_initRefused.store(true, std::memory_order_relaxed);
-        FileLog(L"mod init refused: the previous activation's executor has not "
-                L"finished stopping; no hook, no channel and no thread "
-                L"installed");
-        return FALSE;
-    }
-    ResetReinitState();
-    if (reinit) {
-        FileLog(L"activation state reset");
-    }
-
-    // A prerequisite, before the channel and the hooks: a close frame that
-    // outlives the unload must return into mapped code, and a shell-owned thread
-    // needs valid return code as much as a worker would. Nothing is installed
-    // when this fails; see PinThisModule.
-    if (!PinThisModule()) {
-        g_initRefused.store(true, std::memory_order_relaxed);
-        FileLog(L"mod init refused: the image could not be pinned; no hook, no "
-                L"channel and no thread installed");
-        return FALSE;
-    }
-
     // The channel to the Start side. Opening it here means the section and its
     // events exist before the first Hide, and a Start mod that attaches later
     // joins the same ones. This is the only call: SwipeIpcOpen may sleep for its
@@ -15956,21 +15356,24 @@ BOOL RoleInit() {
     // a hook. A failure here means every close runs at once for the life
     // of this attachment, which the budget makes reachable only for a section
     // that cannot be initialised at all.
-    //
-    // A re-enable of the pinned image starts with no channel, because a drained
-    // unload closes it before Wh_ModUninit returns; a refused activation never
-    // opened one. Either way, do not map over a channel this process already
-    // holds: SwipeIpcOpen would leak the first and swap the globals under it.
     bool created = false;
     DWORD ipcError = 0;
-    const bool channelOpen = g_ipc.state != nullptr;
-    if (!channelOpen && !SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
+    if (!SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
         Wh_Log(L"Swipe IPC channel unavailable (%u); the shell's own path "
                L"serves every trigger",
                static_cast<unsigned>(ipcError));
     } else {
         FileLog(L"ipc open created=%d", created ? 1 : 0);
     }
+
+    // The acknowledgement event for the window's destruction. Created before
+    // any window can exist; the unload resets it before it posts the teardown
+    // and waits on it without a deadline.
+    g_execWindowGone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_execWindowGone) {
+        FileLog(L"exec window gone event failed err=%u", GetLastError());
+    }
+
     if (g_ipc.state) {
         StartExecutorWorker();
     }
@@ -15998,11 +15401,12 @@ BOOL RoleInit() {
     // executor worker so the PDB fetch never blocks Explorer's thread.
     NoteLoadedExplorerModule();
 
+    g_initialised = true;
     return TRUE;
 }
 
 void RoleAfterInit() {
-    if (g_initRefused.load(std::memory_order_relaxed)) {
+    if (!g_initialised) {
         return;
     }
     g_afterInit = true;
@@ -16011,122 +15415,67 @@ void RoleAfterInit() {
 }
 
 void RoleBeforeUninit() {
-    // A refused activation installed nothing; the flag and the reset below
-    // belong to the activation that is still running.
-    if (g_initRefused.load(std::memory_order_relaxed)) {
+    if (!g_initialised) {
         return;
     }
     // This must be set before Windhawk removes the hooks. Every hook and the
     // executor's WndProc reads it: a close or a dispatch that enters after this
-    // point skips the channel, and one that is already inside holds its lease
-    // until it returns. The v7 channel is closed in Wh_ModUninit, after that flag
-    // and after the drain.
-    //
-    // The lock is what makes the flag authoritative for the worker's symbol
-    // install: a HookSymbols call that is already inside the lock finishes first
-    // (and its install sees the flag), and one that starts after this point
-    // refuses before it queues anything.
+    // point skips the channel. The lock is what makes the flag authoritative
+    // for the worker's symbol install: a HookSymbols call that is already inside
+    // the lock finishes first (and its install sees the flag), and one that
+    // starts after this point refuses before it queues anything.
     AcquireSRWLockExclusive(&g_explorerSymbolLock);
     g_disabled = true;
     ReleaseSRWLockExclusive(&g_explorerSymbolLock);
+    // Dispatch is closed before the worker is signalled: no new message may be
+    // posted for a channel that is about to be unmapped, and the worker's own
+    // wait sees the stop before the Exec event.
+    g_execReady.store(false, std::memory_order_release);
+    if (g_execStopEvent) {
+        SetEvent(g_execStopEvent);
+    }
 }
 
 void RoleUninit() {
-    // A refused activation installed nothing, so the channel and the count
-    // below belong to the activation that is still running.
-    if (g_initRefused.load(std::memory_order_relaxed)) {
+    if (!g_initialised) {
         return;
     }
 
-    // The executor first: it posts to the hidden window and its dispatches call
-    // the launcher. StopExecutorWorker closes admission to window creation,
-    // drains a creator, joins the worker before it closes either of the worker's
-    // handles, and has the window destroyed and acknowledged. Its result is the
-    // answer this unload needs: false means an outstanding participant still uses
-    // the channel, the stop event or the window, so the channel stays and the
-    // next enable refuses until that join or destruction has completed.
-    const bool executorStopped = StopExecutorWorker();
+    // The posting worker first. It never calls the launcher synchronously, so
+    // the join does not depend on the launcher thread; it sees the stop event
+    // set in BeforeUninit.
+    g_execReady.store(false, std::memory_order_release);
+    if (g_execStopEvent) {
+        SetEvent(g_execStopEvent);
+    }
+    JoinExecutorWorker();
 
-    // The v7 channel is closed, because its objects are named and its records
-    // belong to the other process: g_ipc is unmapped and its mapping, mutex and
-    // five events are closed once no close hook and no executor dispatch can
-    // still be inside them AND the executor's own teardown completed. g_disabled
-    // was set in RoleBeforeUninit and the executor's ready flag was cleared by
-    // StopExecutorWorker, so neither a new close decision nor a queued command
-    // reaches the channel; g_closeCalls names the frames that are already inside.
-    //
-    // The wait below has no deadline, and that is the whole point. The lease
-    // spans the whole frame, the original calls included, so a count of zero also
-    // proves that no frame of either hook can still need the MinHook trampoline.
-    // Windhawk removes the hooks and frees their trampolines as soon as this
-    // function returns, so returning with a frame still about to call
-    // the original would hand the host a frame whose trampoline it is about to
-    // free. A timeout cannot stand in for the count: it would expire under
-    // exactly that frame. The two outcomes are `drained` — the count reached
-    // zero, the channel is closed, this call returns — and `stalled` — the count
-    // is still nonzero and nothing else happens: no close, no return, no handle
-    // left behind. The price is paid where it is owed: a close that does not
-    // return, because the shell call under it never came back or a debugger
-    // suspended its thread, blocks the Windhawk reload until it resumes.
-    //
-    // kIpcUnloadMarkMs and kIpcUnloadStallReportMs are diagnostics only. Neither
-    // grants anything and neither ends the wait. The reports go through FileLog,
-    // so a close wedged inside FileLog keeps them out of the file; that changes no
-    // outcome, because this call is blocked either way.
-    //
-    // The pin and the count are not the same cover. The pin keeps an entry that
-    // has not yet taken its lease from returning into unmapped code; the drain
-    // covers the trampoline use of every counted frame. What remains is the
-    // host's unload: Windhawk calls this function before it waits for threads
-    // inside the mod image (ModsManager::ReloadModsAndSettings calls
-    // Wh_ModUninit, then ThreadsCallStackWaitForRegions(..., 200, 400), then
-    // frees the module), and that wait is bounded and its result discarded. So
-    // "the scan found the frame" and "the frame exited before removal" are two
-    // claims: the first is what that scan gives when it can see the stack, the
-    // second is what this drain gives for every counted frame, and neither one
-    // is proof for an uncounted entry. The pin does not reach the trampoline; it
-    // is the host's allocation, not this image.
-    const ULONGLONG drainStart = GetTickCount64();
-    bool markLogged = false;
-    ULONGLONG nextStallReport = 0;
-    for (;;) {
-        const int closes = g_closeCalls.load(std::memory_order_acquire);
-        if (closes == 0) {
-            break;
-        }
-        const ULONGLONG now = GetTickCount64();
-        if (!markLogged &&
-            now - drainStart >= static_cast<ULONGLONG>(kIpcUnloadMarkMs)) {
-            markLogged = true;
-            nextStallReport = now + kIpcUnloadStallReportMs;
-            FileLog(L"ipc unload drain over %u ms closes=%d",
-                    static_cast<unsigned>(kIpcUnloadMarkMs), closes);
-        }
-        if (markLogged && now >= nextStallReport) {
-            nextStallReport = now + kIpcUnloadStallReportMs;
-            FileLog(L"ipc unload stalled closes=%d waited=%llu ms", closes,
-                    static_cast<unsigned long long>(now - drainStart));
-        }
-        Sleep(kHidePollMs);
+    // Then the one window, on its owner thread, with the worker already joined:
+    // no new post can arrive and no timer can survive the destruction.
+    DestroyExecutorWindow();
+
+    // The class is unregistered only after the window is gone, under the same
+    // instance that registered it. A class that outlives the image would point
+    // at an unmapped WndProc.
+    UnregisterExecutorClass();
+
+    if (g_execWindowGone) {
+        CloseHandle(g_execWindowGone);
+        g_execWindowGone = nullptr;
+    }
+    if (g_execStopEvent) {
+        CloseHandle(g_execStopEvent);
+        g_execStopEvent = nullptr;
     }
 
-    // Drained: the count reached zero, so no counted frame can still need the
-    // trampolines. The channel is a second question: it is closed only when the
-    // executor's half of the unload also completed. A deferred teardown keeps it,
-    // because the surviving worker waits on its Exec event and the surviving
-    // window belongs to the same activation; closing it would hand a live thread
-    // a closed handle and a reused one later.
-    FileLog(L"ipc unload drained waited=%llu ms",
-            static_cast<unsigned long long>(GetTickCount64() - drainStart));
-    if (!executorStopped) {
-        FileLog(L"ipc close deferred: the previous activation's executor has not "
-                L"finished stopping; the channel and its handles stay");
-        return;
-    }
+    // The channel last: no hook path and no worker reads it after this point.
     if (g_ipc.state) {
         SwipeIpcClose(&g_ipc);
         FileLog(L"ipc close");
     }
+
+    g_initialised = false;
+    Wh_Log(L"Legacy Start Swipe uninitialized (explorer role)");
 }
 
 // The explorer role reads no setting: the one settings block belongs to the

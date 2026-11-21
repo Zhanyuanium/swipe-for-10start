@@ -23,6 +23,16 @@
   four hours for a mod loaded at startup (one minute for a mod loaded later),
   so a boot without the symbol server stays passive after the network returns;
   enabling the mod's debug logging disables that throttle for the next attempt.
+  The same call also delays the INFINITE join at unload: disabling the mod while
+  a cold fetch is in flight blocks `Wh_ModUninit` until the call returns. With a
+  warm cache the join is immediate.
+- **A teardown that cannot be proved gone blocks the unload.** The image is not
+  pinned, so returning while a mod-owned thread, delegate or owner window is
+  still reachable would hand it unmapped code. The unload joins threads
+  `INFINITE`, waits for the UI teardown turn and the counted entries, and waits
+  for `WM_NCDESTROY`; a permanently hung launcher or UI thread therefore blocks
+  the disable instead of corrupting the process. There is no bounded-wait
+  success path and no residual return.
 - **The launcher must be attached.** `[outer+0x18+0x160] > 0x10000`; zero means
   no `IXamlLauncherState`. The constructor's sentinel is `0x100`. A first open
   after a fresh logon can therefore be refused; the shell's own gesture then

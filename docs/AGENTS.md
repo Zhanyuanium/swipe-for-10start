@@ -51,8 +51,10 @@ generation, intent/ack, executor command/ack (admission vocabulary, expiry and
 the dismiss confirmation), controller direction, peer liveness/identity (epoch,
 tick, state, the 600 ms detection budget), init handshake.
 
-lifecycle.md: the pin, the instance guard, the counted entries, the unload
-order and residuals, the re-initialisation and the host's unload boundary.
+lifecycle.md: quiescing both roles before the image is unmapped — the Start
+join/UI-teardown/entry-drain order, the bridge worker join/window destruction/
+class unregistration order, the no-safe-success rule, and the host's unload
+boundary.
 
 testing.md: the probes/injectors and the captured measurements in `artifacts/`.
 

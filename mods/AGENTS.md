@@ -116,10 +116,18 @@ fixed-address gate (the file-version compare, the executable-range check, both
 prologue probes and the module poll thread) and the animation-request hook with
 its debug switch; the root is resolved by symbol.
 
-**Lifecycle.** Pinned image (`GetModuleHandleExW(...PIN)`), per-process instance
-mutex, counted module entries, stop-event-driven input thread, XAML revokes with
-the residual rules, the `peerState=gone` publish before every residual return,
-and the per-activation reset. The root hook is resolved by public symbol
+**Lifecycle.** No pin and no instance guard: Windhawk unloads the image, so the
+role quiesces before it returns. The stop event is created before the input
+thread; `Wh_ModBeforeUninit` withdraws the peer, signals the thread and joins it
+`INFINITE` (never on that thread). The thread unregisters raw input, releases the
+1 ms timer period, destroys its window and unregisters its class before exiting.
+`Wh_ModUninit` runs one UI teardown turn on the captured dispatcher: revokes the
+XAML handlers and the settle batch, restores resting progress and the neutral
+translation, resets the scroller watches and drops the UI-owned objects
+(`[[clang::no_destroy]]` protects a skipped uninit, not a normal one). Counted
+module entries are drained through their event; the IPC view and handles close
+last. A revoke or thread proof that cannot be obtained keeps waiting rather than
+returning success. The root hook is resolved by public symbol
 (`StartUI::App::PrepareRootElement`): the `LoadLibraryExW` notification only
 records the returned module, and the input thread runs `HookSymbols`, because
 the first call starts Windhawk's PDB fetch and blocking the shell's loader
@@ -170,29 +178,28 @@ line. One missing symbol refuses the whole set and the hooks are not applied: a
 toggle that can open but not close is worse than the shell's path.
 
 **Executor.** A hidden message-only window, class
-`WindhawkSwipeExecutor_<WndProc>`, created only from a known launcher entry: the
-first of `OnHotkeyInvoke`, `Dismiss`, `ShowStartView`, the manager's `Show` or the
-worker's targeted `WH_GETMESSAGE` adopts that thread (`exec launcher thread`), and
-a hook on any other thread logs `exec launcher thread mismatch` and creates
-nothing. The library-load hook never creates the window. Window creation and
-window shutdown are one protocol: a creator reserves `g_execCreating`, asks
-`g_execAdmissionOpen`, publishes the HWND and releases the reservation; the stop
-closes admission, drains the reservation, joins the worker, then destroys the
-identified owner window (directly on its thread, otherwise through the private
-`kExecTeardownMessage` the owner answers from `WM_NCDESTROY`; only that HWND
-signals). A re-enable keeps admission closed and drains the reservation **before**
-it snapshots the HWND, so a creator that published and released between two reads
-cannot be seen as absent; it never clears the reservation to prove quiescence, and
-a creator that does not leave makes the enable refuse. The procedure refuses
-every dispatch (`kExecMessage`, timers) for an HWND other than the currently
-published one, so a survivor from a previous activation cannot act on this
-activation's channel. Readiness is published by the worker itself after its exit
-guard is installed, and the service gate also requires admission, so a late
-positive write from a stopping worker is unreadable. A worker waits on `Exec`
-with a 100 ms timeout and posts `WM_APP+0x5A`; each timeout runs the launcher
-symbol probe, so the same thread owns the fetch and the commands but never a
-thread Explorer uses. The WndProc reads the command and calls the launcher with
-an empty stack, and a `WAIT_FAILED`/unexpected exit clears readiness.
+`WindhawkSwipeFor10Start.Executor` (fixed, registered under `&__ImageBase`),
+created only from a known launcher entry: the first of `OnHotkeyInvoke`,
+`Dismiss`, `ShowStartView`, the manager's `Show` or the worker's targeted
+`WH_GETMESSAGE` adopts that thread (`exec launcher thread`), and a hook on any
+other thread logs `exec launcher thread mismatch` and creates nothing. The
+library-load hook never creates the window. `ERROR_CLASS_ALREADY_EXISTS` is a
+failure, never adopted. Shutdown is an order: BeforeUninit clears readiness and
+signals the stop; Uninit joins the worker **INFINITE**, destroys the one
+published window on its owner thread (directly there, otherwise through the
+private `kExecTeardownMessage`; `WM_NCDESTROY` signals `g_execWindowGone`), then
+unregisters the class under the same instance, closes the handles and the
+channel last. The old creator reservation, admission flag, creator drain,
+reaper and `CloseCallLease` count are gone; a window or worker that does not go
+away blocks the unload. The procedure refuses every dispatch (`kExecMessage`,
+timers) for an HWND other than the currently published one. Readiness is
+published by the worker itself after its exit guard is installed, and the gate
+also reads `g_disabled`, so a late positive write from a stopping worker is
+unreadable. A worker waits on `Exec` with a 100 ms timeout and posts
+`WM_APP+0x5A`; each timeout runs the launcher symbol probe, so the same thread
+owns the fetch and the commands but never a thread Explorer uses. The WndProc
+reads the command, validates it and calls the launcher with an empty stack, and
+a `WAIT_FAILED`/unexpected exit clears readiness.
 A launcher-thread watermark (`g_execAcceptedSeq`) accepts each record once, so a
 double-delivered signal cannot run a show or a dismiss twice. `show`/`cancel` run
 now; `dismiss` arms `kExecDismissTimer` for `executeAt`; an unarmable timer runs
@@ -206,8 +213,7 @@ has already left is answered `superseded menu=... now=...`. The 300 ms probe log
 with `hidden|visible|unknown`; a successful dismiss also owes a
 300 ms visibility confirmation (`exec dismiss confirmed|unconfirmed|unknown
 seq=... visible=... after=<real ms>`) instead of treating `hr=0` as a hide, and a
-probe or timer failure is answered `unknown`. The window class name is
-unique per image, so a reinstall does not inherit the old WndProc.
+probe or timer failure is answered `unknown`.
 
 **Triggers.**
 - `OnHotkeyInvoke_Hook` (0x14195C): Shift/Ctrl/Alt is a hard gate; the shell's
@@ -318,20 +324,21 @@ mapping with its seqlock writer, and the inactive-at-unload publication. The
 Start half's Raw Input is the product's contact source; the decision and
 executor lines are the evidence that replaced it.
 
-**Lifecycle.** Pinned image, the counted close-hook frames and executor
-dispatches for the v7 channel, the drain with `drained`/`stalled` reports, and the
-re-enable refusal while a close frame or an unfinished executor teardown is still
-inside. On unload admission closes (before readiness clears), the creator
-reservation drains, the worker is joined before either handle is closed, and the
-identified window and its four timers are destroyed (directly on the owner thread,
-otherwise through the private teardown the owner acknowledges). A stop that did
-not complete keeps the handles and the
-channel (`ipc close deferred`) and the next enable refuses (`exec reinit
-refused: ...`) until that join or destruction has completed; a worker that exited
-since is reaped. The re-enable drains the creator **before** it snapshots the
-HWND, and never clears the reservation itself; a creator that outlives the drain
-makes it refuse. See `docs/lifecycle.md` for the test-build hold that stages the
-creator/reaper interleaving.
+0.7.0 also deletes the lifetime machinery the pinned design needed: both image
+pins, the Start instance guard, both `ResetReinitState` paths, the bridge
+`CloseCallLease`/`g_closeCalls` drain, the creator reservation, admission flag,
+creator drain and reaper, and every residual/deferred-success return. `kExecTeardownMessage`
+and the destructive first-frame work remain.
+
+**Lifecycle.** No pin, no instance guard, no re-enable state. The Start side joins
+its input thread `INFINITE` in BeforeUninit, runs one UI teardown turn, drains the
+counted batch entries, then closes the channel. The bridge joins its posting
+worker `INFINITE`, destroys the one published window on the launcher thread and
+waits for `WM_NCDESTROY`, unregisters the fixed class under `&__ImageBase`, then
+closes the handles and the channel. A proof that cannot be obtained (a thread
+that does not exit, a delegate that does not revoke, a window that does not go
+away) keeps the unload waiting; there is no residual success and no deferred
+close. `docs/lifecycle.md` has the order and the blocking cases.
 
 ### swipe_ipc_shared.h (merged mod, 216 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**,

@@ -1,7 +1,7 @@
 # M3.2 architecture — one controller, one executor
 
 > L3-level design record. Mod **0.7.0** (one source, two process halves),
-> channel **v7 / 744 B**. The measured evidence is quoted with the build and the
+> channel **216 B, no version word**. The measured evidence is quoted with the build and the
 > layout it came from; everything below was run on this machine. **Layouts:**
 > *auto-hidden* = work `0,0,1440,900`, the bar off screen, band `804..900`, panel
 > `236,265..1229,840`, trail 265, Distance 852 (current). *Docked* = work
@@ -77,31 +77,23 @@ manager's `Show` or the worker's targeted `WM_GETMESSAGE` adopts the thread (`ex
 launcher thread`), and a window is never created from the `LoadLibraryExW` hook,
 which runs on whichever thread loaded twinui. A worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
-an empty stack. The window
-class is unique per activation
-(`WindhawkSwipeExecutor_<WndProc address>`); a fixed name would return
-`ERROR_CLASS_ALREADY_EXISTS` after a Windhawk reinstall and create the window
-with the previous image's WndProc, whose channel is already closed.
+an empty stack. The window class is one fixed name
+(`WindhawkSwipeFor10Start.Executor`) registered under `&__ImageBase`;
+`ERROR_CLASS_ALREADY_EXISTS` is a failure, never adopted, because a surviving
+class from an earlier image points at an unmapped procedure.
 
-Creation and shutdown are one protocol, not two checks. A creator reserves
-`g_execCreating`, asks `g_execAdmissionOpen`, publishes the HWND and releases the
-reservation; the stop closes admission, drains the reservation, joins the worker,
-then destroys the **identified** owner window — directly when it already runs on
-that thread, otherwise with the private `kExecTeardownMessage` whose
-`WM_NCDESTROY` acknowledgement names that HWND (any other window's destruction
-signals nothing, and the procedure destroys only a window that equals the
-recorded target). A teardown that
-does not complete keeps every handle the outstanding participant still uses,
-including the channel with the `Exec` event the worker waits on, and the unload
-defers its close (`ipc close deferred`). The next enable refuses while that join
-or destruction is still outstanding (`exec reinit refused: ...`), reaps a worker
-that has exited since, proves the creator out **before** it snapshots the HWND,
-and only then clears the activation. The alternative — a
-re-enable that clears the HWND, the owner TID and the watermark anyway — would
-hand a surviving old window the new activation's channel, and an acknowledgement
-from the old window would answer a teardown it does not belong to. The procedure
-also refuses every ordinary dispatch for an HWND other than the published current
-one, so a survivor's armed dismiss cannot fire into a new menu.
+Shutdown is an order, not a set of flags. BeforeUninit clears readiness and
+signals the worker's stop; Uninit joins the worker **INFINITE**, then destroys the
+one published window on its owner thread — directly when it already runs there,
+otherwise with the private `kExecTeardownMessage`, whose `WM_NCDESTROY` signals
+`g_execWindowGone`. The class is unregistered under the same `&__ImageBase`
+instance only after the window is gone, and the worker/stop/window-gone handles
+and the channel close last. The old creator reservation, admission flag, creator
+drain, reaper and `CloseCallLease` count are gone; the join and the class
+ownership are the barriers. A window or worker that does not go away blocks the
+unload rather than returning success into an image it still points at. The
+procedure also refuses every ordinary dispatch for an HWND other than the
+published current one, so a stale message cannot act on this activation.
 
 `IsVisible` is the confirmation. Immediately after `ShowStartView` it is
 honestly `0` (the shell is still cloaking); a 300 ms timer on the same thread
@@ -507,24 +499,23 @@ through (`win open restore (no geometry)` was measured); with the gate, the peer
 stays unpublished and every press is native until the next host session attaches
 a root.
 
-**v7** adds the Start side's activation identity at the tail: `peerEpoch` at 740,
-which the struct's alignment had already paid for, so the section stays 744 bytes
-and the **version word** — in the object names and in the section — is what
-separates v6 from v7. It answers which Start activation is speaking: the attach
-claims a new epoch and the bridge reads it beside a latched press.
+The merged channel is **216 bytes** with one section and four events. The names
+use one merged-mod prefix (`Local\SwipeFor10Start_SingleMod_*`) and there is **no
+product version word**: the ABI namespace is the identity, so an old development
+image cannot join and a future layout changes the prefix. The records are the open
+generation, the intent and its ack, the executor command and its ack, one
+controller direction word plus the touch flag, and the liveness triple
+`peerTick`/`peerState`/`peerEpoch`. The debug command record (`cmdText`, `Cmd`,
+`CmdWrite`, its parser) is gone; `tools/ipc.ps1` is read-only. The executor
+validates every command before the launcher call (show 1/11/16 with flags under
+`0x8|0x4`, dismiss 1/6 with no flags, cancel 0) and refuses anything else instead
+of clamping it. A click-away intent keeps Hide method 7 as evidence; the Start
+side maps it to executor method 6.
 
-**v6** adds the Start side's liveness pair at the tail: `peerTick` at 732
-(GetTickCount64 low bits, refreshed at most once per 100 ms) and `peerState` at
-736 (alive/gone), taking the section from 736 to 744 bytes. It is the bridge's
-interception precondition, described above; it is not a seqlock, because each
-word is a single value written by the Start side and read whole.
-
-**v5** removed the retired M2 slots from the header: the section became 736
-bytes and contained only the command, the open generation, the intent and its
-ack, the executor command and its ack, one controller direction word and the
-touch flag. No dead field remains; v5 also replaced v4's owning/phase pair with
-that one word, so the bridge's toggle rule cannot read new ownership beside a
-stale phase.
+**A note on the retired versions.** v7 added `peerEpoch` at 740 inside v6's
+744-byte section; v6 added the liveness pair at 732/736; v5 removed the M2 slots
+and replaced the owning/phase pair with one direction word. These are history,
+not the current layout; the asserts in `swipe_ipc_shared.h` are the contract.
 
 ## The accepted cap, restated
 

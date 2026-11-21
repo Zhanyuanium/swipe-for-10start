@@ -215,6 +215,10 @@ is revealed; the button test hovers the bottom edge first, then clicks physical
   recorded launcher thread.
 - The shell owns every visual transition. The mods read and request, never
   write the launcher's state.
+- The image is not pinned. Unloading joins every owned thread, runs the UI
+  teardown turn, drains the counted entries, destroys the launcher window and
+  unregisters its class before the channel closes. A proof that cannot be
+  obtained blocks the unload; there is no residual success.
 - Docs and code move together. Update this header, the L2 map and the L3 header
   of the file you changed.
 

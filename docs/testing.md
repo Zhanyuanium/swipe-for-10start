@@ -96,17 +96,14 @@ record left this side), **consumed** (the other side applied it),
 **superseded** (a newer command or activation replaced the record before it
 could act, or before its confirmation could land).
 
-- **A — unload acknowledgement.** Enable the bridge, disable it, enable it again.
-  `bridge.log` shows `exec window destroyed` (or `destroyed directly`) and
-  `ipc close` on the first cycle, then `activation state reset` and a fresh
-  `exec window hwnd=...` on the second. A forced timeout must instead show
-  `ipc close deferred` and the next enable `exec reinit refused: ...`, never a
-  second `exec window hwnd` while the old one lives. A teardown that completes
-  between the two enables is **accepted**: `exec teardown completed late` (or
-  `exec teardown found a surviving window` and then `completed late`) followed by
-  `activation state reset` is the success path, not a failure. See
-  [lifecycle.md](lifecycle.md) for the test-build hold that stages the
-  creator/reaper interleaving.
+- **A — unload quiescence.** Enable, disable and enable again in the same PIDs.
+  `bridge.log` shows `exec worker joined`, `exec window destroyed`, `exec window
+  class unregistered` and `ipc close` on the first cycle, then a fresh
+  `exec window hwnd=...` on the second; both hosts keep running, and the old DLL
+  is gone from the `explorer.exe` and `StartMenuExperienceHost.exe` module lists.
+  There is no deferred close and no re-enable refusal any more: a proof that
+  cannot be obtained (a worker, a window, a delegate) blocks the unload instead
+  of returning success. See [lifecycle.md](lifecycle.md) for the order.
 - **B — activation identity and availability.** Disable the Start mod while a
   close is running; `bridge.log` must show `own pass trigger=... reason=no-peer`
   (or `exec pass hide method=... reason=no-peer`) from the moment of the disable,
