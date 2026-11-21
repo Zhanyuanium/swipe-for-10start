@@ -337,6 +337,40 @@ void TraceLog(const wchar_t* format, ...) {
     ReleaseSRWLockExclusive(&g_traceLock);
 }
 
+// The one show/dismiss vocabulary shared by the bridge's producers and the
+// executor. Producer admission checks it before a press is swallowed, so an
+// unsupported method/flags combination reaches the shell's own path instead of
+// being published and refused later; the executor checks it again as defence in
+// depth. The numbers are the shell's; nothing is clamped or widened.
+constexpr uint32_t kSwipeShowFlagMask = 0x8 | 0x4;
+constexpr uint32_t kSwipeShowMethodKeyboard = 1;
+constexpr uint32_t kSwipeShowMethodStartButton = 11;
+constexpr uint32_t kSwipeShowMethodTouch = 16;
+constexpr uint32_t kSwipeDismissMethodWin = 1;
+constexpr uint32_t kSwipeDismissMethodStartButton = 6;
+constexpr uint32_t kSwipeDismissMethodClickAwayEvidence = 7;
+
+bool SwipeShowAllowed(uint32_t method, uint32_t flags) {
+    return (method == kSwipeShowMethodKeyboard ||
+            method == kSwipeShowMethodStartButton ||
+            method == kSwipeShowMethodTouch) &&
+           (flags & ~kSwipeShowFlagMask) == 0;
+}
+
+bool SwipeDismissAllowed(uint32_t method) {
+    return method == kSwipeDismissMethodWin ||
+           method == kSwipeDismissMethodStartButton;
+}
+
+// The intent carries the shell's observed close method. 7 is the click-away's
+// evidence and is mapped to 6 at the producer; 1 and 6 are the executor's own
+// dismiss values. 5 (Win+Tab) is an external takeover, never a close intent.
+bool SwipeCloseIntentAllowed(uint32_t method) {
+    return method == kSwipeDismissMethodWin ||
+           method == kSwipeDismissMethodStartButton ||
+           method == kSwipeDismissMethodClickAwayEvidence;
+}
+
 namespace start {
 
 
@@ -12053,20 +12087,13 @@ constexpr uint32_t kDismissMethodWinTab = 5;
 constexpr uint32_t kDismissMethodStartButton = 6;
 constexpr uint32_t kDismissMethodClickAway = 7;
 
-// The executor's allowlist. A show carries the keyboard/touch method 1, the
-// Start button's 11, or the touch/edge method 16; its flags are the mask the
-// shell's ShowStartView actually reads (0x8 relaxes the foreground/context-menu
-// check and 0x4 tolerates an open context menu). A dismiss carries the Win close
-// 1 or the Start button's 6; 7 is the click-away's Hide method, kept as intent
-// evidence, and the Start side maps it to 6 before publishing the command.
-// Dismiss records carry no flags. A cancel names only its target. Anything else
-// is refused, never clamped into a legitimate shell action.
-constexpr uint32_t kExecShowMethodKeyboard = 1;
-constexpr uint32_t kExecShowMethodStartButton = 11;
-constexpr uint32_t kExecShowMethodTouch = 16;
-constexpr uint32_t kExecShowFlagMask = 0x8 | 0x4;
-constexpr uint32_t kExecDismissMethodWin = 1;
-constexpr uint32_t kExecDismissMethodStartButton = 6;
+// The executor's allowlist uses the one shared vocabulary
+// (SwipeShowAllowed/SwipeDismissAllowed): a show carries method 1, 11 or 16 with
+// flags under the mask the shell's ShowStartView reads; a dismiss carries 1 or 6
+// and no flags; a cancel names only its target. 7 is the click-away's evidence,
+// mapped to 6 by the producer. The producer checks the same vocabulary before it
+// swallows a press; this check is defence in depth, and anything outside it is
+// refused, never clamped into a legitimate shell action.
 
 // The M2 retract wait and its tapped-close stamp are retired. The M3 executor
 // schedules the dismiss from the duration the Start side plans, and the Start
@@ -12791,6 +12818,17 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
     const int32_t trigger = caller == OwnCaller::ClickAway
                                 ? kSwipeTriggerClickAway
                                 : kSwipeTriggerWin;
+    // The close intent's method is forwarded to the executor. A method outside
+    // the shared vocabulary is the shell's own close, not one this mod can run:
+    // pass it now instead of swallowing it for a command that would be refused.
+    if (!SwipeCloseIntentAllowed(method)) {
+        TraceLog(L"intent pass close trigger=%s method=%u reason=unsupported",
+                trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win",
+                method);
+        callOriginal();
+        OwnResyncFromState(self);
+        return;
+    }
     PublishBridgeIntent(kSwipeIntentClose, trigger, method, 0);
     TraceLog(L"intent close trigger=%s method=%u state=%u",
             trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win", method,
@@ -13042,7 +13080,7 @@ bool ServeLatchedPress(const wchar_t* reason) {
 // hiding makes the older latched reopen obsolete, whichever primitive carried it.
 // A physical Start-button close on a shown panel used to leave the old slot for
 // the hidden event to serve.
-void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
+bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags,
                     uint32_t admittingEpoch) {
     if (g_pressLatch.pending && !ShellHideInFlight(own)) {
@@ -13055,9 +13093,28 @@ void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
     const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
     const int32_t kind = IntentShouldClose(own, direction) ? kSwipeIntentClose
                                                            : kSwipeIntentOpen;
-    // One decision line for every trigger. The method below is the one the action
-    // will use, not the one the shell called with: a reopen from Dismiss(6) asks
-    // for Show(11), and a close from Show(11) asks for Dismiss(6).
+    // The one admission check. The method and flags below are the ones the
+    // action will publish, not necessarily the ones the shell called with: a
+    // reopen from Dismiss(6) asks for Show(11), and a close from Show(11) asks
+    // for Dismiss(6). A combination outside the shared vocabulary goes to the
+    // original; the executor's whitelist would only refuse it after the press
+    // was already swallowed.
+    const uint32_t method =
+        kind == kSwipeIntentClose ? dismissMethod : showMethod;
+    const bool supported = kind == kSwipeIntentClose
+                               ? SwipeDismissAllowed(method)
+                               : SwipeShowAllowed(method, flags);
+    if (!supported) {
+        TraceLog(L"own pass trigger=%s state=%u open=%d kind=%s method=%u "
+                L"flags=%u reason=unsupported",
+                PressTriggerName(trigger), own.state, own.open ? 1 : 0,
+                kind == kSwipeIntentClose ? L"close" : L"open", method, flags);
+        return false;
+    }
+    // One decision line for every trigger. The method below is the one the
+    // action will use, not the one the shell called with: a reopen from
+    // Dismiss(6) asks for Show(11), and a close from Show(11) asks for
+    // Dismiss(6).
     TraceLog(L"own toggle decide trigger=%s state=%u open=%d kind=%s dir=%d",
             PressTriggerName(trigger), own.state, own.open ? 1 : 0,
             kind == kSwipeIntentClose ? L"close" : L"open", direction);
@@ -13066,11 +13123,12 @@ void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
         // The hide or the armed dismiss has already taken the window; the open
         // is served at the landing instead of being published into a no-op show.
         LatchPress(own, trigger, showMethod, flags, admittingEpoch);
-        return;
+        return true;
     }
     PublishBridgeIntent(kind, trigger,
                         kind == kSwipeIntentClose ? dismissMethod : showMethod,
                         flags);
+    return true;
 }
 
 using OnHotkeyInvoke_t = HRESULT (*)(void*, uint32_t);
@@ -13141,8 +13199,11 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
                                        : S_OK;
     }
-    DispatchToggle(own, kSwipeTriggerWin, kDismissMethodWin, kDismissMethodWin,
-                   flags, admittingEpoch);
+    if (!DispatchToggle(own, kSwipeTriggerWin, kDismissMethodWin,
+                        kDismissMethodWin, flags, admittingEpoch)) {
+        return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
+                                       : S_OK;
+    }
     return S_OK;
 }
 using OnStartButtonPressed_t = HRESULT (*)(void*, uint32_t, uint32_t);
@@ -13173,8 +13234,13 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                                                    dismissMethod)
                    : S_OK;
     }
-    DispatchToggle(own, kSwipeTriggerStartButton, showMethod, dismissMethod, 0,
-                   admittingEpoch);
+    if (!DispatchToggle(own, kSwipeTriggerStartButton, showMethod,
+                        dismissMethod, 0, admittingEpoch)) {
+        return OnStartButtonPressed_Original
+                   ? OnStartButtonPressed_Original(self, showMethod,
+                                                   dismissMethod)
+                   : S_OK;
+    }
     return S_OK;
 }
 
@@ -13256,8 +13322,11 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
     // this primitive with method 6 and must reach the controller even while the
     // controller owns the panel. Its reopen form asks for Show(11) instead.
     if (method == kDismissMethodStartButton) {
-        DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0,
-                       admittingEpoch);
+        if (!DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0,
+                            admittingEpoch)) {
+            return Dismiss_Original ? Dismiss_Original(launcher, method)
+                                    : E_FAIL;
+        }
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
@@ -13299,8 +13368,12 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
     // controller while the controller owns a close, so it is decided here before
     // the duplicate suppression. Its close form asks for Dismiss(6).
     if (method == 11) {
-        DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags,
-                       admittingEpoch);
+        if (!DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags,
+                            admittingEpoch)) {
+            return ShowStartView_Original
+                       ? ShowStartView_Original(launcher, method, flags)
+                       : E_FAIL;
+        }
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
@@ -13824,15 +13897,11 @@ bool ValidExecCommand(const SwipeIpcExecCommand& command) {
     switch (command.kind) {
         case kSwipeExecShow:
             return command.executeAt == 0 && command.target == 0 &&
-                   (command.method == kExecShowMethodKeyboard ||
-                    command.method == kExecShowMethodStartButton ||
-                    command.method == kExecShowMethodTouch) &&
-                   (static_cast<uint32_t>(command.flags) &
-                    ~kExecShowFlagMask) == 0;
+                   SwipeShowAllowed(static_cast<uint32_t>(command.method),
+                                    static_cast<uint32_t>(command.flags));
         case kSwipeExecDismiss:
             return command.flags == 0 && command.target == 0 &&
-                   (command.method == kExecDismissMethodWin ||
-                    command.method == kExecDismissMethodStartButton);
+                   SwipeDismissAllowed(static_cast<uint32_t>(command.method));
         case kSwipeExecCancel:
             return command.method == 0 && command.flags == 0 &&
                    command.executeAt == 0;

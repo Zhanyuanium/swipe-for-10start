@@ -121,6 +121,16 @@ legitimate shell action. The show flag mask is the mask `ShowStartView` actually
 reads (`0x8` relaxes the foreground/context-menu check, `0x4` tolerates an open
 context menu).
 
+The producer validates the same vocabulary before it swallows a press: the Win
+key, the Start button, the launcher's `Dismiss`/`ShowStartView` and the
+click-away's close intent all check `SwipeShowAllowed`/`SwipeDismissAllowed`
+(or `SwipeCloseIntentAllowed` for the observed close method) at admission. An
+unsupported combination goes to the shell's original (`own pass ...
+reason=unsupported`) instead of becoming an intent that the executor would
+refuse after the press was lost. The executor's check above is therefore defence
+in depth, not the only validation. The click-away's evidence method 7 is allowed
+as an intent and mapped to 6 at the producer; the executor never accepts 7.
+
 **Expiry.** The controller's budget is 400 ms: a show is answered within 400 ms
 of its publication, a dismiss within 400 ms of the deadline it was given. The
 comparison is `>= due + 400` on both sides, so a dispatch exactly at the boundary

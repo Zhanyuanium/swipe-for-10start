@@ -401,8 +401,11 @@ is **no version word**: the object namespace
 image cannot join and a future layout changes the prefix. The executor validates
 each command before any launcher call: show method 1/11/16 with flags under the
 `0x8|0x4` mask, dismiss method 1/6 with no flags, cancel method/flags 0; anything
-else is refused, never clamped. A click-away intent keeps method 7 as evidence;
-the Start side maps it to executor method 6.
+else is refused, never clamped. The producer checks the same shared vocabulary
+(`SwipeShowAllowed`/`SwipeDismissAllowed`/`SwipeCloseIntentAllowed`) before it
+swallows a press; an unsupported combination is passed to the original at
+admission, so the executor refusal is defence in depth. A click-away intent
+keeps method 7 as evidence; the Start side maps it to executor method 6.
 
 ## Diagnosis (not needed at runtime)
 

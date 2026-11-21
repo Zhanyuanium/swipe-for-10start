@@ -563,8 +563,12 @@ controller direction word plus the touch flag, and the liveness triple
 mutex, event and parser — is gone; `tools/ipc.ps1` is read-only. The executor
 validates every command before the launcher call (show 1/11/16 with flags under
 `0x8|0x4`, dismiss 1/6 with no flags, cancel 0) and refuses anything else instead
-of clamping it. A click-away intent keeps Hide method 7 as evidence; the Start
-side maps it to executor method 6.
+of clamping it. The producer checks the same vocabulary (`SwipeShowAllowed`,
+`SwipeDismissAllowed`) before it swallows a press: an unsupported method/flags
+combination is passed to the shell's original at admission (`own pass ...
+reason=unsupported`), so the executor's refusal is defence in depth, never the
+first time the press is validated. A click-away intent's method 7 is evidence
+and is mapped to 6 at the producer; the executor sees 1 or 6 only.
 
 **A note on the retired versions.** v7 added `peerEpoch` at 740 inside v6's
 744-byte section; v6 added the liveness pair at 732/736; v5 removed the M2 slots
