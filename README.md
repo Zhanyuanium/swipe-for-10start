@@ -46,6 +46,10 @@ in StartMenuExperienceHost and the executor in Explorer.
   shell's own path; with `DiagnosticTrace` on, the log shows
   `exec launcher symbols pending ...` and then
   `exec launcher symbols resolved ... match=1`.
+  The Start half withdraws its interception whenever it has no usable renderer:
+  while the menu's root is being replaced or a failed geometry write has
+  invalidated it, a press runs the shell's own path exactly once, and the mod
+  resumes when a usable root is attached.
 
 ## Install
 

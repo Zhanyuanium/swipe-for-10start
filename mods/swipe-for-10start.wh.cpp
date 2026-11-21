@@ -36,8 +36,7 @@ What you need:
 - Windhawk 2.0 or later and a touchscreen or pen.
 
 Install **Legacy Start Swipe** from Windhawk and enable it. One mod covers both
-processes it needs: the gesture runs in StartMenuExperienceHost and the shell
-calls run in Explorer; no companion mod is required.
+processes: the gesture runs in StartMenuExperienceHost, the shell calls in Explorer.
 
 Settings:
 
@@ -52,7 +51,8 @@ Known limits:
 - The shell owns the reveal, so the first frame can arrive about a quarter of a
   second after the open starts.
 - If the launcher's private symbols or the menu layout are unavailable, the mod
-  steps aside and the shell handles every press natively.
+  steps aside and the shell handles every press natively; the Start side also
+  withdraws while the menu's root is replaced or a failed write invalidates it.
 - Tested with a bottom taskbar on one 2880x1800 display at 200%; the gesture
   reads the taskbar's edge, but only the bottom layout has been exercised.
 
@@ -1316,6 +1316,30 @@ std::atomic<bool> g_rendererInvalid{false};
 bool RendererReady() {
     return g_rendererReady.load(std::memory_order_acquire) &&
            !g_rendererInvalid.load(std::memory_order_acquire);
+}
+
+// Signalled by the UI thread whenever RendererReady() can change: the root is
+// attached, torn down, or invalidated by a failed scalar write. The input thread
+// withdraws the peer on this event and republishes when a usable replacement is
+// attached, instead of testing the raw ready bit once per activation. The event
+// is how round 3's refactor stays event-driven; the loop's own check is only a
+// safety net for a missed signal.
+HANDLE g_rendererEvent = nullptr;
+
+void SignalRendererChanged() {
+    if (g_rendererEvent) {
+        SetEvent(g_rendererEvent);
+    }
+}
+
+void SetRendererReady(bool ready) {
+    g_rendererReady.store(ready, std::memory_order_release);
+    SignalRendererChanged();
+}
+
+void SetRendererInvalid(bool invalid) {
+    g_rendererInvalid.store(invalid, std::memory_order_release);
+    SignalRendererChanged();
 }
 // Diagnostics for a dismiss that did not start: one line per second, not per
 // report, because a deferred scroll produces a sample every ~6 ms.
@@ -8368,12 +8392,12 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
 
     // Object 0 is the stop event, then the idle tick when the waitable timer
-    // exists, then the intent and exec-ack events, then the message queue. The
-    // stop event does not depend on the window: the unload sets it even if this
-    // thread has not published the HWND yet, and it is checked again after every
-    // message batch, because a queued message can win the wait over a
+    // exists, then the intent, exec-ack and renderer events, then the message
+    // queue. The stop event does not depend on the window: the unload sets it
+    // even if this thread has not published the HWND yet, and it is checked again
+    // after every message batch, because a queued message can win the wait over a
     // just-signalled event.
-    HANDLE waits[5] = {};
+    HANDLE waits[6] = {};
     DWORD waitCount = 0;
     if (g_hidStopEvent) {
         waits[waitCount++] = g_hidStopEvent;
@@ -8386,6 +8410,9 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
     if (g_ipc.execAckEvent) {
         waits[waitCount++] = g_ipc.execAckEvent;
+    }
+    if (g_rendererEvent) {
+        waits[waitCount++] = g_rendererEvent;
     }
 
     MSG msg;
@@ -8409,8 +8436,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // the first symbol load blocks for Windhawk's PDB fetch, and this thread is
     // the mod's own. A pending result leaves the peer unpublished.
     ProbeRootSymbolFromInputThread();
-    if (g_rootHookReady.load(std::memory_order_acquire) &&
-        g_rendererReady.load(std::memory_order_acquire)) {
+    if (g_rootHookReady.load(std::memory_order_acquire) && RendererReady()) {
         peerAnnounced = PublishPeerReady(L"consumer");
     }
     while (running) {
@@ -8418,14 +8444,22 @@ DWORD WINAPI HidInputThread(LPVOID) {
         // every tick is a chance to begin the fetch. The call is throttled while
         // the result is pending and stops as soon as ready or refused is set.
         ProbeRootSymbolFromInputThread();
+        // Readiness is a continuing capability, not a one-time announcement. A
+        // root that is torn down, replaced or invalidated by a failed scalar
+        // write must withdraw the peer first; the bridge then passes the press
+        // natively instead of swallowing it for a controller that cannot animate
+        // it. The renderer event is the immediate path; this is the safety net.
+        if (peerAnnounced && !RendererReady()) {
+            SetPeerGone(L"renderer-lost", false);
+            peerAnnounced = false;
+        }
         if (!peerAnnounced &&
-            g_rootHookReady.load(std::memory_order_acquire) &&
-            g_rendererReady.load(std::memory_order_acquire)) {
+            g_rootHookReady.load(std::memory_order_acquire) && RendererReady()) {
             peerAnnounced = PublishPeerReady(L"consumer");
         }
         if (!peerAnnounced && !rendererWaitLogged &&
             g_rootHookReady.load(std::memory_order_acquire) &&
-            !g_rendererReady.load(std::memory_order_acquire)) {
+            !RendererReady()) {
             // One line per activation: the hook is ready, the root is not. The
             // service waits for Setup; a session that never attaches advertises
             // nothing and every press stays native.
@@ -8480,6 +8514,20 @@ DWORD WINAPI HidInputThread(LPVOID) {
             }
             if (signalled == g_ipc.execAckEvent) {
                 ApplyExecAck();
+                continue;
+            }
+            if (signalled == g_rendererEvent) {
+                // The renderer just became usable or unusable. Withdraw before
+                // any interception can happen; republish only when the replacement
+                // is fully set up (RendererReady covers the invalidation bit).
+                if (peerAnnounced && !RendererReady()) {
+                    SetPeerGone(L"renderer-lost", false);
+                    peerAnnounced = false;
+                } else if (!peerAnnounced &&
+                           g_rootHookReady.load(std::memory_order_acquire) &&
+                           RendererReady()) {
+                    peerAnnounced = PublishPeerReady(L"renderer");
+                }
                 continue;
             }
             continue;
@@ -10728,13 +10776,13 @@ bool RefreshGestureGeometry() {
                 // mixture of two layouts, so no gesture may start against it
                 // until a later apply rewrites all three.
                 g_dismissAxis = previousAxis;
-                g_rendererInvalid.store(true, std::memory_order_release);
+                SetRendererInvalid(true);
                 TraceLog(L"gesture renderer invalid until a successful reapply");
                 return false;
             } catch (...) {
                 TraceLog(L"gesture geometry write failed err=unknown");
                 g_dismissAxis = previousAxis;
-                g_rendererInvalid.store(true, std::memory_order_release);
+                SetRendererInvalid(true);
                 TraceLog(L"gesture renderer invalid until a successful reapply");
                 return false;
             }
@@ -10760,7 +10808,7 @@ bool RefreshGestureGeometry() {
     if (previouslyInvalid) {
         // This pass rewrote all three scalars from one layout again; the
         // property set and the committed travel agree from here.
-        g_rendererInvalid.store(false, std::memory_order_release);
+        SetRendererInvalid(false);
     }
 
     // The published snapshot has to match the scalars the expression reads, so it
@@ -10844,7 +10892,7 @@ bool Setup(wux::FrameworkElement const& root) {
     // The property set now carries this travel, so the renderer geometry may be
     // committed to it. A throw above leaves the old value and no renderer.
     g_dismissDistance = distance;
-    g_rendererInvalid.store(false, std::memory_order_release);
+    SetRendererInvalid(false);
 
     // A resize changes the extent the expression slides by, and it may be the
     // first real layout after Setup. The refresh owns the axis check as well, so
@@ -10938,7 +10986,7 @@ bool Setup(wux::FrameworkElement const& root) {
     // here, so the open transition re-measures it, and the measurement below is
     // rejected as "not the panel" when the storyboard has not placed it.
     PublishPanelTrailDip(true, 0, 0);
-    g_rendererReady.store(true, std::memory_order_release);
+    SetRendererReady(true);
 
     const winrt::hstring rootClassName = winrt::get_class_name(root);
     TraceLog(L"attached root=%s size=%.0fx%.0f", rootClassName.c_str(), width,
@@ -11395,8 +11443,8 @@ void ResetComposition() {
     // The renderer is gone: every gate that asks whether gestures may start
     // reads this, so a gesture cannot run against a property set that no longer
     // exists. A half-applied scalar set dies with it.
-    g_rendererReady.store(false, std::memory_order_release);
-    g_rendererInvalid.store(false, std::memory_order_release);
+    SetRendererReady(false);
+    SetRendererInvalid(false);
     // The old root's dispatcher dies with it; PrepareRootElement captures the
     // next root's before it registers anything on it.
     g_dispatcher = nullptr;
@@ -11571,6 +11619,15 @@ BOOL RoleInit() {
     g_hidStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_hidStopEvent) {
         TraceLog(L"hid stop event failed err=%u",
+                static_cast<unsigned>(GetLastError()));
+    }
+    // The renderer-usability event: the UI thread sets it whenever the root is
+    // attached, torn down or invalidated, and the input thread withdraws or
+    // republishes the peer from it. A missing event leaves the loop's own check
+    // as the fallback.
+    g_rendererEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_rendererEvent) {
+        TraceLog(L"renderer event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
     // The completion event for the counted module entries. Created before any
@@ -11810,6 +11867,10 @@ void RoleUninit() {
     if (g_hidStopEvent) {
         CloseHandle(g_hidStopEvent);
         g_hidStopEvent = nullptr;
+    }
+    if (g_rendererEvent) {
+        CloseHandle(g_rendererEvent);
+        g_rendererEvent = nullptr;
     }
     if (g_moduleEntriesGone) {
         CloseHandle(g_moduleEntriesGone);

@@ -190,7 +190,13 @@ flag-check-then-store let the startup write `alive` after the unload had written
 raw-input registrations are not part of readiness — this is **intent-consumer
 readiness**; `RegisterHidUsage` logs a refusal and the touch half degrades, while
 the intent half the interception depends on still runs. The `ipc peer alive` line
-prints `touch=`/`pen=` so the difference is visible. A press during a start or a
+prints `touch=`/`pen=` so the difference is visible. Readiness is continuing: the
+input thread also withdraws (`ipc peer gone reason=renderer-lost terminal=0`)
+when the root is torn down for replacement or a failed scalar write invalidates
+it, and republishes (`ipc peer alive reason=renderer`) only when a usable
+replacement is attached; the UI thread signals a renderer event, so a press in
+that interval runs natively exactly once. The terminal unload withdrawal still
+wins the race. A press during a start or a
 stop is served natively by the shell; that is the intended trade, because an
 `alive` written before the consumer runs would swallow a press for a service that
 does not exist. A press the bridge has already swallowed is a different case:

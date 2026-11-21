@@ -50,12 +50,18 @@ gate reads. `peerEpoch` is claimed once per attach; `peerState=alive` is
 published only by the input thread once its window, its message loop and its
 intent event exist (intent-consumer readiness — a refused raw-input registration
 is logged and does not withdraw it), and the tick is refreshed from that thread's
-idle tick and every positioned report at most once per 100 ms. Withdrawal is
+idle tick and every positioned report at most once per 100 ms. Readiness is
+continuing: `RendererReady()` (root attached and not invalidated) is part of the
+announcement, and a renderer loss withdraws
+(`ipc peer gone reason=renderer-lost terminal=0`) before the bridge can intercept;
+the UI thread's renderer event republishes when a usable replacement attaches.
+Withdrawal is
 recursive and precedes every stop: `gone` plus `controllerDirection=0` plus
 `controllerTouch=0`, written before the input thread is stopped and again as it
 leaves for any reason. Publication and the terminal withdrawal share one SRW
 critical section, so a startup cannot write `alive` after the unload wrote `gone`;
-the consumer withdraws before it unregisters its devices.
+the consumer withdraws before it unregisters its devices, and a renderer
+republish that races the unload is refused by the same lock.
 
 **M3 paths.**
 - `ApplyBridgeIntent` — the only intent consumer. The record is passed to

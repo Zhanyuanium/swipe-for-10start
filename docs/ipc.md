@@ -211,13 +211,24 @@ stops, and the gate closes 600 ms later. A few presses during a start or a stop
 are therefore served natively by the shell, by design.
 
 `alive` means **intent-consumer readiness**: that thread's window, its message
-loop and the intent event exist. It is not a claim about the digitizer: a refused
+loop and the intent event exist, and the renderer it will drive is usable
+(`RendererReady`: the root is attached and its scalar set was not invalidated).
+It is not a claim about the digitizer: a refused
 raw-input registration is logged by `RegisterHidUsage` and the intent half still
 runs; the `ipc peer alive` line prints `touch=`/`pen=` so the difference is
 visible. The publication and the terminal withdrawal are serialised in one
 critical section, so a startup that is already in flight either lands before the
 withdrawal or is refused after it; a flag check followed by an independent store
 would let `alive` overwrite `gone`.
+
+Readiness is continuing, not a one-time announcement. When the root is torn down
+for replacement, or a failed scalar write invalidates it, the input thread
+withdraws the peer (`ipc peer gone reason=renderer-lost terminal=0`) before the
+bridge can intercept again; the press then runs the shell's own path exactly
+once. The UI thread signals a renderer event and the input thread republishes
+(`ipc peer alive reason=renderer`) only once a usable replacement is attached.
+The unload's terminal withdrawal still wins: a republish that races it is
+refused by the same lock.
 
 The window is six refresh intervals: five consecutive refreshes may be missed
 without closing the gate, so a stalled input thread (a settle, a busy message
