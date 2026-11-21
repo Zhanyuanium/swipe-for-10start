@@ -77,8 +77,9 @@ starts there: a close 172 ms into an open started at `from=0.542`; a Win press
 during a held touch started the close from `progress=1.000`; a press during a
 close drops the local dismiss slot, cancels the pending executor command, and
 settles the panel back from its live position (`intent open cancel from=...`).
-The press path is the only one that still starts a settle: a press has no finger
-to bind to.
+The press path is the only one that starts such a settle, and it has no finger to
+bind to; a band pull the retract refuses at or below the entry takes that same
+request (`grab=open`), so its settle is the press's curve too and follows nothing.
 
 A qualified pull during any close this mod still owns is one take, not a take
 followed by a spring. The retract stops where it is and the position is pinned
@@ -95,7 +96,9 @@ The closes a pull cannot take over: one whose `Dismiss` call has already
 returned and whose hide is unconfirmed; one whose published dismiss is at or past
 its deadline, where the bridge may already be inside the call and no cancel can
 recall it (`grab=refused reason=dispatch`); and a retract already at or below the
-entry, where no panel is on screen to take. A refused transfer consumes the
+entry, where no panel is on screen to take. That last one is not a refusal for a
+down in the band: the attempt becomes the press's open request and the panel
+settles back from its live position (`grab=open`). A refused transfer consumes the
 contact, and the landing serves no touch open, so the menu stays closed until a
 new pull. No path replays from the old target.
 

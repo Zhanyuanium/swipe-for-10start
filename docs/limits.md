@@ -135,14 +135,28 @@ still queued/armed or executed-unconfirmed, or when the open-cancel ticket names
 that command. Measured on this machine, close takeover → `win close observed`
 was **562–593 ms over ten maximum-duration (520 ms settle) closes**, mean 578,
 so the worst sample sat 7 ms inside the window — a busy launcher can pass it.
-A pull held through such a close is not released by it: the grab's one transfer
-attempt is refused once the retract is at or below the entry (or the dismiss is
-inside the shell), and the contact is consumed (`grab=refused reason=...`), with
-no touch show at the landing. A pull that qualifies earlier cancels the command
-and never reaches the landing. A landing
+A landing
 with no command
 of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
 for) and the contact is dropped by design.
+
+**The last part of a retract is a settle, not a follow.** A pull held through the
+close can still take it over while the command is cancellable: the transfer
+cancels it and hands the panel to the finger (`grab=taken`). Once the retract is
+at or below the entry there is no panel on screen to take: a down on the surface
+the retract had shown, or in the area it has already left, is refused and consumed
+(`grab=refused reason=offsurface|no-close`), and no touch Show is issued at the
+landing. A down **in the band** is not refused there: it is the same request a
+press makes in that same moment, so the close is cancelled and the menu settled
+back open from its live position (`grab=open`, the press's `intent open cancel`
+curve). That settle follows nothing — the finger's later reports are inert until
+it lifts, and a lift does not change the target — so the panel rises at the
+planner's rate from where the retract left it and can be slower than the finger.
+The pull cannot recall a `Dismiss` already inside the shell: the recovery ticket
+is its one fallback, and if that hide still lands the landing reissues the open
+once (`intent open recovered entry=...`). After a landing no finger reopens the
+menu: the menu's next open comes from a new down. A pull that
+qualifies earlier cancels the command and never reaches the landing.
 
 **No transition is not a stuck close.** A dismiss can be confirmed on a window
 the shell had already hidden (a native hide won the race, the hide arrived

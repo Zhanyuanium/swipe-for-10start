@@ -4,7 +4,7 @@ C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
 tools/ - PowerShell probes, injectors, animation harnesses, the panel-edge tracker, the regression smoke, the store packager and the local installer (16 scripts + AGENTS.md)
-artifacts/ - captured measurements (16 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
+artifacts/ - captured measurements (17 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
 <config>
@@ -160,12 +160,23 @@ beyond the point. A point in the area the retract has left is refused
 (`reveal admit ... reason=offsurface`) and muted for its contact. The grab spends
 its one opportunity at its 24 DIP report: `CancelCloseForQualifiedPull` revokes
 both schedules (the local slot and the armed `exec dismiss`), arms the same
-recovery ticket a press arms, and takes the retract over there (`grab=taken`). A
-refused transfer — the retract already at or below the entry, the dismiss already
+recovery ticket an explicit open request arms, and takes the retract over there
+(`grab=taken`). A
+refused transfer — the dismiss already
 inside the shell, its published dismiss at or past its deadline (the bridge may
-already be inside the call, `reason=dispatch`), no distance, or nothing left to
-cancel — consumes the contact (`grab=refused reason=...`): it keeps no open right
-until it lifts, every later report is inert, and its release leaves no record. A
+already be inside the call, `reason=dispatch`), no distance, nothing left to
+cancel, or a down on the retract's surface with the retract already at or below
+the entry — consumes the contact (`grab=refused reason=...`): it keeps no open
+right until it lifts, every later report is inert, and its release leaves no
+record. A down **in the band** at that same point is the press instead: the
+attempt becomes the explicit open request through the one cancel-and-open body a
+press uses (`grab=open`) — both schedules dropped, the suppression cleared, the
+open direction published, the recovery ticket armed, and the panel settled back
+from its live position — and the finger drives none of it. Every one of those
+endings runs one transition: the reveal session and its timing go, panel
+ownership is republished, and the contact keeps the mute a down refused at
+admission gets, so only a lift or a report that proves a new contact ends it. The
+landing retires a grant the contact never spent the same way. A
 close also consumes every contact that was already on the glass when it started.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
@@ -183,7 +194,8 @@ A landing adopts no finger: after `win close observed` the controller issues no
 touch show, and no hover, carried travel or release record turns a landed close
 into a Show; a contact still down is inert until it lifts (`win close observed
 ... muted=1`). The only open a landing still serves is the explicit, independently
-owed press obligation (`intent open recovered ...`) with its epoch and close
+owed request — a press, or a band pull the retract refused — (`intent open
+recovered ...`) with its epoch and close
 identity, unchanged.
 An intent close is
 `TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture

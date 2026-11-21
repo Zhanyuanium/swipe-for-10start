@@ -182,8 +182,10 @@ core (see [../docs/limits.md](../docs/limits.md)).
   claim is not retried), and then starts the pull generation, drops the previous
   release record, cancels a pending close and calls `PublishOpenClaim`. A grab
   spends the same crossing on `CancelCloseForQualifiedPull` instead
-  (`reveal pull qualified ... grab=taken|refused`) and never asks for a show.
-  The claim block is shared with the press-only `BeginLandingOpen`: entry,
+  (`reveal pull qualified ... grab=taken|open|refused`) and never asks for a
+  show: `taken` hands the panel to the follow, `open` is a band down the retract
+  had no panel left for (the press's own open request), and `refused` consumes the
+  contact. The claim block is shared with the press-only `BeginLandingOpen`: entry,
   insertion, pending open, direction, touch, show request; the preconditions and
   the log line stay at the callers. A band tap requests nothing.
 - `ActivateRevealFollow` — the live takeover. A hidden panel is met at
@@ -209,7 +211,8 @@ core (see [../docs/limits.md](../docs/limits.md)).
   `TryClaimRevealOpen`) is the only abort of a close this mod still owns, and it
   is the grab's one opportunity: at the 24 DIP crossing it drops both schedules
   (the local gesture deadline and the armed executor command), republishes the
-  open direction, arms the same recovery ticket a press arms, and takes the
+  open direction, arms the same recovery ticket an explicit open request arms, and
+  takes the
   retract over from the panel's live position. That is one take: the position is
   pinned and the follow binds to it on the same report (`liveBound`), so no settle
   runs between the cancel and the follow's first move and the panel never passes
@@ -221,11 +224,21 @@ core (see [../docs/limits.md](../docs/limits.md)).
   dismiss whose call already returned with its hide
   unconfirmed (`g_pendingDismissConfirm`), a published dismiss at or past that
   deadline (`reason=dispatch`: the bridge may already be inside the call), a
-  retract already at or below the entry, a layout
-  with no distance, and a close with nothing left to cancel all answer a named
-  reason (`grab=refused reason=...`). The contact then keeps no
-  open right until it lifts, every later report is inert, and its release leaves
-  no late-open record; the landing does not revive it. Contact-down no longer
+  close with nothing left to cancel, a layout
+  with no distance, and (for a down on the retract's surface) a retract already at
+  or below the entry all answer a named
+  reason (`grab=refused reason=...`). A down **in the band** whose retract is
+  already past the entry is not refused: it is the same request a press makes in
+  that moment, so the attempt becomes that request through the one body both share
+  (`CancelCloseForOpenRequest`, `grab=open`): both schedules dropped, the pending
+  command cancelled, the suppression cleared, the open direction published, the
+  recovery ticket armed, and the panel settled back from its live position (or
+  `ShowAtRest` when there is nothing left to travel). The pull owns none of that
+  settle; the finger is consumed like a refused one. Both endings run one
+  transition (`ConsumeGrabContact`): the reveal session and the contact's 1 ms
+  timing go, panel ownership is republished so the layout deferral ends, and the
+  contact gets the same mute a down refused at admission gets — it stays inert
+  until its lift or a report that proves a new contact. Contact-down no longer
   cancels anything; a tap leaves the close alone.
 - `win close observed` — the landing body (`LandClosedMenu`). The cloak
   transition is its usual caller; the executor's confirmation is the second:
@@ -237,15 +250,23 @@ core (see [../docs/limits.md](../docs/limits.md)).
   command is the identity there too, and nothing pretends a transition happened.
   A landing serves **no touch open**: no contact that is still down, no carried
   travel and no release record turns a landed close into a Show
-  (`win close observed ... muted=1` marks a contact consumed by the close). A
+  (`win close observed ... muted=1` reads the one mute: a contact the close
+  consumed at its start, a down refused at admission, a grab whose transfer was
+  refused, or a grant the landing itself retired). A
   grab that crossed 24 DIP while the retract was still cancellable either took it
-  (`grab=taken`) or was refused and consumed; one that had not crossed yet
-  reaches the crossing after the landing and is refused there (`reason=no-close`).
+  (`grab=taken`) or was refused and consumed (`grab=refused`), or — a band down —
+  became the press's open request (`grab=open`). A grant the contact never spent
+  dies with the retract that granted it: the landing retires it through
+  `ConsumeGrabContact`, so no report of it can become a gesture and no later open
+  can adopt it. Only a close that ended without a landing (a terminal executor
+  repair, the suppression expiring under a shown window) leaves a crossing that
+  answers `reason=no-close` and consumes it there.
   Either way it keeps no open right until it lifts, and a
   menu closed by a touch needs a new pull.
   The only open
-  a landing still owes is the press obligation: if the ticket says an open
-  cancelled a close that still landed, the landing reissues that open
+  a landing still owes is the explicit request's obligation: if the ticket says an
+  open — a press or a band pull — cancelled a close that still landed, the
+  landing reissues that open
   (`intent open recovered entry=...`) through the one `BeginLandingOpen`
   transaction, with `controllerTouch=0`. The ticket is bound to the open tick,
   so a landing for another menu cannot serve it. The landing first reconciles an
