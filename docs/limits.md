@@ -128,13 +128,23 @@ run never writes that line. A band pull that the shell opens natively, without
 a show request from this mod, opens the same watch when the contact is admitted,
 so it is covered too.
 
-**A late hide costs latency, not the pull.** The 600 ms suppression window
-(`kRestoreSuppressMs`) governs admission and the unhealed rule, not the
-landing's identity: the landing is this mod's close when its dismiss command is
-still queued/armed or executed-unconfirmed, or when the open-cancel ticket names
-that command. Measured on this machine, close takeover → `win close observed`
-was **562–593 ms over ten maximum-duration (520 ms settle) closes**, mean 578,
-so the worst sample sat 7 ms inside the window — a busy launcher can pass it.
+**A late hide costs latency, not the pull.** The close record, not a clock, owns
+the retracted panel: one accepted close (serial, acceptance tick, the menu it was
+accepted against, a phase and a repair bound) is retired by its landing, a pull
+cancel, an external takeover, a terminal repair, or the repair bound itself
+(`kRestoreSuppressMs`, 600 ms after acceptance). The landing's identity is still
+its dismiss command and its open generation: the landing is this mod's close when
+its dismiss command is still queued/armed or executed-unconfirmed, or when the
+open-cancel ticket names that command. Measured on this machine, close takeover →
+`win close observed` was **562–593 ms over ten maximum-duration (520 ms settle)
+closes**, mean 578, so the worst sample sat 7 ms inside the 600 ms bound — a busy
+launcher can pass it, which is why the bound is a repair and never the answer to
+"is a close in flight". The repair ending is deliberate: it logs one `close ended
+... reason=repair-deadline` line, releases the published direction so the bridge's
+next toggle reads the cloak and the internal state again, and leaves the dismiss
+command and the ticket naming the hide that may still land — the unhealed heal
+waits for that command to answer, so a slow hide does not land on a panel that
+was just restored under it.
 A landing
 with no command
 of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
@@ -188,12 +198,14 @@ Win press opens exactly once; the transition itself is never synthesized.
 - **The digitizer may go quiet during the uncloak and during a close.** The
   idle release would end the contact before the open adopts it; while a
   touch show is in flight (`controllerTouch`/`g_intentOpenActive`), or a close
-  is in flight with a reveal candidate, the idle is skipped. A real lift is a
+  owns the panel with a reveal candidate, the idle is skipped. A real lift is a
   report and still ends the gesture with `src=report`; a genuine silence after
   those windows ends it with `src=idle`. A held release arms no deadline at all:
-  the hold ends on the cloak event or on the executor's answer.
+  the hold ends on the cloak event or on the executor's answer. A close that is
+  still owed its landing holds the release until that ending arrives, and the
+  close's repair bound (600 ms) is the one deadline the record arms.
 - **Silence is not a lift for a contact a close consumed.** The latch and the
-  dismiss mute survive the quiet through the hide: while a close is in flight no
+  dismiss mute survive the quiet through the hide: while a close owns the panel no
   idle expiry runs at all. A consumed contact ends on its lift report or on a
   report that proves a new contact (another device, a different asserted
   identifier, or a different asserted node on a device that names no contacts;

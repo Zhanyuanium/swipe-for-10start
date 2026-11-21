@@ -51,6 +51,7 @@ state has:
 | band candidate's watchdog | QPC | `kCandidateIdleHoldMs`, 120 ms |
 | contact latch and tracked identity expiry | tick | the same 18 ms |
 | the armed close tap | tick | the settle's end (`ScheduleCloseTap`) |
+| the close record's repair bound | tick | `kRestoreSuppressMs`, 600 ms after acceptance (`RepairExpiredClose`) |
 | a show's executor budget | tick | `kBridgeAckTimeoutMs`, 400 ms |
 | a dismiss's executor budget | tick | `executeAt + 400 ms` |
 | the settled measurement's guaranteed turn | tick | `kSettledMeasureDeadlineMs`, 400 ms |
@@ -67,9 +68,11 @@ later of its 8 ms report gap and the 50 ms entry guard, so the wake is one the
 coast can actually use. The one deadline published from the UI thread (the
 scroller retry) posts a wake to the input window, so a planner that already read
 the previous value re-reads it. A release that is held —
-a touch show in flight, or a close in flight with a contact owning the panel —
-contributes nothing: its hold ends on a cloak event or an executor answer, and a
-deadline that cannot act would spin the thread.
+a touch show in flight, or the close record owning the panel with a contact
+owning the panel edge — contributes nothing: its hold ends on a cloak event or an
+executor answer, and a deadline that cannot act would spin the thread. The close
+record's own repair bound is the one deadline that ends a close whose landing never
+came; nothing polls for it.
 
 The open/close state is pushed, not polled: `SetWinEventHook(EVENT_OBJECT_CLOAKED,
 EVENT_OBJECT_UNCLOAKED)` is installed on this thread for its own process and

@@ -142,7 +142,11 @@ on the first positioned report whose signed inward travel reaches 24 DIP
 (`reveal pull qualified ... grab=none` then `reveal show request ...`). A tap
 anywhere in the band — twice the taskbar's thickness — requests nothing and stays
 a native press; the shell's own edge gesture (from about 20 DIP) remains the
-fallback and an open it performs is adopted. One attempt per contact: a refused
+fallback, and the open it performs is adopted by the band down that authored it
+(`g_contactOrigin.author`): adoption needs an author, so a finger that landed on
+the desktop or inside the panel is never bound to a keyboard open, and a down on
+the open panel is the dismiss and is never promoted. One attempt per contact: a
+refused
 request is not retried. The content settle starts at `RevealEntryProgress`, and
 the reveal takeover chases the mapped finger at 2.2 DIP/ms, then follows
 (`behind=0.000`).
@@ -156,10 +160,14 @@ panel back from its live position, because a press has no finger to bind to. Tha
 pull is a grab, and while a close owns the panel a down is admitted only when it
 lands in the band or on the surface the retract still shows — its mapped progress
 at or below the panel's live one, because the panel's trail edge is then at or
-beyond the point. A point in the area the retract has left is refused
+beyond the point, **and** the point inside the panel rectangle's cross range
+(`PanelCrossContains`: top..bottom on a horizontal axis, left..right on a
+vertical one, from the same snapshot rect). A point in the area the retract has
+left, or one perpendicular to and outside the panel, is refused
 (`reveal admit ... reason=offsurface`) and muted for its contact. The grab spends
 its one opportunity at its 24 DIP report: `CancelCloseForQualifiedPull` revokes
-both schedules (the local slot and the armed `exec dismiss`), arms the same
+both schedules (the local slot and the armed `exec dismiss`), ends the close
+record, arms the same
 recovery ticket an explicit open request arms, and takes the retract over there
 (`grab=taken`). A
 refused transfer — the dismiss already
@@ -171,7 +179,7 @@ contact (`grab=refused reason=...`): it keeps no open
 right until it lifts, every later report is inert, and its release leaves no
 record. A down **in the band** at that same point is the same request a press
 makes, with the finger still on it: the attempt shares the press's cancel body
-(`grab=open`) — both schedules dropped, the suppression cleared, the open direction
+(`grab=open`) — both schedules dropped, the close record ended, the open direction
 published, the recovery ticket armed — but not its settle. The grant is spent, so
 the same report starts the follow at `RevealEntryProgress` and chases the mapped
 finger at 2.2 DIP/ms; a window the retract has already hidden gets the ordinary
@@ -211,8 +219,18 @@ identity, unchanged.
 An intent close is
 `TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
-`Dismiss` on the launcher thread. The close suppression keeps the visibility
-service from healing the retracted panel before the dismiss lands.
+`Dismiss` on the launcher thread. The close record — one accepted close with its
+serial, acceptance tick, the menu it was accepted against, a phase and the 600 ms
+repair bound — keeps the visibility service from healing the retracted panel
+before the dismiss lands, and it is the only answer to "is a close in flight?":
+no reader asks a clock. The record is retired by its landing, a pull cancel, an
+external takeover, a terminal repair, or the repair bound. The bound's ending is
+a repair, not an expiry: it logs one `close ended ... reason=repair-deadline`
+line, releases the published direction so the bridge's next toggle reads the
+cloak, and leaves the dismiss command and the recovery ticket naming the hide
+that may still land; the unhealed heal waits for that command to answer
+(`CloseHideMayLand`), so a slow hide does not land on a panel that was just
+restored under it.
 
 The close is judged by behaviour: the shell's hidden event (`own state
 event=hidden open=0`), the executor's `confirmed` (hidden) at its bounded 300 ms
@@ -236,14 +254,16 @@ Deleted in M3: the `VK_LWIN` tap, the close record and its publishes, the retrac
 request/answer and its cancel answer, the arbitration hold, the deferred
 candidate **as an arbitration mechanism**, and the reveal claim. The one live
 use the old candidate left is not arbitration: `BeginEdgeCandidate` (the down's
-admission) calls `StartRevealFollow` with `granted=true` while `CloseInFlight`,
+admission) calls `StartRevealFollow` with `granted=true` while the close record
+owns the panel,
 so a grab is tracked without writing `Progress`; its one transfer attempt is the
 pull cancel, and a refused transfer consumes it — the landing no longer releases
 it. The reveal flag that says so is `granted` (not `deferred`), and the claim
 attempt is `claimAttempted`. The late-release record's `deferred` and `readyQpc`
 fields are deleted: its window is measured from the release, and no landing
-consumes a record. `CloseInFlight` remains only as
-the suppression-window predicate: the settle owns the motion. The
+consumes a record. The panel-ownership clock (`g_suppressRestoreUntil`) is gone
+with the close record: a phase, not an age, answers `CloseInFlight`, and the
+settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
 `CloseInFlight` early return that guards the follow, so it could never fire; the
 press cancel, the press latch and the landing's press recovery are the reopen
@@ -293,7 +313,8 @@ are implemented and **unverified on this machine**: the code path is the same
 
 ## Rules
 
-- One data source per claim: the cloak decides the shell state, the controller's
+- One data source per claim: the cloak decides the shell state, the close record
+  decides whether a close is in flight, the controller's
   published direction decides the toggle, the geometry snapshot decides the mapping.
 - No period. The Start side's input thread arms one high-resolution one-shot for
   the soonest deadline it has and disarms it when that is served; the open/close

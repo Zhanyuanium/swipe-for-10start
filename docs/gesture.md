@@ -18,7 +18,8 @@
   record if it lifts before the open.
 - **grab** — a contact that lands while a close owns the panel. Its down is
   hit-tested against the panel surface that is still on screen (or the band); a
-  point in the area the retract has already left is refused
+  point in the area the retract has already left, or off the panel's cross range,
+  is refused
   (`reveal admit ... reason=offsurface`) and muted for the rest of its contact.
   A grab is measured but writes no `Progress` and gets exactly one transfer
   attempt at 24 DIP. A refused transfer ends the session through the same mute a
@@ -39,12 +40,19 @@ contact lifts.
    window is closed. `StartRevealFollow` records the contact identity, its down
    point and the clocks, and nothing else: no show request, no pull generation,
    no dismiss cancel. A tap anywhere in the band is admitted and then released
-   without a claim. During a close the same call is the grab's admission instead:
+   without a claim. The same pass records the down's **author**
+   (`g_contactOrigin.author`): `Band` for a down in the band — and it stays that
+   author even when the pass could not admit it for a renderer, layout or
+   distance reason, because the shell's own gesture opens from that band — and
+   `Grab` for a down a close granted. During a close the same call is the grab's
+   admission instead:
    the down must be in the band or on the panel surface the retract still shows —
    its mapped progress at or below the panel's live one, which is the same thing
-   as the panel's trail edge being at or beyond the point, both from the run's own
-   geometry (`RevealProgressDip`, `PeekProgressNow`). Anything else is
-   `reason=offsurface` and muted; a granted grab logs `reason=grab`.
+   as the panel's trail edge being at or beyond the point, **and** the point
+   inside the panel rectangle's cross range, both from the run's own
+   geometry (`RevealProgressDip`, `PeekProgressNow`, `PanelCrossContains`).
+   Anything else is `reason=offsurface` and muted; a granted grab logs
+   `reason=grab`.
 2. **Qualified pull** — on the first positioned report of that same contact whose
    signed inward travel (`RevealTravelDip`) reaches `kAdoptTravelDip` (24 DIP),
    `TryClaimRevealOpen` attempts the one open claim. It marks the attempt per
@@ -78,7 +86,14 @@ contact lifts.
    0.348, cold 0.000), not at 0.
 4. **Live takeover** — at the open, `PromoteRevealContact` adopts the contact
    that began in the band if it is still down and has travelled
-   `kAdoptTravelDip` (24 DIP). A grab that still holds its grant is never adopted
+   `kAdoptTravelDip` (24 DIP). **Adoption needs an author**: only a contact whose
+   own down was admitted for that open — the band's open claim, or a grab — is
+   adopted (`AdoptRevealContact` reads `g_contactOrigin.author`). A finger that
+   landed on the desktop or inside the panel while the menu was closed has no
+   author, so a keyboard open under it never binds it: the keyboard's open is the
+   keyboard's. A down on the open panel is the dismiss and is never promoted,
+   refused twice by its author and by `startedOpen`. A grab that still holds its
+   grant is never adopted
    here, or anywhere else: the flag keeps every takeover out while the grant is
    unspent, so an open another path performs before the crossing is not the
    grab's. The transfer that spends the grant — a take, or the band pull that
@@ -119,7 +134,8 @@ contact lifts.
    speed. A live takeover, an admitted newer pull and the consumption invalidate
    it; a new down does not.
 7. **Show/close in flight** — while `controllerTouch` or `g_intentOpenActive` is
-   set, and while a close is in flight with a reveal candidate, the idle
+   set, and while the close record owns the panel with a reveal candidate, the
+   idle
    release is skipped: the digitizer may go quiet during the shell's uncloak and
    during the key/hide, and that silence is not a lift. A real lift is a report
    and still ends the contact. The same rule covers a contact a close consumed:
@@ -177,34 +193,77 @@ first frames.
 One close path for the Win key, the Start button and the click-away:
 
 ```
-intent close -> TakeCloseOwnership -> BeginMirrorCloseSettle(TakeProgressNow())
+intent close -> TakeCloseOwnership (the record, accepted) -> BeginMirrorCloseSettle(TakeProgressNow())
              -> exec dismiss at settle + 30 ms -> bridge Dismiss -> hidden
 ```
 
 A gesture close runs the same pipeline with its own release settle and `exec
-dismiss` at that settle's end; it has no 30 ms lead.
+dismiss` at that settle's end; it has no 30 ms lead. Both families accept the
+close **before** the settle's first frame, so no frame and no report can see a
+panel leaving with no close behind it.
 
-`TakeCloseOwnership` sets `g_suppressRestoreUntil` (the visibility service must
-not heal the retracted panel), publishes the `closing` direction **before the
-settle's first frame**, consumes every contact already on the glass (the dismiss
-mute, and the reveal flags cleared), and clears `controllerTouch`. That one word
-is the whole toggle answer while it is set;
-the shell's cloak and state cannot answer it, because they still say open for the
-whole retract. The mirrored settle is the open curve played backwards, full
-travel (387 ms at the bottom auto-hidden 852 DIP; 409 at the bottom docked 900),
-no seam speed,
-from the live position. The dismiss
-is scheduled, not immediate, so the panel is never hidden mid-slide.
+### The close record
+
+A close is an identity, not an age. One record, written and read only by the
+input thread, answers every "is a close in flight?" question:
+
+| field | meaning |
+|---|---|
+| `serial` | monotonic per accepted close |
+| `acceptedTick` | when the ownership was taken |
+| `openTick`, `openGeneration` | the menu it was accepted against, read from the open record at that instant (diagnostics — a landing is identified by its dismiss command and its open generation) |
+| `phase` | `Settling` (the retract runs, this side has not published its dismiss), `AwaitingHide` (the dismiss is published, the shell's hide is ahead), `Done` |
+| `repairAt` | `acceptedTick + kRestoreSuppressMs` (600 ms): the bound after which a close that never landed is repaired |
+
+The tick fields are data; `phase` is the answer. `CloseInFlight()` reads the
+phase, and the record's own tick fields never decide anything: a duration is not
+a state. Acceptance logs `close accepted serial=... kind=... open=... gen=...
+repair=...`; an ending logs `close ended serial=... kind=... phase=... reason=...
+age=...ms`.
+
+`TakeCloseOwnership` publishes the `closing` direction **before the settle's
+first frame**, consumes every contact already on the glass (the dismiss mute, and
+the reveal flags cleared), clears `controllerTouch` and accepts the record. That
+one word is the whole toggle answer while the record owns the panel; the shell's
+cloak and state cannot answer it, because they still say open for the whole
+retract. The mirrored settle is the open curve played backwards, full travel
+(387 ms at the bottom auto-hidden 852 DIP; 409 at the bottom docked 900), no seam
+speed, from the live position. The dismiss is scheduled, not immediate, so the
+panel is never hidden mid-slide.
+
+**Endings.** The record is retired by exactly these, and each one knows what it
+owes beyond the record: the landing (`landing`, or `external` when the hide was
+not this mod's — the landing body already clears the slots), a pull cancel
+(`pull-cancel`, the open direction was published and the follow owns the panel), a
+press or band-pull cancel (`open-cancel`), an external takeover (`external`), a
+shell open that arrived during the close (`open`), a terminal refusal or repair
+(`no-settle`, `no-executor`, `window-closed`, `repair`), and the repair bound.
+The ending retires the record only: the dismiss command and its open generation
+stay identified, because that command is the landing's identity.
+
+**The repair bound.** At `repairAt` a close that never landed ends as a repair
+(`close ended ... reason=repair-deadline`): the published direction is released
+(the bridge's next toggle reads the cloak and the internal state again, and the
+unhealed rule may bring the panel back), and the one line says so. It is not a
+silent expiry — the command and the open-cancel ticket still name the hide that
+may land, and the unhealed heal waits for that command to answer
+(`CloseHideMayLand`), so the panel is not restored under a hide that is still
+coming.
 
 A touch contact that lands during a close is decided on its down. It is a grab
 only when the point is in the band or on the panel surface the retract still
-shows; a point in the area the panel has already left is refused
-(`reveal admit ... reason=offsurface`) and muted for the rest of its contact, so
-it can never open the menu. A grab is measured but writes no `Progress` and
-leaves the close's dismiss armed. When it crosses 24 DIP inward it spends its one
+shows: the point must be on the panel's side of its trailing edge along the
+gesture (its mapped progress at or below the panel's own live progress) **and
+inside the panel rectangle's cross range** (the axis the gesture does not slide
+along, `PanelCrossContains`). Both failures are one refusal: a point in the area
+the panel already left, and a point perpendicular to and entirely outside the
+panel, are `reveal admit ... reason=offsurface` and muted for the rest of their
+contact, so neither can ever open the menu. A grab is measured but writes no
+`Progress` and leaves the close's dismiss armed. When it crosses 24 DIP inward it
+spends its one
 opportunity: `CancelCloseForQualifiedPull` drops both close schedules — the armed
 local dismiss and the armed `exec dismiss` the bridge is holding for the end of
-the settle — clears the suppression, republishes the open direction, arms the
+the settle — ends the close record, republishes the open direction, arms the
 same recovery ticket an explicit open request arms, and takes the retract over
 from the panel's
 live position (`grab=taken`). That take is the transfer's only one: the position
@@ -228,7 +287,7 @@ the close stands. The exception is the band down: that finger
 asked for the same menu the Win key asks for, so the attempt becomes the explicit
 open request instead of a refusal (`grab=open`). With a close still in flight it
 shares the press's cancel body
-— both schedules dropped, the pending command cancelled, the suppression cleared,
+— both schedules dropped, the pending command cancelled, the close record ended,
 the open direction published, the recovery ticket armed — and only that body: a
 press has no finger and settles the panel back (`intent open cancel from=...`),
 while the pull keeps its finger, spends the grant, and the follow starts the panel
@@ -250,8 +309,8 @@ continues from the pinned position.
 A press while the close runs is recovered, not guaranteed. `IntentShouldClose`
 reads the controller's phase, so a press during the retract is an open:
 - a close still settling publishes open at once; the Start side drops
-  the local dismiss slot, cancels the pending executor command, clears the
-  suppression and settles the panel back from its live position
+  the local dismiss slot, cancels the pending executor command, ends the close
+  record and settles the panel back from its live position
   (`intent open cancel from=...`). If the
   dismiss already entered the shell's `Dismiss` call, the hide lands and the
   landing reissues the open (`intent open recovered entry=...`), provided the
@@ -322,7 +381,8 @@ reads open, or cannot answer, the confirmation is **retained** instead
 (`exec dismiss retained command=... gen=...`): the command and its open
 generation wait for the transition, which lands them once
 (`exec dismiss retained served`) within a bounded wait. The command that owns the
-pending dismiss is the identity, never the suppression window, and a
+pending dismiss is the identity — never the close record, which ends with the
+landing — and a
 confirmation from a menu a later open replaced is stale: it cannot land the new
 menu's hide. A generation-zero stamp is valid only while no open has been
 published; once one is, it is as stale as any other mismatch, and a fresh open
@@ -332,8 +392,9 @@ is consumed
 exactly as after any transition. The transition itself is never synthesized.
 
 The idle is held through the close so the digitizer's pause during the key/hide
-does not drop a contact that is mid-grab. The hold ends on the close's landing,
-its cancel, or the contact's own lift, and a real lift is still a report. The
+does not drop a contact that is mid-grab. The hold ends on the close's ending —
+its landing, its cancel, its repair — or the contact's own lift, and a real lift
+is still a report. The
 earlier build released a held pull *at* the landing and replayed the open from
 the panel's position (`reveal takeover ... live=0`, measured on the bottom docked
 layout with a 350 DIP pull held through a Win close); that adoption is gone. A
@@ -370,8 +431,9 @@ that settle. There is no Windows-key tap anywhere.
   `seq_cst` sides of one handshake; a layout change under a live contact is
   deferred whole and applied once after the release.
 - **Unhealed window** — a shown window with the panel off it (a close whose hide
-  landed, or a reopen whose settle never ran) is healed once the close's
-  suppression has ended and no animation/follow owns the panel; a pull on that
+  landed, or a reopen whose settle never ran) is healed once the close record has
+  ended, no dismiss of ours may still land (`CloseHideMayLand`) and no
+  animation/follow owns the panel; a pull on that
   window is admitted as the reveal (`reason=unhealed`).
 
 ## Settle ownership

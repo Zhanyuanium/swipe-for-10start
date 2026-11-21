@@ -55,7 +55,7 @@ dismiss and reveal sessions; the band admission and the grab's down hit-test; th
 reveal entry and the
 2.2 DIP/ms chase; the commit thresholds; the settle spring and the coast; the
 scroll survey and its gate; the unhealed-window rule; the geometry snapshot and
-its lock; the close suppression; and the peer liveness the bridge's interception
+its lock; the close record; and the peer liveness the bridge's interception
 gate reads. `peerEpoch` is claimed once per attach; `peerState=alive` is
 published only by the input thread once its window, its message loop and its
 intent event exist (intent-consumer readiness — a refused raw-input registration
@@ -80,13 +80,15 @@ cloak event and one high-resolution one-shot timer, and `NextInputDeadlineMs`
 arms that timer for the soonest deadline only: the 8 ms coast start (later for a
 follow, whose 50 ms entry guard cannot start one earlier), the 18 ms
 idle release, the 120 ms candidate watchdog, the 18 ms latch/identity expiry, the
-armed close tap, the show/dismiss executor budgets, the settled measurement's
+armed close tap, the close record's 600 ms repair bound (`RepairExpiredClose`),
+the show/dismiss executor budgets, the settled measurement's
 400 ms guaranteed turn, the scroller retry, the fallback watch and the root-hook
 bootstrap probe. Nothing due disarms it. The scroller retry is the one deadline
 written by the UI thread; it posts a private wake to the input window so a
 planner that already read the previous value re-reads it. A held release (a
 touch show in flight,
-a close in flight with a contact on the panel) contributes no deadline: its hold
+a close that owns the panel with a contact on the panel edge) contributes no
+deadline: its hold
 ends on a cloak event or an executor answer, and a deadline that could not act
 would spin. The tick-domain deadlines are armed at 1 ms when already past
 because serving them clears them; the coast start is armed only while ahead.
@@ -113,13 +115,32 @@ Measured with the menu closed, the old build woke 190.6 times/s and queried
 zero times, and the Start host's idle CPU fell from 0.625 % to 0.026 % of one
 core (see [../docs/limits.md](../docs/limits.md)).
 
+The close record. A close is an identity, not an age: one record (`g_close`,
+input thread only) with a serial, the tick it was accepted at, the menu it was
+accepted against (the open record's tick and generation, diagnostics only), a
+phase (`Settling` — the retract runs, this side has not published its dismiss;
+`AwaitingHide` — the dismiss is published; `Done`) and the 600 ms repair bound.
+`TakeCloseOwnership` is the one acceptance for both families and runs before the
+settle's first frame; `EndClose` is the one ending and only retires the record,
+because what an ending owes beyond it differs (the landing has cleared the slots,
+a cancel has published the open, a repair must leave a command that may still hide
+the window identified). The endings are the landing, a pull cancel, a press or
+band-pull cancel, an external takeover, an open observed during the close, a
+terminal refusal/repair, and the repair bound. `CloseInFlight` reads the phase and
+nothing else — the tick fields are data — and a call site that needs "a hide may
+still land" asks `CloseHideMayLand` (a published dismiss is queued, armed or
+executed-unconfirmed), which is the unhealed heal's second question. Acceptance
+logs `close accepted serial=... kind=... open=... gen=... repair=...`; an ending
+logs `close ended serial=... kind=... phase=... reason=... age=...ms`.
+
 **M3 paths.**
 - `ApplyBridgeIntent` — the only intent consumer. The record is passed to
   `ApplyBridgeIntentRecord`, so the landing reconciliation applies the record it
   examined instead of re-reading. `open` sets the controller's
   open direction; if the window is still shown (`StartWindowIsOpen`) the press
   cancels the close: the local dismiss slot is cleared (`ClearLocalCloseTap`), the
-  suppression cleared, and one settle from `TakeProgressNow()` back to 1
+  close record is ended (`open-cancel`), and one settle from `TakeProgressNow()`
+  back to 1
   (`intent open cancel from=...`); the cancel writes the recovery ticket
   (`CloseCancelTicket`: open tick + the cancelled executor sequence + a
   deadline) for the dismiss-won race, through the one helper the qualified pull
@@ -129,12 +150,15 @@ core (see [../docs/limits.md](../docs/limits.md)).
   show that cannot be published is refused (`intent open refused ...
   reason=no-executor`), the panel is not claimed and the ack says refused.
   `close` cancels both close schedules (`CancelCloseSchedules`: the local slot and
-  the executor command), calls `TakeCloseOwnership` (which publishes the closing
-  direction before the settle's first frame), runs
+  the executor command), calls `TakeCloseOwnership` (the one acceptance: it stamps
+  the close record — serial, acceptance tick, the menu, `Settling` — and publishes
+  the closing direction before the settle's first frame), runs
   `BeginMirrorCloseSettle(TakeProgressNow())` and asks for `exec dismiss` at
-  `settle + 30 ms`; a dismiss that cannot be published releases the ownership and
-  answers refused. `external` revokes both schedules and the recovery ticket,
-  clears the suppression, drops the touch state and resyncs from the cloak. The
+  `settle + 30 ms` (`noteCloseDismissPublished` moves the record to
+  `AwaitingHide`); a dismiss that cannot be published ends the record and releases
+  the ownership, and answers refused. `external` revokes both schedules and the
+  recovery ticket, ends the close record, drops the touch state and resyncs from
+  the cloak. The
   attach publishes `exec cancel target=0` so a record the previous activation left
   queued cannot act on the menu this one opens.
 - `ApplyExecAck` / `CheckExecAckTimeout` — one ack per command. A refused show or
@@ -167,16 +191,24 @@ core (see [../docs/limits.md](../docs/limits.md)).
   bridge was told to run at), and publishes an `exec cancel` naming the sequence
   (show: target 0) so the executor cannot read the stale record as its newest
   command. A failed show while a dismiss is pending leaves the close's ownership
-  alone.
+  alone. Every terminal dismiss repair ends the close record (`close ended ...
+  reason=repair`) before `ReleaseExecutorOwnership`, so the panel is not left
+  unreadable for the rest of the record's bound.
 - `BeginEdgeCandidate` / `StartRevealFollow` — the down's decision, then
   admission only: contact, down point and clocks. Outside a close the down must
   be inside the band. During a close the point is hit-tested against the surface
   the retract still shows — its mapped progress
-  (`RevealProgressDip`) at or above the panel's live one (`PeekProgressNow`) — or
+  (`RevealProgressDip`) at or above the panel's live one (`PeekProgressNow`), and
+  the point inside the panel rectangle's cross range (`PanelCrossContains`, the
+  axis the gesture does not slide along) — or
   the band: a granted grab logs `reason=grab`, and a point in the area the
-  retract has left, or one that cannot be judged (no renderer, stale layout, no
+  retract has left, a point perpendicular to and outside the panel, or one that
+  cannot be judged (no renderer, stale layout, no
   distance), logs `reason=offsurface` or its own refusal and is muted for the
-  rest of the contact. The show request moved to `TryClaimRevealOpen`, which runs
+  rest of the contact. The down's own admission also records its **author**
+  (`g_contactOrigin.author`: `Band` for the band's open claim, `Grab` for a
+  granted grab, `None` otherwise), and only an authored contact may be adopted or
+  promoted later. The show request moved to `TryClaimRevealOpen`, which runs
   on the first positioned report of that contact whose signed inward travel
   reaches `kAdoptTravelDip` (24 DIP), marks the attempt per contact (a refused
   claim is not retried), and then starts the pull generation, drops the previous
@@ -208,12 +240,13 @@ core (see [../docs/limits.md](../docs/limits.md)).
   travel (or `claimAttempted`), so a stationary finger on a shown
   but off-rest panel never acquires `Progress`.
 - `RunPendingCloseTap` — despite the name, it requests `exec dismiss`; it is the
-  schedule point, not a Windows-key tap. A dismiss that cannot be published
-  releases the ownership.
+  schedule point, not a Windows-key tap. A dismiss that cannot be published ends
+  the close record and releases the ownership.
 - The pull cancel (`CancelCloseForQualifiedPull`, called from
   `TryClaimRevealOpen`) is the only abort of a close this mod still owns, and it
   is the grab's one opportunity: at the 24 DIP crossing it drops both schedules
-  (the local gesture deadline and the armed executor command), republishes the
+  (the local gesture deadline and the armed executor command), ends the close
+  record (`pull-cancel`), republishes the
   open direction, arms the same recovery ticket an explicit open request arms, and
   takes the
   retract over from the panel's live position. That is one take: the position is
@@ -240,7 +273,7 @@ core (see [../docs/limits.md](../docs/limits.md)).
   ordinary open (`grab=open window=open|hidden entry=... reason=offsurface|no-close`,
   the reason naming which one routed it): a close still in flight is revoked
   through the press's cancel body (`CancelCloseForOpenRequest`) — both schedules
-  dropped, the pending command cancelled, the suppression cleared, the open
+  dropped, the pending command cancelled, the close record ended, the open
   direction published, the recovery ticket armed — while a close that is already
   over has nothing to revoke, so no ticket is armed, no pending entry is cleared,
   and only the open direction is published. The press's tail is a settle
@@ -280,8 +313,9 @@ core (see [../docs/limits.md](../docs/limits.md)).
   crossing answers `no-close`, and a band down is the ordinary open of a closed
   menu (`grab=open ... reason=no-close`). Only a refusal consumes the grab
   (`ConsumeGrabContact`), and the mute never covers a live grant. A close that
-  ended without a landing (a terminal executor repair, the suppression expiring
-  under a shown window) leaves the same crossing, and it ends the same way.
+  ended without a landing (a terminal executor repair, or the repair bound ending
+  the record under a shown window) leaves the same crossing, and it ends the same
+  way.
   The only open
   a landing still owes is the explicit request's obligation: if the ticket says an
   open — a press or a band pull — cancelled a close that still landed, the
@@ -293,10 +327,11 @@ core (see [../docs/limits.md](../docs/limits.md)).
   (`intent reconcile ... (before landing recovery)`) because the cloak event and
   the intent event are separate wakes and the landing reads the intent record
   itself before it acts. A landing is identified as this mod's close by its
-  **command or its open-cancel ticket**, never by the 600 ms suppression window:
-  a maximum-duration close plus launcher dispatch and cloak delivery measured
-  562–593 ms over ten runs (mean 578, 7 ms inside the window at the worst), and
-  the window would drop a genuine pull held through a slower one.
+  **command or its open-cancel ticket**, never by the close record: the record
+  ends with the landing and its repair bound is 600 ms, while a maximum-duration
+  close plus launcher dispatch and cloak delivery measured
+  562–593 ms over ten runs (mean 578, 7 ms inside the bound at the worst) — so the
+  bound would drop a genuine pull held through a slower one.
   The command is also bound to the **open generation** it was stamped with
   (`DismissGenerationCurrent`): a retained confirmation from a menu that a later
   open replaced is stale, and the landing classifies the hide as external.
@@ -304,12 +339,14 @@ core (see [../docs/limits.md](../docs/limits.md)).
   `exec dismiss retained served command=... gen=...` before the one
   `win close observed`, so the same command and generation are visible as the
   close that landed.
-  The window still governs admission and the unhealed rule.
+  The record still governs admission and the unhealed rule, and its repair bound
+  is the one ending that is not evidence about the panel: it releases the
+  direction and logs, while the command and the ticket keep naming the hide.
 - The 18 ms idle is a one-shot deadline armed at the last report, and it is held
-  through a touch show and through a close in flight, so
+  through a touch show and through a close that owns the panel, so
   the digitizer's pause during the key/hide cannot drop the contact. A contact
   the close consumed keeps its latch and its mute through that pause: no idle
-  expiry runs while a close is in flight, and a consumed contact ends only on
+  expiry runs while a close owns the panel, and a consumed contact ends only on
   its lift report or on a report that proves a new contact (another device, a
   different identifier, or a different asserted node on a device that names no
   contacts; the decoder logs
@@ -324,7 +361,8 @@ core (see [../docs/limits.md](../docs/limits.md)).
   tracked identity. `newContact` is `!g_contactDown` in both sample handlers: a
   report gap alone is never a new down, so the admission origin survives it.
 
-**Deleted here.** The `VK_LWIN` tap, the close record publishes, the retract
+**Deleted here.** The `VK_LWIN` tap, the M2 close record's cross-process
+publishes, the retract
 request handler/answer, the reveal claim, the deferred candidate's close
 machinery, the `win open continued` ticket (its stamp sat behind the follow's
 own `CloseInFlight` guard, so it never fired) and the two-curve style switch.

@@ -41,10 +41,14 @@ liveness and idle rules, the release deadlines, and what wakes the input thread
 peer heartbeat) with the measured idle cost.
 
 gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admission
-and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry
+and its 24 DIP qualified open claim (a tap requests nothing), the down's author
+(only a band down or a grab may be adopted or promoted), the reveal entry
 and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
 from the panel's position), the one close path (`TakeProgressNow` → mirrored
-settle → scheduled `exec dismiss`), the grab's down hit-test and its one
+settle → scheduled `exec dismiss`), the close record (serial, acceptance tick, the
+menu, a phase, the 600 ms repair bound) and its endings including the logged
+repair, the grab's down hit-test (the trail along the axis **and** the panel
+rect's cross range) and its one
 transfer attempt (a taken transfer follows from the live position, a band down
 whose retract is already past the entry shares the press's cancel body but follows
 from the entry, a band down whose close has already ended asks for the open like
@@ -57,7 +61,8 @@ animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, th
 start-speed seam, the mirrored close, the coast, and the measured lines.
 
 geometry.md: the `GestureGeometry` snapshot and its lock, the panel-trail
-measurement and band, the taskbar axis probe, the deferred measurement, the
+measurement and band, the axial and cross-axis halves of a point's hit test, the
+taskbar axis probe, the deferred measurement, the
 scroll survey, and the measured layouts.
 
 ipc.md: the merged mod's channel — names, 216-byte layout, seqlocks, open
@@ -75,7 +80,9 @@ the smoke's `DiagnosticTrace` precondition and the tap tests.
 
 limits.md: the measured limits — the shell cap, the launcher readiness, the
 launcher thread, the 24 DIP band threshold with the native-gesture trade-off,
-the touch-show idle suppression, the cold entry, the taskbar auto-hide state,
+the close's 600 ms repair bound (and why a late hide costs latency, not the
+pull), the touch-show idle suppression, the cold entry, the taskbar auto-hide
+state,
 the engine's symbol cache layout and four-hour error cache, and the hardware
 still owed.
 

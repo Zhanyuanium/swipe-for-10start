@@ -135,8 +135,11 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   and keep their two runtime lifetimes: explorer outlives a Start restart, and
  *   a touch-first open can reach the launcher before any Win or Start-button
  *   hook ran. The controller decides; the executor performs. The one shared rule
- *   is the suppression window: a close suppresses the retracted panel until the
- *   executor's dismiss has landed. The cloak read is tri-state (a failed read is
+ *   is the close record: one accepted close (serial, acceptance tick, the menu it
+ *   was accepted against, a phase and the repair bound) owns the retracted panel
+ *   until an ending retires it — the landing, a pull cancel, an external takeover,
+ *   a terminal repair, or the repair bound itself. No reader asks a clock whether
+ *   a close is in flight. The cloak read is tri-state (a failed read is
  *   unknown, never hidden), and a landing is bound to the open generation the
  *   dismiss command was stamped with — a close intent's zero is stamped with the
  *   section's current generation, and zero stays valid only while no open has
@@ -1435,11 +1438,6 @@ NO_DESTROY wux::FrameworkElement g_sizeRoot{nullptr};     // UI thread only
 
 std::atomic<bool> g_dismissSettling{false};
 std::atomic<uint32_t> g_dismissSerial{0};
-// Set whenever this mod starts a close itself: the committed dismiss and the
-// cancelled reveal both set it when their settle starts. ServiceRootVisibility
-// must not read the still-open window as a reopen while the close is in flight.
-// 0 means no close of this mod is pending.
-std::atomic<uint64_t> g_suppressRestoreUntil{0};
 
 // ---------------------------------------------------------------------------
 // The gesture close
@@ -1464,6 +1462,62 @@ enum class CloseKind {
     Dismiss,
     RevealCancel,
 };
+
+// ---------------------------------------------------------------------------
+// The close record
+// ---------------------------------------------------------------------------
+//
+// A close is an identity, not an age. The suppression window used to answer "is
+// a close in flight?" from a clock, `tick < accepted + 600 ms`, and every reader
+// — the down's admission, the follow's activation, both idle holds, the unhealed
+// rule — got a duration instead of a state. A hide that arrived late was then
+// healed open by a window that had already expired, and a settle that never
+// started kept the panel unreadable for the whole window.
+//
+// One record, written and read only by the input thread, answers for both close
+// families (the intent close and the gesture close):
+//
+// - `serial` is monotonic per accepted close;
+// - `acceptedTick` is when the ownership was taken;
+// - `openTick`/`openGeneration` are the menu it was accepted against, read from
+//   the open record at that instant. They are diagnostics: a landing is
+//   identified by its dismiss command and its open generation, never by this
+//   record;
+// - `phase` is the state every reader asks about;
+// - `repairAt` is the bound the suppression window already carried, and the only
+//   clock the record has: a close whose landing has not arrived by then ends as a
+//   repair (`RepairExpiredClose`).
+//
+// The tick fields are data. No reader derives its answer from them: a duration is
+// not a state, and the measured close lands 562-593 ms after the ownership
+// (docs/limits.md) — 7 ms inside the 600 ms window at the worst — so a window can
+// expire under a close that is still performing, and a close that never started
+// can hold one open.
+enum class ClosePhase {
+    Settling,      // the retract runs; this side has not published its dismiss
+    AwaitingHide,  // the dismiss is published; the shell's hide is ahead
+    Done,          // no close of this mod owns the panel
+};
+
+struct CloseRecord {
+    ClosePhase phase = ClosePhase::Done;
+    uint32_t serial = 0;
+    uint64_t acceptedTick = 0;
+    uint32_t openTick = 0;
+    uint64_t openGeneration = 0;
+    uint64_t repairAt = 0;
+    CloseKind kind = CloseKind::None;
+};
+
+CloseRecord g_close;         // input thread only
+uint32_t g_closeSerial = 0;  // input thread only
+
+// The transitions are defined with the close state itself, after everything they
+// touch. The gesture path accepts its close before its settle starts, so the ones
+// it calls are declared here.
+void TakeCloseOwnership(CloseKind kind, uint64_t tickMs, bool contactStillDown);
+void EndClose(const wchar_t* reason);
+void ReleaseExecutorOwnership();
 
 // A pull is a contact that becomes a reveal candidate (BeginEdgeCandidate): it
 // starts in the taskbar edge band, or it grabs the surface a close still shows.
@@ -2027,9 +2081,9 @@ void PublishPanelOwnership();
 extern bool g_commitNeedsProgressReset;
 
 // Defined with the gesture state below: both close families open the same
-// ownership state (no session drives Progress, and the suppression window is
-// open) through this one helper.
-void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown);
+// ownership state (no session drives Progress, and one accepted close record)
+// through this one helper, before their settle's first frame.
+void TakeCloseOwnership(CloseKind kind, uint64_t tickMs, bool contactStillDown);
 
 // Defined with the visibility service below: the one close-landing body, run by a
 // cloak transition and by the executor's confirmation when the window is already
@@ -2975,9 +3029,6 @@ const wchar_t* CloseKindName(CloseKind kind) {
 // The tail every close shares: ownership and the dismiss armed for the end of
 // the settle. The dismiss and the reveal cancel both come through here.
 void ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
-    // A finger that has just lifted is already leaving the panel, so this close
-    // does not have to mute a contact that will keep reporting.
-    TakeCloseOwnership(GetTickCount64(), false);
     ScheduleCloseTap(kind, static_cast<uint64_t>(duration.count()));
 }
 
@@ -3010,17 +3061,28 @@ struct GestureClose {
     bool started = false;
 };
 
-// The close every gesture path runs, from the value the coast left. A close
-// exists only once its settle started: the suppression, the closing direction and
-// the armed dismiss follow that animation, never a failed one. The dismiss is armed
-// for the end of the settle, so the panel is off screen when the shell hides the
+// The close every gesture path runs, from the value the coast left. The close is
+// accepted before its settle's first frame: the record, the closing direction and
+// the consumed contacts are in place for the whole retract, so no frame and no
+// report can see a panel leaving with no close behind it. The dismiss is armed for
+// the end of the settle, so the panel is off screen when the shell hides the
 // window. The committed dismiss wraps this call in its settle batch; the reveal
 // cancel calls it directly.
+//
+// A settle that fails leaves an accepted close with no retract, so the record ends
+// as a refusal (the caller's AbandonClose restores the panel). A finger that has
+// just lifted is already leaving the panel, so this close does not mute a contact
+// that will keep reporting.
 GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
                                uint32_t* serialOut = nullptr) {
     GestureClose close;
+    TakeCloseOwnership(kind, GetTickCount64(), false);
     std::chrono::milliseconds duration{0};
     if (!BeginGestureSettle(from, 0.0f, velocity, duration, serialOut)) {
+        // No retract: the record ends and the ownership it published goes back,
+        // so the next press reads the cloak instead of a close that never ran.
+        EndClose(L"no-settle");
+        ReleaseExecutorOwnership();
         return close;
     }
     close.started = true;
@@ -3030,14 +3092,12 @@ GestureClose BeginGestureClose(float from, float velocity, CloseKind kind,
 
 // Puts the panel back for a close that provably never started.
 //
-// A close exists only once its settle starts: ArmGestureClose publishes the
-// closing direction and arms the dismiss after BeginGestureSettle returned true. A
-// close that never started therefore published no direction and armed no dismiss, so
-// there is nothing to recall here; the restore is the whole operation. This is
-// the only path that
-// may restore a panel after a failed close, and the log names the visible
-// outcome: the missing settle line already says the close never started, and
-// this line says what the panel did instead.
+// A close that never started has no retract, no armed dismiss and no published
+// direction: its record ended with the failed settle (`close ended ...
+// reason=no-settle`), so there is nothing to recall here and the restore is the
+// whole operation. This is the only path that may restore a panel after a failed
+// close, and the log names the visible outcome: the missing settle line already
+// says the close never started, and this line says what the panel did instead.
 bool AbandonClose(CloseKind kind) {
     TraceLog(L"close abandoned kind=%s", CloseKindName(kind));
     return ShowAtRest();
@@ -3078,7 +3138,7 @@ struct DismissCloseResult {
 // either asks for it or drops the close. No deferral file exists.
 //
 // Committed dismiss: the settle batch observes the settle, the shared close tail
-// arms the dismiss. The settle itself, the log line, the suppression window and
+// arms the dismiss. The settle itself, the log line, the close record and
 // the closing direction all come from BeginGestureClose, so this path and the reveal
 // cancel cannot diverge.
 //
@@ -3119,8 +3179,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
             BeginGestureClose(from, velocity, CloseKind::Dismiss, &serial);
         if (!close.started) {
             // No animation, so the batch holds nothing and no handler may be
-            // registered: a close that never settled must not clear a flag, and
-            // it published no direction and armed no dismiss.
+            // registered: the accepted close already ended with the failed
+            // settle (`close ended ... reason=no-settle`), so it armed no dismiss
+            // and published no direction to keep.
             {
                 std::lock_guard lock(g_compositionMutex);
                 InvalidateDismissBatchLocked();
@@ -3129,9 +3190,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
             return result;
         }
 
-        // From here on the close exists: its settle runs, its closing direction
-        // is published and its dismiss is scheduled. Nothing below may restore the
-        // panel.
+        // From here on the close runs: its record was accepted and its closing
+        // direction published before the settle's first frame, and its dismiss is
+        // scheduled. Nothing below may restore the panel.
         result.start = DismissClose::StartedUnobserved;
 
         // The counted entry is taken before the batch is ended, so a completion
@@ -4601,6 +4662,18 @@ struct HidRevealSession {
 
 HidRevealSession g_reveal;  // input thread only
 
+// The author of an open a contact may later join. A down the band admitted is
+// the open claim: the shell's own edge gesture opens from that band, with or
+// without our show request, so that down owns the open it caused. A down a close
+// granted is the grab of its retract. Nothing else authors an open — a down on
+// the open panel is the dismiss, and a down anywhere else is not this gesture —
+// so adoption and promotion ask this record instead of guessing from travel.
+enum class HidDownAuthor {
+    None,
+    Band,
+    Grab,
+};
+
 // The current contact's first and last positioned point, screen DIP, whether or
 // not a session owns it. The reveal candidate is admitted on the down, but the
 // shell can open the menu under a contact that started a little further in than
@@ -4614,6 +4687,11 @@ HidRevealSession g_reveal;  // input thread only
 struct HidContactOrigin {
     bool valid = false;
     bool startedOpen = false;  // the menu was open when this contact went down
+    // The author of the open this contact may be adopted into, decided by the
+    // down's own admission (`BeginEdgeCandidate`) and never re-read later: a
+    // layout change can move the band, and a travel measured after the fact is
+    // not a grant. `None` is a down that is not this gesture.
+    HidDownAuthor author = HidDownAuthor::None;
     float downX = 0.0f;
     float downY = 0.0f;
     float x = 0.0f;  // last positioned point
@@ -4764,7 +4842,7 @@ uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
 constexpr bool g_debugEdge = false;
 
 // ---------------------------------------------------------------------------
-// A close suppresses the panel
+// A close owns the panel
 // ---------------------------------------------------------------------------
 //
 // A gesture close and a keyboard close must leave the mod in one state, or the
@@ -4775,8 +4853,10 @@ constexpr bool g_debugEdge = false;
 //
 // The ownership state is:
 //
-// - the suppression window is open, so the reopen poll does not restore the
-//   resting value and no drag starts until the shell has hidden the window;
+// - one accepted close record (`g_close`), so a reader asks the record and never
+//   a clock: the panel is not usable until the close ends, and the end is an
+//   event (the landing, a cancel, an external takeover, a repair), not an
+//   expiry;
 // - no gesture session owns Progress. `contactStillDown` mutes the rest of that
 //   contact (its reports would otherwise start a new session, and its release
 //   would settle an open); a gesture close arrives from its own release, where
@@ -4788,20 +4868,71 @@ constexpr bool g_debugEdge = false;
 //   or be revived at its landing. Only the contact's sample history survives;
 // - the 1 ms timer period is released: no session is left that needs it.
 //
-// One helper, called by both families. It changes no dismiss slot: the
-// keyboard close drops the armed dismiss at its caller, the gesture close arms
-// one. The name answers only whether the close-suppression window is still open
-// (`tickMs < g_suppressRestoreUntil`); the settle owns Progress. A contact that
-// arrives while this is true is a grab of the surface still on screen or a
-// refusal (`BeginEdgeCandidate`); the grab's one transfer attempt is
+// `CloseInFlight` answers the record's phase and nothing else. A contact that
+// arrives while it is true is a grab of the surface still on screen or a refusal
+// (`BeginEdgeCandidate`); the grab's one transfer attempt is
 // `CancelCloseForQualifiedPull`, and a refused transfer consumes it.
-bool CloseInFlight(uint64_t tickMs) {
-    return tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+bool CloseInFlight() {
+    return g_close.phase != ClosePhase::Done;
 }
 
-void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
-    g_suppressRestoreUntil.store(tickMs + kRestoreSuppressMs,
-                                 std::memory_order_relaxed);
+// "A hide may still land": a dismiss this side published is still queued, armed,
+// or executed with its hide unconfirmed. This is a different question from
+// `CloseInFlight`: the repair deadline can end the record while a slow launcher's
+// command is still ahead, and the command is the hide's identity either way. The
+// one reader that must not restore a panel under it is the unhealed heal — the
+// settle it would start is what the coming hide interrupts — and the wait is
+// bounded by the executor's own answers (its deadline plus the budget, then the
+// confirmation probe).
+bool CloseHideMayLand() {
+    return g_pendingDismissExec.load(std::memory_order_relaxed) != 0 ||
+           g_pendingDismissConfirm != 0;
+}
+
+const wchar_t* ClosePhaseName(ClosePhase phase) {
+    switch (phase) {
+        case ClosePhase::Settling:
+            return L"settling";
+        case ClosePhase::AwaitingHide:
+            return L"awaiting-hide";
+        case ClosePhase::Done:
+            return L"done";
+    }
+    return L"done";
+}
+
+// The one acceptance, for both families, before the settle's first frame. It
+// changes no dismiss slot: the intent close publishes its command after the
+// settle is planned, and the gesture close arms its local slot after the settle
+// starts.
+void TakeCloseOwnership(CloseKind kind, uint64_t tickMs,
+                        bool contactStillDown) {
+    // A newer close decides the menu: the record of a close that has not ended
+    // cannot speak for this one. Its dismiss command was already revoked by the
+    // caller, so this is the ending, not a repair.
+    EndClose(L"superseded");
+    g_close.serial = ++g_closeSerial;
+    g_close.phase = ClosePhase::Settling;
+    g_close.acceptedTick = tickMs;
+    g_close.repairAt = tickMs + kRestoreSuppressMs;
+    g_close.kind = kind;
+    // The menu this close belongs to, for the record and its lines. A failed read
+    // leaves zeros: the record names no menu, and nothing downstream decides by
+    // these fields (the dismiss command carries its own open generation).
+    uint64_t openGeneration = 0;
+    uint64_t openTick = 0;
+    if (SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick)) {
+        g_close.openGeneration = openGeneration;
+        g_close.openTick = static_cast<uint32_t>(openTick);
+    } else {
+        g_close.openGeneration = 0;
+        g_close.openTick = 0;
+    }
+    TraceLog(L"close accepted serial=%u kind=%s open=%u gen=%llu repair=%llu",
+            g_close.serial, CloseKindName(kind), g_close.openTick,
+            static_cast<unsigned long long>(g_close.openGeneration),
+            static_cast<unsigned long long>(g_close.repairAt));
+
     SwipeIpcSetControllerTouch(&g_ipc, false);
     // A new close decides the menu: an earlier close's confirmation, retained or
     // not, can no longer land this one's hide.
@@ -4851,6 +4982,52 @@ void TakeCloseOwnership(uint64_t tickMs, bool contactStillDown) {
     // Nothing owns the panel edge any more, so a settled measurement may move it
     // even though the finger is still on the glass.
     PublishPanelOwnership();
+}
+
+// The dismiss is published: the retract may still be running, but the hide is now
+// the shell's to perform, and the record says which half of the close is
+// outstanding.
+void NoteCloseDismissPublished() {
+    if (g_close.phase == ClosePhase::Settling) {
+        g_close.phase = ClosePhase::AwaitingHide;
+    }
+}
+
+// The one ending. It retires the record and logs the phase it ended in; what the
+// ending owes beyond that — the published direction, the dismiss slots, the
+// recovery ticket, the panel's position — belongs to the caller, because the
+// endings are not one thing: a landing has already cleared them, a pull cancel
+// has published the open, and a repair must leave a command that may still hide
+// the window identified. Retiring the record never clears a dismiss command: that
+// command and its open generation are the landing's identity.
+void EndClose(const wchar_t* reason) {
+    if (g_close.phase == ClosePhase::Done) {
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    TraceLog(L"close ended serial=%u kind=%s phase=%s reason=%s age=%llums",
+            g_close.serial, CloseKindName(g_close.kind),
+            ClosePhaseName(g_close.phase), reason,
+            static_cast<unsigned long long>(now > g_close.acceptedTick
+                                                ? now - g_close.acceptedTick
+                                                : 0));
+    g_close.phase = ClosePhase::Done;
+}
+
+// The repair bound. A close whose landing never came ends here, and the ending is
+// a repair, not an expiry: the ownership goes back to the cloak (the direction is
+// unowned, so the bridge's next toggle reads the cloak and the internal state
+// again, and the unhealed rule may bring the panel back) and the record says so in
+// one line. It does not pretend the hide is over — the dismiss command and the
+// recovery ticket still identify it, so a hide that lands afterwards is still read
+// as this close's, and the heal waits for that command to answer
+// (`CloseHideMayLand`).
+void RepairExpiredClose(uint64_t tickMs) {
+    if (g_close.phase == ClosePhase::Done || tickMs < g_close.repairAt) {
+        return;
+    }
+    EndClose(L"repair-deadline");
+    ReleaseExecutorOwnership();
 }
 
 // The coast runs on the finger's own speed, smoothed over the last three
@@ -5101,7 +5278,8 @@ void ResetActivationState() {
     g_hidSession = HidGestureSession{};
     g_reveal = HidRevealSession{};
 
-    g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+    g_close = CloseRecord{};
+    g_closeSerial = 0;
     g_measureDeferred.store(false, std::memory_order_relaxed);
     g_panelOwned.store(false, std::memory_order_relaxed);
     g_dismissSettling.store(false, std::memory_order_relaxed);
@@ -5392,6 +5570,28 @@ bool PanelContainsPress(const GestureGeometry& geometry, float x, float y) {
            y <= geometry.bottom + kPanelBandSlopDip;
 }
 
+// Whether the point lies inside the panel rectangle's cross range: the axis the
+// gesture does not slide along. A progress number answers where a point sits
+// along the gesture relative to the panel's trail edge; it cannot answer this
+// one, because it is the other coordinate, and a point perpendicular to and
+// entirely outside the panel maps to a perfectly plausible progress. The same
+// 2 DIP the rect's own border needs is allowed. A panel that was never measured
+// places no point (the trail test and the band still decide), as in
+// PanelContainsPress.
+bool PanelCrossContains(const GestureGeometry& geometry, float x, float y) {
+    if (!geometry.panel) {
+        return true;
+    }
+    const bool horizontal = IsHorizontalAxis(geometry.axis());
+    // On a horizontal axis the panel slides along x, so the rect's cross range is
+    // its top and bottom; on a vertical one it is its left and right.
+    const float position = horizontal ? y : x;
+    const float low = horizontal ? geometry.top : geometry.left;
+    const float high = horizontal ? geometry.bottom : geometry.right;
+    return position >= low - kPanelBandSlopDip &&
+           position <= high + kPanelBandSlopDip;
+}
+
 // Input thread only: the only reader of the snapshot. The write side reads
 // `g_geometry` under the same lock, because it is the thread that writes it.
 //
@@ -5639,9 +5839,10 @@ bool CancelCloseForOpenRequest() {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
     // The local dismiss slot is dropped before the executor command can fire;
     // the command itself was cancelled above. The window is not hidden by this
-    // cancel, so the panel stays on screen at its live position.
+    // cancel, so the panel stays on screen at its live position, and the close
+    // this request answers ends here: the open owns the panel from this line.
     ClearLocalCloseTap();
-    g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+    EndClose(L"open-cancel");
     g_commitNeedsProgressReset = false;
     g_intentOpenActive.store(false, std::memory_order_relaxed);
     ForgetPendingDismiss();
@@ -5744,8 +5945,8 @@ GrabTransferResult BandPullOpen(const GestureGeometry& geometry,
 //   there is no schedule left to drop. It is not a statement about the close's
 //   window, so it is checked wherever the close stands;
 // - a layout with no distance can map no pull, so it consumes the contact;
-// - the close must still be in flight. The suppression window is the close's own
-//   ownership state, not a timeout to judge the pull by, and a close that has
+// - the close must still own the panel. The close record is the ownership state,
+//   not a timeout to judge the pull by, and a close that has
 //   ended has no retract to reverse. A band down is not refused there: the menu it
 //   asked for is closed, and a press in that same moment opens it, so the attempt
 //   becomes the ordinary `Open`. A down on the surface the retract had shown, or
@@ -5795,7 +5996,7 @@ GrabTransferResult CancelCloseForQualifiedPull(const GestureGeometry& geometry,
     // contact is not the retract's any more: a band down is a pull on a closed
     // menu, which is the ordinary open claim; a down on the surface the retract
     // had shown keeps no open right.
-    if (!CloseInFlight(tickMs)) {
+    if (!CloseInFlight()) {
         if (!g_reveal.grantDownInBand) {
             return {GrabTransfer::Refused, L"no-close"};
         }
@@ -5831,7 +6032,9 @@ GrabTransferResult CancelCloseForQualifiedPull(const GestureGeometry& geometry,
     if (!dropped.slot && !dropped.command) {
         return {GrabTransfer::Refused, L"no-schedule"};
     }
-    g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+    // The schedules are gone, so this close will never ask for its dismiss: the
+    // record ends here and the pull owns the panel.
+    EndClose(L"pull-cancel");
     g_closeCancelledTick = tickMs;
     // The close is gone and the menu stays open, so the controller owns an open
     // again. The direction must follow: closing with a shown menu would turn
@@ -6045,7 +6248,7 @@ void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
 // take a live retract over) starts at the position the transfer pinned, so the
 // chase begins from where it is and the reversal never passes through a settle.
 bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
-                          uint64_t sampleQpc, uint64_t tickMs) {
+                          uint64_t sampleQpc) {
     HidRevealSession& reveal = g_reveal;
     if (reveal.granted) {
         // A grab is transferred only by its own qualified pull
@@ -6054,7 +6257,7 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
         // landing is not the grab's.
         return false;
     }
-    if (CloseInFlight(tickMs)) {
+    if (CloseInFlight()) {
         // A close owns the panel: its retract is the only motion, and no contact
         // may write Progress under it.
         return false;
@@ -6229,7 +6432,7 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
     // in the band — and nothing else: the area the retract has already left is
     // refused, and a contact there can never open this menu. It writes no
     // Progress and leaves the close's dismiss armed.
-    const bool closeInFlight = CloseInFlight(tickMs);
+    const bool closeInFlight = CloseInFlight();
     // The live position and the restore the state owes, for the grab's hit test
     // and the `reason=open` refusal: the window reporting itself open is not
     // proof that the menu is usable, and the two numbers are what tell a healthy
@@ -6266,11 +6469,17 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
                 // panel's trail edge sits where its own progress puts it, so a
                 // point is on the surface when its mapped progress is at or below
                 // the live one; above it, the retract has already left that area.
+                // The cross axis has no progress: the point must also lie inside
+                // the rect's cross range, or a point perpendicular to and
+                // entirely outside the panel would pass on its axial coordinate
+                // alone. Both failures are the same answer — this point is not on
+                // the surface the retract still shows.
                 float downTrail = 0.0f;
                 const float downProgress = RevealProgressDip(
                     geometry, geometry.distance(), x, y, downTrail);
                 const float slack = kProgressEpsilonDip / geometry.distance();
-                if (downProgress > progress + slack) {
+                if (!PanelCrossContains(geometry, x, y) ||
+                    downProgress > progress + slack) {
                     reason = L"offsurface";
                     break;
                 }
@@ -6304,12 +6513,26 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
     } while (false);
 
     // A close consumes every contact it does not grant. A point it refused (the
-    // vacated area) or could not judge (no renderer, a stale layout, no
-    // distance) has no open right, and the mute makes that true for the rest of
-    // the contact's life: no report of it becomes a gesture, and no later open
-    // adopts it. The lift clears the mute with the contact.
+    // vacated area, or a point off the panel's cross range) or could not judge (no
+    // renderer, a stale layout, no distance) has no open right, and the mute makes
+    // that true for the rest of the contact's life: no report of it becomes a
+    // gesture, and no later open adopts it. The lift clears the mute with the
+    // contact.
     if (closeInFlight && !admitted) {
         g_hidSession.suppress = true;
+    }
+
+    // The down's own decision is also the author of any open this contact may
+    // later join, and it is recorded once, here. The band is the open claim's
+    // test, and it stays the author even when this pass could not admit (a
+    // renderer, layout or distance refusal): the shell's own gesture opens from
+    // that band, and the open it performs is adopted through this record. A
+    // granted grab authors the retract it may take over. A refused down gets no
+    // author, so no travel measured later can turn it into a follow.
+    if (inBand) {
+        g_contactOrigin.author = HidDownAuthor::Band;
+    } else if (closeInFlight && admitted) {
+        g_contactOrigin.author = HidDownAuthor::Grab;
     }
 
     if (inBand || closeInFlight) {
@@ -6442,7 +6665,7 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
                 return;
             }
         }
-        if (!ActivateRevealFollow(geometry, x, y, sampleQpc, tickMs)) {
+        if (!ActivateRevealFollow(geometry, x, y, sampleQpc)) {
             return;
         }
     }
@@ -6460,15 +6683,23 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
 // edge (the visible entry through the cloak), not the absolute mapped position it
 // never displayed.
 //
-// Three tests keep a tap a tap: the contact must have started while the menu was
-// closed (a contact on the open panel is a dismiss), it must have moved
-// `kAdoptTravelDip` along the opening axis (a tap does not move), and no session
-// may already own it. The adoption runs from the open transition's own service
-// pass and from the report path, so a flick whose lift arrives before the cloak
-// event is still adopted.
+// Adoption needs an author, and the contact's own down is the only one: a down
+// the band admitted claims the open, and a down a close granted is the grab of its
+// retract (`g_contactOrigin.author`, recorded in BeginEdgeCandidate). A contact
+// with no author is not this gesture — it landed on the panel, which is the
+// dismiss, or on the desktop — and travel measured after the fact can never turn
+// it into a follow. A down on the panel is refused twice over: by its author and
+// by `startedOpen`.
+//
+// The other tests keep a tap a tap: the contact must have moved `kAdoptTravelDip`
+// along the opening axis (a tap does not move), and no session may already own it.
+// The adoption runs from the open transition's own service pass and from the
+// report path, so a flick whose lift arrives before the cloak event is still
+// adopted.
 bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     if (g_reveal.edgeCandidate || g_reveal.active || g_hidSession.active ||
         g_hidSession.suppress || !g_contactOrigin.valid ||
+        g_contactOrigin.author == HidDownAuthor::None ||
         g_contactOrigin.startedOpen || !RendererReady() ||
         !GeometryLayoutCurrent(geometry)) {
         return false;
@@ -6476,7 +6707,7 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
     // A close owns the panel until its landing, and the only grab it grants is
     // decided on the contact's own down (`BeginEdgeCandidate`). A travel measured
     // after the fact is not a grant, so no contact is adopted into a retract.
-    if (CloseInFlight(tickMs)) {
+    if (CloseInFlight()) {
         return false;
     }
 
@@ -6488,6 +6719,8 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
         return false;
     }
 
+    // The band is printed, not tested: the author was decided on the contact's
+    // own down, and a layout that moved since then must not re-judge it.
     float low = 0.0f;
     float high = 0.0f;
     const bool haveBand = RevealBandDip(geometry, low, high);
@@ -6495,7 +6728,7 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
                       g_contactOrigin.downTick, tickMs);
     const uint64_t sampleQpc = QpcMsNow();
     if (!ActivateRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
-                              sampleQpc, tickMs)) {
+                              sampleQpc)) {
         return false;
     }
     DriveRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
@@ -6510,7 +6743,9 @@ bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
 // The open found a finger that is still down and already pulling. A candidate is
 // promoted here, at the open: it would activate on its next report anyway, and
 // waiting for that report is exactly the race that lost the seam when the finger
-// lifted first. A contact with no candidate is adopted from its own down point.
+// lifted first. A candidate is an admitted band down (or a spent grab), so its
+// author is its own admission. A contact with no author is adopted from its own
+// down point only when that down was admitted for this open (`AdoptRevealContact`).
 // Either way the follow owns Progress from this frame, which is the only
 // suppression the open decision may use.
 void PromoteRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
@@ -6537,7 +6772,7 @@ void PromoteRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
         }
         const uint64_t sampleQpc = QpcMsNow();
         if (ActivateRevealFollow(geometry, g_contactOrigin.x,
-                                 g_contactOrigin.y, sampleQpc, tickMs)) {
+                                 g_contactOrigin.y, sampleQpc)) {
             DriveRevealFollow(geometry, g_contactOrigin.x, g_contactOrigin.y,
                               sampleQpc);
         }
@@ -6788,7 +7023,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     }
 
     // Short reveal: the same settle, the same log line, the same close direction,
-    // the same suppression window and the same armed dismiss as the committed
+    // the same close record and the same armed dismiss as the committed
     // dismiss, from the same release speed. Both close paths read identically
     // from any finger position.
     //
@@ -6836,11 +7071,10 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
         return;
     }
 
-    // A close this mod started is still in flight: the panel is leaving, the
-    // shell's Hide is ahead, and a session here would drag Progress back to rest
-    // and flash the menu while it is being hidden.
-    if (g_dismissSettling.load(std::memory_order_relaxed) ||
-        tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+    // A close this mod accepted still owns the panel: it is leaving, the shell's
+    // Hide is ahead, and a session here would drag Progress back to rest and
+    // flash the menu while it is being hidden.
+    if (g_dismissSettling.load(std::memory_order_relaxed) || CloseInFlight()) {
         if (tickMs > g_skipLogTick + 1000) {
             g_skipLogTick = tickMs;
             TraceLog(L"dismiss skipped settling");
@@ -6927,12 +7161,11 @@ void BeginHidSession(const GestureGeometry& geometry, float x, float y,
     // pinned value, so a takeover mid-settle has no jump. After a commit the base
     // value can still be 0, because the settle callback may not have run yet, so
     // restore the resting value before the first sample drives the scalar. The
-    // restore is skipped while a close this mod started is still in flight:
+    // restore is skipped while a close this mod accepted still owns the panel:
     // inserting 1 there flashed the fully open panel until the shell hid the
     // window. The flag stays set so the next open restores the scalar.
     session.startProgress = TakeProgressNow(L"hid-begin");
-    if (g_commitNeedsProgressReset &&
-        tickMs >= g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+    if (g_commitNeedsProgressReset && !CloseInFlight()) {
         g_commitNeedsProgressReset = false;
         session.startProgress = kProgressRest;
     }
@@ -6998,13 +7231,12 @@ void ReleaseHidSession(const GestureGeometry& geometry, bool allowCommit,
     }
 
     session.active = false;
-    // A close started by the shell (a click outside, a Windows-key press) hides
-    // the window while this contact is still up. Animating Progress back to rest
-    // then replays the panel over a window that is being hidden, which is the
-    // flash the user reported. Leave Progress to the close.
-    if (g_dismissSettling.load(std::memory_order_relaxed) ||
-        GetTickCount64() <
-            g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+    // A close of this mod's owns the panel (a Win key, a Start button, a
+    // click-away or a gesture): the panel is leaving and the shell's Hide is
+    // ahead. Animating Progress back to rest then replays the panel over a window
+    // that is being hidden, which is the flash the user reported. Leave Progress
+    // to the close.
+    if (g_dismissSettling.load(std::memory_order_relaxed) || CloseInFlight()) {
         TraceLog(L"cancel animation skipped (close in flight)");
         return;
     }
@@ -7128,13 +7360,12 @@ void OnHidSampleStep(const GestureGeometry& geometry, int contacts, float xDip,
     // contact, so a retried admission cannot move the down point.
     if (!g_contactOrigin.valid) {
         g_contactOrigin.valid = true;
-        // A close in flight is not an open panel. A contact that lands during the
-        // retract is decided by its own down (`BeginEdgeCandidate`): a grab of
-        // the surface still on screen, or a refusal that mutes it. Either way it
-        // did not start on an open menu, so adoption must not read the
+        // A close that owns the panel is not an open panel. A contact that lands
+        // during the retract is decided by its own down (`BeginEdgeCandidate`): a
+        // grab of the surface still on screen, or a refusal that mutes it. Either
+        // way it did not start on an open menu, so adoption must not read the
         // shown-but-leaving window as one.
-        const bool closeInFlight =
-            tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
+        const bool closeInFlight = CloseInFlight();
         const bool windowOpen =
             !closeInFlight && StartWindowIsOpenThrottled(tickMs);
         // The same reading covers the other uncloaked-but-empty window: a close
@@ -7297,8 +7528,7 @@ void OnHidSample(int contacts, float xDip, float yDip, uint64_t tickMs) {
 // idle tick runs while the stream is silent, so it starts the coast, and it is
 // also the tick that ends the session 10-15 ms later: that release stops the
 // coast and plans the close from its value.
-void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
-                uint64_t qpcNow) {
+void MaybeCoast(const GestureGeometry& geometry, uint64_t qpcNow) {
     if (g_panel.coasting.load(std::memory_order_relaxed)) {
         // Nothing interrupted this coast: pin the value it was heading to. The
         // animation is over at this point, and its base value is the report
@@ -7314,9 +7544,9 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
         return;
     }
 
-    // A close this mod started still owns Progress, and a menu that is already
-    // closing has no finger motion left to continue.
-    if (tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed)) {
+    // A close that owns the panel still owns Progress, and a menu that is
+    // already closing has no finger motion left to continue.
+    if (CloseInFlight()) {
         return;
     }
 
@@ -7380,15 +7610,16 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t tickMs,
 // - A touch show is in flight: the shell is uncloaking the window and the
 //   digitizer may go quiet for that whole window. The uncloak (or the show's
 //   refusal) is the event that ends it.
-// - A close is in flight and a contact owns the panel: the key press and the
-//   shell's hide pause the digitizer too, and the close's end — its landing, its
-//   cancel, or the contact's own lift — is the event that ends it.
-bool IdleReleaseHeld(uint64_t tickMs) {
+// - A close owns the panel and a contact owns the panel edge: the key press and
+//   the shell's hide pause the digitizer too, and the close's end — its landing,
+//   its cancel, its repair, or the contact's own lift — is the event that ends
+//   it.
+bool IdleReleaseHeld() {
     const bool touchShowInFlight =
         SwipeIpcControllerTouch(&g_ipc) ||
         g_intentOpenActive.load(std::memory_order_relaxed);
     const bool holdThroughClose =
-        CloseInFlight(tickMs) && (g_reveal.edgeCandidate || g_reveal.active);
+        CloseInFlight() && (g_reveal.edgeCandidate || g_reveal.active);
     return touchShowInFlight || holdThroughClose;
 }
 
@@ -7426,7 +7657,7 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     // panel standing still for the whole gap. Starting it here makes that tick
     // start the coast and then hand it to the release, which stops it and settles
     // from its value, exactly as on the clean path.
-    MaybeCoast(geometry, tickMs, qpcNow);
+    MaybeCoast(geometry, qpcNow);
 
     // The settled measurement's deadline: the layout watch needs a second layout
     // pass, and one may never come after the open storyboard finishes. The
@@ -7469,7 +7700,9 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     // owning the panel is held through that gap, and its real lift is a report
     // that releases it explicitly. Both holds are IdleReleaseHeld's, and its
     // comment says why the wait planner reads the same predicate.
-    const bool held = IdleReleaseHeld(tickMs);
+    // A close that owns the panel holds Progress, and the idle must not release
+    // a contact that is owning it.
+    const bool held = IdleReleaseHeld();
     const bool sessionIdle =
         session.active && qpcNow >= session.lastAliveQpc &&
         qpcNow - session.lastAliveQpc >= kIdleReleaseMs;
@@ -7512,7 +7745,7 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     //
     // A consumed contact is the exception, and the reason this clock is read
     // here: silence through a close is the shell's hide, not a lift. While a
-    // close is in flight neither clock runs at all, and a Contact Identifier
+    // close owns the panel neither clock runs at all, and a Contact Identifier
     // never lets silence end the mute: the decoder ends it when a report names
     // a different identifier. A node index or the coordinate-only path can end
     // it in a report, but not through silence — the node can be handed on, and
@@ -7522,7 +7755,7 @@ void CheckHidIdleRelease(uint64_t tickMs) {
     // No session may own the contact here: a live session's reports carry the
     // points (or the asserted tip) that refresh this clock, and its own idle
     // release runs first in this tick.
-    const bool closeInFlight = CloseInFlight(tickMs);
+    const bool closeInFlight = CloseInFlight();
     const bool holdLatch =
         closeInFlight || (session.suppress && g_trackedContact.hasIdentifier);
     if (!session.active && !g_reveal.edgeCandidate && !holdLatch &&
@@ -7559,7 +7792,9 @@ void CheckHidIdleRelease(uint64_t tickMs) {
 // The dismiss both close paths arm. It runs on the input thread at the end of
 // the settle. A pull that started after the release owns the menu again, so the
 // dismiss is dropped and no Dismiss request reaches the bridge; the pull
-// generation sampled at the arm decides the drop.
+// generation sampled at the arm decides the drop. A close whose dismiss is
+// dropped here or cannot be published ends its record at this call: the close
+// will never ask for its hide.
 void RunPendingCloseTap(uint64_t tickMs) {
     if (g_pendingTapTick == 0 || tickMs < g_pendingTapTick) {
         return;
@@ -7570,7 +7805,10 @@ void RunPendingCloseTap(uint64_t tickMs) {
 
     if (g_pullSerial != pull || g_reveal.active ||
         (g_reveal.edgeCandidate && !g_reveal.granted)) {
+        // A newer pull owns the menu; the open it claims has already published
+        // the open direction, so this ending retires the record and nothing else.
         CancelCloseSchedules(L"superseded");
+        EndClose(L"superseded");
         return;
     }
 
@@ -7581,10 +7819,12 @@ void RunPendingCloseTap(uint64_t tickMs) {
     // A Win press during the retract cancels this dismiss (the open intent drops
     // the slot), so a window already closed here was hidden by something else: an
     // external takeover or the shell's own close. The dismiss would only ask the
-    // shell to close a window that is already closed.
+    // shell to close a window that is already closed, and this close is over.
     if (!StartWindowIsOpen()) {
         TraceLog(L"close dismiss skipped kind=%s (already closed)",
                 CloseKindName(kind));
+        EndClose(L"window-closed");
+        ReleaseExecutorOwnership();
         return;
     }
 
@@ -7603,13 +7843,15 @@ void RunPendingCloseTap(uint64_t tickMs) {
     SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick);
     if (!RequestBridgeDismiss(1, GetTickCount64(), openGeneration)) {
         // Nothing can run this dismiss: the window would stay shown over a
-        // retracted panel. Give the ownership up now, and the unhealed rule
-        // restores the panel once the suppression window ends.
+        // retracted panel. The close ends as a refusal, the ownership goes back
+        // now, and the unhealed rule restores the panel.
+        EndClose(L"no-executor");
         ReleaseExecutorOwnership();
         TraceLog(L"close dismiss skipped kind=%s reason=no-executor",
                 CloseKindName(kind));
         return;
     }
+    NoteCloseDismissPublished();
     TraceLog(L"close dismiss kind=%s", CloseKindName(kind));
 }
 
@@ -7937,12 +8179,12 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
     if (intent.kind == kSwipeIntentExternal) {
         // External ownership wins: both close schedules are revoked and the
         // cancel-recovery ticket is dropped, so nothing of ours can still hide
-        // the window or reissue an open the shell did not ask for. The
-        // suppression goes too: this takeover's close is the shell's, and the
-        // poll must classify its landing as external (drop the pull, no reopen).
+        // the window or reissue an open the shell did not ask for. The close
+        // record ends too: this takeover's close is the shell's, and the poll must
+        // classify its landing as external (drop the pull, no reopen).
         const CloseScheduleCancel dropped = CancelCloseSchedules(L"external");
         g_intentCancel = CloseCancelTicket{};
-        g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+        EndClose(L"external");
         g_intentOpenActive.store(false, std::memory_order_relaxed);
         ForgetPendingDismiss();
         if (g_hidSession.active) {
@@ -7967,8 +8209,8 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             // The close this request answers has not hidden the window yet, so
             // the request cancels it. The cancel body is shared with the band pull
             // the retract refused: the local dismiss slot is dropped before the
-            // executor command can fire, that command is cancelled, the
-            // suppression goes, the open direction is published, and the recovery
+            // executor command can fire, that command is cancelled, the close
+            // record ends, the open direction is published, and the recovery
             // ticket is armed for a dismiss that may already be inside the shell.
             // The tail is the press's own: a press has no finger, so the panel is
             // settled back up from where the retract left it. The window never
@@ -8018,18 +8260,20 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         // confirmation and the generation are void from here.
         ForgetPendingDismiss();
         // The close owns the panel now: one close mechanism, the same ownership
-        // the gesture and keyboard closes take. It sets the restore suppression
-        // so the visibility poll cannot "heal" the retracted panel while the
-        // bridge's dismiss is still on its way, and it mutes a contact still on
-        // the glass.
-        TakeCloseOwnership(GetTickCount64(), g_contactDown);
+        // the gesture and keyboard closes take, accepted before the settle's
+        // first frame. The record is what keeps the visibility poll from
+        // "healing" the retracted panel while the bridge's dismiss is still on
+        // its way, and it mutes a contact still on the glass.
+        TakeCloseOwnership(CloseKind::Dismiss, GetTickCount64(), g_contactDown);
         const float from = TakeProgressNow(L"intent-close");
         std::chrono::milliseconds duration{0};
         if (!BeginMirrorCloseSettle(from, duration)) {
-            // No settle, so there is no close to own: the panel returns to rest
-            // and the controller states its release in one place.
+            // No settle, so there is no retract: the panel returns to rest, the
+            // record ends as a refusal and the controller states its release in
+            // one place.
             ShowAtRest();
             g_commitNeedsProgressReset = false;
+            EndClose(L"no-settle");
             ReleaseExecutorOwnership();
             ackState = kSwipeAckRefused;
             ackHr = E_FAIL;
@@ -8042,13 +8286,15 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             if (RequestBridgeDismiss(
                     ExecDismissMethodForIntent(intent.method, intent.trigger),
                     executeAt, intent.open)) {
+                NoteCloseDismissPublished();
                 ackDuration = static_cast<int32_t>(duration.count());
                 TraceLog(L"intent close from=%.3f dur=%lld", from,
                         static_cast<long long>(duration.count()));
             } else {
                 // Nothing will hide this window. The settle already retracted the
-                // panel; the ownership goes back now and the unhealed rule
-                // restores the panel after the suppression window.
+                // panel; the record ends as a refusal, the ownership goes back
+                // now and the unhealed rule restores the panel.
+                EndClose(L"no-executor");
                 ReleaseExecutorOwnership();
                 ackState = kSwipeAckRefused;
                 ackHr = E_FAIL;
@@ -8074,9 +8320,9 @@ void ApplyBridgeIntent() {
 // in the same step, and the pending open entry is dropped. The published
 // direction then follows the window's cloak on the next transition, which is the
 // one source of truth for a panel the controller no longer drives. A failed
-// dismiss leaves the panel retracted with the window still shown; the
-// suppression window still expires, and the unhealed rule then brings the panel
-// back instead of leaving an invisible menu attached to a shown window.
+// dismiss leaves the panel retracted with the window still shown; its close record
+// ends with the failure, and the unhealed rule then brings the panel back instead
+// of leaving an invisible menu attached to a shown window.
 void ReleaseExecutorOwnership() {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
     SwipeIpcSetControllerTouch(&g_ipc, false);
@@ -8244,6 +8490,10 @@ void ApplyExecAck() {
                 g_intentCancel = CloseCancelTicket{};
             }
             ForgetConfirmedDismiss();
+            // The hide is not coming: the close ends as a terminal repair, and
+            // its record must not keep the panel unreadable for the rest of the
+            // window.
+            EndClose(L"repair");
             ReleaseExecutorOwnership();
             TraceLog(L"exec dismiss %s command=%lld state=%u hr=%08X visible=%d",
                     unconfirmed ? L"unconfirmed" : L"failed",
@@ -8337,6 +8587,9 @@ void CheckExecAckTimeout(uint64_t now) {
                         static_cast<long long>(dismiss));
             }
             ForgetConfirmedDismiss();
+            // No dismiss of this close can still run: the record ends as a
+            // terminal repair before the ownership goes back.
+            EndClose(L"repair");
             ReleaseExecutorOwnership();
             TraceLog(L"exec ack timeout seq=%lld kind=dismiss open=%d (resync "
                     L"from cloak)",
@@ -8360,6 +8613,7 @@ void CheckExecAckTimeout(uint64_t now) {
             static_cast<unsigned long long>(
                 g_pendingDismissConfirmGeneration));
     ForgetPendingDismiss();
+    EndClose(L"repair");
     ReleaseExecutorOwnership();
 }
 
@@ -8430,20 +8684,21 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     // timer has the lower index: the landing can be served before the
     // `external` intent that came with it is processed, and processing it
     // afterwards does not revoke a Show this branch already issued. The
-    // already-published superseding intent is reconciled first, and it clears
-    // the suppression and the recovery ticket as any external takeover does.
+    // already-published superseding intent is reconciled first, and it ends the
+    // close record and the recovery ticket as any external takeover does.
     ReconcileSupersedingIntentBeforeLanding();
-    // Whether the hide that just landed belongs to a close this mod
-    // started. The suppression *window* is not the evidence: it is 600 ms,
-    // and a maximum-duration close (520 ms settle + the 30 ms lead +
-    // launcher dispatch + cloak delivery) measured 579-594 ms, so a busy
-    // launcher can pass it and a genuine pull held through that close would
-    // be dropped as an external takeover. The command is the identity: a
-    // dismiss of ours is queued/armed, or executed and awaiting its
-    // confirmation, for exactly the menu this landing closes. Every path
-    // that revokes it (a cancel, a failure, an external intent) clears those
-    // slots first, so this cannot claim someone else's close. A close whose
-    // command an open intent revoked is added below through its ticket.
+    // Whether the hide that just landed belongs to a close this mod started. The
+    // close record is not the evidence: it ends with this landing and says
+    // nothing about who asked for the hide, and its repair bound is 600 ms while
+    // a maximum-duration close (520 ms settle + the 30 ms lead + launcher
+    // dispatch + cloak delivery) measured 579-594 ms — a busy launcher can pass
+    // any such bound, and a genuine pull held through that close would be
+    // dropped as an external takeover. The command is the identity: a dismiss of
+    // ours is queued/armed, or executed and awaiting its confirmation, for
+    // exactly the menu this landing closes. Every path that revokes it (a cancel,
+    // a failure, an external intent) clears those slots first, so this cannot
+    // claim someone else's close. A close whose command an open intent revoked is
+    // added below through its ticket.
     //
     // The command is only ours while the open generation it was stamped with is
     // still the section's current one. A retained confirmation from a menu that a
@@ -8498,10 +8753,10 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
                 static_cast<unsigned long long>(
                     g_pendingDismissConfirmGeneration));
     }
-    // The close has landed, so its suppression no longer applies. Without
-    // this a Win press right after the hide opened the window with Progress
-    // still at 0, and the panel was invisible until the next open.
-    g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+    // The close has landed, so the record ends and its suppression no longer
+    // applies. Without this a Win press right after the hide opened the window
+    // with Progress still at 0, and the panel was invisible until the next open.
+    EndClose(closeOurs ? L"landing" : L"external");
     if (!closeOurs) {
         // A close this mod did not start: an external takeover owns the
         // screen. The pull is dropped, not deferred — the takeover's window
@@ -8641,22 +8896,22 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         }
     }
     const bool justOpened = open && !wasOpen;
-    // A close this mod started reports the window open until the shell has run
+    // A close that owns the panel reports the window open until the shell has run
     // the Hide its dismiss caused. Reading that as a reopen restored Progress 1
-    // while the close was still in flight, so a follow that began in that window
+    // while the retract was still running, so a follow that began in that window
     // flashed the panel fully open and the window then vanished.
-    const bool closeInFlight = CloseInFlight(tickMs);
+    const bool closeInFlight = CloseInFlight();
     if (justOpened) {
-        // An open the shell really performed while this mod still held a close in
-        // flight. The window is shown again, so the close is over: its Hide either
-        // already ran (and this is the next open) or was superseded. The
-        // suppression is dropped here so the one open path below runs, and the
-        // settle starts from the position the panel has now instead of from 0, so
-        // the retract's last frame is continued rather than replayed.
+        // An open the shell really performed while this mod still owned a close.
+        // The window is shown again, so the close is over: its Hide either already
+        // ran (and this is the next open) or was superseded. The record ends here
+        // so the one open path below runs, and the settle starts from the position
+        // the panel has now instead of from 0, so the retract's last frame is
+        // continued rather than replayed.
         const bool openDuringClose = closeInFlight;
         if (openDuringClose) {
             TraceLog(L"win open during close progress=%.3f", PeekProgressNow());
-            g_suppressRestoreUntil.store(0, std::memory_order_relaxed);
+            EndClose(L"open");
             // The close is over, but the finger that was grabbing it is not the
             // owner of this window: its grant died with the retract, and the
             // open proceeds as the shell's own.
@@ -8807,13 +9062,17 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         const float live = PeekProgressNow();
         const bool offScreen =
             distance > 0.0f && live < RevealEntryProgress(geometry);
-        // A close still in flight owns this window: its Hide is ahead, and
-        // restoring the panel there is the flash the suppression window exists to
-        // prevent. Only a window whose close is over can be unhealed.
-        const bool closeInFlight =
-            tickMs < g_suppressRestoreUntil.load(std::memory_order_relaxed);
-        if (offScreen && !closeInFlight && !ProgressMotionActive() &&
-            !g_reveal.active && !g_hidSession.active) {
+        // A close that owns this window keeps its Hide ahead, and restoring the
+        // panel there is the flash the close record exists to prevent: only a
+        // window whose close is over can be unhealed. A close whose repair bound
+        // ended the record but whose dismiss may still land is not over either —
+        // the settle this heal would start is exactly what the coming hide
+        // interrupts — so that question is asked by its own predicate.
+        const bool closeOwnsPanel = CloseInFlight();
+        const bool hideMayLand = CloseHideMayLand();
+        if (offScreen && !closeOwnsPanel && !hideMayLand &&
+            !ProgressMotionActive() && !g_reveal.active &&
+            !g_hidSession.active) {
             if (tickMs > g_unhealedLogTick &&
                 tickMs - g_unhealedLogTick >= 1000) {
                 g_unhealedLogTick = tickMs;
@@ -8899,7 +9158,7 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
                     static_cast<uint64_t>(kCoastDuration.count()));
     }
 
-    if (!IdleReleaseHeld(nowTick)) {
+    if (!IdleReleaseHeld()) {
         // The coast starts 8 ms after the last point, so the panel is already
         // moving when the release is planned 10 ms later. The release itself is
         // the 18 ms silence, and the candidate's watchdog is its longer window.
@@ -8926,12 +9185,12 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
         }
         // The latch and the identity clocks expire on the same 18 ms silence as
         // a session, and only while no session owns the contact. They are not
-        // armed while they could not act: a close in flight holds both (the
-        // quiet is the shell's hide), and a consumed contact whose name can
+        // armed while they could not act: a close that owns the panel holds both
+        // (the quiet is the shell's hide), and a consumed contact whose name can
         // prove the next one is ended by that report, not by a clock. A deadline
         // that cannot act would spin the thread at the timer's smallest delay.
         const bool holdLatch =
-            CloseInFlight(nowTick) ||
+            CloseInFlight() ||
             (g_hidSession.suppress && g_trackedContact.hasIdentifier);
         if (!g_hidSession.active && !g_reveal.edgeCandidate && !holdLatch) {
             if (g_contactDown) {
@@ -8941,6 +9200,13 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
                 considerTick(g_trackedContact.lastEvidenceTick + kIdleReleaseMs);
             }
         }
+    }
+
+    // The close's repair bound: the one deadline the record has, and the wake
+    // that ends a close whose landing never came. Armed only while the record
+    // owns the panel, so nothing wakes for a close that has ended.
+    if (CloseInFlight()) {
+        considerTick(g_close.repairAt);
     }
 
     // The close tap's deadline: the end of the settle it was armed for.
@@ -8997,6 +9263,9 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
 // tick did; what changed is that nothing calls it while nothing is due.
 void ServiceDeadlineWork(uint64_t tickMs) {
     RunPendingCloseTap(tickMs);
+    // The close's repair bound is a deadline like the others: a close whose
+    // landing never came ends here instead of holding the panel.
+    RepairExpiredClose(tickMs);
     CheckHidIdleRelease(tickMs);
     CheckExecAckTimeout(tickMs);
     if (g_visibilityPollUntil != 0) {
