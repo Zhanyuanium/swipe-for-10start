@@ -214,7 +214,10 @@ generation wait for the transition, which lands them once
 (`exec dismiss retained served`) within a bounded wait. The command that owns the
 pending dismiss is the identity, never the suppression window, and a
 confirmation from a menu a later open replaced is stale: it cannot land the new
-menu's hide. A held pull is released by that landing, and a still-down qualified
+menu's hide. A generation-zero stamp is valid only while no open has been
+published; once one is, it is as stale as any other mismatch, and a fresh open
+cancels a still-queued dismiss at the bridge and drops the confirmation. A held
+pull is released by that landing, and a still-down qualified
 contact reopens exactly as it does after any transition. The transition itself is
 never synthesized.
 

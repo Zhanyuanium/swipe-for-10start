@@ -431,8 +431,12 @@ and its open generation, so the direction cannot stay `closing` into the next
 press. When the confirmation reads hidden but the cloak still says open or
 cannot answer, the command and generation are **retained** for the transition
 (`exec dismiss retained`), which then lands them once
-(`exec dismiss retained served`); a later open invalidates the retained
-command, and its bound ends the wait if no transition comes. The close is
+(`exec dismiss retained served`); a later open retires both slots — cancelling a
+still-queued command at the bridge and dropping the confirmation — and the bound
+ends the wait if no transition comes. The dismiss is stamped with the section's
+current open generation at request time even when the close intent carries 0,
+and the generation comparison is exact: a zero stamp is admissible only while no
+open has been published. The close is
 judged by that hidden event and the executor's `confirmed` (hidden) at its 300 ms
 probe, not by an internal `0xA` value;
 that value is not a criterion. `unconfirmed`/`unknown` is a repair, not a hide. A

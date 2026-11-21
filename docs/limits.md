@@ -145,7 +145,11 @@ hidden), the command and its open generation are retained for the transition,
 which lands them once (`exec dismiss retained served`) within one more
 confirmation budget. A command from a menu that a later open replaced is stale
 and cannot land the new hide, and a retained command that no transition reaches
-retires with `exec dismiss retained expired` and the ordinary repair. The
+retires with `exec dismiss retained expired` and the ordinary repair. A dismiss
+stamped with generation 0 — a close intent that could not read the open record
+while the section has none — is valid only while the section still has no open
+record; once an open is published it is stale like any other mismatch, and the
+fresh open cancels a still-queued command at the bridge. The
 direction returns to unowned (open-capable) without another press, and the next
 Win press opens exactly once; the transition itself is never synthesized.
 

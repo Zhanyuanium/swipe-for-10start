@@ -150,9 +150,15 @@ core (see [../docs/limits.md](../docs/limits.md)).
   (`exec dismiss retained` → `exec dismiss retained served`). A retained command
   carries a bound. A generation that a
   later open replaced is stale (`exec dismiss stale`) and retires without
-  landing; a fresh open drops a retained confirmation (`exec dismiss confirm
+  landing; a fresh open retires **both** slots — a still-queued exec command is
+  cancelled through the cancel path (`exec cancel request ... reason=fresh-open`)
+  and a confirmation is dropped (`exec dismiss confirm
   dropped ... (fresh open=...)`), and a retained command that outlives its bound
   retires with `exec dismiss retained expired` and the ordinary repair.
+  The stamp is the section's **current** generation at request time even when the
+  close intent's own field is 0, and the comparison is exact: a zero stamp is
+  valid only while the section still has no open record (no menu has opened
+  yet), never as a wildcard for a later menu.
   `unconfirmed`/`unknown` is the same terminal repair, and `superseded` needs no
   repair. A 400 ms silence does the same from `g_pendingShowUntil` for a
   show and from `g_pendingDismissExecAt + 400 ms` for a dismiss (the deadline the

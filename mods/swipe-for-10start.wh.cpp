@@ -130,7 +130,10 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   is the suppression window: a close suppresses the retracted panel until the
  *   executor's dismiss has landed. The cloak read is tri-state (a failed read is
  *   unknown, never hidden), and a landing is bound to the open generation the
- *   dismiss command was stamped with. A landing the cloak never reports — the
+ *   dismiss command was stamped with — a close intent's zero is stamped with the
+ *   section's current generation, and zero stays valid only while no open has
+ *   been published. A fresh open cancels a still-queued command at the bridge.
+ *   A landing the cloak never reports — the
  *   window was already hidden when `Dismiss` ran — is finished by the executor's
  *   own confirmation (`win close observed reason=confirmed-without-transition`),
  *   never by inventing a transition; a confirmation whose cloak sample disagrees
@@ -3508,9 +3511,23 @@ bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
                 method, g_ipc.state ? L"no-executor" : L"no-channel");
         return false;
     }
+    // The command's generation is the section's current one. A close intent can
+    // carry 0 when its publisher could not read the open record; letting that
+    // travel on would make the bridge's "0 matches any" rule, and this side's
+    // confirmation, accept a later menu's hide as this close. The read is the
+    // publisher's own open record, so the command carries the same identity the
+    // bridge will compare before it calls the launcher.
+    uint64_t commandOpen = open;
+    if (commandOpen == 0) {
+        uint64_t currentGeneration = 0;
+        uint64_t currentTick = 0;
+        if (SwipeIpcReadOpen(&g_ipc, &currentGeneration, &currentTick)) {
+            commandOpen = currentGeneration;
+        }
+    }
     const LONG64 sequence = SwipeIpcPublishExec(
         &g_ipc, kSwipeExecDismiss, static_cast<int32_t>(method), 0, executeAt,
-        open);
+        commandOpen);
     if (sequence <= 0) {
         TraceLog(L"exec dismiss request skipped seq=none method=%u "
                 L"reason=no-sequence",
@@ -3519,19 +3536,20 @@ bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
     }
     g_pendingDismissExec.store(sequence, std::memory_order_relaxed);
     g_pendingDismissExecAt.store(executeAt, std::memory_order_relaxed);
-    // The section's open generation, the same value the bridge compares before
-    // it calls the launcher. A landing for a later menu must not claim this
-    // command, so the start side carries the same identity.
-    g_pendingDismissExecGeneration = open;
+    // The same stamp, kept for the confirmation and the landing. A landing for
+    // a later menu must not claim this command.
+    g_pendingDismissExecGeneration = commandOpen;
     // The new command replaces whatever confirmation an earlier dismiss still
     // owed; the bridge answers the superseded one with its own state.
     ForgetConfirmedDismiss();
     // The close is on its way: watch for its cloak event, and poll slowly if it
     // never arrives.
     NoteVisibilityTransition(kVisibilityWantClosed);
-    TraceLog(L"exec dismiss request seq=%lld method=%u executeAt=%llu open=%llu",
+    TraceLog(L"exec dismiss request seq=%lld method=%u executeAt=%llu open=%llu "
+            L"intent_open=%llu",
             static_cast<long long>(sequence), method,
             static_cast<unsigned long long>(executeAt),
+            static_cast<unsigned long long>(commandOpen),
             static_cast<unsigned long long>(open));
     return true;
 }
@@ -3552,6 +3570,26 @@ LONG64 CancelPendingDismiss(const wchar_t* reason) {
     TraceLog(L"exec cancel request target=%lld reason=%s",
             static_cast<long long>(target), reason);
     return target;
+}
+
+// A fresh open ends every dismiss of the menu it replaced. A command still in the
+// exec slot may be queued at the bridge: cancel it through the one cancel path so
+// the bridge is not left with a command to run against the new menu. A
+// confirmation (a command whose primitive returned) is dropped; its generation is
+// older than the one just published, so it could never land this menu's hide.
+void RetirePendingDismissForFreshOpen(uint64_t freshOpen) {
+    if (g_pendingDismissConfirm != 0) {
+        TraceLog(L"exec dismiss confirm dropped command=%lld gen=%llu "
+                L"(fresh open=%llu)",
+                static_cast<long long>(g_pendingDismissConfirm),
+                static_cast<unsigned long long>(
+                    g_pendingDismissConfirmGeneration),
+                static_cast<unsigned long long>(freshOpen));
+    }
+    if (g_pendingDismissExec.load(std::memory_order_relaxed) != 0) {
+        CancelPendingDismiss(L"fresh-open");
+    }
+    ForgetPendingDismiss();
 }
 
 // The repair every terminal executor failure performs, whatever kind the command
@@ -7568,22 +7606,20 @@ void ReleaseExecutorOwnership() {
 }
 
 // Whether a dismiss command still belongs to the menu the section is showing.
-// The command carries the open generation the Start side published when it was
+// The command carries the open generation the Start side stamped when it was
 // requested; the bridge refuses a record whose generation no longer matches, and
-// this side uses the same rule before a landing may claim a close. 0 on either
-// side is the section's wildcard (a command written before an open record
-// existed), so it stays admissible; a failed read proves nothing and is not
-// admissible for a command that carries a generation.
+// this side uses the same rule before a landing may claim a close. The comparison
+// is exact, including 0: a zero stamp is valid only while the section still has
+// no open record. Once an open has been published, a zero-stamped command belongs
+// to the menu before it and must not land the newer menu's hide. A failed read
+// proves nothing and is never admissible.
 bool DismissGenerationCurrent(uint64_t commandGeneration) {
-    if (commandGeneration == 0) {
-        return true;
-    }
     uint64_t currentGeneration = 0;
     uint64_t openTick = 0;
     if (!SwipeIpcReadOpen(&g_ipc, &currentGeneration, &openTick)) {
         return false;
     }
-    return currentGeneration == 0 || currentGeneration == commandGeneration;
+    return commandGeneration == currentGeneration;
 }
 
 void ApplyExecAck() {
@@ -8204,18 +8240,12 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         // have not seen yet.
         const LONG64 publishedOpen = SwipeIpcPublishOpen(&g_ipc, tickMs);
         g_ipcOpenTickLow = static_cast<uint32_t>(tickMs);
-        // A fresh open invalidates a confirmation retained for the menu it
-        // replaced. The command's generation is now older than this open, and a
-        // later hide of this menu must not be landed by it.
-        if (g_pendingDismissConfirm != 0) {
-            TraceLog(L"exec dismiss confirm dropped command=%lld gen=%llu "
-                    L"(fresh open=%lld)",
-                    static_cast<long long>(g_pendingDismissConfirm),
-                    static_cast<unsigned long long>(
-                        g_pendingDismissConfirmGeneration),
-                    static_cast<long long>(publishedOpen));
-            ForgetConfirmedDismiss();
-        }
+        // A fresh open retires every dismiss of the menu it replaced: a queued
+        // command is cancelled at the bridge, and a confirmation is dropped. The
+        // command's generation is older than the one just published, so it could
+        // never land this menu's hide.
+        RetirePendingDismissForFreshOpen(
+            static_cast<uint64_t>(publishedOpen));
         // A new open is also a new geometry epoch: every measurement recorded for
         // the previous one is stale from this point on, and a request that was
         // still live is cancelled by the epoch check in its turn.

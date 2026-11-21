@@ -167,7 +167,11 @@ left to arrive, finishes through the same landing
 cannot keep publishing `closing` into the next press. When the confirmation and
 the cloak disagree (or the cloak cannot answer), the command and its open
 generation are kept for the transition, within a bounded wait; a later open
-invalidates them. The transition is not invented, only the close is completed.
+retires them — a queued command is cancelled at the bridge, and a confirmation
+is dropped. A close intent's zero generation is stamped with the section's
+current one at request time, and a zero stamp is valid only while no open has
+been published, never as a wildcard for a newer menu. The transition is not
+invented, only the close is completed.
 The internal `0xA` value is **not** an acceptance criterion and is no longer
 quoted.
 
