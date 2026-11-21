@@ -199,6 +199,9 @@ too. The late-release record only exists for a pull that travelled 24 DIP. A
 finger merely resting in the band during the retract is admitted deferred, logs
 `reveal defer released candidate=1 down=1` at the landing, and is not reopened; a
 qualified release and an independently owed Win/button recovery are unaffected.
+Touch ownership follows the finger: a release record reopens as `pull=0 late=1`
+with `controllerTouch=0`, so the next real click away from the menu closes it;
+only a contact still down at the landing keeps the click-away protection.
 The idle is held through the close so the digitizer's pause during the key/hide
 does not drop the pull. Measured on the bottom docked layout: held pull at 350
 DIP, Win close, landing reopened with `reveal takeover from=0.348 offset=0.558`,

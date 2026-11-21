@@ -5234,7 +5234,10 @@ bool VerticalDismissAllowed(const GestureGeometry& geometry, int32_t axis,
 // its entry, the controller's direction and touch, and the show request. The two
 // callers keep their own preconditions and their own log line — the band admits a
 // contact, a landing serves a close — and this function owns exactly the writes
-// they share. The closed keyboard intent's `g_panel.Begin` is deliberately not
+// they share. `touch` is the shared click-away guard: it is true only for a
+// contact that is still down and owns the panel, never for a pull that already
+// lifted (a late release record) or for a close-cancel recovery. The closed
+// keyboard intent's `g_panel.Begin` is deliberately not
 // here: that path starts the controller at the entry, while these two replace a
 // panel that is being pulled or restored from a settled position.
 //
@@ -5967,6 +5970,13 @@ bool ConsumeLateRevealRelease(const GestureGeometry& geometry) {
     // The animation owns the whole travel now, so no later path needs to restore
     // the resting value for this open.
     g_commitNeedsProgressReset = false;
+    // The record is a lifted contact's open: the finger that pulled is gone, so
+    // nothing owns the panel for the click-away guard, and the pending entry the
+    // show reserved is spent. Both are cleared here rather than in the keyboard
+    // branch, which a successful adoption skips, so the show-in-flight hold
+    // cannot outlive the open it waited for.
+    SwipeIpcSetControllerTouch(&g_ipc, false);
+    g_intentOpenActive.store(false, std::memory_order_relaxed);
     TraceLog(L"reveal adopt late travel=%.0f vel=%.2f age=%llu gen=%u from=%.3f "
             L"pos=%.3f",
             record.travel, SpeedTowardDip(record.velocity, from, 1.0f, distance),
@@ -7644,9 +7654,13 @@ void ReconcileSupersedingIntentBeforeLanding() {
 // open end here: a pull that was down (or lifted inside the late window) when the
 // close landed, and an open intent that cancelled a close whose dismiss still
 // ran. Entry, progress, the pending flag, the controller state and the show
-// request are one sequence; the caller chooses the reason and the log line, and
-// only the pull marks the contact as the panel's owner (`controllerTouch`), so
-// the bridge keeps swallowing the shell's click-away from that same finger.
+// request are one sequence; the caller chooses the reason and the log line.
+//
+// Touch ownership follows the *finger*, not the reason. Only a contact that is
+// still down owns the opening panel (`pullDown`); a release record means the
+// contact already lifted, and marking the shared touch word for it made the
+// bridge swallow the next real desktop click as `reason=touch-owner` on a menu
+// no finger was touching.
 bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
     if (!RendererReady() || StartWindowIsOpen() ||
         g_intentOpenActive.load(std::memory_order_relaxed)) {
@@ -7654,7 +7668,7 @@ bool BeginLandingOpen(bool pullReopen, bool pullDown, bool lateFresh) {
     }
     const GestureGeometry geometry = ReadGestureGeometry();
     float entry = 0.0f;
-    if (!PublishOpenClaim(geometry, pullReopen, entry)) {
+    if (!PublishOpenClaim(geometry, pullDown, entry)) {
         // The landing cannot present anything: the panel stays retracted with the
         // window hidden, and the controller claims nothing. The next open
         // (the shell's own or a later pull) starts from the entry again.

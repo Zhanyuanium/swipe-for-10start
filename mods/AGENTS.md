@@ -182,7 +182,11 @@ core (see [../docs/limits.md](../docs/limits.md)).
   (`intent reconcile ... (before landing recovery)`) because the cloak event and
   the intent event are separate wakes and the landing reads the intent record
   itself before it acts. Both landing opens run the one `BeginLandingOpen`
-  transaction; the pull keeps its precedence and marks the touch.
+  transaction; the pull keeps its precedence, and **only a still-down contact
+  marks the touch**: a late release record reopens with `controllerTouch=0`
+  (`pull=0 late=1`), because that finger is gone and the next real desktop
+  click must close the menu. A successful late adoption also clears the pending
+  open entry it inherited from the show.
 - The 18 ms idle is a one-shot deadline armed at the last report, and it is held
   through a touch show and through a close in flight, so
   the digitizer's pause during the key/hide cannot drop the contact. A band
