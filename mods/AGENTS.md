@@ -534,7 +534,11 @@ probe or timer failure is answered `unknown`.
   which runs the original under the executor guard for an immediate and a queued
   click alike. The click-away's
   opening suppression (state 1/3, `reason=opening`) and the `controllerTouch`
-  suppression require `caller=clickaway`, not the number 7 alone. Method 7 is
+  suppression require `caller=clickaway`, not the number 7 alone. A click-away
+  delivered while our own executor `Dismiss` is on the stack (`depth=1`) takes the
+  same path instead of the native Hide: the suppressions above apply, then the one
+  dispatcher sees `t_execCall` and latches the reopen
+  (`own hide clickaway ... reason=executor`). Method 7 is
   click-away evidence, so an **ordinary** caller's
   method-7 Hide passes to the shell (`reason=caller-scope`) instead of becoming a
   click decision — the number alone never makes a click ours, and the 7→6 mapping

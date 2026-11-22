@@ -238,6 +238,11 @@ could act, or before its confirmation could land).
   second is not published at the 1000 ms take (`decision=consumed awaiting=ack`),
   only after `own press ack`, and its kind is the opposite of the first (close
   then open, or the reverse), not a second same-direction intent.
+- **Click-away inside `Dismiss` (D).** A click-away delivered on the executor's
+  `Dismiss` stack logs `own hide clickaway ... depth=1 reason=executor`, then the
+  one dispatcher's `own toggle decide trigger=clickaway ... kind=open` and
+  `own press latched` (or a served press), never `exec pass hide ...
+  reason=executor` on the native Hide.
 
 ## The one-pass smoke
 

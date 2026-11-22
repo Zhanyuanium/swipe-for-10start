@@ -14555,6 +14555,42 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
                     OwnCallerName(execCaller), method, execState, t_execCall);
             return;
         }
+        if (execCaller == OwnCaller::ClickAway &&
+            method == kDismissMethodClickAway) {
+            // The shell can deliver a click-away while our own Dismiss is on the
+            // stack (the state has already left 5 for the hide). A Win press on
+            // this same stack takes the one dispatcher and latches the reopen;
+            // the click-away is the same trigger, so it must not take the native
+            // Hide instead. The two suppressions are the click-away's own: the
+            // opening window is not a target, and a touch-owned panel belongs to
+            // the finger that opened it.
+            if (execState == 1 || execState == 3) {
+                TraceLog(L"intent ignore trigger=clickaway caller=%s method=%u "
+                        L"state=%u depth=%d reason=opening",
+                        OwnCallerName(execCaller), method, execState, t_execCall);
+                return;
+            }
+            if (SwipeIpcControllerTouch(&g_ipc)) {
+                TraceLog(L"intent ignore trigger=clickaway caller=%s method=%u "
+                        L"state=%u depth=%d reason=touch-owner",
+                        OwnCallerName(execCaller), method, execState, t_execCall);
+                return;
+            }
+            const OwnSnapshot clickOwn = OwnSyncState(self);
+            if (!clickOwn.ready) {
+                TraceLog(L"intent pass clickaway method=%u reason=state-not-ready",
+                        method);
+                callOriginal();
+                OwnResyncFromState(self);
+                return;
+            }
+            TraceLog(L"own hide clickaway state=%u depth=%d reason=executor",
+                    execState, t_execCall);
+            DispatchToggle(clickOwn, kSwipeTriggerClickAway,
+                           kSwipeShowMethodStartButton, method, 0,
+                           PeerEpochNow(), kPressEntryHide);
+            return;
+        }
         TraceLog(L"exec pass hide caller=%s method=%u state=%u depth=%d "
                 L"reason=executor",
                 OwnCallerName(execCaller), method, execState, t_execCall);

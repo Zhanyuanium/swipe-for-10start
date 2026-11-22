@@ -184,7 +184,12 @@ The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user
 click. The same Hide(7) issued inside our own `ShowStartView` is swallowed while
 the state is 1/3 (`reason=own-show`); otherwise the served open is closed by the
-shell the instant it appears.
+shell the instant it appears. A click-away delivered while our own executor
+`Dismiss` is on the stack (`depth=1`, caller `clickaway`) is not passed to the
+native Hide: it enters the same dispatcher as a Win press, so the opening/touch
+suppressions apply and a click during the hide becomes the latch's reopen
+(`own hide clickaway ... reason=executor`, then the usual `own toggle decide ...
+kind=open` and `own press latched`).
 
 The bridge's executor is a hidden message-only window on the **launcher
 thread** — the thread that runs `OnHotkeyInvoke` and the shell's own
