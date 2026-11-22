@@ -737,6 +737,12 @@ constexpr int kRendererWaitRetries = 20;
 // budget this retry runs inside.
 constexpr uint64_t kRootProbeMs = 100;
 
+// A fallback for a channel whose capability event could not be created: while
+// the peer is unadvertised and the bridge has no capability, come back at this
+// cadence to read the word. With the event present this deadline is never
+// armed; capability changes wake the thread directly.
+constexpr uint64_t kCapabilityProbeMs = 100;
+
 // The fallback poll under the cloak event. A WinEvent can be missed (a dropped
 // message, a hook installed after the transition); a menu left in the wrong
 // state is a bug the user sees, so a request keeps a bounded window open in
@@ -3339,9 +3345,9 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_SingleMod2_Intent  kind, trigger, method, flags, open
+//   Local\SwipeFor10Start_SingleMod3_Intent  kind, trigger, method, flags, open
 //                                            (bridge -> here)
-//   Local\SwipeFor10Start_SingleMod2_Exec    show, dismiss, cancel (here -> bridge)
+//   Local\SwipeFor10Start_SingleMod3_Exec    show, dismiss, cancel (here -> bridge)
 //   ..._State.openSeq                "this is a new menu"               (here)
 //   ..._State.intentTaken            "this sequence is being acted on" (here)
 //   ..._State.peerTick/peerState     "a controller is here"             (here)
@@ -3462,6 +3468,14 @@ void PublishPeerGone(const wchar_t* why) {
     SetPeerGone(why, true);
 }
 
+// The bridge's executor capability, read from the one shared word. A mapped
+// section is not an executor: the bridge publishes 1 only when its window, its
+// worker, the verified layout and the launcher primitives all exist. The Start
+// side drives nothing and advertises nothing while this is false.
+bool BridgeCapabilityNow() {
+    return g_ipc.state != nullptr && SwipeIpcExecCapable(&g_ipc);
+}
+
 // Publishes availability from the consumer that is about to serve the intents,
 // never from init: an `alive` written before that thread runs is a promise of a
 // service that does not exist yet, and a press in that window would be swallowed
@@ -3502,6 +3516,14 @@ bool PublishPeerReady(const wchar_t* why) {
         // Without the intent event the bridge can publish a decision nobody
         // wakes for. That is not a consumer, so it is not announced.
         TraceLog(L"ipc peer not published reason=no-intent-event");
+        return false;
+    }
+    if (!BridgeCapabilityNow()) {
+        // A section with no capability is a bridge that cannot execute: the
+        // Start side must not advertise a controller the bridge would swallow a
+        // press for. This is a defence in depth; the input loop already checks
+        // the word before it calls here.
+        TraceLog(L"ipc peer not published reason=no-capability");
         return false;
     }
     bool published = false;
@@ -3588,6 +3610,14 @@ constexpr uint64_t kBridgeAckTimeoutMs = 400;
 constexpr uint64_t kDismissConfirmGraceMs = 300;
 
 bool RequestBridgeShow(uint32_t method, uint32_t flags) {
+    if (!BridgeCapabilityNow()) {
+        // The one place a show can be published. A caller that races a capability
+        // drop gets no command, and the panel is not claimed for one.
+        TraceLog(L"exec show request skipped seq=none method=%u "
+                L"reason=no-capability",
+                method);
+        return false;
+    }
     if (!g_ipc.state || !g_ipc.execEvent) {
         TraceLog(L"exec show request skipped seq=none method=%u reason=%s",
                 method, g_ipc.state ? L"no-executor" : L"no-channel");
@@ -3640,6 +3670,15 @@ uint32_t ExecDismissMethodForIntent(int32_t intentMethod, int32_t intentTrigger)
 }
 
 bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
+    if (!BridgeCapabilityNow()) {
+        // A close command is only meaningful while the executor that will run it
+        // exists. A drop mid-settle is handled by the loss reset, not by arming a
+        // command nobody will execute.
+        TraceLog(L"exec dismiss request skipped seq=none method=%u "
+                L"reason=no-capability",
+                method);
+        return false;
+    }
     if (!g_ipc.state || !g_ipc.execEvent) {
         TraceLog(L"exec dismiss request skipped seq=none method=%u reason=%s",
                 method, g_ipc.state ? L"no-executor" : L"no-channel");
@@ -5744,6 +5783,11 @@ bool VerticalDismissAllowed(const GestureGeometry& geometry, int32_t axis,
 // leaves the panel to the path that can still open it.
 bool PublishOpenClaim(const GestureGeometry& geometry, bool touch,
                       float& entryOut) {
+    if (!BridgeCapabilityNow()) {
+        // No executor, no claim: writing the entry would move a panel nothing
+        // can present, and the shell's own gesture must remain the owner.
+        return false;
+    }
     const float entry = std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
     InsertProgress(entry);
     g_intentOpenActive.store(true, std::memory_order_relaxed);
@@ -6433,6 +6477,18 @@ bool BeginEdgeCandidate(const GestureGeometry& geometry, float x, float y,
     // refused, and a contact there can never open this menu. It writes no
     // Progress and leaves the close's dismiss armed.
     const bool closeInFlight = CloseInFlight();
+    if (!BridgeCapabilityNow()) {
+        // No executor: a thumb in the band is the shell's own edge gesture, not
+        // this mod's. No candidate, no author, no Progress write. The line is
+        // per contact (the caller only runs this on the first report).
+        if (inBand || closeInFlight) {
+            TraceLog(L"reveal admit x=%.0f y=%.0f axis=%d band=%.0f,%.0f ok=0 "
+                    L"reason=no-capability",
+                    x, y, axis, haveBand ? low : -1.0f,
+                    haveBand ? high : -1.0f);
+        }
+        return false;
+    }
     // The live position and the restore the state owes, for the grab's hit test
     // and the `reason=open` refusal: the window reporting itself open is not
     // proof that the menu is usable, and the two numbers are what tell a healthy
@@ -6697,6 +6753,9 @@ void UpdateRevealSession(const GestureGeometry& geometry, float x, float y,
 // report path, so a flick whose lift arrives before the cloak event is still
 // adopted.
 bool AdoptRevealContact(const GestureGeometry& geometry, uint64_t tickMs) {
+    if (!BridgeCapabilityNow()) {
+        return false;
+    }
     if (g_reveal.edgeCandidate || g_reveal.active || g_hidSession.active ||
         g_hidSession.suppress || !g_contactOrigin.valid ||
         g_contactOrigin.author == HidDownAuthor::None ||
@@ -8157,6 +8216,15 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         return;
     }
     g_lastIntentSeq = intent.seq;
+    if (!BridgeCapabilityNow()) {
+        // The bridge published this record before its capability dropped, or a
+        // stale activation left it behind. Nothing may settle for an executor
+        // that no longer exists; answer so the publisher releases the record.
+        TraceLog(L"intent drop seq=%lld reason=no-capability",
+                static_cast<long long>(intent.seq));
+        SwipeIpcAnswerIntent(&g_ipc, intent.seq, kSwipeAckRefused, 0, 0, E_ABORT);
+        return;
+    }
     const wchar_t* kind = intent.kind == kSwipeIntentOpen
                               ? L"open"
                               : (intent.kind == kSwipeIntentClose ? L"close"
@@ -8918,6 +8986,11 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
     }
     const bool open = sample == CloakState::Open;
     const bool wasOpen = g_rootWasOpen;
+    // The panel is only this mod's to animate while the bridge can execute. A
+    // shell that opens or closes without that capability keeps its own
+    // storyboard; the Start side records the state and publishes the generation
+    // but starts no settle and no takeover.
+    const bool capable = BridgeCapabilityNow();
     // The open state this call is a sample of. A request stops being waited for
     // the moment the state matches it; every observation keeps a short settle
     // watch so the unhealed repair below still gets its polls after the open's
@@ -8972,6 +9045,17 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         // the previous one is stale from this point on, and a request that was
         // still live is cancelled by the epoch check in its turn.
         AdvanceOpenGeneration();
+
+        if (!capable) {
+            // The shell opened on its own while this side has no executor. The
+            // generation is recorded, but no takeover, settle or measurement
+            // starts: the panel belongs to the shell's storyboard until the
+            // bridge publishes a capability again.
+            g_intentOpenActive.store(false, std::memory_order_relaxed);
+            g_commitNeedsProgressReset = false;
+            g_rootWasOpen = open;
+            return true;
+        }
 
         // The shell opens the menu from a strip wider than any fixed band this
         // mod can admit, so a pull that began inside the taskbar's thickness can
@@ -9070,6 +9154,9 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         const SettledMeasureRequest request = StartMeasureRequest(
             !g_hidSession.active && !g_reveal.edgeCandidate);
         PostGeometryMeasurement(request, false);
+    } else if (!capable) {
+        // No executor: a close that lands is the shell's, and a shown window is
+        // not this side's to heal. The state is still recorded below.
     } else if (!open && g_rootWasOpen) {
         LandClosedMenu(tickMs, nullptr);
     } else if (open) {
@@ -9187,6 +9274,15 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
     if (!g_rootHookReady.load(std::memory_order_acquire) &&
         !g_rootHookRefused.load(std::memory_order_acquire)) {
         consider(kRootProbeMs);
+    }
+
+    // The capability word normally wakes the thread through its event. A
+    // channel whose event could not be created still needs a bounded way to see
+    // the first 1 and the drop; this is a bootstrap only, because the deadline
+    // disappears once the peer is advertised and the 100 ms heartbeat is running.
+    if (!g_ipc.capabilityEvent && !BridgeCapabilityNow() &&
+        g_rootHookReady.load(std::memory_order_acquire) && RendererReady()) {
+        consider(kCapabilityProbeMs);
     }
 
     const bool coasting = g_panel.coasting.load(std::memory_order_relaxed);
@@ -9322,6 +9418,36 @@ void ServiceDeadlineWork(uint64_t tickMs) {
             g_lastVisibilityPollTick = tickMs;
             ServiceRootVisibility(tickMs, true);
         }
+    }
+}
+
+// One transition when the bridge's capability drops while this activation still
+// owns a panel. The peer is withdrawn by the caller; this releases everything
+// the controller was driving and puts the panel at the rest the cloak shows, so
+// a half-open scalar does not survive into the shell's own state. The input
+// thread is the only caller, the same thread that writes Progress.
+void ResetDrivenStateForCapabilityLoss() {
+    CancelCloseSchedules(L"capability");
+    EndClose(L"capability");
+    ForgetPendingDismiss();
+    g_pendingShowExec.store(0, std::memory_order_relaxed);
+    g_pendingShowUntil.store(0, std::memory_order_relaxed);
+    g_intentCancel = CloseCancelTicket{};
+    ReleaseExecutorOwnership();
+    if (g_hidSession.active) {
+        g_hidSession.active = false;
+        EndContactTiming();
+    }
+    g_reveal = HidRevealSession{};
+    g_contactOrigin = HidContactOrigin{};
+    g_lateRelease = RevealLateRelease{};
+    g_commitNeedsProgressReset = false;
+    if (RendererReady()) {
+        // The cloak, not the last animation target, decides which rest is
+        // current: 1 for a menu still on screen, 0 for a hidden one.
+        const float rest = StartWindowIsOpen() ? 1.0f : 0.0f;
+        InsertProgress(rest);
+        g_panel.phase = PanelPhase::Idle;
     }
 }
 
@@ -10057,11 +10183,11 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
 
     // Object 0 is the stop event, then the deadline timer and the cloak event,
-    // then the intent, exec-ack and renderer events, then the message queue. The
-    // stop event does not depend on the window: the unload sets it even if this
-    // thread has not published the HWND yet, and it is checked again after every
-    // message batch, because a queued message can win the wait over a
-    // just-signalled event.
+    // then the intent, exec-ack, capability and renderer events, then the
+    // message queue. The stop event does not depend on the window: the unload
+    // sets it even if this thread has not published the HWND yet, and it is
+    // checked again after every message batch, because a queued message can win
+    // the wait over a just-signalled event.
     HANDLE waits[8] = {};
     DWORD waitCount = 0;
     if (g_hidStopEvent) {
@@ -10075,6 +10201,9 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
     if (g_ipc.execAckEvent) {
         waits[waitCount++] = g_ipc.execAckEvent;
+    }
+    if (g_ipc.capabilityEvent) {
+        waits[waitCount++] = g_ipc.capabilityEvent;
     }
     if (g_rendererEvent) {
         waits[waitCount++] = g_rendererEvent;
@@ -10107,6 +10236,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // once Setup attaches the root — still from the consumer itself, never from
     // the loading thread.
     bool peerAnnounced = false;
+    bool capabilitySeen = BridgeCapabilityNow();
+    bool capabilityWaitLogged = false;
     bool rendererWaitLogged = false;
     // The bounded startup retry and its one park line, both only reached when the
     // renderer event could not be created. They are not the peer heartbeat.
@@ -10121,7 +10252,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // the first symbol load blocks for Windhawk's PDB fetch, and this thread is
     // the mod's own. A pending result leaves the peer unpublished.
     ProbeRootSymbolFromInputThread();
-    if (g_rootHookReady.load(std::memory_order_acquire) && RendererReady()) {
+    if (g_rootHookReady.load(std::memory_order_acquire) && RendererReady() &&
+        capabilitySeen) {
         peerAnnounced = PublishPeerReady(L"consumer");
     }
     while (running) {
@@ -10130,6 +10262,26 @@ DWORD WINAPI HidInputThread(LPVOID) {
         // back to look. The call is throttled while the result is pending and
         // stops as soon as ready or refused is set.
         ProbeRootSymbolFromInputThread();
+        // The bridge's capability is a continuing promise. A gain is what lets
+        // this side advertise; a loss withdraws the peer before any press can be
+        // swallowed for an executor that is gone, and releases the panel it was
+        // driving at the rest the cloak shows.
+        const bool capableNow = BridgeCapabilityNow();
+        if (capabilitySeen && !capableNow) {
+            capabilitySeen = false;
+            capabilityWaitLogged = false;
+            TraceLog(L"ipc capability lost");
+            if (peerAnnounced) {
+                SetPeerGone(L"capability-lost", false);
+                peerAnnounced = false;
+            }
+            visibilitySeeded = false;
+            ResetDrivenStateForCapabilityLoss();
+        } else if (!capabilitySeen && capableNow) {
+            capabilitySeen = true;
+            capabilityWaitLogged = false;
+            TraceLog(L"ipc capability gained");
+        }
         // Readiness is a continuing capability, not a one-time announcement. A
         // root that is torn down, replaced or invalidated by a failed scalar
         // write must withdraw the peer first; the bridge then passes the press
@@ -10142,8 +10294,17 @@ DWORD WINAPI HidInputThread(LPVOID) {
             visibilitySeeded = false;
         }
         if (!peerAnnounced &&
-            g_rootHookReady.load(std::memory_order_acquire) && RendererReady()) {
+            g_rootHookReady.load(std::memory_order_acquire) && RendererReady() &&
+            capableNow) {
             peerAnnounced = PublishPeerReady(L"consumer");
+        }
+        if (!peerAnnounced && !capabilityWaitLogged &&
+            g_rootHookReady.load(std::memory_order_acquire) && RendererReady() &&
+            !capableNow) {
+            // One line per wait: the root and renderer are ready, but the
+            // bridge has no executor. No advertisement, no touch settle.
+            capabilityWaitLogged = true;
+            TraceLog(L"ipc peer withheld reason=no-capability");
         }
         if (!peerAnnounced && !rendererWaitLogged &&
             g_rootHookReady.load(std::memory_order_acquire) &&
@@ -10292,6 +10453,11 @@ DWORD WINAPI HidInputThread(LPVOID) {
                 ApplyExecAck();
                 continue;
             }
+            if (signalled == g_ipc.capabilityEvent) {
+                // The event is only a wake: the loop's next pass reads the
+                // steady word and publishes or withdraws from it.
+                continue;
+            }
             if (signalled == g_rendererEvent) {
                 // The renderer just became usable or unusable. Withdraw before
                 // any interception can happen; republish only when the replacement
@@ -10302,7 +10468,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
                     visibilitySeeded = false;
                 } else if (!peerAnnounced &&
                            g_rootHookReady.load(std::memory_order_acquire) &&
-                           RendererReady()) {
+                           RendererReady() && BridgeCapabilityNow()) {
                     peerAnnounced = PublishPeerReady(L"renderer");
                 }
                 continue;
@@ -13725,38 +13891,40 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
 // twinui.pcshell.dll is resolved by public symbol, not by address. The hook
 // array in InstallExplorerHooks carries every name inline: each is the exact
-// DIA undecorated name for 10.0.26100.9949, read from twinui.pcshell.pdb with
-// the same undecorator the Windhawk symbol API matches, and a name is a literal
-// because the store's symbol extractor reads only a literal. The decorated
-// spellings are in docs/re/ and are not used.
+// DIA undecorated name for 10.0.26100.10068 (fixed; the display string still
+// reads 9949), read from twinui.pcshell.pdb with the same undecorator the
+// Windhawk symbol API matches, and a name is a literal because the store's
+// symbol extractor reads only a literal. The decorated spellings are in
+// docs/re/ and are not used.
 
-// The reference RVAs, for the resolution log only. A different value is reported
-// and the symbol is still used: the name is the contract, the address is
-// evidence.
-constexpr uintptr_t kRvaShow = 0x254C90;
-constexpr uintptr_t kRvaHideStartAndCortana = 0x24BCB0;
-constexpr uintptr_t kRvaOnStartShown = 0x141DF0;
-constexpr uintptr_t kRvaOnStartHidden = 0x65E70;
-constexpr uintptr_t kRvaOnHotkeyInvoke = 0x14195C;
-constexpr uintptr_t kRvaOnStartButtonPressed = 0x492C90;
-constexpr uintptr_t kRvaDismiss = 0x25D670;
-constexpr uintptr_t kRvaShowStartView = 0x141AF0;
-constexpr uintptr_t kRvaLauncherSlot = 0x948E80;
-constexpr uintptr_t kRvaLauncherIsVisible = 0x1F9B40;
-constexpr uintptr_t kRvaDismissStartAndCortana = 0x4991C0;
-constexpr uintptr_t kRvaDismissSynchronously = 0x48F7C0;
-constexpr uintptr_t kRvaActiveZBand = 0x24FC50;
+// The reference RVAs, for the resolution log and the layout identity. A
+// different value on an unknown version means the layout is not proven.
+constexpr uintptr_t kRvaShow = 0x2516B0;
+constexpr uintptr_t kRvaHideStartAndCortana = 0x2485E0;
+constexpr uintptr_t kRvaOnStartShown = 0xF71C0;
+constexpr uintptr_t kRvaOnStartHidden = 0x692B0;
+constexpr uintptr_t kRvaOnHotkeyInvoke = 0xF6D2C;
+constexpr uintptr_t kRvaOnStartButtonPressed = 0x4934E0;
+constexpr uintptr_t kRvaDismiss = 0x25A060;
+constexpr uintptr_t kRvaShowStartView = 0xF6EC0;
+constexpr uintptr_t kRvaLauncherSlot = 0x95F0E8;
+constexpr uintptr_t kRvaLauncherIsVisible = 0x1F6790;
+constexpr uintptr_t kRvaDismissStartAndCortana = 0x499A10;
+constexpr uintptr_t kRvaDismissSynchronously = 0x48FF20;
+constexpr uintptr_t kRvaActiveZBand = 0x24C550;
 
 // The private offsets below were read from one image: twinui.pcshell.dll fixed
-// file version 10.0.26100.9974, with all 13 named symbols at the reference
+// file version 10.0.26100.10068, with all 13 named symbols at the reference
 // RVAs. A name alone is not the layout: a rebuild can keep every name and move
 // a member or a vtable slot, and the failure mode is an Explorer crash. The
 // offset-dependent capability is therefore enabled only when this exact
 // identity is present; anything else is a native pass-through, never a
-// null/sentinel probe.
+// null/sentinel probe. On this image the live read gives launcher
+// `outer + 0x18`, state `launcher + 0x160`, `InternalState 5` while shown, and
+// state vtable `+0x40` = the resolved DismissStartAndCortana.
 constexpr uint64_t kTwinuiReferenceVersion =
     (static_cast<uint64_t>(10) << 48) |
-    (static_cast<uint64_t>(26100) << 16) | 9974;
+    (static_cast<uint64_t>(26100) << 16) | 10068;
 std::atomic<bool> g_launcherLayoutVerified{false};
 
 // The fixed file version of a loaded module, or 0 when it cannot be read.
@@ -13937,6 +14105,11 @@ constexpr UINT kExecDismissConfirmMs = 300;
 // dismiss that never comes. A failed worker startup leaves it false and the
 // shell's own path serves every trigger.
 std::atomic<bool> g_execReady{false};
+// The published capability: the worker, the window on the recorded launcher
+// thread, the verified layout and the primitives that window will call. It is
+// the bridge's own copy of the shared word; every lifecycle point publishes it
+// through PublishExecutorCapability and the Start side reads only the word.
+std::atomic<bool> g_execCapable{false};
 // Set by WM_NCDESTROY on the launcher thread when the published window is
 // destroyed. The unload resets it before posting the teardown and waits on it
 // without a deadline, so the window and its timers are gone before the class is
@@ -14009,15 +14182,13 @@ std::atomic<bool> g_disabled{false};
 // before it sets g_disabled, so a fetch that is still running either finishes
 // first or the install sees the stop and adds nothing.
 SRWLOCK g_explorerSymbolLock = SRWLOCK_INIT;
-// The worker's retry schedule. Worker thread only; a fresh image starts these at
-// zero. The deadline covers the 33 MB twinui.pcshell.pdb
-// (the measured download took 180 s) and one retry after a failed parse; it is
-// printed on every pending line.
+// The worker's one symbol attempt. `HookSymbols` blocks on Windhawk's PDB fetch
+// (measured up to 571 s on this machine), so the worker makes that call once per
+// module per install. A false result is terminal for the session: retrying after
+// the fetch already failed turns one long stall into a storm and keeps every press
+// waiting on symbol work. The per-role trace says the outcome once.
 constexpr uint64_t kExecSymbolProbeMs = 100;
-constexpr uint64_t kExecSymbolPendingDeadlineMs = 240000;
-uint64_t g_execProbeNextTick = 0;
-uint64_t g_execProbeFirstTick = 0;
-int g_execProbeAttempts = 0;
+std::atomic<bool> g_explorerSymbolAttempted{false};
 // Set only after Wh_SetFunctionHook accepted the close-decision hook, so no
 // close is ever arbitrated on a build where that hook was refused.
 std::atomic<bool> g_closeHookEnabled{false};
@@ -14433,10 +14604,52 @@ uint32_t PeerTickAgeMs() {
 // The executor half of the gate: the worker that turns a command into a
 // launcher call. Without it, a command the controller publishes would have no
 // thread to run it.
-bool BridgeCanServe() {
+bool ExecutorWorkerReady() {
     return g_ipc.state != nullptr &&
            g_execReady.load(std::memory_order_acquire) &&
            !g_disabled.load(std::memory_order_relaxed);
+}
+
+// The full capability the Start side is told about. A started worker is not
+// enough: the window must exist on the recorded launcher thread, the layout must
+// be the verified identity, and the primitives that window calls must be
+// resolved. Every one of these is read as a capability, never assumed from a
+// mapped channel.
+bool ExecutorCapabilityNow() {
+    if (!ExecutorWorkerReady() ||
+        !g_launcherLayoutVerified.load(std::memory_order_acquire)) {
+        return false;
+    }
+    if (!g_execWindow.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const DWORD launcher = g_launcherThread.load(std::memory_order_relaxed);
+    if (launcher == 0 || g_execThreadId == 0 || g_execThreadId != launcher) {
+        return false;
+    }
+    return g_dismiss && g_showStartView && g_launcherSlot &&
+           g_launcherIsVisible;
+}
+
+// Publishes the capability word and wakes the Start side. The word is written
+// even when the value did not change, so an unload clear can never be skipped;
+// the one log line is emitted only on a transition. One mechanism, one shape.
+void PublishExecutorCapability(const wchar_t* reason) {
+    if (!g_ipc.state) {
+        return;
+    }
+    const bool capable = ExecutorCapabilityNow();
+    const bool was = g_execCapable.exchange(capable, std::memory_order_acq_rel);
+    SwipeIpcPublishExecCapable(&g_ipc, capable);
+    if (was != capable) {
+        TraceLog(L"exec capable=%d reason=%s window=%p tid=%u launcher=%u "
+                L"layout=%d worker=%d",
+                capable ? 1 : 0, reason,
+                g_execWindow.load(std::memory_order_relaxed), g_execThreadId,
+                g_launcherThread.load(std::memory_order_relaxed),
+                g_launcherLayoutVerified.load(std::memory_order_relaxed) ? 1 : 0,
+                g_execReady.load(std::memory_order_relaxed) ? 1 : 0);
+    }
 }
 
 // The window this activation dispatches through, on the calling thread. A window
@@ -14492,7 +14705,7 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
         }
     }
     const uint32_t epoch = PeerEpochNow();
-    if (!BridgeCanServe()) {
+    if (!ExecutorWorkerReady()) {
         TraceLog(L"own pass trigger=%s reason=no-executor", trigger);
         return false;
     }
@@ -14506,6 +14719,17 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
     EnsureExecutorWindow();
     if (!ExecutorWindowOnThisThread()) {
         TraceLog(L"own pass trigger=%s reason=no-window", trigger);
+        return false;
+    }
+    // The window may have been created on this very call, so the capability is
+    // published here before the decision: the Start side needs the word to
+    // advertise, and this press is the first proof the executor can serve.
+    PublishExecutorCapability(L"press");
+    if (!ExecutorCapabilityNow()) {
+        // A started worker with no verified layout or no callable primitive is
+        // not an executor. The press stays native; the Start side is not told a
+        // capability it does not have.
+        TraceLog(L"own pass trigger=%s reason=no-capability", trigger);
         return false;
     }
     if (epochOut) {
@@ -14540,7 +14764,7 @@ bool HideCanServeClose(const wchar_t** reason) {
         *reason = L"callers-unverified";
         return false;
     }
-    if (!BridgeCanServe()) {
+    if (!ExecutorWorkerReady()) {
         *reason = L"no-executor";
         return false;
     }
@@ -14552,6 +14776,14 @@ bool HideCanServeClose(const wchar_t** reason) {
     }
     if (!ExecutorWindowOnThisThread()) {
         *reason = L"no-window";
+        return false;
+    }
+    // Re-publish before the close decision: a window exists, but the symbols may
+    // still be pending or the layout unverified, and the Start side must hear
+    // the loss before this close is turned into a command.
+    PublishExecutorCapability(L"hide");
+    if (!ExecutorCapabilityNow()) {
+        *reason = L"no-capability";
         return false;
     }
     if (!g_dismiss) {
@@ -14600,7 +14832,8 @@ bool ClickAwayPointerNow() {
 }
 
 // XamlLauncherState::HideStartAndCortana(void* self, uint32_t method)
-// twinui.pcshell.dll 26100.9949, RVA 0x24BCB0. The function reads the dismiss
+// twinui.pcshell.dll fixed version 26100.10068, RVA 0x2485E0. The function reads
+// the dismiss
 // method in edx, writes the transient state at [self+0x28] and calls the
 // manager's Hide through [self+0x38]; it returns nothing.
 void HideStartAndCortana_Hook(void* self, uint32_t method) {
@@ -15198,7 +15431,7 @@ bool ServeLatchedPress(const wchar_t* reason) {
         DropPressLatch(L"expired", reason);
         return false;
     }
-    if (!PeerAliveNow() || !BridgeCanServe()) {
+    if (!PeerAliveNow() || !ExecutorCapabilityNow()) {
         DropPressLatch(L"peer-gone", reason);
         return false;
     }
@@ -15604,7 +15837,7 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
         return true;
     }
     if (!PeerAliveNow() || PeerEpochNow() != press.admittingEpoch ||
-        !BridgeCanServe()) {
+        !ExecutorCapabilityNow()) {
         TraceLog(L"own press fallback trigger=%s entry=%s reason=peer-gone "
                 L"wait=%llu",
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
@@ -16931,6 +17164,7 @@ bool InstallExplorerHooks(HMODULE module) {
     // makes this call refuse before HookSymbols.
     Wh_ApplyHookOperations();
     TraceLog(L"exec launcher hooks applied tid=%u", GetCurrentThreadId());
+    PublishExecutorCapability(L"symbols");
     ReleaseSRWLockExclusive(&g_explorerSymbolLock);
 
     for (const ResolvedSymbol& symbol : resolved) {
@@ -16983,12 +17217,14 @@ void NoteLoadedExplorerModule() {
     }
 }
 
-// Resolves the launcher symbols from the executor worker. Called on every wait
-// timeout: immediate when the module is first known, then throttled while the
-// result is pending. Never called on a thread Explorer owns.
+// Resolves the launcher symbols from the executor worker. One call per module
+// per install: HookSymbols blocks on the PDB fetch, and once it returns false
+// the session has no launcher hooks; a retry would only repeat the stall. The
+// worker is not the press path, so no trigger waits on this call.
 void ProbeExplorerSymbolsFromWorker() {
     if (!g_afterInit.load(std::memory_order_relaxed) ||
         g_disabled.load(std::memory_order_relaxed) ||
+        g_explorerSymbolAttempted.load(std::memory_order_acquire) ||
         g_explorerSymbolsReady.load(std::memory_order_acquire) ||
         g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
         return;
@@ -17002,46 +17238,26 @@ void ProbeExplorerSymbolsFromWorker() {
         g_explorerModuleSeen.store(module, std::memory_order_release);
     }
 
-    const uint64_t now = GetTickCount64();
-    const bool first = g_execProbeFirstTick == 0;
-    if (!first && now < g_execProbeNextTick) {
-        return;
-    }
-    g_execProbeNextTick = now + kExecSymbolProbeMs;
-    if (first) {
-        g_execProbeFirstTick = now;
-    }
-
+    // Claim the one attempt before the blocking call. A concurrent caller (there
+    // is none but the unload) sees the claim and does not start a second fetch.
+    g_explorerSymbolAttempted.store(true, std::memory_order_release);
     if (InstallExplorerHooks(module)) {
-        // The install applied its own queued hooks under the lock.
+        // The install applied its own queued hooks under the lock and published
+        // the resulting capability. A resolved symbol set with an unverified
+        // layout is still "resolved": the layout gate, not a retry, decides
+        // whether the capability is on.
         return;
     }
-    if (g_explorerSymbolsReady.load(std::memory_order_acquire) ||
-        g_disabled.load(std::memory_order_relaxed)) {
+    if (g_disabled.load(std::memory_order_relaxed)) {
         return;
     }
-
-    g_execProbeAttempts++;
-    const uint64_t waited = GetTickCount64() - g_execProbeFirstTick;
-    if (waited >= kExecSymbolPendingDeadlineMs) {
-        g_explorerSymbolsRefused.store(true, std::memory_order_release);
-        TraceLog(L"exec launcher symbols deadline attempts=%d waited=%llums "
-                L"deadline=%llums",
-                g_execProbeAttempts, static_cast<unsigned long long>(waited),
-                static_cast<unsigned long long>(
-                    kExecSymbolPendingDeadlineMs));
-        TraceLog(L"exec launcher symbols unresolved name=twinui.pcshell.dll "
-                L"(symbol, signature or hook refused)");
-        Wh_Log(L"twinui.pcshell.dll symbols could not be resolved within the "
-               L"%llu ms pending deadline; no launcher hook is installed and "
-               L"every press stays native",
-               static_cast<unsigned long long>(kExecSymbolPendingDeadlineMs));
-        return;
-    }
-    TraceLog(L"exec launcher symbols pending attempt=%d waited=%llums "
-            L"deadline=%llums",
-            g_execProbeAttempts, static_cast<unsigned long long>(waited),
-            static_cast<unsigned long long>(kExecSymbolPendingDeadlineMs));
+    g_explorerSymbolsRefused.store(true, std::memory_order_release);
+    PublishExecutorCapability(L"symbols-refused");
+    TraceLog(L"exec launcher symbols unresolved attempts=1 "
+            L"name=twinui.pcshell.dll (symbol, signature or hook refused)");
+    Wh_Log(L"twinui.pcshell.dll symbols could not be resolved on the one "
+           L"attempt this session makes; no launcher hook is installed and "
+           L"every press stays native");
 }
 
 // ---------------------------------------------------------------------------
@@ -17609,6 +17825,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         if (identified) {
             g_execWindow.store(nullptr, std::memory_order_release);
         }
+        PublishExecutorCapability(L"window-gone");
         TraceLog(L"exec window gone hwnd=%p identified=%d tid=%u", window,
                 identified ? 1 : 0, GetCurrentThreadId());
         return 0;
@@ -17810,6 +18027,9 @@ void EnsureExecutorWindow() {
     // sees is never a window without its thread.
     g_execThreadId = GetCurrentThreadId();
     g_execWindow.store(window, std::memory_order_release);
+    // A created window on the recorded thread is the last missing piece when the
+    // symbols are already resolved; publish before any decision can read it.
+    PublishExecutorCapability(L"window");
     // The assertion the owner-thread report is for: a created window must be on
     // the launcher thread, never on the thread that happened to call a hook.
     const DWORD launcherThread = g_launcherThread.load(std::memory_order_relaxed);
@@ -17883,6 +18103,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
     struct ReadyOnExit {
         ~ReadyOnExit() {
             g_execReady.store(false, std::memory_order_release);
+            PublishExecutorCapability(L"worker-exit");
         }
     } readyOnExit;
 
@@ -17901,6 +18122,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
     // reads g_disabled, which BeforeUninit sets before it signals the stop.
     if (!g_disabled.load(std::memory_order_relaxed)) {
         g_execReady.store(true, std::memory_order_release);
+        PublishExecutorCapability(L"worker");
         TraceLog(L"exec worker ready tid=%u window=%p", GetCurrentThreadId(),
                 g_execWindow.load(std::memory_order_relaxed));
     }
@@ -17925,21 +18147,19 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
         // a thread Explorer owns freezes the shell, so the install is scheduled from
         // here; the command event still wakes the loop at once.
         //
-        // The probe is throttled by `g_execProbeNextTick` while an attempt is
-        // pending, and it is over for good once the symbols resolved or the 240 s
-        // budget refused them: at that point this wait has no timeout at all and the
-        // worker sleeps on its events. The executor's own timers — the dismiss
-        // delay, the visibility confirmation, the press latch and the press ack
-        // bound — are message timers on the launcher thread's window, which the
-        // worker never services, so they add no wake here; they are listed in the
-        // AGENTS contract so a later change does not turn this into a poll again.
+        // Before the one symbol attempt, the timeout only waits for
+        // twinui.pcshell.dll to be present; after it, the result is ready or
+        // refused for the session and this wait has no timeout at all. The
+        // executor's own timers — the dismiss delay, the visibility confirmation,
+        // the press latch and the press ack bound — are message timers on the
+        // launcher thread's window, which the worker never services, so they add
+        // no wake here; they are listed in the AGENTS contract so a later change
+        // does not turn this into a poll again.
         DWORD waitMs = INFINITE;
-        if (!g_explorerSymbolsReady.load(std::memory_order_acquire) &&
+        if (!g_explorerSymbolAttempted.load(std::memory_order_acquire) &&
+            !g_explorerSymbolsReady.load(std::memory_order_acquire) &&
             !g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
-            const uint64_t now = GetTickCount64();
-            waitMs = g_execProbeNextTick > now
-                         ? static_cast<DWORD>(g_execProbeNextTick - now)
-                         : static_cast<DWORD>(kExecSymbolProbeMs);
+            waitMs = static_cast<DWORD>(kExecSymbolProbeMs);
         }
         const DWORD wait = WaitForMultipleObjects(waitCount, events, FALSE, waitMs);
         if (wait == WAIT_OBJECT_0) {
@@ -18222,6 +18442,10 @@ BOOL RoleInit() {
                static_cast<unsigned>(ipcError));
     } else {
         TraceLog(L"ipc open created=%d", created ? 1 : 0);
+        // A section can outlive the activation that filled it. Clear the previous
+        // activation's capability before this one starts a worker; the Start side
+        // must not read a stale 1 as an executor that exists.
+        PublishExecutorCapability(L"init");
     }
 
     // The acknowledgement event for the window's destruction. Created before
@@ -18289,6 +18513,7 @@ void RoleBeforeUninit() {
     // posted for a channel that is about to be unmapped, and the worker's own
     // wait sees the stop before the Exec event.
     g_execReady.store(false, std::memory_order_release);
+    PublishExecutorCapability(L"unload");
     if (g_execStopEvent) {
         SetEvent(g_execStopEvent);
     }
@@ -18316,6 +18541,11 @@ void RoleUninit() {
     // instance that registered it. A class that outlives the image would point
     // at an unmapped WndProc.
     UnregisterExecutorClass();
+
+    // No executor exists past the window teardown. Write the clear one last time
+    // before the section is closed, so the Start side never reads this
+    // activation's 1 into the next one.
+    PublishExecutorCapability(L"uninit");
 
     if (g_execWindowGone) {
         CloseHandle(g_execWindowGone);

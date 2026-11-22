@@ -1,22 +1,23 @@
 # IPC — the merged mod's channel
 
-> Mod 0.7.0 (one source, two process halves). One session-local section, four
+> Mod 0.8.0 (one source, two process halves). One session-local section, five
 > named events, every record a seqlock. There is no file, no mutex, no command
 > channel and no polling on either side.
 
 ## Names and layout
 
 ```
-Local\SwipeFor10Start_SingleMod2_State      SwipeIpcState (224 bytes)
-Local\SwipeFor10Start_SingleMod2_Intent     auto-reset, bridge -> Start
-Local\SwipeFor10Start_SingleMod2_IntentAck  auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod2_Exec       auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod2_ExecAck    auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod3_State      SwipeIpcState (232 bytes)
+Local\SwipeFor10Start_SingleMod3_Intent     auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod3_IntentAck  auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod3_Exec       auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod3_ExecAck    auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod3_Capability auto-reset, bridge -> Start
 ```
 
-`kSwipeIpcMagic = 0x53323053` (`S02S`). There is no product version word: the
-**namespace is the ABI identity**. The `2` in the prefix is the layout identity:
-the `intentTaken` word made the section 224 bytes, so the old 216-byte namespace
+`kSwipeIpcMagic = 0x53333053` (`S03S`). There is no product version word: the
+**namespace is the ABI identity**. The `3` in the prefix is the layout identity:
+the `execCapable` word made the section 232 bytes, so the old 224-byte namespace
 must never be joined. A future incompatible layout changes the
 prefix again, so an old pinned development image can never join this channel and a
 same-size change is never reinterpreted across a staggered update. Every field's
@@ -43,7 +44,8 @@ layout.
 200  controllerTouch
 204  peerTick         208  peerState        212  peerEpoch
 216  intentTaken
-size 224
+224  execCapable
+size 232
 ```
 
 The debug command channel is **gone**: its record, mutex, event and parser were
@@ -340,16 +342,16 @@ Start side refreshes the tick from its input thread at most once per
 stops, and the gate closes 600 ms later. A few presses during a start or a stop
 are therefore served natively by the shell, by design.
 
-`alive` means **intent-consumer readiness**: that thread's window, its message
-loop and the intent event exist, and the renderer it will drive is usable
-(`RendererReady`: the root is attached and its scalar set was not invalidated).
-It is not a claim about the digitizer: a refused
-raw-input registration is logged by `RegisterHidUsage` and the intent half still
-runs; the `ipc peer alive` line prints `touch=`/`pen=` so the difference is
-visible. The publication and the terminal withdrawal are serialised in one
-critical section, so a startup that is already in flight either lands before the
-withdrawal or is refused after it; a flag check followed by an independent store
-would let `alive` overwrite `gone`.
+`alive` means **intent-consumer readiness plus executor capability**: that thread's
+window, its message loop and the intent event exist, the renderer it will drive is
+usable (`RendererReady`: the root is attached and its scalar set was not
+invalidated), and the bridge's `execCapable` word is 1. It is not a claim about
+the digitizer: a refused raw-input registration is logged by `RegisterHidUsage`
+and the intent half still runs; the `ipc peer alive` line prints `touch=`/`pen=`
+so the difference is visible. The publication and the terminal withdrawal are
+serialised in one critical section, so a startup that is already in flight either
+lands before the withdrawal or is refused after it; a flag check followed by an
+independent store would let `alive` overwrite `gone`.
 
 Readiness is continuing, not a one-time announcement. When the root is torn down
 for replacement, or a failed scalar write invalidates it, the input thread
@@ -370,6 +372,39 @@ the gate check to the `SetEvent` of a published intent (sub-millisecond, but not
 atomic against a kill), and, for the latch, the whole wait it is held for, which
 is why the serve re-reads the peer and the epoch instead of trusting the press.
 
+### Executor capability — bridge -> Start
+
+`execCapable` is one word, written only by the bridge. It is 1 only while all of
+these hold:
+
+- the executor worker is running (`g_execReady`, not disabled);
+- the hidden executor window exists, and its owner is the recorded launcher
+  thread (`g_execThreadId == g_launcherThread`);
+- the loaded `twinui.pcshell.dll` is the verified layout identity;
+- the show and dismiss primitives, the launcher slot and the visibility probe
+  are resolved.
+
+Any loss — a window destruction, a worker exit, a symbol refusal, an unload —
+clears the word and signals the `Capability` event. The Start side reads the word
+directly: it publishes `peerState=alive` only while it is 1, and on a 1 -> 0
+transition it withdraws the peer (`ipc peer gone reason=capability-lost`), clears
+the shared direction/touch, ends any gesture or close it was driving and restores
+`Progress` to the rest the cloak shows. A 0 -> 1 transition logs
+`ipc capability gained`; the normal publication path then announces the peer.
+
+The word is a flag, not a seqlock record: the event only says it changed, and the
+reader takes the steady value. A channel whose `Capability` event could not be
+created falls back to a 100 ms read while the peer is unadvertised; with the
+event present, no timer is armed for it.
+
+The symbol attempt is part of this capability, not a retry loop. `HookSymbols`
+blocks on the PDB fetch (measured up to 571 s), so the worker makes **one attempt
+per module per install**. A false result is terminal for the session:
+`exec launcher symbols unresolved attempts=1 ...` and every trigger stays
+native. A resolved symbol set whose layout is not the reference identity stays
+`exec launcher layout unverified ... native=1` and the capability remains 0; it is
+not retried, because the image cannot change under the loaded module.
+
 ## Initialisation
 
 `SwipeIpcOpen` creates the section with `CreateFileMappingW(INVALID_HANDLE_VALUE,
@@ -377,8 +412,9 @@ PAGE_READWRITE, sizeof(SwipeIpcState), name)`; an existing section is opened and
 validated. The `initState` handshake is a four-value CAS state machine
 (`Blank -> Initialising -> Ready`, `Abandoned` after a dead claim); the whole
 call has a 550 ms budget, so a young claim is abandoned inside the call rather
-than waited on. A missing event disables only the direction it carries. Both
-mods call it at `Wh_ModInit`, never in a hook.
+than waited on. A missing event disables only the direction it carries; a missing
+`Capability` event leaves the 100 ms fallback read described above. Both mods
+call it at `Wh_ModInit`, never in a hook.
 
 A reinstall loads a fresh image at a fresh base; the old image is unmapped by its
 unload, and the new image opens the same section because the namespace is
@@ -396,5 +432,6 @@ process-local; its only input is the section.
 
 `pwsh -File tools/ipc.ps1 -State` prints one snapshot: the open generation, the
 intent and its ack, the executor command and its ack with outcome and visibility
-names, the controller direction/touch, and the peer triple. It refuses a section
-whose `initState` is not ready or whose magic or `layoutBytes` disagrees.
+names, the controller direction/touch, the peer triple and `execCapable`. It
+refuses a section whose `initState` is not ready or whose magic or `layoutBytes`
+disagrees.

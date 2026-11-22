@@ -1,7 +1,7 @@
 # M3.2 architecture — one controller, one executor
 
 > L3-level design record. Mod **0.8.0** (one source, two process halves),
-> channel **224 B, no product version word** (`SingleMod2` namespace). The measured evidence is quoted with the build and the
+> channel **232 B, no product version word** (`SingleMod3` namespace). The measured evidence is quoted with the build and the
 > layout it came from; everything below was run on this machine. **Layouts:**
 > *left docked* (live, measured 2026-11-21) = `axis=0`, work `48,0,1440,900`,
 > the bar at `0,0..48,900` (96 physical wide), band `0..96`, panel
@@ -52,34 +52,35 @@ only debug switch.
 
 ## The launcher read (corrected)
 
-`twinui.pcshell.dll + 0x948E80` holds `XamlLauncher::s_pLauncher`, the **outer**
+`twinui.pcshell.dll + 0x95F0E8` holds `XamlLauncher::s_pLauncher`, the **outer**
 object. The shell passes the **`IXamlLauncher` subobject at `outer + 0x18`** to
 `ShowStartView` / `Dismiss` / `IsVisible`; that subobject's `[+0x160]` is the
 live `IXamlLauncherState`.
 
 The offsets are reference-build facts, and a name alone does not prove them. The
 capability is enabled only when the loaded image is the identity those offsets
-were read from: fixed file version **10.0.26100.9974** and all 13 named symbols
-at the reference RVAs. `ModuleFixedFileVersion` reads the fixed version through
-`version.dll` (resolved at runtime), and `InstallExplorerHooks` compares every
-resolved RVA. On any other image the capability is off: the decision hooks pass
-their original, `LauncherNow` returns null, the executor refuses its command,
-and the shell serves the press. One line states it:
+were read from: fixed file version **10.0.26100.10068** (the display string still
+reads 9949) and all 13 named symbols at the reference RVAs.
+`ModuleFixedFileVersion` reads the fixed version through `version.dll` (resolved
+at runtime), and `InstallExplorerHooks` compares every resolved RVA. On any other
+image the capability is off: the decision hooks pass their original,
+`LauncherNow` returns null, the executor refuses its command, and the shell
+serves the press. One line states it:
 `exec launcher layout unverified version=... matches=... native=1 reason=version|rva`;
 the verified image logs `exec launcher layout verified ... native=0`.
 
-Measured in explorer (10.0.26100.9949); the same RVAs still match the
-10.0.26100.9974 image (13/13), which is the identity the gate requires:
+Measured in explorer on 2026-11-22 (10.0.26100.10068); the 13 symbols resolve at
+the reference RVAs and the private layout is the one this gate requires:
 
 | Read | Value |
 |---|---|
-| outer | `0x0A22F960`, vtable `twinui+0x77E1C0` |
-| outer `[+0x160]` | `0` (never the state) |
-| outer `+0x18` | `0x0A22F978`, vtable `twinui+0x77E078` |
-| `[outer+0x18+0x160]` | state `0x0755A5C8`, vtable `twinui+0x77E3C8` |
-| state vtable `+0x38` | `twinui+0x26F780` (`XamlLauncherState::ShowStartView`) |
-| state vtable `+0x40` | `twinui+0x4991C0` (`DismissStartAndCortana`) |
-| state vtable `+0x68` | `twinui+0x1B6050` (`IsVisible` query) |
+| outer | `0x4A13790`, vtable `twinui+0x78A248` |
+| outer `+0x18` | `0x4A137A8`, vtable `twinui+0x78A100` |
+| `[outer+0x18+0x160]` | state `0x7705AB8`, vtable `twinui+0x78A450` |
+| state vtable `+0x38` | `twinui+0x26CD00` (`XamlLauncherState::ShowStartView`) |
+| state vtable `+0x40` | `twinui+0x499A10` (`DismissStartAndCortana`, a resolved symbol) |
+| state vtable `+0x68` | `twinui+0x1B0B80` (`IsVisible` query) |
+| state vtable `+0x70` | `twinui+0x1D1830` (`IsStartWindowVisible`) |
 | state `[+0x28]` | `5` while shown |
 
 Readiness: `[+0x160] > 0x10000`. The constructor leaves the sentinel `0x100`;
@@ -221,13 +222,22 @@ clock taken after the tick. Otherwise it logs one
 `exec pass hide method=... reason=no-peer`) and calls the original, so the
 shell's own toggle serves the press exactly once. If an older press is outstanding
 or queued, a stale peer instead logs `reason=peer-stale-queued` and lets the press
-reach admission; a native pass would overtake the queue.
+reach admission; a native pass would overtake the queue. A live peer is still not
+an executor: after the thread and window tests, the gate requires
+`execCapable=1` and otherwise logs `reason=no-capability` and calls the original.
+The capability is one word the bridge publishes only when the worker, the window
+on the recorded launcher thread, the verified layout and the show/dismiss
+primitives all exist; the Start side publishes `peerState=alive` only while it is
+1, so a bridge with unresolved symbols or an unverified layout can never make the
+controller animate.
 
 Availability belongs to the activation that serves. The Start side claims a
 `peerEpoch` at attach, withdraws `gone` and resets the shared direction and touch
 there, and publishes `alive` from the input thread once that thread's window, its
-message loop and the intent event exist and it is about to wait on intents. It
-withdraws again before that thread is stopped and on every exit from it. The
+message loop and the intent event exist, the root is attached, and the bridge's
+`execCapable` word is 1. It withdraws again before that thread is stopped and on
+every exit from it, and on a capability drop it also ends the gesture or close it
+was driving and restores `Progress` at the rest the cloak shows. The
 publication and the terminal withdrawal share one critical section: a
 flag-check-then-store let the startup write `alive` after the unload had written
 `gone`, and the bridge then served a controller whose thread was leaving. The
@@ -247,7 +257,8 @@ does not exist. A press the bridge has already swallowed is a different case:
 it is ours, and the recovery paths below decide it.
 
 That thread has no period. It waits on the stop event, the intent and
-executor-ack events, the renderer event, the cloak event, and one high-resolution
+executor-ack events, the capability event, the renderer event, the cloak event,
+and one high-resolution
 one-shot armed for the soonest deadline only; `docs/input.md` lists the deadlines
 and their clocks. A release that cannot act (a touch show in flight, a close in
 flight with a contact on the panel) arms nothing, and with no deadline the timer
@@ -256,14 +267,27 @@ CoreWindow, delivered to that thread; the callback only sets an event, and the
 service behind it reads the cloaked attribute once. A bounded 100 ms fallback
 poll runs while a requested or just-observed transition is outstanding, so a
 missed event costs latency, not state. The one idle wake is the 100 ms
-`peerTick` heartbeat, and only while the peer is advertised.
+`peerTick` heartbeat, and only while the peer is advertised. The capability
+event is a wake, not a record: the next pass reads the steady word. A channel
+whose capability event could not be created arms a 100 ms read while the peer is
+unadvertised; the event path itself arms nothing.
 
 The close intent's capability is checked separately (`HideCanServeClose`): peer,
 the caller wrappers, a started worker, the **recorded** launcher thread (a Hide
-never adopts one), a window on that thread, and a callable `Dismiss`. One missing
+never adopts one), a window on that thread, the verified layout, and a callable
+`Dismiss`. One missing
 piece and the shell's close runs, because converting a native close into a
 command nothing can execute leaves the window shown over the controller's
 retracted panel.
+
+**Symbol work is one attempt.** `HookSymbols` blocks on Windhawk's PDB fetch
+(measured up to 571 s), so the executor worker runs it, never a hook, and makes
+exactly one attempt per module per install. A false result is terminal:
+`exec launcher symbols unresolved attempts=1 ...`, no retry, and every press
+stays native. A resolved symbol set whose fixed version or RVAs are not the
+reference identity is `exec launcher layout unverified ... native=1` and the
+capability stays 0; that is not a fetch failure and is not retried, because the
+loaded module cannot change under the session.
 
 `peerState` is still a detection budget, not a delivery guarantee. A decision
 taken inside the 600 ms window can be published after the peer died, and a press
@@ -715,10 +739,13 @@ The explorer half moved the same way. The launcher entry points, the
 `twinui.pcshell.dll`; the fixed VAs, the `twinui` file-version/timestamp gate,
 the executable-range check and the prologue/body probes are deleted. The
 `LoadLibraryExW` notification only records the returned image; the executor
-worker runs the resolution at most once per 100 ms with a 240 s pending
-deadline. A still-blocked PDB fetch leaves the mod passive — every press runs
+worker runs the resolution **once per module per install** (the 100 ms wait is
+only for the module to be present). A still-blocked PDB fetch leaves the mod
+passive — every press runs
 the shell's own path — and never blocks `explorer.exe`, because the fetch runs
-on the mod's worker rather than on a thread the shell owns. Every resolved
+on the mod's worker rather than on a thread the shell owns. A false result is
+terminal (`exec launcher symbols unresolved attempts=1 ...`), not a retry loop.
+Every resolved
 address is logged against the reference RVA; the set line
 `exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence,
 and one missing symbol refuses the whole set instead of installing half a
@@ -734,23 +761,27 @@ classified; a Hide it reaches outside those scopes stays `unknown` and runs
 natively. The measured desktop click-away is inside the ActiveZBand scope, so
 it keeps the animated close.
 
-The controller advertises that service only once the root is attached
-(`PublishPeerReady` requires `g_rendererReady`, not just the hook). A session
+The controller advertises that service only once the root is attached and the
+bridge has published `execCapable=1` (`PublishPeerReady` requires
+`g_rendererReady` and `SwipeIpcExecCapable`, not just the hook). A session
 that missed `PrepareRootElement` during the cold fetch has no geometry, so a
 press admitted there would be swallowed for a controller that can only pass it
 through (`win open restore (no geometry)` was measured); with the gate, the peer
 stays unpublished and every press is native until the next host session attaches
-a root.
+a root. A capability drop withdraws the peer even when the root is healthy, and a
+capability gain does not republish until the root and the renderer are both
+usable.
 
-The merged channel is **224 bytes** with one section and four events. The names
-use one merged-mod prefix (`Local\SwipeFor10Start_SingleMod2_*`) and there is **no
+The merged channel is **232 bytes** with one section and five events. The names
+use one merged-mod prefix (`Local\SwipeFor10Start_SingleMod3_*`) and there is **no
 product version word**: the ABI namespace is the identity, so an old development
 image cannot join and a future layout changes the prefix. The records are the open
 generation, the intent and its ack and the `intentTaken` claim, the executor
 command and its ack, one
-controller direction word plus the touch flag, and the liveness triple
-`peerTick`/`peerState`/`peerEpoch`. The debug command channel — its record,
-mutex, event and parser — is gone; `tools/ipc.ps1` is read-only. The executor
+controller direction word plus the touch flag, the liveness triple
+`peerTick`/`peerState`/`peerEpoch`, and the `execCapable` word. The debug command
+channel — its record, mutex, event and parser — is gone; `tools/ipc.ps1` is
+read-only. The executor
 validates every command before the launcher call (show 1/11/16 with flags under
 `0x8|0x4`, dismiss 1/6 with no flags, cancel 0) and refuses anything else instead
 of clamping it. The producer checks the same vocabulary (`SwipeShowAllowed`,

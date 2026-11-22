@@ -4,6 +4,11 @@
 
 Reverse-engineering notes. Static analysis of shipped Microsoft binaries, kept
 out of the behavioural docs because every claim here carries an RVA and a build.
+The notes below analyse `twinui.pcshell.dll` 10.0.26100.9949. The shipping mod's
+verified reference is now fixed version 10.0.26100.10068 (measured 2026-11-22);
+the symbol names are unchanged, the RVAs moved, and `docs/architecture.md` carries
+the current live table. A note dated 9949 is historical evidence, not the
+current layout.
 
 close-decisions.md: who decides to close the Start menu, for the three triggers
 (Windows key, taskbar Start button, click outside), and whether a close can be

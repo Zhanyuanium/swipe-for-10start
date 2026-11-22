@@ -75,7 +75,47 @@
 - `tools/ipc.ps1` — the read-only view of the channel; see
   [ipc.md](ipc.md) for the protocol and the records. `-State` prints `peerEpoch`
   beside `peerTick`/`peerState`, which is how a re-enable is told from a
-  still-running activation. There is no command publisher any more.
+  still-running activation, and `execCapable`, which is how an executor is told
+  from a mapped section. There is no command publisher any more.
+
+## Executor capability, two states, 2026-11-22
+
+The machine moved to `twinui.pcshell.dll` fixed **10.0.26100.10068** (display
+9949) after the Windows update. The private layout was re-read live (state at
+`launcher+0x160`, `InternalState=5`, state vtable `+0x40` = the resolved
+`DismissStartAndCortana`) and the reference RVAs were updated. The reference is
+still one identity: an image whose fixed version or RVAs differ keeps every
+trigger native.
+
+**Unresolved.** Forced with a test-only layout override, removed before commit;
+the new reference still resolved 13/13 symbols. The bridge logged
+`exec launcher layout unverified version=10.0.26100.10068 matches=13 native=1
+reason=test`; `execCapable=0`, `peerState=0`. The Start side logged
+`ipc peer not published reason=no-capability` and
+`ipc peer withheld reason=no-capability`. A Win tap open/close and a desktop
+click produced **no** renderer or bridge decision line (the shell served them
+natively). A band pull logged only
+`reveal admit ... ok=0 reason=no-capability`, with no `exec show request`, no
+`settle` and no `panel intent`; the shell's own gesture opened the menu. The full
+smoke on this state: `starts closed` and `no error lines` passed; every row that
+requires mod execution failed, and the touch rows reported
+`layout incomplete: axis,band,rect,scale` and injected nothing. That is the
+intended native fallback, not a hang.
+
+**Resolved.** The committed build logged
+`exec launcher layout verified ... native=0` and
+`exec capable=1 reason=window window=... tid=... layout=1 worker=1`; the Start
+side logged `ipc capability gained` and `ipc peer alive reason=consumer`. The
+full smoke passed every row: `win open`, `win close`, `touch open`,
+`touch close (injected) producer=hid`, `click-away`, and the three interrupted
+closes (`from≈0.94`, `0.92`, `0.02`; each `final=True`). The Win close line is
+`settle ... dir=close` then `exec dismiss request ...` and
+`exec dismiss confirmed ... visible=hidden`; the open is
+`settle ... dir=open`; the touch open is `reveal pull qualified` plus the
+executor's ack for the same show sequence. The only first-open exception is the
+cold executor: after an explorer/reload with no recorded launcher thread, the
+first native open creates the window, publishes `exec capable=1`, and the Start
+side advertises; every later trigger is intercepted.
 
 ## Release evidence: the full smoke, 2026-11-22
 

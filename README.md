@@ -11,8 +11,8 @@ By Zhanyuanium, distributed as Windhawk mods.
 ## What you need
 
 - **Windows 11** with **ExplorerPatcher** set to the Windows 10 (legacy) Start
-  menu (`Start_ShowClassicMode=1`). Verified on Windows 11 build 26300.9974 and
-  ExplorerPatcher 26100.9711.
+  menu (`Start_ShowClassicMode=1`). Verified on Windows 11 build 26300.10075
+  (`twinui.pcshell.dll` fixed 10.0.26100.10068) and ExplorerPatcher 26100.9711.
 - **Windhawk** 2.0 or later.
 - A touchscreen or pen. (The mouse is deliberately not used for these
   gestures.)

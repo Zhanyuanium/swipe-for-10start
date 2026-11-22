@@ -10,7 +10,8 @@ why each design decision was taken. The user-facing quick start is
 ## Verified environment
 
 Everything here was measured, not assumed. Verified on: Windows 11 build
-26300.9974, ExplorerPatcher 26100.9711 (`Start_ShowClassicMode=1`), Windhawk
+26300.10075 (`twinui.pcshell.dll` fixed 10.0.26100.10068), ExplorerPatcher
+26100.9711 (`Start_ShowClassicMode=1`), Windhawk
 2.0 alpha, 2880x1800 physical at 200% scaling (1440x900 DIP), ELAN2513
 touchscreen. The taskbar was on the left for the early measurements and on top
 for the vertical-path runs. **Current layout: left, docked** (`axis=0`), measured
@@ -32,7 +33,7 @@ names it.
 | [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the grab's down hit-test and one transfer attempt (a refusal consumes the contact; the landing adopts no finger), the gates and the settle ownership. |
 | [animation.md](animation.md) | The damped-spring settle, both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam, the mirrored close, the scheduled dismiss, and the measured lines. |
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
-| [ipc.md](ipc.md) | The merged mod's shared-memory channel: names, 224-byte layout with `intentTaken` at 216, seqlocks, the open generation, intents and acks with the claim/abort rule, executor commands and acks with their admission vocabulary and expiry rules, the controller direction, peer liveness and activation identity (600 ms is a detection budget), and the init handshake. |
+| [ipc.md](ipc.md) | The merged mod's shared-memory channel: names, 232-byte layout with `intentTaken` at 216 and `execCapable` at 224, seqlocks, the open generation, intents and acks with the claim/abort rule, executor commands and acks with their admission vocabulary and expiry rules, the controller direction, peer liveness and activation identity (600 ms is a detection budget), the bridge's executor capability and its terminal symbol attempt, and the init handshake. |
 | [lifecycle.md](lifecycle.md) | Quiescing both roles before the image is unmapped: the Start join/UI-teardown/entry-drain order, the bridge worker join/window destruction/class unregistration order, the no-safe-success rule, and the host's unload boundary. |
 | [testing.md](testing.md) | The PowerShell/Python probes and injectors, and the captured measurements in `artifacts/`. |
 | [limits.md](limits.md) | Known limits and risks, what the real-machine pass covered, and what is still owed (a pen by hand, and the HID dismiss log excerpt). |

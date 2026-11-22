@@ -42,13 +42,15 @@ display change, a forwarded modified Win press) publish `intent=external` and ar
 never held; Win+Tab's `Dismiss(5)` runs the shell's original (Task View) and the
 record retires the controller's pending dismiss.
 
-The bridge intercepts only while the Start side is alive. The bridge creates the
+The bridge intercepts only while the Start side is alive, and the Start side is
+alive only while the bridge is capable. The bridge creates the
 channel, so a mapped section says nothing about the controller; the Start side
 publishes `peerEpoch` (its activation identity, claimed at attach), `peerState`
 (alive/gone) and `peerTick` (refreshed from its input thread at most once per
 100 ms), and every consuming hook reads them before any decision. Availability is
 published **from the ready consumer** — the input thread, once its window, its
-message loop and its intent event exist — and withdrawn before that thread is
+message loop, its intent event and the root exist, and the bridge's `execCapable`
+word is 1 — and withdrawn before that thread is
 stopped and again as it leaves; the withdrawal also resets the shared direction and
 touch, so a kill while `closing` cannot be read as the next activation's decision.
 Readiness is *intent-consumer readiness*: a refused raw-input registration is
@@ -65,13 +67,34 @@ would run it ahead of the older press. A few presses during a start or a stop
 are passed natively; that is the intended trade. 600 ms is a detection budget, not
 a delivery guarantee.
 
+`execCapable` is the bridge's one-word promise that an executor exists: a started
+worker, the hidden window on the recorded launcher thread, the verified launcher
+layout and the show/dismiss primitives. The bridge publishes 1 on the transition
+(`exec capable=1 reason=window|worker|symbols`) and 0 on every loss
+(`window-gone`, `worker-exit`, `symbols-refused`, `unload`, `uninit`), waking the
+Start side through the `Capability` event. The Start side withdraws the peer on a
+1 -> 0 transition (`ipc peer gone reason=capability-lost`), releases any gesture or
+close it was driving and restores `Progress` at the rest the cloak shows. It never
+advertises, settles or requests a show without the word. A missing capability
+event falls back to a 100 ms read only while the peer is unadvertised.
+
 The bridge's gate proves a capability, not just a peer: the recorded launcher
 thread (checked **before** any launcher-local field, including the existing-window
-path), a window this activation created on that thread, a started worker, and for
+path), a window this activation created on that thread, a started worker, the
+verified layout, and for
 the directional close intent the callable `Dismiss` the command will need. A Hide
-never adopts an unproven thread (`reason=wrong-thread|no-window|no-primitive`).
+never adopts an unproven thread
+(`reason=wrong-thread|no-window|no-capability|no-primitive`).
 A wrong-thread launcher call is not a clean error: never call from a hook frame,
 and the executor window is created only from a known launcher entry.
+
+Launcher symbols are resolved once per module per install, on the executor
+worker, never in a hook. `HookSymbols` blocks on Windhawk's PDB fetch (measured
+up to 571 s); a false result is terminal for the session
+(`exec launcher symbols unresolved attempts=1 ...`) and every trigger stays
+native. There is no retry storm, and no press waits on symbol work. A resolved
+set whose layout is not the reference identity is the other terminal state:
+`exec launcher layout unverified ... native=1`, capability 0, no retry.
 
 A press is recovered, not guaranteed. The bridge's one dispatch reads the
 controller's published direction: `closing` (a close in flight)
@@ -251,7 +274,7 @@ kind=open` and `own press latched`).
 The bridge's executor is a hidden message-only window on the **launcher
 thread** — the thread that runs `OnHotkeyInvoke` and the shell's own
 `ShowStartView`. The launcher is the `IXamlLauncher` subobject at
-`s_pLauncher + 0x18` (`twinui.pcshell.dll + 0x948E80` holds the outer object);
+`s_pLauncher + 0x18` (`twinui.pcshell.dll + 0x95F0E8` holds the outer object);
 `[+0x160]` is the `IXamlLauncherState`, ready when `> 0x10000` (the sentinel is
 `0x100`). The readiness floor is checked at every read, including the resync after
 a forwarded `Show`/`Dismiss`: the pre-call check cannot cover the pointer the
@@ -409,30 +432,34 @@ header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h`: one session-local section (224 bytes) and four named
-events (`State/Intent/IntentAck/Exec/ExecAck` — five objects), every record a
-seqlock with its own counter and an `offsetof` assert, plus two single-word
-claims (`controllerDirection`, `intentTaken`). The names carry the merged
-mod's own prefix with the layout identity (`SwipeFor10Start_SingleMod2_`) and
+`mods/swipe_ipc_shared.h`: one session-local section (232 bytes) and five named
+events (`State/Intent/IntentAck/Exec/ExecAck/Capability` — six objects), every
+record a
+seqlock with its own counter and an `offsetof` assert, plus single-word
+claims (`controllerDirection`, `intentTaken`) and the bridge's `execCapable`.
+The names carry the merged
+mod's own prefix with the layout identity (`SwipeFor10Start_SingleMod3_`) and
 there is **no product version
 word**: the namespace is the ABI identity, so an older development image cannot
 join, and a future layout changes the prefix. The records are the open
 generation, the intent and its ack and the taken sequence (the ack is the
 bridge's next-press barrier; the take is the timeout's proof), the executor
 command and its ack, one
-controller direction word plus the touch flag, and the liveness triple
-`peerTick` (204) / `peerState` (208) / `peerEpoch` (212). The consumer claim
+controller direction word plus the touch flag, the liveness triple
+`peerTick` (204) / `peerState` (208) / `peerEpoch` (212), and `execCapable`
+(224). The consumer claim
 `intentTaken` (216) is a separate word, not liveness. The debug command
 channel — its record, mutex, event and parser — is **gone**.
-`tools/ipc.ps1` is read-only: `-State` reads 224 bytes and prints the records and
-the peer epoch.
+`tools/ipc.ps1` is read-only: `-State` reads 232 bytes and prints the records, the
+peer epoch and the capability.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
 `initState` are refused, never waited on. Each role opens the channel at its
 `RoleInit`, never in a hook.
 
 ## Machine
 
-Windows 11 10.0.26100.9949, ExplorerPatcher legacy Start
+Windows 11 26300.10075, `twinui.pcshell.dll` fixed 10.0.26100.10068 (display
+string 9949), ExplorerPatcher legacy Start
 (`Start_ShowClassicMode=1`), 2880x1800 physical at 200 % (1440x900 DIP).
 **The bar is not pinned to an edge.** The controller derives the axis, band, panel
 rectangle, `Distance` and scale from the live geometry on every read, and the
@@ -463,19 +490,21 @@ are implemented and **unverified on this machine**: the code path is the same
   state is a WinEvent, not a poll, with a bounded 100 ms fallback while a
   transition is outstanding. The only idle wake is the 100 ms `peerTick`
   heartbeat, and only while the peer is advertised. The Explorer worker blocks
-  on its events once the launcher symbols resolved or were refused. A change that
+  on its events once its one symbol attempt resolved or was refused. A change that
   reintroduces a periodic tick or a state poll is a regression. Two bounded
   exceptions are state-owned, not periodic: the open-generation gate reads its
   generation every 20 ms for at most 900 ms, and a standing press slot or
-  external barrier keeps a 100 ms reserve poll for its queue bound. Each stops
-  when its state clears, and neither wakes an idle thread.
+  external barrier keeps a 100 ms reserve poll for its queue bound. A third is a
+  degraded channel: without a `Capability` event the Start side reads
+  `execCapable` every 100 ms while the peer is unadvertised. Each stops when its
+  state clears, and none wakes an idle thread.
 - A mapped channel is not a live peer. Interception needs the Start side's
   `peerState=alive` and a `peerTick` younger than 600 ms; otherwise the shell's
-  own path runs. Availability is published only by the ready consumer and
-  withdrawn before it is stopped.
+  own path runs. Availability is published only by the ready consumer, only while
+  `execCapable=1`, and withdrawn before it is stopped or when the word drops.
 - A live peer is not a usable executor. The gate also proves the recorded launcher
-  thread, a window this activation created on it, a running worker, and the
-  primitive the decision needs.
+  thread, a window this activation created on it, a running worker, the verified
+  layout and the primitive the decision needs; `execCapable` is the shared answer.
 - One mechanism, one log shape. A decision line and an executor line per
   trigger; no per-trigger branch in either mod.
 - A wrong-thread launcher call is not a clean error. Never call from a hook

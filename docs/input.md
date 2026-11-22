@@ -97,7 +97,10 @@ The one wake that exists with nothing to do is the peer heartbeat: while this
 activation advertises a service, the wait times out every
 `kSwipePeerTickIntervalMs` (100 ms) to refresh `peerTick`, because the bridge
 reads a tick younger than `kSwipePeerStaleMs` (600 ms). With the peer withheld
-or gone the wait is `INFINITE` — no timer, no poll, no wake. Measured with the
+or gone the wait is `INFINITE` — no timer, no poll, no wake — except for one
+degraded channel: if the bridge's `Capability` event could not be created, a
+100 ms read of `execCapable` runs while the peer is unadvertised so the first 1
+is not missed. Measured with the
 menu closed and nothing touching the screen, on this build: **190 wakes/s and
 32 DWM cloak queries/s before, 9.2 wakes/s and 0 queries/s after**, and the
 Start host's idle CPU fell from 0.625 % to 0.026 % of one core.

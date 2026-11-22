@@ -8,20 +8,21 @@
 // Shared-memory contract between the StartMenuExperienceHost-side controller and
 // the explorer-side bridge.
 //
-// Two processes, one session-local section and four auto-reset events. There is
+// Two processes, one session-local section and five auto-reset events. There is
 // no file, no mutex and no polling: every record carries its own sequence
 // number, and a reader accepts a record only when that number did not move
 // while the record was being copied.
 //
-//   Local\SwipeFor10Start_SingleMod2_State      SwipeIpcState
-//   Local\SwipeFor10Start_SingleMod2_Intent     auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod2_IntentAck  auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod2_Exec       auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod2_ExecAck    auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod3_State      SwipeIpcState
+//   Local\SwipeFor10Start_SingleMod3_Intent     auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod3_IntentAck  auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod3_Exec       auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod3_ExecAck    auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod3_Capability auto-reset, bridge -> Start
 //
 // The names are session-local because both processes run as the same user in the
 // same session. There is no product version word: the ABI namespace *is* the
-// layout identity. The `2` marks the 224-byte layout that added `intentTaken`; a
+// layout identity. The `3` marks the 232-byte layout that added `execCapable`; a
 // future incompatible layout changes the prefix again, so an old
 // pinned development image can never join this channel and a same-size change is
 // never reinterpreted across a staggered update. Only a single shipping mod
@@ -125,19 +126,31 @@
 // alive and the tick is younger than kSwipePeerStaleMs: a clean disable is
 // immediate through peerState, and a crashed host is caught by the tick going
 // stale. That window is a detection budget, not a delivery guarantee.
+//
+// Executor capability (bridge -> Start): execCapable is one word. It is 1 only
+// while the bridge has an executor window created on the recorded launcher
+// thread, a started worker, a verified launcher layout and the show/dismiss
+// primitives that window will call. The bridge clears it on any loss - unload,
+// window destruction, worker exit, symbol refusal - and signals capabilityEvent.
+// The Start side publishes peerState=alive only while execCapable is 1 and
+// withdraws it when the word drops, so a mapping is never mistaken for a usable
+// executor. The word is a flag, not a record: the reader takes the steady value
+// and the event only says that it changed.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_SingleMod2_State";
+    L"Local\\SwipeFor10Start_SingleMod3_State";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod2_Intent";
+    L"Local\\SwipeFor10Start_SingleMod3_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod2_IntentAck";
+    L"Local\\SwipeFor10Start_SingleMod3_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod2_Exec";
+    L"Local\\SwipeFor10Start_SingleMod3_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod2_ExecAck";
+    L"Local\\SwipeFor10Start_SingleMod3_ExecAck";
+constexpr wchar_t kSwipeIpcCapabilityEventName[] =
+    L"Local\\SwipeFor10Start_SingleMod3_Capability";
 
-constexpr uint32_t kSwipeIpcMagic = 0x53323053;  // 'S' '0' '2' 'S', LE
+constexpr uint32_t kSwipeIpcMagic = 0x53333053;  // 'S' '3' '0' 'S', LE
 
 // M3 intents, executor commands and acknowledgements.
 constexpr int32_t kSwipeIntentOpen = 0;
@@ -299,6 +312,12 @@ struct SwipeIpcState {
     // is still untaken". One atomic word, not a seqlock: it is a claim, not a
     // record with fields that must agree.
     volatile LONG64 intentTaken;
+
+    // Bridge -> Start: 1 only while the executor can actually execute. The Start
+    // side requires it before it advertises a controller and before it drives a
+    // touch open or close; a press is never swallowed for a bridge that cannot
+    // perform the command. Written by the bridge, read by the Start side.
+    volatile LONG execCapable;
 };
 
 static_assert(offsetof(SwipeIpcState, magic) == 0, "layout");
@@ -339,7 +358,8 @@ static_assert(offsetof(SwipeIpcState, peerTick) == 204, "layout");
 static_assert(offsetof(SwipeIpcState, peerState) == 208, "layout");
 static_assert(offsetof(SwipeIpcState, peerEpoch) == 212, "layout");
 static_assert(offsetof(SwipeIpcState, intentTaken) == 216, "layout");
-static_assert(sizeof(SwipeIpcState) == 224, "layout");
+static_assert(offsetof(SwipeIpcState, execCapable) == 224, "layout");
+static_assert(sizeof(SwipeIpcState) == 232, "layout");
 
 struct SwipeIpcChannel {
     SwipeIpcState* state;
@@ -348,6 +368,7 @@ struct SwipeIpcChannel {
     HANDLE intentAckEvent;
     HANDLE execEvent;
     HANDLE execAckEvent;
+    HANDLE capabilityEvent;
 };
 
 // Reads a 64-bit field that the other process may write at any time.
@@ -524,6 +545,8 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
         CreateEventW(nullptr, FALSE, FALSE, kSwipeIpcExecEventName);
     HANDLE execAckEvent =
         CreateEventW(nullptr, FALSE, FALSE, kSwipeIpcExecAckEventName);
+    HANDLE capabilityEvent =
+        CreateEventW(nullptr, FALSE, FALSE, kSwipeIpcCapabilityEventName);
 
     *error = 0;
     channel->state = state;
@@ -532,6 +555,7 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
     channel->intentAckEvent = intentAckEvent;
     channel->execEvent = execEvent;
     channel->execAckEvent = execAckEvent;
+    channel->capabilityEvent = capabilityEvent;
     return true;
 }
 
@@ -556,6 +580,9 @@ inline void SwipeIpcClose(SwipeIpcChannel* channel) {
     }
     if (channel->execAckEvent) {
         CloseHandle(channel->execAckEvent);
+    }
+    if (channel->capabilityEvent) {
+        CloseHandle(channel->capabilityEvent);
     }
     *channel = SwipeIpcChannel{};
 }
@@ -1002,4 +1029,23 @@ inline bool SwipeIpcPeerAlive(SwipeIpcChannel* channel, uint32_t staleMs) {
         return false;
     }
     return now - tick < staleMs;
+}
+
+// The executor capability word. The bridge writes it only from the lifecycle
+// points that can add or remove a piece of the executor (window, worker,
+// symbols, unload); the Start side only reads it. The event is a wake, not the
+// fact: a reader that missed a signal still sees the steady value.
+inline void SwipeIpcPublishExecCapable(SwipeIpcChannel* channel, bool capable) {
+    if (!channel->state) {
+        return;
+    }
+    InterlockedExchange(&channel->state->execCapable, capable ? 1 : 0);
+    if (channel->capabilityEvent) {
+        SetEvent(channel->capabilityEvent);
+    }
+}
+
+inline bool SwipeIpcExecCapable(SwipeIpcChannel* channel) {
+    return channel->state != nullptr &&
+           InterlockedCompareExchange(&channel->state->execCapable, 0, 0) == 1;
 }

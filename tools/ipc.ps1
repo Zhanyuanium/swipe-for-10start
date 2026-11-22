@@ -4,7 +4,8 @@
 #          defines.
 # [OUTPUT]: `pwsh -File tools/ipc.ps1 -State` prints one snapshot of the channel
 #           (each record with the sequence it was copied under, plus the controller
-#           words, the peer liveness pair and the peer activation epoch) and
+#           words, the peer liveness pair, the peer activation epoch and the
+#           bridge's execCapable word) and
 #           refuses a section whose initState is not ready or whose magic or
 #           layoutBytes is not this header's.
 # [POS]: the read-only view of the merged mod's channel. There is no command
@@ -30,7 +31,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_SingleMod2_State'
+$StateName = 'Local\SwipeFor10Start_SingleMod3_State'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -70,7 +71,8 @@ $OffsetPeerTick = 204
 $OffsetPeerState = 208
 $OffsetPeerEpoch = 212
 $OffsetIntentTaken = 216
-$StateBytes = 224
+$OffsetExecCapable = 224
+$StateBytes = 232
 
 # The ack outcome and visibility words are shared constants (swipe_ipc_shared.h).
 # A missing key prints a blank name, the number is still shown beside it.
@@ -145,7 +147,7 @@ try {
     $magic = $view.ReadUInt32($OffsetMagic)
     $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
     $initState = $view.ReadInt32($OffsetInitState)
-    if ($initState -ne 2 -or $magic -ne 0x53323053 -or
+    if ($initState -ne 2 -or $magic -ne 0x53333053 -or
         $layoutBytes -ne $StateBytes) {
         $detail = ('magic=0x{0:X8} layoutBytes={1} initState={2}') -f
                   $magic, $layoutBytes, $initState
@@ -215,6 +217,7 @@ try {
         peerTick            = $view.ReadUInt32($OffsetPeerTick)
         peerState           = $view.ReadInt32($OffsetPeerState)
         peerEpoch           = $view.ReadUInt32($OffsetPeerEpoch)
+        execCapable         = $view.ReadInt32($OffsetExecCapable)
     } | Format-List
     $view.Dispose()
 } finally {

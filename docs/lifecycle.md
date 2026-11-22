@@ -28,7 +28,10 @@ reachable.
    a complete install or makes the next install refuse before `HookSymbols`. The
    input thread also withdraws non-terminally (`renderer-lost`) whenever
    `RendererReady()` goes false and republishes when a usable replacement is
-   attached; that withdrawal is before any interception can happen again. It
+   attached; that withdrawal is before any interception can happen again. A
+   capability drop is the same kind of withdrawal: `capability-lost`, the shared
+   direction/touch cleared, the driven gesture/close released, and `Progress`
+   restored at the cloak's rest. It
    signals the input
    thread's stop event and posts `WM_QUIT` as a second signal for a queued
    message, then joins the thread **INFINITE**, never on that thread.
@@ -68,14 +71,18 @@ them explicitly on the UI thread.
 ## Explorer (explorer.exe)
 
 1. **`Wh_ModBeforeUninit`** takes the symbol-install lock, sets `g_disabled`,
-   clears `g_execReady` and signals `g_execStopEvent`. Every hook and the
+   clears `g_execReady`, clears the published `execCapable` word and signals
+   `g_execStopEvent`. Every hook and the
    executor's WndProc reads `g_disabled` and passes; the worker's wait sees the
    stop before the `Exec` event. The launcher hooks are applied inside the same
    lock as their resolution, so a stop either waits for the complete install or
    makes the install refuse; the worker never applies hooks after this point.
 2. **`Wh_ModUninit`** joins the posting worker **INFINITE**. The worker never
    calls the launcher synchronously and never waits for an owner callback, so
-   this join cannot be held up by the launcher thread.
+   this join cannot be held up by the launcher thread. The window destruction
+   publishes the terminal clear again (`exec capable=0 reason=window-gone`), and
+   the class teardown writes the last `exec capable=0 reason=uninit` before the
+   section is closed.
 3. The one published HWND is destroyed on its owner thread: directly when the
    unload already runs there, otherwise through the private
    `kExecTeardownMessage`, which kills the dismiss/probe/latch timers and calls

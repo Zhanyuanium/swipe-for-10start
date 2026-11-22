@@ -7,7 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
-| `v0.8.0` | 0.8.0 | — | 224 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
+| `v0.8.0` | 0.8.0 | — | 232 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger; an executor capability word |
 | `v0.7.0` | 0.7.0 | — | 216 B | one mod, two processes: the collection's review answered (symbol hooks, no pin, deadline-driven wakeups, tap rejection, lean channel) |
 | `v0.6.2` | 0.44.0 | 0.25.0 | v7 | M3.3: one controller, one executor |
 | `v0.6.1` | 0.40.0 | 0.21.0 | v4 | intent direction from the controller state; no press lost after a gesture close |
@@ -48,16 +48,24 @@ can fight.
   retract no longer resurrects the menu afterwards, and a consumed contact ends
   only on its lift or a report that proves another contact — never on the
   digitizer's quiet through a hide.
+- **A capability, not a mapping.** The bridge publishes one `execCapable` word
+  only while its worker, the executor window on the recorded launcher thread, the
+  verified launcher layout and the show/dismiss primitives all exist. The Start
+  side advertises, animates and commands only while that word is 1; a drop
+  withdraws the peer, releases the panel and restores its rest. Launcher symbols
+  are resolved once per module per install, with a terminal `unresolved` line,
+  instead of a retry loop that could stall every press. The reference image is
+  `twinui.pcshell.dll` fixed 10.0.26100.10068.
 - **Two diagnostic lines.** `exec dismiss enter ... at=` dates the launcher call
   from before it was entered, and `motion sample` records the position and slope
   a takeover read. Both are written only with `DiagnosticTrace`.
 - **A tracker for the evidence.** `tools/panel_edge_track.ps1` samples the
   panel's trailing edge for any of the four docks, which is how every claim above
   was judged in pixels rather than in logs.
-- **The channel is 224 bytes.** `intentTaken` at 216 is new in this release; the
-  layout grows from the 216 bytes of the previous tag to 224. No separate ABI
-  bump is needed because `v0.8.0` itself is the boundary: the tag names one
-  mod built from one layout.
+- **The channel is 232 bytes.** `intentTaken` at 216 and `execCapable` at 224 are
+  new in this release; the layout grows from the 216 bytes of the previous tag
+  through 224 to 232. The `SingleMod3` namespace is the ABI identity: the tag
+  names one mod built from one layout.
 
 Still owed, and named in `docs/limits.md`: the top and right docks are
 implemented but unmeasured on this machine, a pen by hand, and a consumed finger

@@ -108,6 +108,15 @@ $startMenu = Join-Path $PSScriptRoot 'start_menu.ps1'
 $inject = Join-Path $PSScriptRoot 'inject_swipe.ps1'
 $rows = New-Object System.Collections.Generic.List[object]
 
+# A smoke run is minutes. A `t=` more than an hour ahead of the run mark is a
+# line from a previous boot: GetTickCount64 restarts from zero, and the logs are
+# appended across boots, so a plain `t >= mark` cursor would otherwise accept an
+# old boot's larger tick and wait for its deadline.
+$RunWindowMs = 3600000
+function In-Run { param([long]$Tick, [long]$From)
+    return ($Tick -ge $From) -and ($Tick -le ($From + $RunWindowMs))
+}
+
 if (-not ('Smoke.Native' -as [type])) {
     Add-Type -Namespace Smoke -Name Native -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, System.UIntPtr extra);
@@ -155,7 +164,7 @@ function Mark {
 function New-Lines { param($fromTick, [string]$Path = $Log)
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
     return @(Get-Content -LiteralPath $Path | Where-Object {
-        $_ -match '^t=(\d+) ' -and [long]$Matches[1] -ge [long]$fromTick
+        $_ -match '^t=(\d+) ' -and (In-Run ([long]$Matches[1]) ([long]$fromTick))
     })
 }
 function State {
@@ -222,7 +231,7 @@ function Get-Layout {
     $allLines = @()
     if (Test-Path -LiteralPath $Log) { $allLines = @(Get-Content -LiteralPath $Log) }
     $lines = @($allLines | Where-Object {
-        $_ -match '^t=(\d+) ' -and [long]$Matches[1] -ge $Since
+        $_ -match '^t=(\d+) ' -and (In-Run ([long]$Matches[1]) ([long]$Since))
     })
     $layout = [pscustomobject]@{
         Axis = 3; Low = 804; High = 900; Left = 236; Top = 265; Right = 1229; Bottom = 840

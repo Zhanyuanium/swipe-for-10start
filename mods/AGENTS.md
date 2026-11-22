@@ -3,7 +3,7 @@
 
 ## Shipping mod
 
-### swipe-for-10start.wh.cpp (0.7.0, StartMenuExperienceHost.exe + explorer.exe)
+### swipe-for-10start.wh.cpp (0.8.0, StartMenuExperienceHost.exe + explorer.exe)
 One image, installed once and loaded into two hosts that never share a process.
 The file holds both halves in named namespaces — `start` (the controller and the
 touch gesture) and `bridge` (the launcher executor and the non-touch triggers) —
@@ -58,7 +58,8 @@ scroll survey and its gate; the unhealed-window rule; the geometry snapshot and
 its lock; the close record; and the peer liveness the bridge's interception
 gate reads. `peerEpoch` is claimed once per attach; `peerState=alive` is
 published only by the input thread once its window, its message loop and its
-intent event exist (intent-consumer readiness — a refused raw-input registration
+intent event exist, the root is attached, and the bridge's `execCapable` word is
+1 (intent-consumer readiness — a refused raw-input registration
 is logged and does not withdraw it), and the tick is refreshed from that thread's
 deadline service on every wake and from every positioned report, at most once per
 100 ms, and only while the peer is advertised. Readiness is
@@ -66,7 +67,11 @@ continuing: `RendererReady()` (root attached and not invalidated) is part of the
 announcement, and a renderer loss withdraws
 (`ipc peer gone reason=renderer-lost terminal=0`) before the bridge can intercept;
 the UI thread's renderer event republishes when a usable replacement attaches.
-Withdrawal is
+A capability drop is a second withdrawal (`reason=capability-lost`): the shared
+direction/touch are reset, the gesture or close this side was driving is ended,
+and `Progress` is restored at the cloak's rest (`0` hidden, `1` shown) by the
+input thread. A gain logs `ipc capability gained` and the normal publication path
+runs; the 1 -> 0 direction is the one that must never animate. Withdrawal is
 recursive and precedes every stop: `gone` plus `controllerDirection=0` plus
 `controllerTouch=0`, written before the input thread is stopped and again as it
 leaves for any reason. Publication and the terminal withdrawal share one SRW
@@ -75,15 +80,20 @@ the consumer withdraws before it unregisters its devices, and a renderer
 republish that races the unload is refused by the same lock.
 
 **What wakes the input thread.** There is no period. The thread waits on the
-stop event, the bridge's intent and executor-ack events, the renderer event, the
-cloak event and one high-resolution one-shot timer, and `NextInputDeadlineMs`
+stop event, the bridge's intent and executor-ack events, the capability event,
+the renderer event,
+the cloak event and one high-resolution one-shot timer, and `NextInputDeadlineMs`
 arms that timer for the soonest deadline only: the 8 ms coast start (later for a
 follow, whose 50 ms entry guard cannot start one earlier), the 18 ms
 idle release, the 120 ms candidate watchdog, the 18 ms latch/identity expiry, the
 armed close tap, the close record's 600 ms repair bound (`RepairExpiredClose`),
 the show/dismiss executor budgets, the settled measurement's
 400 ms guaranteed turn, the scroller retry, the fallback watch and the root-hook
-bootstrap probe. Nothing due disarms it. The scroller retry is the one deadline
+bootstrap probe. Nothing due disarms it. The capability event is a wake only; the
+next pass reads the steady word. A channel whose capability event could not be
+created arms a 100 ms read while the peer is unadvertised; that fallback stops
+once the peer is advertised or the event exists. The scroller retry is the one
+deadline
 written by the UI thread; it posts a private wake to the input window so a
 planner that already read the previous value re-reads it. A held release (a
 touch show in flight,
@@ -420,10 +430,10 @@ restarts (a measured limit, not a bug to paper over).
 ### The executor (namespace bridge, explorer.exe)
 The launcher executor and the non-touch triggers.
 
-**Launcher read.** `s_pLauncher` at `twinui.pcshell.dll + 0x948E80` is the
+**Launcher read.** `s_pLauncher` at `twinui.pcshell.dll + 0x95F0E8` is the
 outer object; the execution interface is `outer + 0x18`; `[+0x160]` is the
 `IXamlLauncherState` and must be `> 0x10000`. `ShowStartView` is
-`twinui+0x141AF0`, `Dismiss` `+0x25D670`, `IsVisible` `+0x1F9B40`. One checked
+`twinui+0xF6EC0`, `Dismiss` `+0x25A060`, `IsVisible` `+0x1F6790`. One checked
 reader answers readiness (`LauncherStateReady`): the hook paths, `LauncherNow`
 and `OwnResyncFromState` use it, so the constructor's `0x100` sentinel is never
 dereferenced. `OwnIsVisible`/`OwnInternalState` refuse an unready pointer
@@ -436,20 +446,19 @@ hook's pointer.
 **Launcher symbols.** Every launcher entry point, the `s_pLauncher` slot and
 `IsVisible` are resolved by one `WindhawkUtils::SYMBOL_HOOK` array and one
 `HookSymbols` call on the loaded `twinui.pcshell.dll`. The names are DIA's
-undecorated public-symbol strings for 10.0.26100.9949. The fixed VAs, the
+undecorated public-symbol strings for 10.0.26100.10068. The fixed VAs, the
 file-version/timestamp compare, the executable-range check and the prologue/body
 probes are deleted. The `LoadLibraryExW` notification only records the returned
 module; the executor worker runs the resolution, because the first call starts
 Windhawk's PDB fetch and blocking a thread Explorer owns freezes the shell. The
-worker's wait has a deadline only while that probe is unresolved: it is throttled
-to one attempt per 100 ms, so a false result while the fetch runs is
-pending (`exec launcher symbols pending attempt=... waited=...ms
-deadline=240000ms`), never a refusal. The deadline produces `unresolved` and no
-launcher hook; a still-blocked fetch leaves the mod passive (the shell's own
-path serves every trigger) but never blocks Explorer. **Once the symbols resolve
-or the deadline terminally refuses them, the worker's wait has no timeout**: it
+worker waits 100 ms at a time only until it can start its **one** `HookSymbols`
+call; that is a wait for the module, not a retry of the fetch. A false result is
+terminal (`exec launcher symbols unresolved attempts=1 ...`), and **once the
+symbols resolve
+or the one attempt refuses them, the worker's wait has no timeout**: it
 blocks on the stop, Exec and IntentAck events and wakes only for a command or an
-intent answer. The executor's
+intent answer. A still-blocked fetch leaves the mod passive (the shell's own
+path serves every trigger) but never blocks Explorer. The executor's
 own timers — the dismiss delay, the visibility confirmation, the press latch,
 the press ack bound and the open-generation gate — are message timers on the
 launcher thread's window, which
@@ -461,7 +470,7 @@ expected=... match=0|1`); the set line
 line. One missing symbol refuses the whole set and the hooks are not applied: a
 toggle that can open but not close is worse than the shell's path. The private
 layout is gated on identity, not names: the fixed file version must be
-`10.0.26100.9974` and all 13 resolved RVAs must match the reference. On any
+`10.0.26100.10068` and all 13 resolved RVAs must match the reference. On any
 other image the hooks pass, `LauncherNow` returns null, the executor refuses
 and the shell serves the press; one
 `exec launcher layout unverified ... native=1 reason=...` line states it, and
@@ -470,6 +479,14 @@ the verified image logs `exec launcher layout verified ... native=0`. The apply
 the lock is released: `BeforeUninit` either waits for the complete install or
 takes the lock first and makes the install refuse before `HookSymbols`, so no
 hook can become live after the stop.
+
+**One attempt.** `HookSymbols` blocks on the public PDB fetch (measured up to
+571 s), so the worker calls it once per module per install. A false result is
+terminal: `exec launcher symbols unresolved attempts=1 ...`, no retry, and every
+trigger stays native. A resolved set with an unverified layout is the other
+terminal state; the image cannot change under the loaded module, so retrying the
+fetch would not help. No press ever waits on symbol work: the gate reads the
+capability word.
 
 **Executor.** A hidden message-only window, class
 `WindhawkSwipeFor10Start.Executor` (fixed, registered under `&__ImageBase`),
@@ -489,8 +506,16 @@ away blocks the unload. The procedure refuses every dispatch (`kExecMessage`,
 timers) for an HWND other than the currently published one. Readiness is
 published by the worker itself after its exit guard is installed, and the gate
 also reads `g_disabled`, so a late positive write from a stopping worker is
-unreadable. A worker waits on `Exec` with a 100 ms timeout and posts
-`WM_APP+0x5A`; each timeout runs the launcher symbol probe, so the same thread
+unreadable. The full capability is `PublishExecutorCapability`: it writes the
+shared `execCapable` word and wakes the Start side at every lifecycle point
+(`window`, `worker`, `symbols`, `window-gone`, `worker-exit`, `unload`,
+`uninit`), with one `exec capable=1|0 reason=...` line per transition. A window
+alone, a worker alone or resolved names alone are not enough; all of them plus
+the verified layout and the callable primitives must hold. The worker waits on
+`Exec` (plus stop and intent ack); before its one
+symbol attempt it also waits 100 ms at a time for `twinui.pcshell.dll`, and after
+that attempt its wait is INFINITE. Each command wakes it and it posts
+`WM_APP+0x5A`, so the same thread
 owns the fetch and the commands but never a thread Explorer uses. The WndProc
 reads the command, validates it and calls the launcher with an empty stack, and
 a `WAIT_FAILED`/unexpected exit clears readiness.
@@ -510,7 +535,7 @@ seq=... visible=... after=<real ms>`) instead of treating `hr=0` as a hide, and 
 probe or timer failure is answered `unknown`.
 
 **Triggers.**
-- `OnHotkeyInvoke_Hook` (0x14195C): Shift/Ctrl/Alt is a hard gate; the shell's
+- `OnHotkeyInvoke_Hook` (0xF6D2C): Shift/Ctrl/Alt is a hard gate; the shell's
   own open flag passes; otherwise the one dispatcher decides. It creates the
   executor window on this thread.
 - `ShowStartView_Hook`: method 11 is the Start button's open trigger; any other
@@ -524,7 +549,7 @@ probe or timer failure is answered `unknown`.
   dismiss is swallowed only while the controller owns the panel. Both button
   methods go through the same dispatcher as the Win key, so a press during a
   retract is a reopen whatever primitive it entered through.
-- `HideStartAndCortana_Hook` (0x24BCB0): lock/unknown/Win+Tab and a forwarded
+- `HideStartAndCortana_Hook` (0x2485E0): lock/unknown/Win+Tab and a forwarded
   modified press publish `intent=external` and pass. An admitted click-away is not
   a close by definition: it reaches the one dispatcher, so `closing` makes it the
   reopen only while a real left button is down (`ClickAwayPointerNow`); a z-band
@@ -567,10 +592,11 @@ probe or timer failure is answered `unknown`.
   wrapper hook around a proven caller's original call, restoring the previous
   value so nesting and re-entry are safe; it is not a return-address match.
   `XamlLauncherState::DismissStartAndCortana` (0x4991C0) is Ordinary,
-  `XamlLauncher::DismissSynchronouslyWithoutTransition` (0x48F7C0) is Lock, and
-  `ImmersiveMonitorHelper::ActiveZBandChangedForMonitor` (0x24FC50) is
-  ClickAway; its body carries the synchronous `mov edx,7; call [vtable+0x48]`
-  (0x24FDDE). A ClickAway scope with any other method is treated as unclassified
+  `XamlLauncher::DismissSynchronouslyWithoutTransition` (0x48FF20) is Lock, and
+  `ImmersiveMonitorHelper::ActiveZBandChangedForMonitor` (0x24C550) is
+  ClickAway; its body carries the synchronous method-7 call (the 9949
+  analysis measured it at +0x18E; the installed wrapper uses the symbol, not the
+  offset). A ClickAway scope with any other method is treated as unclassified
   and passes external, never as a second click-away. The old fourth return
   address, 0x4916D0, is a WRL delegate invoker with no public symbol; DIA names
   the instantiation after a `CortanaExperienceManager` typed event, but WRL
@@ -586,11 +612,13 @@ probe or timer failure is answered `unknown`.
   side's `peerState=alive` and a `peerTick` younger than 600 ms, with the clock
   read after the tick. Then an open channel, a started worker and no disable in
   flight, then the recorded launcher thread (`reason=wrong-thread` otherwise),
-  then a window created on this thread. The gate returns the **admitting epoch**:
+  then a window created on this thread, then `execCapable=1`
+  (`reason=no-capability` otherwise). The gate returns the **admitting epoch**:
   the same read that proved the peer is the value the latch stores, so a restart
   between admission and latch creation cannot relabel an old press. Without the
   gate the trigger passes to the
-  shell (`own pass trigger=... reason=no-peer` and the other reasons); nothing is
+  shell (`own pass trigger=... reason=no-peer`, `reason=no-executor`,
+  `reason=no-capability` and the other reasons); nothing is
   swallowed for a command nobody would execute. With an older press outstanding or
   queued, a stale peer is not a pass: on the recorded launcher thread the gate
   logs `reason=peer-stale-queued` and lets the press reach admission, which
@@ -598,8 +626,8 @@ probe or timer failure is answered `unknown`.
   launcher-local, so the gate reads it only after the thread is proven. The
   channel alone is not the
   condition: this mod creates it, so it stays valid with the Start mod disabled.
-  A failed worker startup is the same case for the life of the attachment. 600 ms
-  is a detection budget, not a delivery guarantee.
+  A failed worker startup or a failed symbol attempt is the same case for the life
+  of the attachment. 600 ms is a detection budget, not a delivery guarantee.
 - `IntentShouldClose`: the controller's one direction word decides. `2` is a
   reopen (close in flight), `1` is a close, and `0` falls back to the cloak and
   the internal state (1/3/5 open or opening, 7/9/11 closing). The shell's state
@@ -772,20 +800,21 @@ that does not exit, a delegate that does not revoke, a window that does not go
 away) keeps the unload waiting; there is no residual success and no deferred
 close. `docs/lifecycle.md` has the order and the blocking cases.
 
-### swipe_ipc_shared.h (merged mod, 224 bytes)
+### swipe_ipc_shared.h (merged mod, 232 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**,
 and so is the debug command channel (0.7.0): its record, mutex, event and parser
 were deleted. The records that ship are the open generation, the
 intent and its ack and the `intentTaken` claim, the executor command and its ack,
 one controller direction
-word, the touch flag, and the peer liveness triple `peerTick` (204,
+word, the touch flag, the peer liveness triple `peerTick` (204,
 GetTickCount64 low bits) / `peerState` (208, alive/gone) / `peerEpoch` (212, the
-activation identity), plus `intentTaken` (216, the consumer's claim, written
-before it acts). Every offset is asserted; the magic is `0x53323053`. There
+activation identity), `intentTaken` (216, the consumer's claim, written
+before it acts), and `execCapable` (224, the bridge's one-word executor promise).
+Every offset is asserted; the magic is `0x53333053`. There
 is **no version word**: the object namespace
-(`Local\SwipeFor10Start_SingleMod2_*`) is the ABI identity, so an old development
-image cannot join and a future layout changes the prefix (the `2` marks the
-224-byte layout). The executor validates
+(`Local\SwipeFor10Start_SingleMod3_*`) is the ABI identity, so an old development
+image cannot join and a future layout changes the prefix (the `3` marks the
+232-byte layout and the `Capability` event). The executor validates
 each command before any launcher call: show method 1/11/16 with flags under the
 `0x8|0x4` mask, dismiss method 1/6 with no flags, cancel method/flags 0; anything
 else is refused, never clamped. The producer checks the same shared vocabulary
