@@ -37,7 +37,7 @@ What you need:
 - Windows 11, x86-64, with ExplorerPatcher's legacy Start
   (`Start_ShowClassicMode=1`). Verified on build 26300.10075
   (`twinui.pcshell.dll` fixed 10.0.26100.10068) with ExplorerPatcher 26100.9711.
-- Windhawk 2.0 or later and a touchscreen or pen.
+- Windhawk and a touchscreen or pen.
 
 Install **Swipe for 10Start** from Windhawk and enable it. One mod covers both
 processes: the gesture runs in StartMenuExperienceHost, the shell calls in Explorer.
@@ -127,77 +127,35 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   reveal and dismiss follows, the coast and the geometry snapshot; the hidden
  *   executor window on explorer's launcher thread that runs the one shell call
  *   per command; one decision line and one executor line per trigger. One intent
- *   is outstanding at a time: an admitted press waits in a four-entry FIFO until
- *   the intent ack for the press before it (or its 1000 ms bound) and then decides
- *   from the direction the controller published by then; an ack timeout reads
- *   the Start side's `intentTaken` claim: a taken sequence is consumed and holds
- *   the queue until its ack, an untaken current record with a live peer is
- *   reserved (never overwritten), and only a moved record or a peer whose state
- *   is gone is replayed. Admission reconciliation reads the same claim and holds
- *   the slot on a claim found there.
- *   A queue overflow drops the arriving press with the depth and keeps the
- *   queue's order; a press still unpublished past its wait runs the shell's own
- *   primitive under the executor guard. Every
- *   line goes through `TraceLog`: `Wh_Log` always, and the role's file only
- *   while the `DiagnosticTrace` setting is on. The two interruption dates are
- *   `motion sample` — the position and slope `TakeProgressNow` reads, once per
- *   call under the composition lock (a grab logs one, `caller=pull`, and its
- *   follow binds to it without taking again) — and `exec dismiss enter`, the QPC
- *   instant
- *   taken immediately before the launcher call and written after it returned.
- *   Wh_ModInit
- *   selects exactly one role table from the host executable name
- *   (start::Role or bridge::Role), and the four Windhawk entry points forward
- *   to that table. Wh_ModAfterInit attaches the Start half to a host that is
- *   already running by taking Window::Current().Content() on that host's own
- *   thread; the PrepareRootElement hook remains the path for a later root. The
- *   bridge reads the loaded twinui fixed file version before
- *   its one symbol attempt: any other image is refused with
- *   `exec launcher layout unverified ... skipped=version` and no PDB fetch.
- * [POS]: the single shipping source. The two halves were two mods before 0.7.0
- *   and keep their two runtime lifetimes: explorer outlives a Start restart, and
- *   a touch-first open can reach the launcher before any Win or Start-button
- *   hook ran. The controller decides; the executor performs. The one shared rule
- *   is the close record: one accepted close (serial, acceptance tick, the menu it
- *   was accepted against, a phase and the repair bound) owns the retracted panel
- *   until an ending retires it — the landing, a pull cancel, an external takeover,
- *   a terminal repair, or the repair bound itself. No reader asks a clock whether
- *   a close is in flight. The cloak read is tri-state (a failed read is
- *   unknown, never hidden), and a landing is bound to the open generation the
- *   dismiss command was stamped with — a close intent's zero is stamped with the
- *   section's current generation, and zero stays valid only while no open has
- *   been published. A fresh open cancels a still-queued command at the bridge.
- *   The same cancel body serves an explicit open request — a press, or a band pull
- *   the retract refused at or below the entry — through one recovery ticket, and
- *   the tails differ because only one request has a finger: a press settles the
- *   panel back from its live position, while a pull takes the retract over in one
- *   take — the position is pinned and the follow binds to it on the same report,
- *   keeping the finger-to-panel offset it took over rather than starting at the
- *   open's entry — and a pull the retract had already hidden starts the ordinary
- *   show at the entry and binds there. A transfer is refused when the
- *   dismiss already
- *   returned from the shell call with its hide unconfirmed, or its published
- *   deadline has passed and the bridge may already be inside the call; a refusal
- *   spends the contact's one grab opportunity and consumes it through the same
- *   mute a down refused at admission gets. A close that has already ended is not
- *   a refusal for a band down — the pull is the ordinary open of a closed menu,
- *   and the finger is not swallowed where the key works — and a landing retires
- *   no grant, so a contact still on its way to its own 24 DIP report keeps its
- *   right. A close consumes every
- *   contact already on the glass, and a landing serves no touch open of its own:
- *   only the independently owed explicit request reopens.
- *   A landing the cloak never reports — the
- *   window was already hidden when `Dismiss` ran — is finished by the executor's
- *   own confirmation (`win close observed reason=confirmed-without-transition`),
- *   never by inventing a transition; a confirmation whose cloak sample disagrees
- *   or cannot answer keeps the command, and its bound, for the transition.
- *   Nothing in either half runs on a period: the
- *   controller arms one high-resolution one-shot for the soonest deadline it has
- *   and waits on its events otherwise (the open/close state is a WinEvent with a
- *   bounded fallback poll), and the executor's worker blocks on its events once
- *   the launcher symbols resolved or were refused. The only idle wake is the
- *   100 ms peer-tick heartbeat, and only while the peer is advertised.
- * [PROTOCOL]: Update this header on change, then check AGENTS.md
+ *   is outstanding at a time: an admitted press waits in a four-entry FIFO for
+ *   the intent ack of the press before it (or its 1000 ms bound), and an ack
+ *   timeout reads the Start side's `intentTaken` claim: a taken sequence is
+ *   consumed and holds the queue until its ack, an untaken current record with a
+ *   live peer is reserved, and only a moved record or a gone peer is replayed.
+ *   A queue overflow drops the arriving press; a press still unpublished past
+ *   its wait runs the shell's own primitive under the executor guard. One role
+ *   table is chosen from the host executable name. Wh_ModAfterInit attaches the
+ *   Start half to an already-running host through Window::Current().Content(),
+ *   while PrepareRootElement remains the path for a later root. The bridge checks
+ *   the twinui file version before its one symbol attempt. Every line goes
+ *   through `TraceLog`: `Wh_Log` always, the role's file only while
+ *   `DiagnosticTrace` is on.
+ * [POS]: the single shipping source. The controller owns the gesture, the panel
+ *   claim and the close record; the executor performs the shell call and never
+ *   decides. The two lifetimes are separate: explorer outlives a Start restart,
+ *   and a touch-first open can reach the launcher before any Win or Start-button
+ *   hook ran. A close is one record (serial, the menu it was accepted against, a
+ *   phase and the repair bound); no reader asks a clock whether a close is in
+ *   flight. The cloak read is tri-state, and a landing is bound to the open
+ *   generation the dismiss command was stamped with. A fresh open cancels a
+ *   still-queued command at the bridge. A pull that cancels a close and a press
+ *   that reopens one share the cancel body; only the press settles the panel
+ *   back, because only it has no finger to bind to. Nothing runs on a period:
+ *   one high-resolution one-shot for the soonest deadline, a WinEvent for the
+ *   open/close state, and the 100 ms heartbeat only while the peer is
+ *   advertised. The state machines and the recovery ticket are recorded in the
+ *   repository's technical documentation.
+ * [PROTOCOL]: Update this header on change.
  */
 
 #include <windhawk_utils.h>
@@ -842,11 +800,6 @@ constexpr uint64_t kRevealChaseMaxStepMs = 50;
 // frame after the uncloak is composited, and the panel appears a few percent open
 // instead of exactly at the edge. It costs the catch-up that much extra time.
 constexpr uint64_t kRevealEntryHoldMs = 30;
-// The coast start/stop lines measured the coast; off in the shipping build.
-constexpr bool g_debugCoast = false;
-// The `vel window` and `follow`/`take` lines print the release-speed window one
-// release reads; off in the shipping build, like g_debugCoast.
-constexpr bool g_debugVelocity = false;
 
 // Raw input and HID decoding limits.
 constexpr int kMaxHidDevices = 4;
@@ -1270,9 +1223,9 @@ class UiDepthGuard {
 //
 // The setting stores its display label, so the label the user picks is the
 // value the code compares: exactly "Windows 10" selects the spring, and every
-// other value (including the default "Windows 11") selects the Fluent curve. A
-// missing or unrecognized value therefore lands on the default behaviour
-// instead of inventing a third one.
+// other value (including the default "Windows 11") selects the Windows 11
+// spring. A missing or unrecognized value therefore lands on the default
+// behaviour instead of inventing a third one.
 // ---------------------------------------------------------------------------
 enum class SettleStyle : int32_t {
     Win11 = 0,
@@ -1302,8 +1255,8 @@ void LoadAnimationStyle() {
     g_settleStyle.store(style, std::memory_order_relaxed);
 }
 
-// The percentage from the mod settings: the Windows 10 spring's initial
-// velocity as a percentage of the finger's release speed. Wh_ModInit and
+// The percentage from the mod settings: the settle's initial velocity as a
+// percentage of the finger's release speed. Wh_ModInit and
 // Wh_ModSettingsChanged write it, every spring settle reads it once; no setting
 // lookup runs per settle.
 std::atomic<int> g_gestureStartSpeedPercent{kGestureStartSpeedDefault};
@@ -1349,6 +1302,11 @@ NO_DESTROY wuc::Compositor g_compositor{nullptr};
 NO_DESTROY wuc::CompositionPropertySet g_state{nullptr};
 NO_DESTROY wuc::ExpressionAnimation g_translationExpression{nullptr};
 NO_DESTROY wuc::Visual g_visual{nullptr};
+// Kept: the completion stops the finished animation and clears the sampled frame
+// record after the close lands. `g_dismissSettling` is not only an alias for
+// `CloseInFlight()`: a completion delayed past the close record still suppresses
+// the heal. Removing the batch would leave the animation and its samples for the
+// next take.
 NO_DESTROY wuc::CompositionScopedBatch g_dismissBatch{nullptr};
 // The Completed registration of that batch, kept so the handler can be removed
 // before the module goes away. Written under g_compositionMutex. A revoke that
@@ -1376,26 +1334,6 @@ std::shared_ptr<ModuleEntryLease> g_settleLease;
 // the touch adapter as the only caller; the non-touch paths still use their old
 // functions, which write the same controller so the two cannot disagree.
 // ---------------------------------------------------------------------------
-enum class PanelPhase : int32_t {
-    Idle = 0,    // no motion: the value is the position
-    Drag = 1,    // a contact or a direct write owns the value
-    Coast = 2,   // the 200 ms continuation between reports
-    Settle = 3,  // a sampled curve is playing
-};
-
-const wchar_t* PanelPhaseName(PanelPhase phase) {
-    switch (phase) {
-        case PanelPhase::Drag:
-            return L"drag";
-        case PanelPhase::Coast:
-            return L"coast";
-        case PanelPhase::Settle:
-            return L"settle";
-        default:
-            return L"idle";
-    }
-}
-
 struct PanelController {
     // The value written to the property set. While a settle plays this is the
     // animation's target, not its position; only TakeProgressNow may read it as
@@ -1403,7 +1341,6 @@ struct PanelController {
     std::atomic<float> progress{kProgressRest};
     std::atomic<bool> coasting{false};
     // Guarded by g_compositionMutex, like the animation record below.
-    PanelPhase phase = PanelPhase::Idle;
     float samples[kSettleMaxFrames] = {};
     int frames = 0;
     uint64_t startQpc = 0;
@@ -1569,7 +1506,6 @@ std::array<ScrollerWatch, kMaxScrollRegions>& ScrollerWatches() {
 // open transition and the settled pass both measure the same elements, and only
 // a rect that actually moved is worth a second line. The `scroller none` line is
 // the settled pass telling the log that nothing here scrolls vertically.
-bool g_scrollerLogged = false;
 bool g_scrollerNoneLogged = false;
 bool g_scrollerOverflowLogged = false;
 bool g_scrollerRegionLogged[kMaxScrollRegions] = {};
@@ -2156,10 +2092,6 @@ std::atomic<HWND> g_hidHwnd{nullptr};
 // next to the idle tick and the two IPC events, so it leaves the loop even when
 // the thread has not published g_hidHwnd yet. Set once, by the unload.
 HANDLE g_hidStopEvent = nullptr;
-// Set when a thread outlived its wait. Unload then leaves every resource in
-// place and says so: the module cannot honestly claim it is gone while module
-// code still runs on a thread Windhawk is about to unmap.
-std::atomic<bool> g_hidThreadLeaked{false};
 
 // The root hook's outcome. `ready` is set only when
 // StartUI::App::PrepareRootElement resolved and its hook was installed;
@@ -2379,7 +2311,6 @@ bool ShowAtRest() {
         g_panel.coasting.store(false, std::memory_order_relaxed);
         g_state.InsertScalar(L"Progress", kProgressRest);
         g_panel.progress.store(kProgressRest, std::memory_order_relaxed);
-        g_panel.phase = PanelPhase::Idle;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Composition reset failed: %08X %s", e.code(),
                e.message().c_str());
@@ -2415,7 +2346,6 @@ bool InsertProgress(float progress) {
         }
         g_state.InsertScalar(L"Progress", progress);
         g_panel.progress.store(progress, std::memory_order_relaxed);
-        g_panel.phase = PanelPhase::Drag;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress update failed: %08X %s", e.code(),
                e.message().c_str());
@@ -2480,7 +2410,6 @@ bool AnimateProgressTo(float to, std::chrono::milliseconds duration,
         g_state.StartAnimation(L"Progress", animation);
         g_panel.progress.store(std::clamp(to, 0.0f, 1.0f),
                             std::memory_order_relaxed);
-        g_panel.phase = PanelPhase::Settle;
         // This animation replaces whatever owned Progress: an older batch's
         // completion must not stop it, and no dismiss settle is still running.
         // The serial this animation installs is minted here, under the same lock
@@ -2664,7 +2593,6 @@ float TakeProgressNow(const wchar_t* caller) {
     g_panel.frames = 0;
     g_panel.durationMs = 0;
     g_panel.coasting.store(false, std::memory_order_relaxed);
-    g_panel.phase = PanelPhase::Idle;
     RevokeDismissBatchLocked();
     InvalidateDismissBatchLocked();
     return value;
@@ -2723,19 +2651,12 @@ bool ProgressMotionActive() {
         return true;
     }
     if (g_panel.frames < 2 || g_panel.durationMs == 0) {
-        if (g_panel.phase == PanelPhase::Settle ||
-            g_panel.phase == PanelPhase::Coast) {
-            g_panel.phase = PanelPhase::Idle;
-        }
         return false;
     }
     const uint64_t qpcNow = QpcMsNow();
     const uint64_t elapsed =
         qpcNow > g_panel.startQpc ? qpcNow - g_panel.startQpc : 0;
     if (elapsed >= g_panel.durationMs) {
-        if (g_panel.phase == PanelPhase::Settle) {
-            g_panel.phase = PanelPhase::Idle;
-        }
         return false;
     }
     return true;
@@ -2785,7 +2706,6 @@ bool StartCoast(float from, float to) {
     g_panel.coastTo = to;
     g_panel.coastStartQpc = qpcNow;
     g_panel.coasting.store(true, std::memory_order_relaxed);
-    g_panel.phase = PanelPhase::Coast;
     return true;
 }
 
@@ -2817,7 +2737,6 @@ bool StopCoast(float& value) {
         InvalidateDismissBatchLocked();
         g_state.InsertScalar(L"Progress", value);
         g_panel.progress.store(value, std::memory_order_relaxed);
-        g_panel.phase = PanelPhase::Drag;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress coast stop failed: %08X %s", e.code(),
                e.message().c_str());
@@ -2827,23 +2746,15 @@ bool StopCoast(float& value) {
         return false;
     }
 
-    if (g_debugCoast) {
-        TraceLog(L"coast stop value=%.3f", value);
-    }
     return true;
 }
 
-// The four intents. Each records what the controller is doing before the motion
-// itself starts, so a diagnostic can name the phase without reconstructing it
-// from the animation record. A caller never waits for a previous motion: the
+// The four intents. Each writes the value the controller is moving from before
+// the motion itself starts. A caller never waits for a previous motion: the
 // value the panel has now is the value the animation was handed. The end value
-// and the seam speed are the caller's arguments and the log's; nothing is kept
-// on the controller besides the phase.
+// and the seam speed are the caller's arguments and the log's; nothing else is
+// kept on the controller.
 void PanelController::Begin(const float* position) {
-    {
-        std::lock_guard lock(g_compositionMutex);
-        phase = PanelPhase::Drag;
-    }
     if (position) {
         InsertProgress(*position);
     }
@@ -2854,19 +2765,10 @@ void PanelController::Begin(const float* position) {
 
 bool PanelController::Move(float position) {
     const float value = std::clamp(position, 0.0f, 1.0f);
-    if (!InsertProgress(value)) {
-        return false;
-    }
-    std::lock_guard lock(g_compositionMutex);
-    phase = PanelPhase::Drag;
-    return true;
+    return InsertProgress(value);
 }
 
 void PanelController::End(float to, float endVelocity) {
-    {
-        std::lock_guard lock(g_compositionMutex);
-        phase = PanelPhase::Settle;
-    }
     TraceLog(L"panel intent=end progress=%.3f velocity=%.2f target=%.0f",
             progress.load(std::memory_order_relaxed), endVelocity,
             std::clamp(to, 0.0f, 1.0f));
@@ -2876,10 +2778,6 @@ void PanelController::End(float to, float endVelocity) {
 // the far end, and has no seam speed. The samples are planned by the caller,
 // exactly as a release's are.
 void PanelController::Commit(float to) {
-    {
-        std::lock_guard lock(g_compositionMutex);
-        phase = PanelPhase::Settle;
-    }
     TraceLog(L"panel intent=commit progress=%.3f target=%.0f",
             progress.load(std::memory_order_relaxed),
             std::clamp(to, 0.0f, 1.0f));
@@ -3500,8 +3398,8 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 // Every record is a seqlock: this side bumps the counter to odd, writes, and
 // bumps it to even, so the bridge can never accept a half-written intent, exec
 // command or open generation, and this side never accepts half a command. The
-// command record is additionally serialised by a named mutex, because more than
-// one tool can publish into it.
+// command record has one writer, this side; its seqlock is what keeps the
+// bridge from reading a half-written command.
 //
 // The section outlives either process, so its sequence numbers start from
 // whatever the other side left. This mod records them at attach and acts only
@@ -5121,9 +5019,6 @@ float g_screenDipHeight = 0.0f;  // input thread only
 // value of 0, so BeginHidSession restores the resting value first.
 bool g_commitNeedsProgressReset = false;  // input thread only
 bool g_rootWasOpen = false;              // input thread only
-uint64_t g_edgeLogTick = 0;              // input thread only, diagnostic
-// The edge line was a measurement instrument: it is off in the shipping build.
-constexpr bool g_debugEdge = false;
 
 // ---------------------------------------------------------------------------
 // A close owns the panel
@@ -5399,8 +5294,6 @@ float CoastVelocity(float distance) {
 // that is moving away from its target to 0.
 constexpr uint64_t kEndVelocityWindowMs = 30;
 constexpr uint64_t kEndVelocityMinMs = 8;
-// The `vel window` line prints the whole window one release reads; off in the
-// shipping build, like g_debugCoast.
 
 struct EndVelocitySample {
     float progress = 0.0f;
@@ -5409,23 +5302,17 @@ struct EndVelocitySample {
 
 EndVelocitySample g_endVelocity[kEndVelocitySamples];
 int g_endVelocityCount = 0;  // input thread only
-int g_endVelocityCalls = 0;  // input thread only, diagnostic
-int g_endVelocityRepeats = 0;  // input thread only, diagnostic
 
 void ResetEndVelocity() {
     g_endVelocityCount = 0;
-    g_endVelocityCalls = 0;
-    g_endVelocityRepeats = 0;
 }
 
 // Keeps the last few reports of the moving panel. A report that repeats the last
 // value did not move the panel: it only makes the window end here.
 void SampleEndVelocity(float progress, uint64_t qpcMs) {
-    g_endVelocityCalls++;
     if (g_endVelocityCount > 0) {
         EndVelocitySample& newest = g_endVelocity[g_endVelocityCount - 1];
         if (newest.progress == progress) {
-            g_endVelocityRepeats++;
             newest.qpc = qpcMs;
             return;
         }
@@ -5454,7 +5341,6 @@ void SampleEndVelocity(float progress, uint64_t qpcMs) {
 // lift. The whole pair therefore need not lie inside the last 30 ms.
 float EndVelocityProgressPerMs(uint64_t releaseQpc) {
     float result = 0.0f;
-    int firstIndex = -1;
 
     do {
         if (g_endVelocityCount < 2) {
@@ -5487,7 +5373,6 @@ float EndVelocityProgressPerMs(uint64_t releaseQpc) {
                 break;
             }
             first = &g_endVelocity[i];
-            firstIndex = i;
             break;
         }
 
@@ -5501,29 +5386,6 @@ float EndVelocityProgressPerMs(uint64_t releaseQpc) {
         }
         result = (newest.progress - first->progress) / elapsed;
     } while (false);
-
-    if (g_debugVelocity) {
-        const uint64_t newestQpc =
-            g_endVelocityCount > 0
-                ? g_endVelocity[g_endVelocityCount - 1].qpc
-                : 0;
-        const uint64_t age =
-            releaseQpc > newestQpc ? releaseQpc - newestQpc : 0;
-        const uint64_t firstAge =
-            firstIndex >= 0 ? newestQpc - g_endVelocity[firstIndex].qpc : 0;
-        const float delta =
-            firstIndex >= 0
-                ? g_endVelocity[g_endVelocityCount - 1].progress -
-                      g_endVelocity[firstIndex].progress
-                : 0.0f;
-        TraceLog(L"vel window count=%d calls=%d repeats=%d rel=%llu newest=%llu "
-                L"age=%llu first=%d firstage=%llu d=%.5f raw=%.4f",
-                g_endVelocityCount, g_endVelocityCalls, g_endVelocityRepeats,
-                static_cast<unsigned long long>(releaseQpc),
-                static_cast<unsigned long long>(newestQpc),
-                static_cast<unsigned long long>(age), firstIndex,
-                static_cast<unsigned long long>(firstAge), delta, result);
-    }
 
     return result;
 }
@@ -5607,7 +5469,6 @@ void ResetActivationState() {
     g_lastOpenCheckTick = 0;
     g_skipLogTick = 0;
     g_unhealedLogTick = 0;
-    g_edgeLogTick = 0;
     g_scrollerRejectLogTick = 0;
     g_bandTailLogTick = 0;
     g_closeCancelledTick = 0;
@@ -7850,9 +7711,6 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t qpcNow) {
         if (qpcNow >= g_panel.coastStartQpc &&
             qpcNow - g_panel.coastStartQpc >=
                 static_cast<uint64_t>(kCoastDuration.count())) {
-            if (g_debugCoast) {
-                TraceLog(L"coast end value=%.3f", g_panel.coastTo);
-            }
             g_panel.Move(g_panel.coastTo);  // ends the coast, see InsertProgress
         }
         return;
@@ -7910,10 +7768,7 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t qpcNow) {
         return;  // the travel is used up; there is nothing to continue
     }
 
-    if (StartCoast(from, to) && g_debugCoast) {
-        TraceLog(L"coast start from=%.3f to=%.3f vel=%.2f", from, to,
-                velocity * distance);
-    }
+    StartCoast(from, to);
 }
 
 // Whether the idle release of both gesture families is held. The two holds end
@@ -9780,16 +9635,6 @@ void FeedContactPoint(HidDevice& device, long rawX, long rawY, USHORT reportId,
     // thread only knows in pixels; publish it in the same DIP space as xDip.
     g_screenDipWidth = static_cast<float>(screenWidth) / dpiScale;
     g_screenDipHeight = static_cast<float>(screenHeight) / dpiScale;
-
-    // Diagnostic: does the digitizer see a touch that starts on the screen edge
-    // before the menu is open? Off in the shipping build; it measured the edge
-    // contact and EP's own open threshold.
-    if (g_debugEdge && !g_hidSession.active && xDip < 200.0f &&
-        tickMs > g_edgeLogTick + 100) {
-        g_edgeLogTick = tickMs;
-        TraceLog(L"edge x=%.0f y=%.0f open=%d", xDip, yDip,
-                StartWindowIsOpen() ? 1 : 0);
-    }
 
     OnHidSample(1, xDip, yDip, tickMs);
     // Where this contact was last seen. Only the tie between two real contacts
@@ -12782,7 +12627,6 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
             continue;
         }
         g_scrollerRegionLogged[r] = true;
-        g_scrollerLogged = true;
         g_scrollerLoggedRect[r][0] = region.left;
         g_scrollerLoggedRect[r][1] = region.top;
         g_scrollerLoggedRect[r][2] = region.right;
@@ -12805,7 +12649,6 @@ void ReleaseScrollableElement() {
         // handler may write offsets into a region that describes no element.
         ScrollerWatches()[i].viewer = nullptr;
     }
-    g_scrollerLogged = false;
     g_scrollerNoneLogged = false;
     g_scrollerOverflowLogged = false;
     g_scrollerRetryLogged = false;
@@ -13821,7 +13664,6 @@ void ResetComposition() {
             g_state.InsertScalar(L"Progress", kProgressRest);
             g_panel.progress.store(kProgressRest, std::memory_order_relaxed);
         }
-        g_panel.phase = PanelPhase::Idle;
         if (g_visual) {
             g_visual.StopAnimation(L"Translation");
             g_visual.Properties().InsertVector3(
@@ -14659,8 +14501,8 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 // DIA undecorated name for 10.0.26100.10068 (fixed; the display string still
 // reads 9949), read from twinui.pcshell.pdb with the same undecorator the
 // Windhawk symbol API matches, and a name is a literal because the store's
-// symbol extractor reads only a literal. The decorated spellings are in
-// docs/re/ and are not used.
+// symbol extractor reads only a literal. The decorated spellings are not used;
+// the undecorated names above are what the symbol matcher reads.
 
 // The reference RVAs, for the resolution log and the layout identity. A
 // different value on an unknown version means the layout is not proven.
