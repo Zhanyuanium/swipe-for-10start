@@ -108,6 +108,13 @@ $readmeBlock = [regex]::Replace(
     $readmeBlock,
     '(?m)^(\*\*English\*\* \| \[简体中文\]\([^)]*\)|\[English\]\([^)]*\) \| \*\*简体中文\*\*)\r?\n\r?\n',
     '')
+# The mod page has no repository beside it, so the demo images need absolute
+# URLs; the repository guides keep the relative ones.
+$readmeBlock = $readmeBlock.Replace(
+    'docs/images/demo-bottom.gif',
+    'https://raw.githubusercontent.com/Zhanyuanium/swipe-for-10start/main/docs/images/demo-bottom.gif').Replace(
+    'docs/images/demo-left.gif',
+    'https://raw.githubusercontent.com/Zhanyuanium/swipe-for-10start/main/docs/images/demo-left.gif')
 
 $cli = $null
 if ($isStore) { $cli = Resolve-WindhawkCli }
