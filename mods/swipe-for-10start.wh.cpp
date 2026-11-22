@@ -9025,12 +9025,12 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
             g_visibilityPollUntil = watch;
         }
     }
-    const bool justOpened = open && !wasOpen;
     // A close that owns the panel reports the window open until the shell has run
     // the Hide its dismiss caused. Reading that as a reopen restored Progress 1
     // while the retract was still running, so a follow that began in that window
     // flashed the panel fully open and the window then vanished.
     const bool closeInFlight = CloseInFlight();
+    const bool justOpened = open && !wasOpen;
     if (justOpened) {
         // An open the shell really performed while this mod still owned a close.
         // The window is shown again, so the close is over: its Hide either already
@@ -9041,10 +9041,21 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         const bool openDuringClose = closeInFlight;
         if (openDuringClose) {
             TraceLog(L"win open during close progress=%.3f", PeekProgressNow());
+            // The shell showed the window while this close was retracting it.
+            // The close is over, and the controller takes the new open: both
+            // close schedules go (the local gesture deadline and the executor
+            // dismiss), the old close's recovery ticket is dropped with the
+            // record, and the direction says the next toggle is a close. Without
+            // this the direction stayed `closing` and a pending local dismiss
+            // could fire against the new menu's generation.
+            CancelCloseSchedules(L"open");
+            g_intentCancel = CloseCancelTicket{};
+            SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
+            SwipeIpcSetControllerTouch(&g_ipc, false);
             EndClose(L"open");
-            // The close is over, but the finger that was grabbing it is not the
-            // owner of this window: its grant died with the retract, and the
-            // open proceeds as the shell's own.
+            // The finger that was grabbing the retract is not the owner of this
+            // window: its grant died with the close. The open proceeds as the
+            // shell's own and settles from the panel's live position below.
         }
         // A fresh menu, so every executor command written for the previous one is
         // void from this point on, whatever its own deadline says. The
