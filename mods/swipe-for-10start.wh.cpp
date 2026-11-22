@@ -7219,6 +7219,17 @@ void LogHidRelease(const HidGestureSession& session, float velocity,
 
 void BeginHidSession(const GestureGeometry& geometry, float x, float y,
                      uint64_t tickMs) {
+    // No executor, no retract: a dismiss drag with the bridge stopped would
+    // drive Progress to 0 while no dismiss can ever hide the window, leaving an
+    // empty Start window for the next native open. The press stays the shell's.
+    if (!BridgeCapabilityNow()) {
+        if (tickMs > g_skipLogTick + 1000) {
+            g_skipLogTick = tickMs;
+            TraceLog(L"dismiss skipped no-capability");
+        }
+        return;
+    }
+
     // No gesture starts while a layout apply owns the renderer: the claim sees
     // the reservation, or the apply sees this claim and defers whole. The next
     // report retries, because no session was started.
@@ -9155,8 +9166,10 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         if (!capable) {
             // The shell opened on its own while this side has no executor. The
             // generation is recorded, but no takeover, settle or measurement
-            // starts: the panel belongs to the shell's storyboard until the
-            // bridge publishes a capability again.
+            // starts. The panel is restored to rest first: every mod-driven
+            // close leaves Progress at 0 while the window is hidden, so an
+            // unhealed native open would otherwise show an empty Start window.
+            ShowAtRest();
             g_intentOpenActive.store(false, std::memory_order_relaxed);
             g_commitNeedsProgressReset = false;
             g_rootWasOpen = open;
@@ -9555,11 +9568,12 @@ void ResetDrivenStateForCapabilityLoss() {
     g_lateRelease = RevealLateRelease{};
     g_commitNeedsProgressReset = false;
     if (RendererReady()) {
-        // The cloak, not the last animation target, decides which rest is
-        // current: 1 for a menu still on screen, 0 for a hidden one.
-        const float rest = StartWindowIsOpen() ? 1.0f : 0.0f;
-        InsertProgress(rest);
-        g_panel.phase = PanelPhase::Idle;
+        // The window is reused across opens. Restore the resting value even when
+        // the cloak currently says hidden: Progress 0 is correct only while a
+        // close is hiding the window, and the next native open has no executor
+        // to heal it. ShowAtRest stops any stale animation and leaves the panel
+        // at 1 behind the cloak.
+        ShowAtRest();
     }
 }
 
