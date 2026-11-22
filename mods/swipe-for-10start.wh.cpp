@@ -15016,6 +15016,10 @@ struct OutstandingPress {
     LONG64 seq = 0;
     uint64_t publishedTick = 0;
     QueuedPress press{};
+    // True for an external takeover's barrier: it holds subsequent publications
+    // until Start reconciles the takeover, and its timeout has no press to
+    // replay.
+    bool external = false;
 };
 OutstandingPress g_pressOutstanding;  // launcher thread only
 
@@ -15041,13 +15045,21 @@ void DropPressQueue(const wchar_t* reason) {
         if (window) {
             KillTimer(window, kPressAckTimer);
         }
-        TraceLog(L"own press dropped trigger=%s entry=%s reason=%s seq=%lld "
-                L"wait=%llu",
-                PressTriggerName(g_pressOutstanding.press.trigger),
-                PressEntryName(g_pressOutstanding.press.entry), reason,
-                static_cast<long long>(g_pressOutstanding.seq),
-                static_cast<unsigned long long>(
-                    GetTickCount64() - g_pressOutstanding.publishedTick));
+        if (g_pressOutstanding.external) {
+            TraceLog(L"own external dropped seq=%lld reason=%s wait=%llu",
+                    static_cast<long long>(g_pressOutstanding.seq), reason,
+                    static_cast<unsigned long long>(
+                        GetTickCount64() - g_pressOutstanding.publishedTick));
+        } else {
+            TraceLog(L"own press dropped trigger=%s entry=%s reason=%s "
+                    L"seq=%lld wait=%llu",
+                    PressTriggerName(g_pressOutstanding.press.trigger),
+                    PressEntryName(g_pressOutstanding.press.entry), reason,
+                    static_cast<long long>(g_pressOutstanding.seq),
+                    static_cast<unsigned long long>(
+                        GetTickCount64() -
+                        g_pressOutstanding.publishedTick));
+        }
         g_pressOutstanding = OutstandingPress{};
         ++dropped;
     }
@@ -15293,12 +15305,21 @@ void HandlePressAck() {
     if (window) {
         KillTimer(window, kPressAckTimer);
     }
-    TraceLog(L"own press ack seq=%lld state=%d trigger=%s entry=%s wait=%llu",
-            static_cast<long long>(ack.intent), ack.state,
-            PressTriggerName(press.press.trigger),
-            PressEntryName(press.press.entry),
-            static_cast<unsigned long long>(GetTickCount64() -
-                                            press.publishedTick));
+    if (press.external) {
+        TraceLog(L"own external ack seq=%lld state=%d wait=%llu "
+                L"decision=reconciled",
+                static_cast<long long>(ack.intent), ack.state,
+                static_cast<unsigned long long>(GetTickCount64() -
+                                                press.publishedTick));
+    } else {
+        TraceLog(L"own press ack seq=%lld state=%d trigger=%s entry=%s "
+                L"wait=%llu",
+                static_cast<long long>(ack.intent), ack.state,
+                PressTriggerName(press.press.trigger),
+                PressEntryName(press.press.entry),
+                static_cast<unsigned long long>(GetTickCount64() -
+                                                press.publishedTick));
+    }
     ServeNextPress(L"ack");
 }
 
@@ -15332,13 +15353,21 @@ void HandlePressAckTimeout() {
         if (window) {
             KillTimer(window, kPressAckTimer);
         }
-        TraceLog(L"own press ack late seq=%lld state=%d trigger=%s entry=%s "
-                L"wait=%llu",
-                static_cast<long long>(ack.intent), ack.state,
-                PressTriggerName(press.press.trigger),
-                PressEntryName(press.press.entry),
-                static_cast<unsigned long long>(GetTickCount64() -
-                                                press.publishedTick));
+        if (press.external) {
+            TraceLog(L"own external ack late seq=%lld state=%d wait=%llu "
+                    L"decision=reconciled",
+                    static_cast<long long>(ack.intent), ack.state,
+                    static_cast<unsigned long long>(GetTickCount64() -
+                                                    press.publishedTick));
+        } else {
+            TraceLog(L"own press ack late seq=%lld state=%d trigger=%s "
+                    L"entry=%s wait=%llu",
+                    static_cast<long long>(ack.intent), ack.state,
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(GetTickCount64() -
+                                                    press.publishedTick));
+        }
         ServeNextPress(L"late-ack");
         return;
     }
@@ -15354,6 +15383,19 @@ void HandlePressAckTimeout() {
         KillTimer(window, kPressAckTimer);
     }
     const uint64_t wait = GetTickCount64() - press.publishedTick;
+    if (press.external) {
+        // The takeover itself is native and has no original to replay. A live
+        // peer that is silent is treated as having reconciled it so the held
+        // presses can start; a gone/stale peer means they cannot be published,
+        // and their own turns run them natively under the usual timeout policy.
+        TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
+                L"epoch=%u decision=%s",
+                static_cast<long long>(press.seq),
+                static_cast<unsigned long long>(wait), peer, peerAge,
+                PeerEpochNow(), peerAlive ? L"consumed" : L"unobserved");
+        ServeNextPress(L"timeout");
+        return;
+    }
     TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
             L"peer=%s age=%u epoch=%u decision=%s",
             static_cast<long long>(press.seq),
@@ -17150,6 +17192,25 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                                                             : L"override")),
             static_cast<long long>(sequence),
             static_cast<unsigned long long>(open), method, flags);
+    if (kind == kSwipeIntentExternal && sequence > 0) {
+        // The takeover itself is native and immediate. What follows it is not:
+        // until Start answers this record, a press would overwrite the one slot
+        // with an intent the takeover has already made obsolete. The barrier
+        // holds those publications; its bound is the same ack bound.
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window && SetTimer(window, kPressAckTimer,
+                               static_cast<UINT>(kPressAckTimeoutMs),
+                               nullptr) != 0) {
+            g_pressOutstanding = OutstandingPress{true, sequence,
+                                                  GetTickCount64(),
+                                                  QueuedPress{}, true};
+            TraceLog(L"own external barrier seq=%lld armed",
+                    static_cast<long long>(sequence));
+        } else {
+            TraceLog(L"own external barrier seq=%lld unarmed err=%u",
+                    static_cast<long long>(sequence), GetLastError());
+        }
+    }
     return sequence;
 }
 

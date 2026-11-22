@@ -364,7 +364,10 @@ point for the next admitted press, not a barrier the command waits for:
 - external takeovers (Win+Tab, lock, display change, a modified forwarded Win
   press) publish `intent=external`: the Start side revokes both close schedules
   and the recovery ticket, ends the close record, drops the touch state and
-  resyncs from the cloak.
+  resyncs from the cloak. The bridge publishes it at once and holds every later
+  publication behind its ack or bound (`own external barrier seq=... armed`), so
+  a following press cannot overwrite the takeover before Start reads it; the
+  takeover has no original to replay on a timeout.
 
 Fallbacks, each logged once:
 

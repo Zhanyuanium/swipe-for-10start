@@ -131,7 +131,11 @@ under the executor guard (`reason=queue-wait`); and the ack timeout is stricter
 than both: a live peer that is silent is treated as having consumed the record
 (`decision=consumed`), because replaying a close that landed would reopen the
 menu; only a gone or stale peer is replayed (`decision=replay`, `reason=no-ack`).
-The timeout line carries the sequence, the wait, the peer age and the epoch.
+The timeout line carries the sequence, the wait, the peer age and the epoch. An
+external takeover is published at once and clears the queue and latch; it then
+arms the same barrier for the presses that follow, because its record is the one
+Start must reconcile before another intent may overwrite it. A held press follows
+the timeout policy above; the takeover itself has no original to replay.
 
 The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user

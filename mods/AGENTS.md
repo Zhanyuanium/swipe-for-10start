@@ -639,7 +639,10 @@ probe or timer failure is answered `unknown`.
   and only a gone/stale peer is replayed (`peer=stale ... decision=replay`,
   `reason=no-ack`). The queue's own lines are
   `own press queued|published|ack|ack timeout|dropped`. An
-  `external` intent clears both the queue and the latch.
+  `external` intent clears both the queue and the latch, is published at once,
+  and arms the same barrier: a following press waits for its ack or bound
+  (`own external barrier seq=... armed`, `own external ack ... reconciled`), and
+  a timeout with a gone/stale peer serves the held presses natively.
 
 **Deleted here.** The retract request/plan wait, the arbitration hold, the
 close-record read/seed, `OwnDecideFrom` and its open/close/reopen helpers, the
