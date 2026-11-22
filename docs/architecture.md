@@ -361,8 +361,8 @@ never a wedged menu.
 
 The Start side publishes the executor command and then answers the intent
 (`intent ack`); every branch publishes the resulting controller direction before
-that answer, so the ack means "direction visible" and is the bridge's
-serialisation point for the next admitted press:
+that answer, so the ack means "direction visible" and is the bridge's one
+serialisation point for the next admitted press — the take alone is not:
 
 - open: `exec show` immediately; the shell's own show is swallowed while the
   controller owns the panel and the same opening touch is protected by
@@ -387,7 +387,9 @@ serialisation point for the next admitted press:
 
 An unanswered intent is resolved by the record, not by the heartbeat. The Start
 side claims the sequence before copying and re-checks the claim after the copy.
-The bridge's timeout either accepts a taken sequence as consumed or aborts the
+The bridge's timeout either waits for the ack of a taken sequence (the take proves
+execution, not that the direction is visible; every branch publishes the direction
+before the ack) or aborts the
 record (its counter goes odd, so no consumer can copy or claim it) and re-reads
 the claim before any replay. A changed `peerEpoch` at the watchdog is a restart:
 the replacement seeded `g_lastIntentSeq` past the record and will never answer, so

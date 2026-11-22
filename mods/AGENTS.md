@@ -656,7 +656,12 @@ probe or timer failure is answered `unknown`.
   The Start side claims the
   sequence before it copies the record and re-checks the claim after the copy
   (`intent drop ... reason=record-gone` on a revocation). An ack timeout is then
-  resolved by proof: `taken == seq` is `decision=consumed` with no replay;
+  resolved by proof: `taken == seq` is `decision=consumed awaiting=ack` — the
+  take proves execution, not that the direction is published, so the next press
+  waits for the ack and only the queued presses' own bound can serve them
+  (`own press poll timer failed` drains them if that wake cannot be armed). Every
+  Start branch publishes the resulting direction before its ack, so the press
+  after an ack reads the new direction (close then reopen, not two closes).
   `taken != seq` aborts the record (`SwipeIpcAbortIntent`, the counter's odd
   state), re-reads the claim, and only replays when the abort succeeded and the
   claim is not this sequence (`decision=replay reason=revoked|epoch-changed`). A

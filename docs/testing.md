@@ -220,11 +220,24 @@ could act, or before its confirmation could land).
 
 ## Round-5 runtime checks
 
+- **Before-take pause (A).** Suspend the Start host, send one Win press while its
+  heartbeat is still fresh, let the 1000 ms bound run, then resume it. The bridge
+  logs `own press ack timeout ... decision=replay reason=revoked`, runs the native
+  fallback once, and the section's `intentSeq` stays odd (`tools/ipc.ps1 -State`
+  prints `unstable`); the resumed activation logs no `intent recv` for that
+  sequence. Exactly one toggle.
+- **Claimed but unacked (A/C).** With the consumer paused after the claim (a test
+  harness that sleeps after the copy), the timeout logs `decision=consumed
+  awaiting=ack` and no `own press fallback`; the late ack releases the queue.
 - **Restart with an outstanding intent (B).** Publish one or two presses, kill and
   relaunch the host before it takes them. The watchdog sees the replacement's
   epoch and logs `decision=replay reason=epoch-changed`; the queued press drains
   (`reason=peer-gone`) rather than waiting for an ack the replacement never sends,
   and the next press is one intent with one toggle.
+- **Ack, then the second press (C).** Two presses against a paused consumer: the
+  second is not published at the 1000 ms take (`decision=consumed awaiting=ack`),
+  only after `own press ack`, and its kind is the opposite of the first (close
+  then open, or the reverse), not a second same-direction intent.
 
 ## The one-pass smoke
 

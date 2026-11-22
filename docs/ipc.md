@@ -124,8 +124,13 @@ the line names it (`intent open refused entry=... reason=no-executor`,
 `intent close refused from=... reason=no-executor`); the bridge does not retry the
 original on an answered refusal. An **unanswered** decision is not replayed on a
 guess. At the 1000 ms bound the bridge re-reads the ack, `intentTaken` and the
-shared intent record. A taken sequence is consumed (`decision=consumed`, no
-replay). Otherwise the bridge **aborts** the record (`SwipeIpcAbortIntent` steps
+shared intent record. A taken sequence is `decision=consumed awaiting=ack`: the
+take proves the controller has the record, not that the resulting direction is
+published, so the next press waits for the ack while the queued presses keep
+their own queue-age bound (and are served natively if that ack never comes).
+Every Start branch publishes the resulting direction before it answers, so the
+press after an ack reads the new direction. Otherwise the bridge **aborts** the
+record (`SwipeIpcAbortIntent` steps
 the counter to its odd state, which every reader rejects) and re-reads the claim.
 If the abort succeeded and the claim is not this sequence, the original runs once
 (`decision=replay reason=revoked`); if the claim landed after the abort the record

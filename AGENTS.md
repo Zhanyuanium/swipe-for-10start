@@ -146,8 +146,12 @@ a record the bridge aborted in between is dropped (`intent drop ...
 reason=record-gone`). The ack timeout then decides by proof, not by the
 heartbeat:
 
-- `taken == seq` is `decision=consumed`: the controller has the record and no
-  replay follows;
+- `taken == seq` is `decision=consumed awaiting=ack`: the take proves execution,
+  not that the resulting direction is published, so the next press waits for the
+  ack while the queued presses keep their own 1500 ms bound. An ack is the
+  bridge's one release: every Start branch publishes the resulting direction
+  before it answers, so the press after an ack reads the new direction (a close
+  then a reopen, not two same-direction intents);
 - `taken != seq` aborts the record (the counter goes to its odd state, so no
   consumer can copy or claim it), then re-reads the claim. Not this sequence:
   `decision=replay reason=revoked` runs the original once. This sequence:

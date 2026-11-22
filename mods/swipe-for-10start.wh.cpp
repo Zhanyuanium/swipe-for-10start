@@ -15165,6 +15165,11 @@ struct OutstandingPress {
     // gone: the replacement seeds past it (OpenIpcChannel) and will never answer,
     // so the record is reconciled by the epoch, not by waiting for an ack.
     uint32_t publishedEpoch = 0;
+    // The take proves the controller has the record; it does not prove the
+    // resulting direction is published. While this is true the press waits for
+    // its ack (or a changed epoch) and the queue is not served from the take
+    // alone.
+    bool consumedAwaitingAck = false;
 };
 OutstandingPress g_pressOutstanding;  // launcher thread only
 
@@ -15218,6 +15223,17 @@ void DropPressQueue(const wchar_t* reason) {
     }
 }
 
+// Arms the one-shot that lets a press which queued behind a consumed (taken,
+// unacked) intent reach its queue-age bound. The ack event is the primary wake;
+// this is the bound's guaranteed callback. False means no window or SetTimer
+// refused.
+bool ArmConsumedPressPoll() {
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    return window && SetTimer(window, kPressAckTimer,
+                              static_cast<UINT>(kPressReservePollMs),
+                              nullptr) != 0;
+}
+
 // Adds one press to the FIFO. The arriving press on a full queue is dropped with
 // the depth in the line: it is the one that cannot be held, and running it now
 // would execute it ahead of the presses already queued. Launcher thread only.
@@ -15237,6 +15253,13 @@ bool QueuePress(const QueuedPress& press, const wchar_t* source) {
             PressTriggerName(press.trigger), PressEntryName(press.entry),
             g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0,
             static_cast<long long>(g_pressOutstanding.seq), source);
+    if (g_pressOutstanding.pending && g_pressOutstanding.consumedAwaitingAck &&
+        !ArmConsumedPressPoll()) {
+        // Without a wake the age bound would never run. Serving the head on this
+        // turn is the same fallback the bound would perform.
+        TraceLog(L"own press poll timer failed err=%u q=%d", GetLastError(),
+                g_pressQueueCount);
+    }
     return true;
 }
 
@@ -15601,8 +15624,9 @@ void HandlePressAck() {
 // the ack once more, the consumer's `intentTaken` claim and the shared record:
 //
 // - a late ack is the answer and only advances the queue;
-// - `taken == seq` means the controller has the record: the press is consumed,
-//   no replay, whichever the peer is doing;
+// - `taken == seq` proves consumption, not that the resulting direction is
+//   visible. The press waits for its ack; the queued presses keep their own
+//   queue-age bound and are served natively if that ack never comes;
 // - `taken != seq` is resolved by aborting the record: the counter is stepped to
 //   its odd state, so no consumer can copy or claim it afterwards. The claim is
 //   then re-read. Not this sequence: the original is the one execution. This
@@ -15718,25 +15742,50 @@ void HandlePressAckTimeout() {
         return;
     }
     if (taken == press.seq) {
-        // The controller claimed this exact sequence before acting. A replay
-        // now would be a second execution, whether the answer is merely late or
-        // the controller is stalled after the take. A changed epoch means the
-        // claim belongs to an activation that is gone: no ack is coming.
-        g_pressOutstanding = OutstandingPress{};
-        HWND window = g_execWindow.load(std::memory_order_relaxed);
-        if (window) {
-            KillTimer(window, kPressAckTimer);
+        if (epochChanged) {
+            // The old activation claimed the record and then vanished. The
+            // replacement seeded past it, so no ack is coming and the press is
+            // consumed without one.
+            g_pressOutstanding = OutstandingPress{};
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                KillTimer(window, kPressAckTimer);
+            }
+            TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s "
+                    L"wait=%llu taken=%lld peer=%s age=%u epoch=%u->%u "
+                    L"decision=consumed reason=epoch-changed",
+                    static_cast<long long>(press.seq),
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(wait),
+                    static_cast<long long>(taken), peer, peerAge,
+                    press.publishedEpoch, epochNow);
+            ServeNextPress(L"epoch");
+            return;
         }
-        TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-                L"taken=%lld peer=%s age=%u epoch=%u->%u decision=consumed%s",
-                static_cast<long long>(press.seq),
-                PressTriggerName(press.press.trigger),
-                PressEntryName(press.press.entry),
-                static_cast<unsigned long long>(wait),
-                static_cast<long long>(taken), peer, peerAge,
-                press.publishedEpoch, epochNow,
-                epochChanged ? L" reason=epoch-changed" : L"");
-        ServeNextPress(L"taken");
+        if (!g_pressOutstanding.consumedAwaitingAck) {
+            // The take precedes the direction publication. Until the ack says
+            // the direction is visible, the next press must not decide from the
+            // old one; this slot keeps waiting without serving the queue.
+            g_pressOutstanding.consumedAwaitingAck = true;
+            TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s "
+                    L"wait=%llu taken=%lld peer=%s age=%u epoch=%u "
+                    L"decision=consumed awaiting=ack",
+                    static_cast<long long>(press.seq),
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(wait),
+                    static_cast<long long>(taken), peer, peerAge, epochNow);
+        }
+        AgeOutQueuedPress();
+        if (g_pressQueueCount > 0 && !ArmConsumedPressPoll()) {
+            // Without a wake the queued presses would park past their bound.
+            TraceLog(L"own press poll timer failed err=%u seq=%lld",
+                    GetLastError(), static_cast<long long>(press.seq));
+            while (g_pressQueueCount > 0) {
+                ServeQueuedOriginal(L"timer-failed");
+            }
+        }
         return;
     }
     // Not taken. The replay is proved by the abort, not by the peer: the abort
