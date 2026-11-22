@@ -7,7 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
-| `v0.8.0` | 0.8.0 | — | 216 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
+| `v0.8.0` | 0.8.0 | — | 224 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
 | `v0.7.0` | 0.7.0 | — | 216 B | one mod, two processes: the collection's review answered (symbol hooks, no pin, deadline-driven wakeups, tap rejection, lean channel) |
 | `v0.6.2` | 0.44.0 | 0.25.0 | v7 | M3.3: one controller, one executor |
 | `v0.6.1` | 0.40.0 | 0.21.0 | v4 | intent direction from the controller state; no press lost after a gesture close |

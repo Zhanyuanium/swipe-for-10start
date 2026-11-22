@@ -708,17 +708,20 @@ that does not exit, a delegate that does not revoke, a window that does not go
 away) keeps the unload waiting; there is no residual success and no deferred
 close. `docs/lifecycle.md` has the order and the blocking cases.
 
-### swipe_ipc_shared.h (merged mod, 216 bytes)
+### swipe_ipc_shared.h (merged mod, 224 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**,
 and so is the debug command channel (0.7.0): its record, mutex, event and parser
 were deleted. The records that ship are the open generation, the
-intent and its ack, the executor command and its ack, one controller direction
+intent and its ack and the `intentTaken` claim, the executor command and its ack,
+one controller direction
 word, the touch flag, and the peer liveness triple `peerTick` (204,
 GetTickCount64 low bits) / `peerState` (208, alive/gone) / `peerEpoch` (212, the
-activation identity). Every offset is asserted; the magic is `0x53313053`. There
+activation identity), plus `intentTaken` (216, the consumer's claim, written
+before it acts). Every offset is asserted; the magic is `0x53323053`. There
 is **no version word**: the object namespace
-(`Local\SwipeFor10Start_SingleMod_*`) is the ABI identity, so an old development
-image cannot join and a future layout changes the prefix. The executor validates
+(`Local\SwipeFor10Start_SingleMod2_*`) is the ABI identity, so an old development
+image cannot join and a future layout changes the prefix (the `2` marks the
+224-byte layout). The executor validates
 each command before any launcher call: show method 1/11/16 with flags under the
 `0x8|0x4` mask, dismiss method 1/6 with no flags, cancel method/flags 0; anything
 else is refused, never clamped. The producer checks the same shared vocabulary

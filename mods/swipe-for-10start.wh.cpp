@@ -3337,10 +3337,11 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
 //
 // Kept in the shipping build. Both directions run through the one section in
 // swipe_ipc_shared.h and its events, so no file is involved and nothing polls:
-//   Local\SwipeFor10Start_SingleMod_Intent  kind, trigger, method, flags, open
-//                                           (bridge -> here)
-//   Local\SwipeFor10Start_SingleMod_Exec    show, dismiss, cancel (here -> bridge)
+//   Local\SwipeFor10Start_SingleMod2_Intent  kind, trigger, method, flags, open
+//                                            (bridge -> here)
+//   Local\SwipeFor10Start_SingleMod2_Exec    show, dismiss, cancel (here -> bridge)
 //   ..._State.openSeq                "this is a new menu"               (here)
+//   ..._State.intentTaken            "this sequence is being acted on" (here)
 //   ..._State.peerTick/peerState     "a controller is here"             (here)
 //   ..._State.peerEpoch              "which activation answers"         (here)
 //

@@ -22,7 +22,7 @@ landing still serves, the command-expiry rule
 (one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
 auto-hidden timing/interruption chains (the bottom docked numbers are named as
 historical; the live left docked layout is a separate set), the
-accepted cloak cap, the 216-byte channel, the intent-consumer readiness/interception
+accepted cloak cap, the 224-byte channel, the intent-consumer readiness/interception
 capability precondition, and the deleted M2 mechanisms.
 
 re/: reverse-engineering records, read-only analysis of this build's shell, kept
@@ -65,8 +65,9 @@ measurement and band, the axial and cross-axis halves of a point's hit test, the
 taskbar axis probe, the deferred measurement, the
 scroll survey, and the measured layouts.
 
-ipc.md: the merged mod's channel — names, 216-byte layout, seqlocks, open
-generation, intent/ack, executor command/ack (admission vocabulary, expiry and
+ipc.md: the merged mod's channel — names, 224-byte layout, seqlocks, open
+generation, intent/ack and the intent take, executor command/ack (admission
+vocabulary, expiry and
 the dismiss confirmation), controller direction, peer liveness/identity (epoch,
 tick, state, the 600 ms detection budget), init handshake.
 
