@@ -1139,26 +1139,65 @@ std::atomic<DWORD> g_hidThreadId{0};
 std::atomic<int> g_moduleEntryCount{0};
 // Set by the first UI-turn lease ever constructed: a dispatcher turn or the
 // settle batch. Those release inside a destructor whose tail needs the empty
-// drain turn when no window exists. The root hook's admission lease is a
-// control entry for ordering and the count-only wait; it does not mark this.
-// The first turn logs once, so a trace shows the guard's flag is live.
+// drain turn when no window exists. The root hook uses the admission lock
+// below, not this count. The first turn logs once, so a trace shows the guard's
+// flag is live.
 std::atomic<bool> g_uiTurnEverUsed{false};
 
-// Admission: the root hook's control entry. UiTurn: a dispatcher turn or the
-// settle batch, whose destructor tail the drain barrier covers. Both increment
-// the same count and release it the same way; only UiTurn sets the no-window
-// guard flag.
-enum class ModuleEntryKind {
-    Admission,
-    UiTurn,
+// The root hook's admission gate. The hook takes it shared; unload takes it
+// exclusive before it chooses a teardown, waits for an in-flight hook, and holds
+// it through the teardown so a late hook cannot register. It is a lock, not a
+// counted lease: an admission hook must not depend on a teardown that has not
+// run yet.
+SRWLOCK g_rootAdmissionLock = SRWLOCK_INIT;
+
+class RootAdmissionShared {
+  public:
+    RootAdmissionShared() {
+        if (TryAcquireSRWLockShared(&g_rootAdmissionLock)) {
+            held_ = true;
+            return;
+        }
+        // The only exclusive writer is the unload, which sets g_unloading before
+        // it takes the lock. Returning without it is the late-hook path; the
+        // flag check in the hook then registers nothing. A failed try with the
+        // flag clear is not expected, so wait for the shared lock.
+        if (!g_unloading.load(std::memory_order_relaxed)) {
+            AcquireSRWLockShared(&g_rootAdmissionLock);
+            held_ = true;
+        }
+    }
+    ~RootAdmissionShared() {
+        if (held_) {
+            ReleaseSRWLockShared(&g_rootAdmissionLock);
+        }
+    }
+    RootAdmissionShared(const RootAdmissionShared&) = delete;
+    RootAdmissionShared& operator=(const RootAdmissionShared&) = delete;
+
+  private:
+    bool held_ = false;
 };
 
+class RootAdmissionExclusive {
+  public:
+    RootAdmissionExclusive() {
+        AcquireSRWLockExclusive(&g_rootAdmissionLock);
+    }
+    ~RootAdmissionExclusive() {
+        ReleaseSRWLockExclusive(&g_rootAdmissionLock);
+    }
+    RootAdmissionExclusive(const RootAdmissionExclusive&) = delete;
+    RootAdmissionExclusive& operator=(const RootAdmissionExclusive&) = delete;
+};
+
+// A UI-turn lease: one dispatcher turn or the settle batch. Both increment the
+// same count and release it the same way. Only this kind sets the no-window
+// guard, because only its destructor tail needs the drain barrier.
 class ModuleEntryLease {
   public:
-    explicit ModuleEntryLease(
-        ModuleEntryKind kind = ModuleEntryKind::UiTurn) {
-        if (kind == ModuleEntryKind::UiTurn &&
-            !g_uiTurnEverUsed.exchange(true, std::memory_order_release)) {
+    ModuleEntryLease() {
+        if (!g_uiTurnEverUsed.exchange(true, std::memory_order_release)) {
             TraceLog(L"module ui turn entry first used");
         }
         g_moduleEntryCount.fetch_add(1, std::memory_order_seq_cst);
@@ -2194,8 +2233,7 @@ template <typename Fn>
 void PostCountedUiTurn(wucore::CoreDispatcher const& dispatcher, Fn&& turn) {
     std::shared_ptr<ModuleEntryLease> lease;
     try {
-        lease = std::make_shared<ModuleEntryLease>(
-            ModuleEntryKind::UiTurn);
+        lease = std::make_shared<ModuleEntryLease>();
     } catch (...) {
         return;
     }
@@ -2998,7 +3036,7 @@ bool BeginGestureSettle(float from, float to, float velocity,
     const float distance =
         std::max(ReadGestureGeometry().distance(), 0.0f);
     const float remaining = std::fabs(target - start) * distance;
-    const int64_t durationMs = std::clamp(
+    int64_t durationMs = std::clamp(
         static_cast<int64_t>(std::llround(
             static_cast<double>(remaining) /
             static_cast<double>(kSettleSpeedDipPerMs))),
@@ -3245,8 +3283,7 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         // and no handler is left inside module code.
         std::shared_ptr<ModuleEntryLease> lease;
         try {
-            lease = std::make_shared<ModuleEntryLease>(
-                ModuleEntryKind::UiTurn);
+            lease = std::make_shared<ModuleEntryLease>();
         } catch (...) {
             // Without a counted entry no handler may be registered: the unload
             // could not prove it has finished.
@@ -13052,11 +13089,10 @@ PrepareRootElement_t PrepareRootElement_Original = nullptr;
 bool EnsureUiRendezvousWindow();
 
 void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
-    // The first touch of this image is the counted entry itself. The unload
-    // either sees this lease and waits, or this hook sees its flag and adds no
-    // state; there is no third ordering in which a registration outlives the
-    // proofs.
-    ModuleEntryLease entryLease(ModuleEntryKind::Admission);
+    // The first touch of this image is the admission lock itself. The unload
+    // either holds the exclusive writer and this hook registers nothing, or the
+    // hook holds it shared and the unload waits for every return below.
+    RootAdmissionShared admission;
     if (g_unloading.load(std::memory_order_relaxed)) {
         // No module state is touched. The shell still gets its own root.
         return PrepareRootElement_Original
@@ -13841,13 +13877,11 @@ HWND TeardownUiOnUiThread() {
     return nullptr;
 }
 
-// Waits for the admitted module entries alone. This is the first half of the
-// unload proof: a PrepareRootElement hook may already hold its lease while it is
-// still between publishing the owner and publishing the rendezvous window. The
-// unload must let that setup finish before it decides that no window exists; the
-// registration check belongs after the teardown. The event is auto-reset and a
-// pending signal from an earlier zero is not trusted: the count is the
-// predicate. No timeout and no polling.
+// Waits for UI-turn leases alone: a dispatcher turn or the settle batch. The
+// root hook uses the admission lock instead, so this wait cannot hold a
+// teardown that has not run yet. The event is auto-reset and a pending signal
+// from an earlier zero is not trusted: the count is the predicate. No timeout
+// and no polling.
 void WaitForModuleEntriesOnly() {
     const bool haveEvent = g_moduleEntriesGone != nullptr;
     for (;;) {
@@ -13861,7 +13895,7 @@ void WaitForModuleEntriesOnly() {
     }
 }
 
-// Requires the entry count and every XAML registration to be gone. On the
+// Requires the UI-turn count and every XAML registration to be gone. On the
 // off-owner path the count is waited for first; on the owner path a non-zero
 // count is a self-deadlock and blocks instead. `waitForEntries` is false only
 // for an unload that already runs on the UI owner.
@@ -13885,7 +13919,7 @@ bool DrainUiThread(HWND hwnd) {
     UiDrainCall call{false};
     if (hwnd) {
         if (!IsWindow(hwnd)) {
-            TraceLog(L"unload drain window gone; counts decide");
+            TraceLog(L"unload drain window gone; no acknowledgement");
         } else {
             SendMessageW(hwnd, kUiDrainMessage, kUiDrainMagic,
                          reinterpret_cast<LPARAM>(&call));
@@ -14119,34 +14153,30 @@ void RoleUninit() {
         }
     }
 
-    // 3a. Count-only before the teardown decision. An admitted
-    //     PrepareRootElement may have published the owner and its lease but not
-    //     the rendezvous window yet; waiting on the count lets that setup finish
-    //     before this code can call the absence of a window a lost one. The
-    //     owner is re-read after the wait because the hook may have published it
-    //     in that window.
-    DWORD uiOwner = g_uiThreadId.load(std::memory_order_relaxed);
-    bool inlineUnload =
-        uiOwner != 0 && uiOwner == GetCurrentThreadId();
-    if (!inlineUnload) {
-        const int admitted = g_moduleEntryCount.load(std::memory_order_acquire);
-        if (admitted != 0) {
-            TraceLog(L"unload waits for admitted root count=%d", admitted);
-        }
-        WaitForModuleEntriesOnly();
+    // 3. Root admission exclusive: waits for any in-flight root hook, then holds
+    //    the writer through the teardown so a hook that arrives after the flag
+    //    registers nothing. This replaces the count-only wait: a gesture close's
+    //    UiTurn lease must not be waited on before the teardown that revokes it.
+    DWORD uiOwner = 0;
+    bool inlineUnload = false;
+    HWND uiWindow = nullptr;
+    {
+        RootAdmissionExclusive admission;
+        TraceLog(L"unload root admission exclusive");
         uiOwner = g_uiThreadId.load(std::memory_order_relaxed);
-        inlineUnload = uiOwner != 0 && uiOwner == GetCurrentThreadId();
-    }
-    if (inlineUnload) {
-        TraceLog(L"unload inline on ui thread entries=%d",
-                g_moduleEntryCount.load(std::memory_order_acquire));
-    }
+        inlineUnload =
+            uiOwner != 0 && uiOwner == GetCurrentThreadId();
+        if (inlineUnload) {
+            TraceLog(L"unload inline on ui thread entries=%d",
+                    g_moduleEntryCount.load(std::memory_order_acquire));
+        }
 
-    // 3b. One synchronous UI turn: revoke the XAML handlers and the settle
-    //     batch, restore resting progress and neutral translation, drop the
-    //     UI-owned objects. SendMessage returns only after TeardownUi has
-    //     returned, so no dispatcher lambda or its delegate thunk outlives it.
-    HWND uiWindow = TeardownUiOnUiThread();
+        // One synchronous UI turn: revoke the XAML handlers and the settle
+        // batch, restore resting progress and neutral translation, drop the
+        // UI-owned objects. SendMessage returns only after TeardownUi has
+        // returned, so no dispatcher lambda or its delegate thunk outlives it.
+        uiWindow = TeardownUiOnUiThread();
+    }
 
     // 4a. Without a window there is no empty-turn barrier. If any UI-turn lease
     //     was ever used (a dispatcher turn or the settle batch), two zero reads

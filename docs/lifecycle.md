@@ -51,31 +51,34 @@ reachable.
    hidden message-only window on the XAML UI thread (created by
    `PrepareRootElement` before `Loaded`; the CoreWindow is only read for the cloak
    and bounds), or runs the turn inline when the unload already is that thread.
-   `PrepareRootElement` is itself an admitted, counted module entry from its
-   first instruction: it takes a lease, re-reads the unload flag before touching
-   module state and again immediately before its first registration, and
-   registers nothing if either check sees a stop or the rendezvous window could
-   not be created. Off the owner, `RoleUninit` first waits on the module-entry
-   count alone, because that hook may have published its owner and lease before
-   its window; it re-reads the owner and window after the wait, then runs the
-   teardown. The turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated` and
-   scroller
+   `PrepareRootElement` is admitted by `g_rootAdmissionLock`, not by the entry
+   count: the hook takes it shared as its first act, checks the unload flag, runs
+   the original, records/creates, checks the flag again immediately before its
+   first registration, and releases on every return. `RoleUninit`, after the flag
+   is set, takes the same lock exclusive before the window/teardown decision and
+   holds it through `TeardownUiOnUiThread`; an in-flight hook finishes first, and
+   a hook arriving after the flag sees it and registers nothing. This also lets
+   the teardown revoke a gesture close's settle batch instead of waiting for a
+   lease only that teardown can release. The turn revokes the `Loaded`,
+   `SizeChanged`, `LayoutUpdated` and scroller
    `ViewChanged` handlers, detaches the settle batch's `Completed`, stops the
    animations, restores resting `Progress` and the neutral translation, resets
    the scroller watches and drops the UI-owned composition/root/dispatcher
    references. The message returns only after the turn and its delegate thunks
    have returned.
-4. **After the teardown the proof is both counts and an acknowledged drain.**
-   No counted entry and no registered XAML handler may remain. Off the owner, one
-   empty drain message follows; its handler sets a caller-owned acknowledgement
-   only for an accepted message from this activation's published window. A drain
+4. **After the teardown the UI-turn count and the registration count must be
+   zero, and the drain must acknowledge.** The admission lock is not part of this
+   count. No UI-turn entry and no registered XAML handler may remain. Off the
+   owner, one empty drain message follows; its handler sets a caller-owned
+   acknowledgement only for an accepted message from this activation's published
+   window. A drain
    that did not run blocks (`ui drain not acknowledged`), because zero alone does
    not prove the last lease destructor returned. A window that is gone after a
-   UI-turn lease was ever used (dispatcher turn or settle batch; the root hook's
-   admission lease does not count) blocks
-   (`no window to drain module entries`). That admission lease is why a hook
+   UI-turn lease was ever used (dispatcher turn or settle batch) blocks
+   (`no window to drain module entries`). A hook
    that failed to create the rendezvous and registered nothing still completes:
-   it leaves no window, no registration and no UI-turn flag. A never-entered
+   it holds only the admission lock, leaves no window, no registration and no
+   UI-turn flag. A never-entered
    process has neither and completes too. An unload already on the owner thread never
    waits: a non-zero count blocks (`unload on ui thread with pending entries`).
    A genuine XAML revoke failure blocks once

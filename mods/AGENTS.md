@@ -805,13 +805,12 @@ creator drain and reaper, and every residual/deferred-success return. `kExecTear
 and the destructive first-frame work remain.
 
 **Lifecycle.** No pin, no instance guard, no re-enable state. The Start side joins
-its input thread `INFINITE` in BeforeUninit. Off the owner it waits on the
-module-entry count alone so an admitted root publishes its window, then sends the
-UI teardown to that window and requires both counts. It follows with one
+its input thread `INFINITE` in BeforeUninit. Off the owner it takes the root
+admission lock exclusive before choosing the teardown, sends the UI teardown to
+the window and requires the UI-turn and registration counts. It follows with one
 acknowledged empty turn; a missing acknowledgement blocks
 (`ui drain not acknowledged`), as do a windowless root after a UI-turn lease was
-ever used (dispatcher turn or settle batch; the hook's admission lease does not
-count) and
+ever used (dispatcher turn or settle batch) and
 an inline owner unload with a pending entry. It then closes the channel.
 The bridge joins its posting worker `INFINITE`, destroys the one published window
 on the launcher thread with a synchronous `SendMessage(kExecTeardownMessage)`

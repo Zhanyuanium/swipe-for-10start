@@ -63,14 +63,16 @@
 - **A teardown that cannot be proved gone blocks the unload.** The image is not
   pinned, so returning while a mod-owned thread, delegate or owner window is
   still reachable would hand it unmapped code. The unload joins the two owned
-  threads `INFINITE`. Off the owner it waits on the entry count before choosing
-  the teardown, sends the UI teardown to the module's own hidden window on the
-  XAML UI thread (the call returns after the turn), then requires both counts
+  threads `INFINITE`. Off the owner it takes the root admission lock exclusive
+  before choosing the teardown, sends the UI teardown to the module's own hidden
+  window on the
+  XAML UI thread (the call returns after the turn), then requires the UI-turn and
+  registration counts
   and one acknowledged empty drain; a drain that did not run blocks
   (`ui drain not acknowledged`), because zero alone does not prove the releasing
   destructor returned. If no
   window exists and a UI-turn lease was ever used (dispatcher turn or settle
-  batch; the root hook's admission lease does not count), or the unload already
+  batch), or the unload already
   runs on the
   owner with a pending entry, it blocks instead of treating a count as the
   destructor's return. The
