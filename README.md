@@ -28,9 +28,9 @@ in StartMenuExperienceHost and the executor in Explorer.
 - **The executor** runs in Explorer and executes the shell's own
   `ShowStartView`/`Dismiss` on the launcher's thread. The Windows key, the Start
   button and a click away publish one intent; the controller decides open or
-  close from its own published state, runs the one mirrored settle, and then
-  asks the executor to dismiss. A close slides out with the same animation the
-  gesture close uses.
+  close from its own published state, runs the one shell-close settle, and then
+  asks the executor to dismiss. A close applies the open spring in the closing
+  direction: it moves at once and decelerates into the taskbar.
   A press during a close is read as a reopen: while the window is still on
   screen the close is cancelled and the panel settles back from where the
   retract left it; a press inside the shell's hide is latched and served when

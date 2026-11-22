@@ -393,7 +393,7 @@ serialisation point for the next admitted press — the take alone is not:
 - open: `exec show` immediately; the shell's own show is swallowed while the
   controller owns the panel and the same opening touch is protected by
   `controllerTouch`;
-- close: `TakeCloseOwnership` + the mirrored settle from `TakeProgressNow()`,
+- close: `TakeCloseOwnership` + the shell-close settle from `TakeProgressNow()`,
   then `exec dismiss` at `settle + 30 ms`;
 - a new intent that takes over the closing panel publishes `exec cancel` with
   the dismiss sequence; the bridge kills its timer and the menu stays open;
@@ -539,9 +539,10 @@ Close: a Win, Start-button or click-away intent calls `TakeCloseOwnership`
 repair bound — publishes the closing direction before the
 settle's first frame, consumes every contact on the glass — the dismiss mute and
 the reveal flags cleared) and runs
-`BeginMirrorCloseSettle` from `TakeProgressNow()`: the open curve played
-backwards, full travel (387 ms at the bottom auto-hidden 852 DIP; 409 ms at the
-bottom docked 900). The dismiss is scheduled at the end plus 30 ms.
+`BeginShellCloseSettle` from `TakeProgressNow()`: the open spring in the closing
+direction, full travel (387 ms at the bottom auto-hidden 852 DIP; 409 ms at the
+bottom docked 900), moving from the first frames and decelerating into the edge.
+The dismiss is scheduled at the end plus 30 ms.
 The bridge's timer runs `Dismiss`; the shell's cloak event follows
 and the Start side logs `win close observed`, clears the direction and
 `controllerTouch`, and the next open is ready. The cloak read is tri-state: a

@@ -166,7 +166,7 @@ logs `close ended serial=... kind=... phase=... reason=... age=...ms`.
   the executor command), calls `TakeCloseOwnership` (the one acceptance: it stamps
   the close record — serial, acceptance tick, the menu, `Settling` — and publishes
   the closing direction before the settle's first frame), runs
-  `BeginMirrorCloseSettle(TakeProgressNow())` and asks for `exec dismiss` at
+  `BeginShellCloseSettle(TakeProgressNow())` and asks for `exec dismiss` at
   `settle + 30 ms` (`noteCloseDismissPublished` moves the record to
   `AwaitingHide`); a dismiss that cannot be published ends the record and releases
   the ownership, and answers refused. `external` revokes both schedules and the

@@ -30,8 +30,8 @@ names it.
 |---|---|
 | [architecture.md](architecture.md) | M3: the launcher read (`s_pLauncher` outer + `0x18` interface, `[+0x160]` state), the executor thread and the taskbar-thread crash, the one-decision/one-executor contract, the measured open/close/interruption chains, the accepted 245–268 ms cap, and the list of deleted M2 mechanisms. |
 | [input.md](input.md) | Why Raw HID: the falsified data sources, the report decode (report IDs, `TipSwitch`/`InRange`, contact identity and its evidence clock, the coordinate-only fallback), release detection and its timers. |
-| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the grab's down hit-test and one transfer attempt (a refusal consumes the contact; the landing adopts no finger), the gates and the settle ownership. |
-| [animation.md](animation.md) | The damped-spring settle, both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam, the mirrored close, the scheduled dismiss, and the measured lines. |
+| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → shell-close settle → scheduled `exec dismiss`), the grab's down hit-test and one transfer attempt (a refusal consumes the contact; the landing adopts no finger), the gates and the settle ownership. |
+| [animation.md](animation.md) | The damped-spring settle, both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam, the shell-close settle, the scheduled dismiss, and the measured lines. |
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
 | [ipc.md](ipc.md) | The merged mod's shared-memory channel: names, 232-byte layout with `intentTaken` at 216 and `execCapable` at 224, seqlocks, the open generation, intents and acks with the claim/abort rule, executor commands and acks with their admission vocabulary and expiry rules, the controller direction, peer liveness and activation identity (600 ms is a detection budget), the bridge's executor capability and its terminal symbol attempt, and the init handshake. |
 | [lifecycle.md](lifecycle.md) | Quiescing both roles before the image is unmapped: the Start join/UI-teardown/entry-drain order, the bridge worker join/window destruction/class unregistration order, the no-safe-success rule, and the host's unload boundary. |
@@ -53,7 +53,7 @@ One mod ships, in one source with two process halves (full member list in
   screen, the grab that aborts a cancellable close and takes the
   retract over from its live position, the landing that serves only the explicit
   request's obligation (no touch open of its own), the
-  one close path (a mirrored
+  one close path (a shell-close
   settle from the live position, then `dismiss`), the recovery ticket that
   exists only for a published command and is armed by one helper for both the
   press and the pull, and the peer liveness

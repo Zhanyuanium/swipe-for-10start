@@ -193,7 +193,7 @@ first frames.
 One close path for the Win key, the Start button and the click-away:
 
 ```
-intent close -> TakeCloseOwnership (the record, accepted) -> BeginMirrorCloseSettle(TakeProgressNow())
+intent close -> TakeCloseOwnership (the record, accepted) -> BeginShellCloseSettle(TakeProgressNow())
              -> exec dismiss at settle + 30 ms -> bridge Dismiss -> hidden
 ```
 
@@ -226,10 +226,10 @@ first frame**, consumes every contact already on the glass (the dismiss mute, an
 the reveal flags cleared), clears `controllerTouch` and accepts the record. That
 one word is the whole toggle answer while the record owns the panel; the shell's
 cloak and state cannot answer it, because they still say open for the whole
-retract. The mirrored settle is the open curve played backwards, full travel
+retract. The close settle is the open spring in the closing direction, full travel
 (387 ms at the bottom auto-hidden 852 DIP; 409 at the bottom docked 900), no seam
-speed, from the live position. The dismiss is scheduled, not immediate, so the
-panel is never hidden mid-slide.
+speed, from the live position: it moves at once and decelerates into the edge.
+The dismiss is scheduled, not immediate, so the panel is never hidden mid-slide.
 
 **Endings.** The record is retired by exactly these, and each one knows what it
 owes beyond the record: the landing (`landing`, or `external` when the hide was

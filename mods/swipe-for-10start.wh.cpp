@@ -2756,7 +2756,8 @@ void PanelController::Commit(float to) {
 // One generator, two parameter sets. The style setting only picks the damping
 // ratio; everything below runs once for both:
 //
-// - Open and close are exact mirrors, because the spring works in normalized
+// - The gesture open and close are exact mirrors, because the spring works in
+//   normalized
 //   travel: y(0) = 0, y(inf) = 1, and y'(0) = y0 is the scaled release speed
 //   divided by the travel left. The sign of the settle direction cancels there,
 //   because (to - from) carries it; the spring always relaxes toward its target.
@@ -2810,11 +2811,12 @@ float SpeedTowardDip(float progressPerMs, float from, float to, float distance) 
 
 // One generator, two consumers. `BuildSpringSamples` fills the polyline for a
 // damped-spring move from `start` to `target`; the gesture outcomes and the
-// keyboard open use it directly, and the shell-triggered close uses it to build
-// the keyboard open's curve and plays that backwards. One formula, so the open,
-// the gesture close and the shell-triggered close cannot drift apart.
+// keyboard open use it directly, and the shell-triggered close builds the
+// keyboard open's curve and applies it in the closing direction. One formula, so
+// the open, the gesture close and the shell-triggered close cannot drift apart.
 //
-// - Open and close are exact mirrors, because the spring works in normalized
+// - The gesture open and close are exact mirrors, because the spring works in
+//   normalized
 //   travel: y(0) = 0, y(inf) = 1, and y'(0) = y0 is the scaled release speed
 //   divided by the travel left. The sign of the settle direction cancels there,
 //   because (to - from) carries it; the spring always relaxes toward its target.
@@ -2982,14 +2984,15 @@ bool BeginGestureSettle(float from, float to, float velocity,
 }
 
 // The three shell-triggered closes — the Windows key, the Start button and a
-// click-away — use the keyboard open's curve played from the live position to 0:
-// the same spring generated for 0 -> 1 and sampled backwards
-// (value(i) = start * openY(steps - i)), no seam speed, and the open's own
-// full-travel duration. The close therefore starts almost still and accelerates
-// into the edge. The gesture close is not this: it keeps following the finger
-// and settles with its release spring (`BeginGestureSettle`).
-bool BeginMirrorCloseSettle(float from, std::chrono::milliseconds& duration,
-                            uint32_t* serialOut = nullptr) {
+// click-away — use the keyboard open's spring in the closing direction: value(i)
+// = start * (1 - openY(i)), with the final sample at 0. The close therefore moves
+// from its first frames and decelerates into the edge; playing the open samples
+// backwards put the fast head at the tail and produced a freeze followed by a
+// snap. The same full-travel duration, style and dismiss lead are kept. The
+// gesture close is not this: it keeps following the finger and settles with its
+// release spring (`BeginGestureSettle`).
+bool BeginShellCloseSettle(float from, std::chrono::milliseconds& duration,
+                           uint32_t* serialOut = nullptr) {
     const float start = std::clamp(from, 0.0f, 1.0f);
     g_panel.Commit(0.0f);
 
@@ -3013,7 +3016,7 @@ bool BeginMirrorCloseSettle(float from, std::chrono::milliseconds& duration,
                                          openSamples);
     float samples[kSettleMaxFrames] = {};
     for (int i = 0; i <= steps; ++i) {
-        samples[i] = std::clamp(start * openSamples[steps - i], 0.0f, 1.0f);
+        samples[i] = std::clamp(start * (1.0f - openSamples[i]), 0.0f, 1.0f);
     }
     samples[steps] = 0.0f;
 
@@ -8202,7 +8205,7 @@ void PostUiOpenWatchRelease(uint32_t closedGeneration,
 
 // M3: one intent handler for the bridge's four triggers. The controller never
 // branches on the trigger: open sets the entry and asks the bridge for Show,
-// close runs the one mirrored close and asks for Dismiss, external drops the
+// close runs the one shell-close settle and asks for Dismiss, external drops the
 // pull and resyncs. The bridge's executor acks through execAck.
 //
 // The record is claimed before it is copied, and the copy is proved by the
@@ -8337,7 +8340,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         TakeCloseOwnership(CloseKind::Dismiss, GetTickCount64(), g_contactDown);
         const float from = TakeProgressNow(L"intent-close");
         std::chrono::milliseconds duration{0};
-        if (!BeginMirrorCloseSettle(from, duration)) {
+        if (!BeginShellCloseSettle(from, duration)) {
             // No settle, so there is no retract: the panel returns to rest, the
             // record ends as a refusal and the controller states its release in
             // one place.
@@ -9097,28 +9100,37 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         const bool lateAdopted =
             !gestureOwnsProgress && ConsumeLateRevealRelease(geometry);
 
-        // The keyboard open is the gesture open from rest: one curve for every
-        // open, so a Windows press and an edge pull cannot look different, and
-        // the travel plans the duration exactly as it does there. An open that
-        // overlapped a close still on its way out starts from where the panel is:
-        // starting it at 0 would rewind the retract it just superseded.
+        // The keyboard open is the gesture open from rest, but only when this
+        // activation asked the shell to show the menu. A shell-initiated show -
+        // the press was passed, or capability arrived with the shell's own Show -
+        // is already at rest when the cloak event runs; animating it from 0 would
+        // rewind the panel and flash. That open adopts the resting value and
+        // publishes no ownership. A show requested by an open intent, a touch
+        // claim or a reveal keeps its entry; an open that overlapped a close still
+        // starts from where the panel is.
         if (!gestureOwnsProgress && !lateAdopted) {
-            // The settle needs the measured travel, from the snapshot the follow
-            // reads. The measurement request below runs after this poll, so an
-            // open that lands before the first publish still has Distance 0: a
-            // settle planned from it would run the 160 ms floor. Restore the
-            // resting value instead and let the shell's own storyboard run.
-            if (geometry.distance() > 0.0f) {
-                const bool intentEntry =
-                    g_intentOpenActive.exchange(false, std::memory_order_relaxed);
-                const float intentFrom =
-                    g_intentOpenEntry.load(std::memory_order_relaxed);
+            const bool intentEntry =
+                g_intentOpenActive.exchange(false, std::memory_order_relaxed);
+            const float intentFrom =
+                g_intentOpenEntry.load(std::memory_order_relaxed);
+            const bool unowned = !intentEntry && !openDuringClose;
+            if (unowned) {
+                // The shell performed this open on its own. The panel is already
+                // presented at the resting value, so there is no settle to run.
+                ShowAtRest();
+                g_commitNeedsProgressReset = false;
+                TraceLog(L"win open adopted reason=unowned");
+            } else if (geometry.distance() > 0.0f) {
+                // The settle needs the measured travel, from the snapshot the
+                // follow reads. The measurement request below runs after this
+                // poll, so an open that lands before the first publish still has
+                // Distance 0: a settle planned from it would run the 160 ms floor.
+                // Restore the resting value instead and let the shell's own
+                // storyboard run.
                 const float from = intentEntry
                                        ? intentFrom
-                                       : (openDuringClose
-                                              ? TakeVisibleProgressNow(
-                                                    L"win-during-close")
-                                              : 0.0f);
+                                       : TakeVisibleProgressNow(
+                                             L"win-during-close");
                 std::chrono::milliseconds duration{0};
                 if (BeginGestureSettle(from, 1.0f, 0.0f, duration)) {
                     // The animation now owns Progress, so no later path needs to
@@ -9127,11 +9139,8 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
                     if (intentEntry) {
                         TraceLog(L"win open intent from=%.3f dur=%llu", from,
                                 static_cast<unsigned long long>(duration.count()));
-                    } else if (openDuringClose) {
-                        TraceLog(L"win open during close from=%.3f dur=%llu", from,
-                                static_cast<unsigned long long>(duration.count()));
                     } else {
-                        TraceLog(L"win open dur=%llu",
+                        TraceLog(L"win open during close from=%.3f dur=%llu", from,
                                 static_cast<unsigned long long>(duration.count()));
                     }
                 }

@@ -45,7 +45,7 @@ gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admissio
 and its 24 DIP qualified open claim (a tap requests nothing), the down's author
 (only a band down or a grab may be adopted or promoted), the reveal entry
 and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
-from the panel's position), the one close path (`TakeProgressNow` → mirrored
+from the panel's position), the one close path (`TakeProgressNow` → shell-close
 settle → scheduled `exec dismiss`), the close record (serial, acceptance tick, the
 menu, a phase, the 600 ms repair bound) and its endings including the logged
 repair, the grab's down hit-test (the trail along the axis **and** the panel
@@ -59,7 +59,7 @@ finger, and silence never releases a consumed contact), the gates and settle
 ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
-start-speed seam, the mirrored close, the coast, and the measured lines.
+start-speed seam, the shell-close settle, the coast, and the measured lines.
 
 geometry.md: the `GestureGeometry` snapshot and its lock, the panel-trail
 measurement and band, the axial and cross-axis halves of a point's hit test, the

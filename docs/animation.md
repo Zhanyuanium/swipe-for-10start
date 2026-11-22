@@ -39,8 +39,12 @@ initial slope, which is why the seam factor is a computed value, not a constant.
 
 ## The open
 
-- keyboard/Start-button open: the settle from rest (`vel=0.00`) to 1, `dur=409`
-  on the full travel;
+- requested keyboard/Start-button open: the shown event starts the settle from
+  the entry this side held (`win open intent from=... dur=...`); a touch claim
+  uses the same entry;
+- an unowned shell show — the press was passed, or capability arrived with the
+  shell's own `Show` — adopts the resting value and starts no settle
+  (`win open adopted reason=unowned`); it publishes no ownership;
 - intent open: the Start side holds the entry (`RevealEntryProgress`, warm
   0.255 bottom auto-hidden, 0.348 bottom docked, cold 0.000) and starts the same
   settle from there when the shell's
@@ -58,12 +62,13 @@ initial slope, which is why the seam factor is a computed value, not a constant.
 
 ## The close
 
-`BeginMirrorCloseSettle` is the open curve played backwards from the live
-position: the same spring sampled in reverse, full travel, no seam speed, so the
-close starts almost still and accelerates into the edge. It is the one close
-shape for the Win key, the Start button, the click-away and the intent close.
-The gesture close keeps its own release spring (`BeginGestureSettle`) and uses
-the mirror only for the shell-triggered family.
+`BeginShellCloseSettle` applies the keyboard open's spring in the closing
+direction: `value(i) = start * (1 - openY(i))`, with the final sample at 0. The
+same full travel, no seam speed, style and duration math apply, so the close moves
+from its first frames and decelerates into the edge. It is the one close shape for
+the Win key, the Start button, the click-away and the intent close. The gesture
+close keeps its own release spring (`BeginGestureSettle`); the shell-triggered
+family is not a reverse-played open curve.
 
 At the end of the close the Start side publishes `exec dismiss` at
 `settle + 30 ms` for an intent close, or at the settle's end for a gesture close;
@@ -143,7 +148,7 @@ motion sample caller=intent-open-cancel phase=settle p=0.542 v=-0.006 qpc=184223
 exec dismiss enter seq=7 gen=18 epoch=1 at=184223189
 ```
 
-The `remaining` in the close line is the full travel by design (the mirrored
+The `remaining` in the close line is the full travel by design (the shell-close
 curve), not `(1 - start) * distance`. The `open follow` line gained one field
 after `commit=`: `live=0|1`, where 1 says the session took a live retract over and
 its commit reads the panel's position instead of the travel. The excerpt above was

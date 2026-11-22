@@ -31,7 +31,7 @@ The controller decides; the executor performs. The Win key
 (`XamlLauncher::OnHotkeyInvoke`), the Start button (`ShowStartView` method 11,
 `Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) reach one
 toggle decision and publish one `intent(seq, kind, trigger, method, flags, open)`;
-the Start side applies it — `exec show`, or the one mirrored close settle and then
+the Start side applies it — `exec show`, or the one shell-close settle and then
 `exec dismiss` — and answers `intent ack`. A real pointer click on the desktop
 therefore closes a settled panel and reverses a close that is still in flight,
 exactly like the other two presses; a z-band change with no left button down
@@ -377,7 +377,7 @@ owed request — a press, or a band pull whose cancel armed the ticket — (`int
 recovered ...`) with its epoch and close
 identity, unchanged.
 An intent close is
-`TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
+`TakeProgressNow()` + the shell-close settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
 `Dismiss` on the launcher thread. The close record — one accepted close with its
 serial, acceptance tick, the menu it was accepted against, a phase and the 600 ms
