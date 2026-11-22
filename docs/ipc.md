@@ -139,10 +139,11 @@ record (`SwipeIpcAbortIntent` steps
 the counter to its odd state, which every reader rejects) and re-reads the claim.
 If the abort succeeded and no claim exists, the original runs once
 (`decision=replay reason=revoked`); a record that already moved cannot be aborted
-(`decision=superseded reason=record-moved`). A different `peerEpoch` means the
-activation that was asked is gone: a taken press is consumed without its ack
+(`decision=superseded reason=record-moved`). A different `peerEpoch` at the
+watchdog **or at the next admission** means the activation that was asked is
+gone: a taken press is consumed without its ack
 (`reason=epoch-changed`), an untaken one is aborted and replayed, and the queue
-advances. The peer words are evidence;
+advances without a timer. The peer words are evidence;
 the abort and the claim are the proof. A take is never replayed: at most one
 execution, one native execution when the record is aborted before any claim, and
 a press lost rather than duplicated if the controller dies after the take.

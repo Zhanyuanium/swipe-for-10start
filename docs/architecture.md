@@ -394,10 +394,11 @@ branch publishes the direction before the ack), and the next press's queue-age
 bound is paused, so no later press can be reordered ahead of it. Only a changed
 `peerEpoch` or a gone/stale peer releases the slot without the ack. An untaken
 record is aborted (its counter goes odd, so no consumer can copy or claim it) and
-re-read before any replay. A changed epoch at the watchdog is a restart: the
-replacement seeded `g_lastIntentSeq` past the record and will never answer, so
-the record is aborted, replayed if no claim exists, and the queue advances. The
-peer words stay in the line as evidence.
+re-read before any replay. A changed epoch at the watchdog **or at the next
+admission** is a restart: the replacement seeded `g_lastIntentSeq` past the record
+and will never answer, so the record is aborted, replayed if no claim exists, the
+external barrier is released, and the queue advances without a timer. The peer
+words stay in the line as evidence.
 
 Fallbacks, each logged once:
 

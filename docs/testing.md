@@ -259,6 +259,11 @@ could act, or before its confirmation could land).
   applies and acks, then press 2 is dequeued `reason=ack` and publishes the
   opposite direction. Order preserved; the bound restarts when press 1's slot is
   released.
+- **No-watchdog restart (C).** Force the external barrier's `SetTimer` to fail
+  (`own external barrier ... unarmed`), publish the takeover, restart the host,
+  and press. The admission compares the recorded epoch and logs
+  `own external barrier ... released reason=epoch-changed` (or
+  `own press abandoned ...`) with no timer, then the press is published once.
 
 ## The one-pass smoke
 

@@ -15645,29 +15645,67 @@ void ServeNextPress(const wchar_t* reason) {
     }
 }
 
+// A publication from a healthy replacement proves the activation that owned the
+// outstanding record is gone (or was replaced) before it answered. The watchdog
+// applies the same rule at its bound; this is the timer-free path, for a watchdog
+// that could not be armed or an unarmed external barrier. The rule is the
+// timeout's: an external has no original and is released; a normal press is
+// consumed when it was claimed, otherwise aborted and replayed only when the
+// abort succeeded and no claim landed.
+void ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
+    const OutstandingPress press = g_pressOutstanding;
+    const uint64_t wait = GetTickCount64() - press.publishedTick;
+    g_pressOutstanding = OutstandingPress{};
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (window) {
+        KillTimer(window, kPressAckTimer);
+    }
+    bool replay = false;
+    if (!press.external && SwipeIpcTakenIntent(&g_ipc) != press.seq) {
+        if (SwipeIpcAbortIntent(&g_ipc, press.seq)) {
+            replay = SwipeIpcTakenIntent(&g_ipc) != press.seq;
+        }
+    }
+    if (press.external) {
+        TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
+                L"decision=released reason=%s",
+                static_cast<long long>(press.seq),
+                static_cast<unsigned long long>(wait), press.publishedEpoch,
+                epochNow, reason);
+    } else {
+        TraceLog(L"own press abandoned seq=%lld trigger=%s entry=%s wait=%llu "
+                L"epoch=%u->%u decision=%s reason=%s",
+                static_cast<long long>(press.seq),
+                PressTriggerName(press.press.trigger),
+                PressEntryName(press.press.entry),
+                static_cast<unsigned long long>(wait), press.publishedEpoch,
+                epochNow, replay ? L"replay" : L"consumed", reason);
+    }
+    if (replay) {
+        RunPressOriginal(press.press, L"abandoned");
+    }
+    ResumePressQueueAge();
+    ServeNextPress(L"abandoned");
+}
+
 // One admitted press. The immediate press decides on this hook's own snapshot;
 // a press behind it is queued and decides later. A press that cannot be queued
 // is dropped, never executed out of order; nothing waits on the launcher hook.
 void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
-    if (g_pressOutstanding.pending && g_pressOutstanding.external &&
-        !PeerAliveNow()) {
-        // The external barrier's release that needs no timer: no answer can
-        // arrive from a peer that is gone, so held presses must not wait behind
-        // it. The ack path is the other release; silence from a live peer is not.
-        TraceLog(L"own external barrier seq=%lld released reason=peer-gone "
-                L"wait=%llu",
-                static_cast<long long>(g_pressOutstanding.seq),
-                static_cast<unsigned long long>(
-                    GetTickCount64() - g_pressOutstanding.publishedTick));
-        g_pressOutstanding = OutstandingPress{};
-        HWND window = g_execWindow.load(std::memory_order_relaxed);
-        if (window) {
-            KillTimer(window, kPressAckTimer);
+    if (g_pressOutstanding.pending) {
+        // The replacement that is admitting this press proves the record's
+        // activation is gone. Reconcile without waiting for a watchdog that may
+        // not be armed: an external barrier is released, a normal press is
+        // consumed or replayed under the claim/abort rule.
+        const uint32_t epochNow = PeerEpochNow();
+        const bool epochChanged =
+            g_pressOutstanding.publishedEpoch != 0 &&
+            epochNow != g_pressOutstanding.publishedEpoch;
+        const bool peerLost = !PeerAliveNow();
+        if (epochChanged || peerLost) {
+            ReconcileOutstandingAtAdmission(
+                epochChanged ? L"epoch-changed" : L"peer-gone", epochNow);
         }
-        // The presses that queued behind the barrier have no other wake: serve
-        // them now, each falling back to its own primitive under the guard.
-        ResumePressQueueAge();
-        ServeNextPress(L"external-peer-gone");
     }
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
         // A held close is requeued by ServePress and served by the gate's timer;

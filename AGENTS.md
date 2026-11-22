@@ -169,12 +169,15 @@ heartbeat:
 
 A claim is released only by its ack, a changed peer epoch, or a peer that is
 gone/stale (`decision=consumed reason=peer-gone`): those are the proofs that no
-direction is still coming. A different `peerEpoch` at the watchdog means the
-activation that was asked is gone: the replacement seeds `g_lastIntentSeq` past
-the record and will never answer, so a taken press is consumed without its ack
-(`reason=epoch-changed`), an untaken record is aborted and replayed under the
-same rule, and the external barrier is released. The peer words are evidence in
-the line; the abort and the claim are the proof.
+direction is still coming. A different `peerEpoch` at the watchdog **or at the
+next admission** means the activation that was asked is gone: the replacement
+seeds `g_lastIntentSeq` past the record and will never answer, so a taken press
+is consumed without its ack (`reason=epoch-changed`), an untaken record is
+aborted and replayed under the same rule, and the external barrier is released
+(`own press abandoned ...` / `own external barrier ... released reason=...`). The
+admission check needs no timer, so a watchdog that failed to arm cannot park the
+queue behind a dead activation. The peer words are evidence in the line; the
+abort and the claim are the proof.
 A take is never replayed: one execution at most, one native execution when the
 record is aborted before any claim, and a press lost rather than duplicated if
 the controller dies after the take. An
