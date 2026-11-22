@@ -518,13 +518,17 @@ probe or timer failure is answered `unknown`.
   methods go through the same dispatcher as the Win key, so a press during a
   retract is a reopen whatever primitive it entered through.
 - `HideStartAndCortana_Hook` (0x24BCB0): lock/unknown/Win+Tab and a forwarded
-  modified press publish `intent=external` and pass. A close intent is a close
-  only from the click-away caller or the Win/button caller; the click-away's
+  modified press publish `intent=external` and pass. An admitted click-away is not
+  a close by definition: it reaches the one dispatcher, so `closing` makes it the
+  reopen and a panel the controller owns makes it the close (method 7 stays the
+  click-away evidence, mapped to 6 on the Start side). A click with no panel to
+  close and no close to reverse passes to the shell (`intent pass clickaway ...
+  reason=no-panel`). The click-away's
   opening suppression (state 1/3, `reason=opening`) and the `controllerTouch`
-  suppression require `caller=clickaway`, not the number 7 alone. The same rule
-  gates admission: method 7 is click-away evidence, so an **ordinary** caller's
+  suppression require `caller=clickaway`, not the number 7 alone. Method 7 is
+  click-away evidence, so an **ordinary** caller's
   method-7 Hide passes to the shell (`reason=caller-scope`) instead of becoming a
-  close intent — the number alone never makes a close ours, and the 7→6 mapping
+  click decision — the number alone never makes a click ours, and the 7→6 mapping
   on the Start side needs the click-away trigger as well as the method. The
   own-show
   exception requires the executor's own stack, an unattributed caller and state
@@ -552,7 +556,8 @@ probe or timer failure is answered `unknown`.
   source. It forwards `edx` to the same Hide and is not wrapped: a Hide it
   reaches outside a wrapped caller stays `unknown` and native. The measured
   desktop click-away runs inside the `ActiveZBandChangedForMonitor` scope
-  (`intent close trigger=clickaway method=7`), so the animation is not lost.
+  (`own toggle decide trigger=clickaway ... kind=close`), so the animation is not
+  lost.
 
 - **The service gate.** Every decision hook runs `BridgeCanServeOnLauncherThread`
   before it reads the panel, and the peer is the first condition: the Start

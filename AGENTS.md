@@ -29,11 +29,15 @@ half's hooks, threads and handles are never created there.
 
 The controller decides; the executor performs. The Win key
 (`XamlLauncher::OnHotkeyInvoke`), the Start button (`ShowStartView` method 11,
-`Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) publish
-one `intent(seq, kind, trigger, method, flags, open)`; the Start side answers
-(`intent ack`) and publishes `exec show`, or runs the one mirrored close settle
-and then `exec dismiss`. External takeovers (Win+Tab, lock, display change, a
-forwarded modified Win press) publish `intent=external` and are never held.
+`Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) reach one
+toggle decision and publish one `intent(seq, kind, trigger, method, flags, open)`;
+the Start side answers (`intent ack`) and publishes `exec show`, or runs the one
+mirrored close settle and then `exec dismiss`. A click on the desktop therefore
+closes a settled panel and reverses a close that is still in flight, exactly like
+the other two presses; method 7 stays the click-away evidence in the intent and
+the Start side maps it to the executor's 6. External takeovers (Win+Tab, lock,
+display change, a forwarded modified Win press) publish `intent=external` and are
+never held.
 
 The bridge intercepts only while the Start side is alive. The bridge creates the
 channel, so a mapped section says nothing about the controller; the Start side

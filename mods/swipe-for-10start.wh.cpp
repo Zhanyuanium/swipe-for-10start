@@ -14186,13 +14186,10 @@ struct OwnSnapshot {
     uint32_t state;
 };
 
-// Reads the cloak truth before a decision and adopts it. A divergence is logged
-// once, with both values; the shell is always right. An unready state (the
-// constructor's 0x100 sentinel, a detached interface, or a pointer there is no
-// reason to trust) is refused here, and the hook that asked passes the call to
-// the shell: deciding from an unread state would be a guess about the direction.
-OwnSnapshot OwnSync(void* launcher) {
-    void* state = OwnStateOf(launcher);
+// Reads the cloak truth and adopts it, from the IXamlLauncherState interface a
+// hook already holds. OwnSync is the launcher-object form; both share this body
+// so the resync and the readiness floor cannot disagree between entries.
+OwnSnapshot OwnSyncState(void* state) {
     const uint64_t raw =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(state));
     if (!LauncherStateReady(raw)) {
@@ -14217,6 +14214,22 @@ OwnSnapshot OwnSync(void* launcher) {
     }
     return OwnSnapshot{true, shellOpen, internal};
 }
+
+// Reads the cloak truth before a decision and adopts it. A divergence is logged
+// once, with both values; the shell is always right. An unready state (the
+// constructor's 0x100 sentinel, a detached interface, or a pointer there is no
+// reason to trust) is refused here, and the hook that asked passes the call to
+// the shell: deciding from an unread state would be a guess about the direction.
+OwnSnapshot OwnSync(void* launcher) {
+    return OwnSyncState(OwnStateOf(launcher));
+}
+
+// The one toggle decision, defined below with the press latch. The Hide entry
+// owns the click-away Hide and reaches it from here; every other entry calls it
+// directly.
+bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
+                    uint32_t dismissMethod, uint32_t flags,
+                    uint32_t admittingEpoch);
 
 // The same adoption after a close the executor passed or served. It reads the
 // state the hook received, which is the IXamlLauncherState interface.
@@ -14502,11 +14515,14 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         return;
     }
 
-    // Every other Hide reaching this hook is a close trigger — the click-away,
-    // the shell's Windows key when the decision hook passed it, or a Start-button
-    // path — not a duplicate of a close the controller already runs. It is
-    // published even while the controller owns the panel; the controller decides
-    // whether it is a new close or a reopen.
+    // A click-away and an ordinary caller's Hide are different entries. The
+    // click-away goes through the one dispatcher below (a close on a settled
+    // panel, a reopen while the controller is closing); every other Hide that
+    // reaches this point is a close trigger — the shell's Windows key when the
+    // decision hook passed it, or a Start-button path — not a duplicate of a
+    // close the controller already runs. It is published even while the
+    // controller owns the panel; the controller decides whether it is a new close
+    // or a reopen.
     //
     // The one exception is the opening touch: when a contact at the band pulls
     // the menu out, the shell sees that same contact outside the freshly shown
@@ -14540,9 +14556,43 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         return;
     }
 
-    const int32_t trigger = caller == OwnCaller::ClickAway
-                                ? kSwipeTriggerClickAway
-                                : kSwipeTriggerWin;
+    // The click-away is not a close by definition. It reaches the same toggle
+    // decision as the Windows key and the Start button, so a click whose panel the
+    // controller is already closing is the reopen that stops the close, and a
+    // click on a settled panel is the close it has always been (method 7 stays the
+    // click-away evidence). A click with no panel to close and no close to reverse
+    // — a callback after the menu has landed — passes to the shell.
+    if (caller == OwnCaller::ClickAway) {
+        const OwnSnapshot clickOwn = OwnSyncState(self);
+        if (!clickOwn.ready) {
+            TraceLog(L"intent pass clickaway method=%u reason=state-not-ready",
+                    method);
+            callOriginal();
+            OwnResyncFromState(self);
+            return;
+        }
+        const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
+        if (direction != kSwipeDirectionClosing && !clickOwn.open) {
+            TraceLog(L"intent pass clickaway method=%u state=%u dir=%d "
+                    L"reason=no-panel",
+                    method, clickOwn.state, direction);
+            callOriginal();
+            OwnResyncFromState(self);
+            return;
+        }
+        // `showMethod` is the Start button's Show(11); the click's ShowStartView
+        // reopens through the executor. The close keeps 7 as evidence in the
+        // intent; the Start side maps it to the executor's 6.
+        if (!DispatchToggle(clickOwn, kSwipeTriggerClickAway,
+                            kSwipeShowMethodStartButton,
+                            kDismissMethodClickAway, 0, PeerEpochNow())) {
+            callOriginal();
+            OwnResyncFromState(self);
+        }
+        return;
+    }
+
+    const int32_t trigger = kSwipeTriggerWin;
     // The close intent's method is forwarded to the executor. 7 is click-away
     // *evidence*, so only the caller scope that proves the source may carry it;
     // an ordinary caller's method-7 Hide is the shell's own close and passes.
@@ -14824,13 +14874,16 @@ bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
     // The one admission check. The method and flags below are the ones the
     // action will publish, not necessarily the ones the shell called with: a
     // reopen from Dismiss(6) asks for Show(11), and a close from Show(11) asks
-    // for Dismiss(6). A combination outside the shared vocabulary goes to the
+    // for Dismiss(6). A close intent's method is evidence about the producing
+    // shell path, not the executor's call: the click-away's 7 is admitted here
+    // and mapped to 6 by the Start side, which is where the executor vocabulary
+    // is checked again. A combination outside the shared vocabulary goes to the
     // original; the executor's whitelist would only refuse it after the press
     // was already swallowed.
     const uint32_t method =
         kind == kSwipeIntentClose ? dismissMethod : showMethod;
     const bool supported = kind == kSwipeIntentClose
-                               ? SwipeDismissAllowed(method)
+                               ? SwipeCloseIntentAllowed(method)
                                : SwipeShowAllowed(method, flags);
     if (!supported) {
         TraceLog(L"own pass trigger=%s state=%u open=%d kind=%s method=%u "

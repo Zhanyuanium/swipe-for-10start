@@ -177,7 +177,7 @@ Triggers and their decision lines:
 | Windows key | `XamlLauncher::OnHotkeyInvoke` (`+0x14195C`) | `own toggle decide trigger=win … kind=open|close` |
 | Start button open | `ShowStartView` method 11 | `own toggle decide trigger=startbutton …` |
 | Start button close | `Dismiss` method 6 | `own toggle decide trigger=startbutton …` |
-| click-away | `HideStartAndCortana` method 7 | `intent close trigger=clickaway` |
+| click-away | `HideStartAndCortana` method 7 | `own toggle decide trigger=clickaway … kind=open|close` |
 | touch | the Start side's qualified band pull (24 DIP) | `reveal show request` |
 
 `IntentShouldClose` is the only toggle rule: the controller's one direction word
@@ -188,8 +188,10 @@ The shell cannot be the direction: a gesture close publishes `2` in
 `TakeCloseOwnership`, before its first frame, because the window still
 reports state 5 and the cloak still reports open for the whole retract, until
 the executor's `Dismiss` runs. Reading the shell there made a press during the
-retract a second close, and the owner's press did nothing. No trigger has its
-own branch.
+retract a second close, and the owner's press did nothing. The click-away runs
+the same rule and only guards the case the shell cannot produce — a method-7
+callback with no open panel and no close to reverse — by passing it to the shell
+(`intent pass clickaway … reason=no-panel`). No trigger has its own branch.
 
 **The interception precondition is the peer, not the section.** The bridge
 creates the channel, so a mapped section proves only that the bridge runs: with
