@@ -14420,6 +14420,44 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 constexpr wchar_t kExecClassName[] = L"WindhawkSwipeFor10Start.Executor";
 bool g_execClassRegistered = false;
 HINSTANCE g_execClassInstance = nullptr;
+
+// The executor window's admission lock. Creation takes it shared around the
+// disabled/class/window checks, class registration and CreateWindowExW; the
+// unload takes it exclusive before the window and class teardown. The shared
+// side is a try: the only writer is the unload, so a late entry returns instead
+// of blocking the launcher thread while the unload sends it a message.
+SRWLOCK g_execAdmissionLock = SRWLOCK_INIT;
+
+class ExecAdmissionShared {
+  public:
+    ExecAdmissionShared() {
+        held_ = TryAcquireSRWLockShared(&g_execAdmissionLock) != 0;
+    }
+    ~ExecAdmissionShared() {
+        if (held_) {
+            ReleaseSRWLockShared(&g_execAdmissionLock);
+        }
+    }
+    bool held() const { return held_; }
+    ExecAdmissionShared(const ExecAdmissionShared&) = delete;
+    ExecAdmissionShared& operator=(const ExecAdmissionShared&) = delete;
+
+  private:
+    bool held_ = false;
+};
+
+class ExecAdmissionExclusive {
+  public:
+    ExecAdmissionExclusive() {
+        AcquireSRWLockExclusive(&g_execAdmissionLock);
+    }
+    ~ExecAdmissionExclusive() {
+        ReleaseSRWLockExclusive(&g_execAdmissionLock);
+    }
+    ExecAdmissionExclusive(const ExecAdmissionExclusive&) = delete;
+    ExecAdmissionExclusive& operator=(const ExecAdmissionExclusive&) = delete;
+};
+
 constexpr UINT kExecMessage = WM_APP + 0x5A;
 // The private shutdown and latch messages. A generic WM_CLOSE says only "some
 // window should close"; the teardown is a request this activation made about
@@ -18432,6 +18470,17 @@ void EnsureExecutorWindow() {
         g_execWindow.load(std::memory_order_relaxed)) {
         return;
     }
+    // Admission: the creation path's checks, class registration and window
+    // creation are all under this shared hold. A try failure is the unload's
+    // exclusive writer; the flag it set is the reason not to create now.
+    ExecAdmissionShared admission;
+    if (!admission.held()) {
+        return;
+    }
+    if (g_disabled.load(std::memory_order_relaxed) ||
+        g_execWindow.load(std::memory_order_relaxed)) {
+        return;
+    }
     // The class is fixed and owned by this image. `ERROR_CLASS_ALREADY_EXISTS`
     // is a failure: it means a previous window of this image survived its
     // unload, and adopting that class would hand this activation's channel to a
@@ -18931,13 +18980,21 @@ void RoleUninit() {
     JoinExecutorWorker();
 
     // Then the one window, on its owner thread, with the worker already joined:
-    // no new post can arrive and no timer can survive the destruction.
-    DestroyExecutorWindow();
+    // no new post can arrive and no timer can survive the destruction. The
+    // exclusive admission holds a creation that already passed its flag check;
+    // a late creation's shared try fails and returns. The launcher-thread
+    // GetMessage hook also uses the shared try, so the teardown SendMessage
+    // cannot deadlock against this writer.
+    {
+        ExecAdmissionExclusive admission;
+        TraceLog(L"exec unload admission exclusive");
+        DestroyExecutorWindow();
 
-    // The class is unregistered only after the window is gone, under the same
-    // instance that registered it. A class that outlives the image would point
-    // at an unmapped WndProc.
-    UnregisterExecutorClass();
+        // The class is unregistered only after the window is gone, under the same
+        // instance that registered it. A class that outlives the image would
+        // point at an unmapped WndProc.
+        UnregisterExecutorClass();
+    }
 
     // The loader reference taken for the one symbol attempt is no longer
     // needed: the worker is joined, the window is gone and no path reads the
