@@ -193,6 +193,20 @@ the same rule and only guards the case the shell cannot produce — a method-7
 callback with no open panel and no close to reverse — by passing it to the shell
 (`intent pass clickaway … reason=no-panel`). No trigger has its own branch.
 
+**One intent at a time.** The channel has one intent record and one event, so a
+second admitted press that decided before the Start side consumed the first would
+overwrite the record and read the same direction: both presses would mean the same
+toggle and one would be lost. Admitted presses wait in a four-entry FIFO on the
+launcher thread. The first is published; the next is published only after the
+`intent ack` for the outstanding sequence (the executor worker waits on the ack
+event and posts it to the executor window) or its 1000 ms bound expires. The
+direction is sampled when the press is published, never at admission, so the
+press after a close reads `2` and reopens. A press the queue cannot serve — full,
+an ack that never arrives, or a wait past 1500 ms — runs the shell's own original
+primitive for that press under the executor guard (`own press fallback …`), so
+the shell is never left without its toggle. An `external` intent clears the queue
+and the latch.
+
 **The interception precondition is the peer, not the section.** The bridge
 creates the channel, so a mapped section proves only that the bridge runs: with
 the Start mod disabled the section is still valid and the old gate decided for a

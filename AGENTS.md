@@ -70,7 +70,10 @@ and the executor window is created only from a known launcher entry.
 A press is recovered, not guaranteed. The bridge's one dispatch reads the
 controller's published direction: `closing` (a close in flight)
 makes the press an open and `open` makes it a close. The launcher's
-state is only the resync for a panel the controller does not own. That direction
+state is only the resync for a panel the controller does not own. The click-away
+is the same dispatch, so a desktop click reverses a close exactly as the Win key
+and the Start button do; a method-7 callback with no panel and no close passes to
+the shell instead of opening a closed menu. That direction
 cannot come from the shell: a gesture close retracts the panel with
 `InternalState` 5 and the cloak still open for the whole settle, until the
 executor's `Dismiss`; the controller publishes `closing` in `TakeCloseOwnership`,
@@ -108,6 +111,19 @@ dropped rather than left with no guaranteed callback. The residual loss window i
 the peer's detection budget: a press after the gate closed, or a latch armed
 before a kill and served after it, is the shell's. A press the bridge already
 swallowed has no shell path left — it is dropped, not passed on.
+
+One press, one intent, and one press at a time. The channel has one intent record,
+so a second press that decided before the consumer ran would overwrite the first
+and read the same direction; both then meant the same toggle and one user press
+was lost. Admitted presses now wait in a four-entry FIFO on the launcher thread:
+the first is published, and the next is published only when the ack for the
+outstanding sequence arrives or its 1000 ms bound expires, so its direction is
+the one the controller published while applying the press before it. The ack event
+is waited on by the executor worker and posted to the executor window; the hook
+never waits. A press the queue cannot serve (full, ack timeout, past its 1500 ms
+wait) runs the shell's own original primitive for that press under the executor
+guard (`own press fallback ... reason=queue-full|no-ack|queue-wait`) instead of
+being lost; an `external` intent clears the queue and the latch.
 
 The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user

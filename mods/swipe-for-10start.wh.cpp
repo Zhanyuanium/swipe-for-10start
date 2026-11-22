@@ -119,7 +119,11 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  * [OUTPUT]: the panel's Progress through the one damped-spring settle, the
  *   reveal and dismiss follows, the coast and the geometry snapshot; the hidden
  *   executor window on explorer's launcher thread that runs the one shell call
- *   per command; one decision line and one executor line per trigger. Every
+ *   per command; one decision line and one executor line per trigger. One intent
+ *   is outstanding at a time: an admitted press waits in a four-entry FIFO until
+ *   the intent ack for the press before it (or its 1000 ms bound) and then decides
+ *   from the direction the controller published by then; a press the queue cannot
+ *   serve runs the shell's own primitive under the executor guard. Every
  *   line goes through `TraceLog`: `Wh_Log` always, and the role's file only
  *   while the `DiagnosticTrace` setting is on. The two interruption dates are
  *   `motion sample` — the position and slope `TakeProgressNow` reads, once per
@@ -13669,8 +13673,8 @@ void EnsureExecutorWindow();
 DWORD NoteLauncherThread(const wchar_t* source);
 void EnsureExecutorOnLauncherThread(const wchar_t* source);
 void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr);
-void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
-                         uint32_t flags);
+LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
+                           uint32_t flags);
 
 // twinui.pcshell.dll is resolved by public symbol, not by address. The hook
 // array in InstallExplorerHooks carries every name inline: each is the exact
@@ -13776,6 +13780,14 @@ constexpr uint32_t kDismissMethodWinTab = 5;
 constexpr uint32_t kDismissMethodStartButton = 6;
 constexpr uint32_t kDismissMethodClickAway = 7;
 
+// The entry a press arrived through: the primitive the queue's fallback must
+// repeat when the press cannot be served as an intent.
+constexpr int32_t kPressEntryHotkey = 0;
+constexpr int32_t kPressEntryButton = 1;
+constexpr int32_t kPressEntryShow = 2;
+constexpr int32_t kPressEntryDismiss = 3;
+constexpr int32_t kPressEntryHide = 4;
+
 // The executor's allowlist uses the one shared vocabulary
 // (SwipeShowAllowed/SwipeDismissAllowed): a show carries method 1, 11 or 16 with
 // flags under the mask the shell's ShowStartView reads; a dismiss carries 1 or 6
@@ -13823,14 +13835,28 @@ constexpr UINT kExecMessage = WM_APP + 0x5A;
 // where the timer and the slot live.
 constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
 constexpr UINT kExecLatchMessage = WM_APP + 0x5C;
+// The intent ack travels worker -> launcher window: the worker is the only
+// thread that can wait on the channel's ack event, and the queue belongs to the
+// launcher thread. This is a notification, not a second record.
+constexpr UINT kExecIntentAckMessage = WM_APP + 0x5D;
 constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
 constexpr WPARAM kExecLatchMagic = 0x53574C41;     // "SWLA"
+constexpr WPARAM kExecIntentAckMagic = 0x53574141;  // "SWAA"
 constexpr UINT_PTR kExecDismissTimer = 0x5358;
 constexpr UINT_PTR kExecProbeTimer = 0x5359;
 constexpr UINT_PTR kPressLatchTimer = 0x535A;
 constexpr UINT_PTR kExecDismissProbeTimer = 0x535B;
+constexpr UINT_PTR kPressAckTimer = 0x535C;
 constexpr uint64_t kPressLatchTimeoutMs = 400;
 constexpr uint64_t kPressLatchRetryMs = 100;
+// One outstanding press. The ack normally arrives in the consumer's own turn
+// (single-digit milliseconds); the bound is the point at which the press is
+// served by the shell's own primitive instead. The queue wait is the total a
+// press may spend behind older presses (four entries, each at most the ack bound)
+// before its own decision is served by the shell for the same reason.
+constexpr uint64_t kPressAckTimeoutMs = 1000;
+constexpr uint64_t kPressQueueWaitMs = 1500;
+constexpr int kPressQueueCapacity = 4;
 // The controller's own budget for one command (its kBridgeAckTimeoutMs): a show
 // is answered within 400 ms of its publication, a dismiss within 400 ms of the
 // deadline it was given. A dispatch that starts after that is stale — the
@@ -14224,12 +14250,12 @@ OwnSnapshot OwnSync(void* launcher) {
     return OwnSyncState(OwnStateOf(launcher));
 }
 
-// The one toggle decision, defined below with the press latch. The Hide entry
-// owns the click-away Hide and reaches it from here; every other entry calls it
-// directly.
+// The one toggle decision, defined below with the press latch and the press
+// queue. The Hide entry owns the click-away Hide and reaches it from here; every
+// other entry calls it directly.
 bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags,
-                    uint32_t admittingEpoch);
+                    uint32_t admittingEpoch, int32_t entry);
 
 // The same adoption after a close the executor passed or served. It reads the
 // state the hook received, which is the IXamlLauncherState interface.
@@ -14585,7 +14611,8 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         // intent; the Start side maps it to the executor's 6.
         if (!DispatchToggle(clickOwn, kSwipeTriggerClickAway,
                             kSwipeShowMethodStartButton,
-                            kDismissMethodClickAway, 0, PeerEpochNow())) {
+                            kDismissMethodClickAway, 0, PeerEpochNow(),
+                            kPressEntryHide)) {
             callOriginal();
             OwnResyncFromState(self);
         }
@@ -14639,6 +14666,64 @@ bool IntentShouldClose(const OwnSnapshot& own, int32_t direction) {
 }
 
 // ---------------------------------------------------------------------------
+// The press queue: one outstanding decision at a time
+// ---------------------------------------------------------------------------
+//
+// The channel has one intent record and one event. Two presses that both decide
+// before the Start side consumes the first overwrite each other and read the same
+// direction, so the second cannot reverse the first: one of the user's presses is
+// silently lost. Every admitted press is therefore one entry in a small FIFO on
+// the launcher thread. The first is published at once; each next is published
+// only after the intent ack for the one before it (or that ack's bounded wait
+// expires), so its direction is the one the controller published while applying
+// the earlier press. The hook never waits: the ack arrives on its event, the
+// worker posts it to the executor window, and the decision runs there.
+//
+// The queue is bounded, and so is each wait. A press the queue cannot serve runs
+// the shell's own original primitive for that press under the executor guard
+// (`t_execCall`), so the shell is never left without its toggle; the line says
+// which entry and why. An external takeover clears the queue: those intents are
+// not this mod's.
+struct QueuedPress {
+    int32_t trigger = kSwipeTriggerWin;
+    // The primitive the shell called and the arguments the fallback repeats. The
+    // two methods are the entry's own vocabulary, not necessarily the action this
+    // press publishes: a reopen from Dismiss(6) publishes Show(11), and its
+    // fallback must still call Dismiss(6).
+    int32_t entry = kPressEntryHotkey;
+    uint32_t showMethod = 0;
+    uint32_t dismissMethod = 0;
+    uint32_t flags = 0;
+    uint32_t admittingEpoch = 0;
+    uint64_t admittedTick = 0;
+};
+
+const wchar_t* PressEntryName(int32_t entry) {
+    switch (entry) {
+        case kPressEntryButton:
+            return L"button";
+        case kPressEntryShow:
+            return L"show";
+        case kPressEntryDismiss:
+            return L"dismiss";
+        case kPressEntryHide:
+            return L"hide";
+        default:
+            return L"hotkey";
+    }
+}
+
+// Defined after the original pointers; the queue's fallback is the only caller.
+void RunPressOriginal(const QueuedPress& press, const wchar_t* reason);
+// Publishes one decision and makes it the outstanding press. 0 means nothing was
+// published and the caller must serve the press with its own primitive.
+LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
+                          const wchar_t* source);
+// Drains the queue while nothing is outstanding. Called after an ack, a latch or
+// a fallback; it never blocks.
+void ServeNextPress(const wchar_t* reason);
+
+// ---------------------------------------------------------------------------
 // The press latch: a press that lands while the shell is already hiding
 // ---------------------------------------------------------------------------
 //
@@ -14654,13 +14739,7 @@ struct PressLatch {
     bool pending = false;
     uint64_t tick = 0;
     int32_t kind = kSwipeIntentOpen;
-    int32_t trigger = kSwipeTriggerWin;
-    uint32_t method = 0;
-    uint32_t flags = 0;
-    // The Start activation that was answering when the press was latched. A
-    // serve against a different epoch is a serve into a controller that never
-    // saw this press, so the slot is invalidated instead.
-    uint32_t epoch = 0;
+    QueuedPress press{};
 };
 
 PressLatch g_pressLatch;  // launcher thread only
@@ -14705,8 +14784,7 @@ bool ShellHideInFlight(const OwnSnapshot& own) {
     return own.state == 9 || own.state == 11;
 }
 
-void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
-                uint32_t flags, uint32_t admittingEpoch) {
+void LatchPress(const OwnSnapshot& own, const QueuedPress& press) {
     const uint64_t now = GetTickCount64();
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (!window) {
@@ -14714,6 +14792,7 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
         // run on. A slot with no guaranteed callback is not armed at all.
         TraceLog(L"own press latch dropped reason=no-window state=%u",
                 own.state);
+        RunPressOriginal(press, L"no-window");
         return;
     }
     if (g_pressLatch.pending) {
@@ -14722,13 +14801,12 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
                 static_cast<unsigned long long>(now - g_pressLatch.tick),
                 own.state);
     }
-    g_pressLatch = PressLatch{true,            now,  kSwipeIntentOpen,
-                              trigger,         method, flags,
-                              admittingEpoch};
-    TraceLog(L"own press latched state=%u trigger=%s tick=%llu epoch=%u "
-            L"(hide or dismiss call in flight)",
-            own.state, PressTriggerName(trigger),
-            static_cast<unsigned long long>(now), g_pressLatch.epoch);
+    g_pressLatch = PressLatch{true, now, kSwipeIntentOpen, press};
+    TraceLog(L"own press latched state=%u trigger=%s entry=%s tick=%llu "
+            L"epoch=%u (hide or dismiss call in flight)",
+            own.state, PressTriggerName(press.trigger),
+            PressEntryName(press.entry),
+            static_cast<unsigned long long>(now), g_pressLatch.press.admittingEpoch);
     g_pressServeReason = L"timeout";
     if (SetTimer(window, kPressLatchTimer, kPressLatchTimeoutMs, nullptr) == 0) {
         // The hidden event is a second serve point, but it is not a guaranteed
@@ -14736,6 +14814,7 @@ void LatchPress(const OwnSnapshot& own, int32_t trigger, uint32_t method,
         // the only promise, so a latch that cannot arm it is dropped.
         TraceLog(L"own press latch timer failed err=%u", GetLastError());
         DropPressLatch(L"timer-failed", L"latch");
+        RunPressOriginal(press, L"latch-timer");
     }
 }
 
@@ -14805,9 +14884,10 @@ bool ServeLatchedPress(const wchar_t* reason) {
         return false;
     }
     const uint32_t epoch = PeerEpochNow();
-    if (epoch != g_pressLatch.epoch) {
-        wchar_t detail[64] = {};
-        swprintf_s(detail, L"latch_epoch=%u now=%u", g_pressLatch.epoch, epoch);
+    if (epoch != g_pressLatch.press.admittingEpoch) {
+        wchar_t detail[80] = {};
+        swprintf_s(detail, L"latch_epoch=%u now=%u",
+                   g_pressLatch.press.admittingEpoch, epoch);
         DropPressLatch(L"peer-changed", detail);
         return false;
     }
@@ -14834,33 +14914,154 @@ bool ServeLatchedPress(const wchar_t* reason) {
     const PressLatch latch = g_pressLatch;
     g_pressLatch = PressLatch{};
     const uint64_t wait = GetTickCount64() - latch.tick;
-    PublishBridgeIntent(kSwipeIntentOpen, latch.trigger, latch.method,
-                        latch.flags);
-    TraceLog(L"own press served wait=%llu state=%u trigger=%s reason=%s "
-            L"epoch=%u",
+    // The served open is a published intent like any other: it becomes the
+    // outstanding press, so a new press arriving before its ack is queued behind
+    // it instead of overwriting the record. A failed publication runs the press's
+    // own primitive, as the queue's fallback does.
+    if (PublishPressIntent(kSwipeIntentOpen, latch.press, L"latch") <= 0) {
+        RunPressOriginal(latch.press, L"latch-publish");
+    }
+    TraceLog(L"own press served wait=%llu state=%u trigger=%s entry=%s "
+            L"reason=%s epoch=%u",
             static_cast<unsigned long long>(wait), own.state,
-            PressTriggerName(latch.trigger), reason, latch.epoch);
+            PressTriggerName(latch.press.trigger),
+            PressEntryName(latch.press.entry), reason, epoch);
     return true;
 }
 
-// The one toggle dispatcher for the three physical entries: the bare Windows
-// press, the Start button's open (ShowStartView method 11) and its close
-// (Dismiss method 6). `showMethod`/`dismissMethod` are the methods this entry
-// uses for each action; the action the direction chose keeps its own method. The
-// click-away is directional and never comes through here.
-//
-// The Start button used to publish a close from Dismiss(6) without asking the
-// direction, so a press during a retract entered as a second close while the
-// controller said the close was still in flight and the owner's press did
-// nothing. Both button entries now run the same rule as the Win key.
-//
-// Supersession lives here, not in one entry: any newer press whose panel is not
-// hiding makes the older latched reopen obsolete, whichever primitive carried it.
-// A physical Start-button close on a shown panel used to leave the old slot for
-// the hidden event to serve.
-bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
-                    uint32_t dismissMethod, uint32_t flags,
-                    uint32_t admittingEpoch) {
+// ---------------------------------------------------------------------------
+// The queue's state and its one published press
+// ---------------------------------------------------------------------------
+
+QueuedPress g_pressQueue[kPressQueueCapacity];  // launcher thread only
+int g_pressQueueHead = 0;
+int g_pressQueueCount = 0;
+
+struct OutstandingPress {
+    bool pending = false;
+    LONG64 seq = 0;
+    uint64_t publishedTick = 0;
+    QueuedPress press{};
+};
+OutstandingPress g_pressOutstanding;  // launcher thread only
+
+// Removes every queued press and the outstanding one. The outstanding intent may
+// still be applied by the Start side (no scheme recalls a record), but nothing
+// here waits for a press that an external takeover has made obsolete. Launcher
+// thread only.
+void DropPressQueue(const wchar_t* reason) {
+    int dropped = 0;
+    while (g_pressQueueCount > 0) {
+        const QueuedPress& press = g_pressQueue[g_pressQueueHead];
+        TraceLog(L"own press dropped trigger=%s entry=%s reason=%s wait=%llu",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                reason,
+                static_cast<unsigned long long>(GetTickCount64() -
+                                                press.admittedTick));
+        g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
+        --g_pressQueueCount;
+        ++dropped;
+    }
+    if (g_pressOutstanding.pending) {
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
+        TraceLog(L"own press dropped trigger=%s entry=%s reason=%s seq=%lld "
+                L"wait=%llu",
+                PressTriggerName(g_pressOutstanding.press.trigger),
+                PressEntryName(g_pressOutstanding.press.entry), reason,
+                static_cast<long long>(g_pressOutstanding.seq),
+                static_cast<unsigned long long>(
+                    GetTickCount64() - g_pressOutstanding.publishedTick));
+        g_pressOutstanding = OutstandingPress{};
+        ++dropped;
+    }
+    if (dropped > 1) {
+        TraceLog(L"own press queue cleared count=%d reason=%s", dropped, reason);
+    }
+}
+
+// Publishes one decision and makes it the outstanding press. The ack timer is
+// armed before the record is published: a timer that cannot be armed means the
+// wait has no bound, so the press is not published and the caller serves it with
+// the shell's own primitive instead. Returns the published sequence, or 0.
+LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
+                          const wchar_t* source) {
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (!window) {
+        TraceLog(L"own press publish refused trigger=%s reason=no-window",
+                PressTriggerName(press.trigger));
+        return 0;
+    }
+    if (SetTimer(window, kPressAckTimer,
+                 static_cast<UINT>(kPressAckTimeoutMs), nullptr) == 0) {
+        TraceLog(L"own press publish refused trigger=%s reason=no-timer err=%u",
+                PressTriggerName(press.trigger), GetLastError());
+        return 0;
+    }
+    const uint32_t method =
+        kind == kSwipeIntentClose ? press.dismissMethod : press.showMethod;
+    const LONG64 sequence =
+        PublishBridgeIntent(kind, press.trigger, method, press.flags);
+    if (sequence <= 0) {
+        KillTimer(window, kPressAckTimer);
+        TraceLog(L"own press publish refused trigger=%s reason=no-channel",
+                PressTriggerName(press.trigger));
+        return 0;
+    }
+    g_pressOutstanding = OutstandingPress{true, sequence, GetTickCount64(),
+                                          press};
+    TraceLog(L"own press published trigger=%s entry=%s seq=%lld kind=%s q=%d "
+            L"source=%s",
+            PressTriggerName(press.trigger), PressEntryName(press.entry),
+            static_cast<long long>(sequence),
+            kind == kSwipeIntentClose ? L"close" : L"open",
+            g_pressQueueCount, source);
+    return sequence;
+}
+
+// One press's turn. The direction is read here, not at admission, so every press
+// behind an outstanding one is decided from the direction the controller
+// published while applying the press before it. `admission` is the hook's own
+// snapshot for the immediate press; a queued press reacquires it on this thread.
+bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
+    const uint64_t now = GetTickCount64();
+    if (now > press.admittedTick && now - press.admittedTick > kPressQueueWaitMs) {
+        TraceLog(L"own press fallback trigger=%s entry=%s reason=queue-wait "
+                L"wait=%llu",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                static_cast<unsigned long long>(now - press.admittedTick));
+        RunPressOriginal(press, L"queue-wait");
+        return true;
+    }
+    if (!PeerAliveNow() || PeerEpochNow() != press.admittingEpoch ||
+        !BridgeCanServe()) {
+        TraceLog(L"own press fallback trigger=%s entry=%s reason=peer-gone "
+                L"wait=%llu",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                static_cast<unsigned long long>(now - press.admittedTick));
+        RunPressOriginal(press, L"peer-gone");
+        return true;
+    }
+    uint64_t state = 0;
+    void* launcher = LauncherNow(&state);
+    if (!launcher) {
+        TraceLog(L"own press fallback trigger=%s entry=%s reason=not-ready "
+                L"state=0x%llX",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                static_cast<unsigned long long>(state));
+        RunPressOriginal(press, L"not-ready");
+        return true;
+    }
+    const OwnSnapshot own = admission ? *admission : OwnSync(launcher);
+    if (!own.ready) {
+        TraceLog(L"own press fallback trigger=%s entry=%s "
+                L"reason=state-not-ready",
+                PressTriggerName(press.trigger), PressEntryName(press.entry));
+        RunPressOriginal(press, L"state-not-ready");
+        return true;
+    }
     if (g_pressLatch.pending && !ShellHideInFlight(own)) {
         // The landing event was missed and this newer press is the one the user
         // means.
@@ -14869,36 +15070,59 @@ bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
     // One sample of the controller's direction drives both the decision and its
     // line. Reading it twice could log a direction the decision never used.
     const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
-    const int32_t kind = IntentShouldClose(own, direction) ? kSwipeIntentClose
-                                                           : kSwipeIntentOpen;
-    // The one admission check. The method and flags below are the ones the
-    // action will publish, not necessarily the ones the shell called with: a
-    // reopen from Dismiss(6) asks for Show(11), and a close from Show(11) asks
-    // for Dismiss(6). A close intent's method is evidence about the producing
-    // shell path, not the executor's call: the click-away's 7 is admitted here
-    // and mapped to 6 by the Start side, which is where the executor vocabulary
-    // is checked again. A combination outside the shared vocabulary goes to the
-    // original; the executor's whitelist would only refuse it after the press
-    // was already swallowed.
+    int32_t kind = kSwipeIntentOpen;
+    if (press.trigger == kSwipeTriggerClickAway) {
+        // A click-away is not a close by definition. The controller's closing
+        // direction is the whole reversal rule; a panel it owns (or the shell's
+        // own open) is the close the click has always been. A callback with no
+        // panel and no close is not a toggle: pass it, never open a closed menu.
+        if (direction == kSwipeDirectionClosing) {
+            kind = kSwipeIntentOpen;
+        } else if (own.open || own.state == 1 || own.state == 3 ||
+                   own.state == 5) {
+            kind = kSwipeIntentClose;
+        } else {
+            TraceLog(L"own press dropped trigger=clickaway entry=hide "
+                    L"reason=no-panel state=%u dir=%d",
+                    own.state, direction);
+            return true;
+        }
+    } else {
+        kind = IntentShouldClose(own, direction) ? kSwipeIntentClose
+                                                 : kSwipeIntentOpen;
+    }
+    // The one admission check. The method below is the one the action will
+    // publish, not necessarily the one the shell called with: a reopen from
+    // Dismiss(6) asks for Show(11), and a close from Show(11) asks for
+    // Dismiss(6). A close intent's method is evidence about the producing shell
+    // path, not the executor's call: the click-away's 7 is admitted here and
+    // mapped to 6 by the Start side, which is where the executor vocabulary is
+    // checked again. An unsupported combination is served by the original, never
+    // published and refused later.
     const uint32_t method =
-        kind == kSwipeIntentClose ? dismissMethod : showMethod;
+        kind == kSwipeIntentClose ? press.dismissMethod : press.showMethod;
     const bool supported = kind == kSwipeIntentClose
                                ? SwipeCloseIntentAllowed(method)
-                               : SwipeShowAllowed(method, flags);
+                               : SwipeShowAllowed(method, press.flags);
     if (!supported) {
-        TraceLog(L"own pass trigger=%s state=%u open=%d kind=%s method=%u "
-                L"flags=%u reason=unsupported",
-                PressTriggerName(trigger), own.state, own.open ? 1 : 0,
-                kind == kSwipeIntentClose ? L"close" : L"open", method, flags);
-        return false;
+        TraceLog(L"own pass trigger=%s entry=%s state=%u open=%d kind=%s "
+                L"method=%u flags=%u reason=unsupported",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                own.state, own.open ? 1 : 0,
+                kind == kSwipeIntentClose ? L"close" : L"open", method,
+                press.flags);
+        RunPressOriginal(press, L"unsupported");
+        return true;
     }
-    // One decision line for every trigger. The method below is the one the
-    // action will use, not the one the shell called with: a reopen from
-    // Dismiss(6) asks for Show(11), and a close from Show(11) asks for
-    // Dismiss(6).
-    TraceLog(L"own toggle decide trigger=%s state=%u open=%d kind=%s dir=%d",
-            PressTriggerName(trigger), own.state, own.open ? 1 : 0,
-            kind == kSwipeIntentClose ? L"close" : L"open", direction);
+    // One decision line for every trigger, written when the press actually
+    // decides. A press queued behind another therefore logs its own direction,
+    // which is the one the earlier press published.
+    TraceLog(L"own toggle decide trigger=%s entry=%s state=%u open=%d kind=%s "
+            L"dir=%d q=%d",
+            PressTriggerName(press.trigger), PressEntryName(press.entry),
+            own.state, own.open ? 1 : 0,
+            kind == kSwipeIntentClose ? L"close" : L"open", direction,
+            g_pressQueueCount);
     if (kind == kSwipeIntentOpen &&
         (ShellHideInFlight(own) || t_execCall > 0)) {
         // The shell is already hiding, or our own `Dismiss` call is live on this
@@ -14908,13 +15132,130 @@ bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod
         // settles the panel back from its live position — so it is published, not
         // latched. A show from either of these states is served at the landing
         // instead of being published into a no-op.
-        LatchPress(own, trigger, showMethod, flags, admittingEpoch);
+        LatchPress(own, press);
         return true;
     }
-    PublishBridgeIntent(kind, trigger,
-                        kind == kSwipeIntentClose ? dismissMethod : showMethod,
-                        flags);
+    if (PublishPressIntent(kind, press, L"press") <= 0) {
+        RunPressOriginal(press, L"publish");
+    }
     return true;
+}
+
+// Drains the queue while nothing is outstanding. A latch, a drop and a fallback
+// leave no ack to wait for, so the next press is served on this same turn; a
+// published press stops the loop at its ack.
+void ServeNextPress(const wchar_t* reason) {
+    while (!g_pressOutstanding.pending && g_pressQueueCount > 0) {
+        const QueuedPress press = g_pressQueue[g_pressQueueHead];
+        g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
+        --g_pressQueueCount;
+        TraceLog(L"own press dequeued trigger=%s entry=%s q=%d reason=%s "
+                L"wait=%llu",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                g_pressQueueCount, reason,
+                static_cast<unsigned long long>(GetTickCount64() -
+                                                press.admittedTick));
+        ServePress(press, nullptr);
+    }
+}
+
+// One admitted press. The immediate press decides on this hook's own snapshot;
+// a press behind it is queued and decides later. A queue overflow serves the new
+// press with its original primitive now, on this same stack, so the shell keeps
+// the toggle; nothing waits on the launcher hook.
+bool AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
+    if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
+        return ServePress(press, &own);
+    }
+    if (g_pressQueueCount >= kPressQueueCapacity) {
+        TraceLog(L"own press dropped trigger=%s entry=%s reason=queue-full q=%d "
+                L"outstanding=%d",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0);
+        RunPressOriginal(press, L"queue-full");
+        return true;
+    }
+    const int tail = (g_pressQueueHead + g_pressQueueCount) % kPressQueueCapacity;
+    g_pressQueue[tail] = press;
+    ++g_pressQueueCount;
+    TraceLog(L"own press queued trigger=%s entry=%s q=%d outstanding=%d "
+            L"seq=%lld",
+            PressTriggerName(press.trigger), PressEntryName(press.entry),
+            g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0,
+            static_cast<long long>(g_pressOutstanding.seq));
+    return true;
+}
+
+// The intent ack for the outstanding press. The worker posts this to the
+// executor window; the record is read here, on the launcher thread, and the next
+// press is published with the direction the controller has by now.
+void HandlePressAck() {
+    SwipeIpcIntentAck ack{};
+    if (!SwipeIpcReadIntentAck(&g_ipc, &ack)) {
+        return;
+    }
+    if (!g_pressOutstanding.pending || ack.intent != g_pressOutstanding.seq) {
+        // An answer for an external takeover or a superseded record is not this
+        // press's. The outstanding press keeps its bound.
+        return;
+    }
+    const OutstandingPress press = g_pressOutstanding;
+    g_pressOutstanding = OutstandingPress{};
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (window) {
+        KillTimer(window, kPressAckTimer);
+    }
+    TraceLog(L"own press ack seq=%lld state=%d trigger=%s entry=%s wait=%llu",
+            static_cast<long long>(ack.intent), ack.state,
+            PressTriggerName(press.press.trigger),
+            PressEntryName(press.press.entry),
+            static_cast<unsigned long long>(GetTickCount64() -
+                                            press.publishedTick));
+    ServeNextPress(L"ack");
+}
+
+// The ack did not arrive inside its bound. The record may still be applied by a
+// controller that was slow, but the user's press can no longer wait for it: run
+// the shell's own primitive for that press and serve the next one. This is the
+// one place the promise is traded explicitly, and the line says so.
+void HandlePressAckTimeout() {
+    if (!g_pressOutstanding.pending) {
+        return;
+    }
+    const OutstandingPress press = g_pressOutstanding;
+    g_pressOutstanding = OutstandingPress{};
+    TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu",
+            static_cast<long long>(press.seq),
+            PressTriggerName(press.press.trigger),
+            PressEntryName(press.press.entry),
+            static_cast<unsigned long long>(GetTickCount64() -
+                                            press.publishedTick));
+    RunPressOriginal(press.press, L"no-ack");
+    ServeNextPress(L"timeout");
+}
+
+// The one toggle dispatcher for the three physical entries: the bare Windows
+// press, the Start button (ShowStartView method 11, Dismiss method 6, or its
+// OnStartButtonPressed toggle) and the click-away. `showMethod`/`dismissMethod`
+// are the methods this entry uses for each action; the action the direction
+// chooses keeps its own method.
+//
+// The Start button used to publish a close from Dismiss(6) without asking the
+// direction, so a press during a retract entered as a second close while the
+// controller said the close was still in flight and the owner's press did
+// nothing. Every entry now runs the same rule, and two presses that arrive before
+// the consumer runs no longer overwrite one intent record: the second waits for
+// the first's ack.
+//
+// Supersession lives in ServePress, not in one entry: any newer press whose panel
+// is not hiding makes the older latched reopen obsolete, whichever primitive
+// carried it.
+bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
+                    uint32_t dismissMethod, uint32_t flags,
+                    uint32_t admittingEpoch, int32_t entry) {
+    const QueuedPress press{trigger, entry, showMethod, dismissMethod, flags,
+                            admittingEpoch, GetTickCount64()};
+    return AdmitPress(press, own);
 }
 
 using OnHotkeyInvoke_t = HRESULT (*)(void*, uint32_t);
@@ -14986,7 +15327,8 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
                                        : S_OK;
     }
     if (!DispatchToggle(own, kSwipeTriggerWin, kDismissMethodWin,
-                        kDismissMethodWin, flags, admittingEpoch)) {
+                        kDismissMethodWin, flags, admittingEpoch,
+                        kPressEntryHotkey)) {
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
                                        : S_OK;
     }
@@ -15021,7 +15363,7 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                    : S_OK;
     }
     if (!DispatchToggle(own, kSwipeTriggerStartButton, showMethod,
-                        dismissMethod, 0, admittingEpoch)) {
+                        dismissMethod, 0, admittingEpoch, kPressEntryButton)) {
         return OnStartButtonPressed_Original
                    ? OnStartButtonPressed_Original(self, showMethod,
                                                    dismissMethod)
@@ -15109,7 +15451,7 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
     // controller owns the panel. Its reopen form asks for Show(11) instead.
     if (method == kDismissMethodStartButton) {
         if (!DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0,
-                            admittingEpoch)) {
+                            admittingEpoch, kPressEntryDismiss)) {
             return Dismiss_Original ? Dismiss_Original(launcher, method)
                                     : E_FAIL;
         }
@@ -15155,7 +15497,7 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
     // the duplicate suppression. Its close form asks for Dismiss(6).
     if (method == 11) {
         if (!DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags,
-                            admittingEpoch)) {
+                            admittingEpoch, kPressEntryShow)) {
             return ShowStartView_Original
                        ? ShowStartView_Original(launcher, method, flags)
                        : E_FAIL;
@@ -15175,6 +15517,61 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
 }
 
 
+
+// Runs the shell's own primitive for one press, under the executor guard so the
+// nested Hide/Show it performs passes through the primitive hooks instead of
+// being decided again. This is the queue's fallback: a press whose decision
+// cannot be served still toggles the shell exactly once. The launcher is
+// reacquired on this thread; no pointer borrowed at admission is used across the
+// wait. `entry` names the primitive the press actually entered through, so a
+// reopen from Dismiss(6) falls back to Dismiss(6), not to a toggle it never
+// called.
+void RunPressOriginal(const QueuedPress& press, const wchar_t* reason) {
+    uint64_t state = 0;
+    void* outer = nullptr;
+    void* launcher = LauncherNow(&state, &outer);
+    TraceLog(L"own press fallback trigger=%s entry=%s reason=%s launcher=%p "
+            L"state=0x%llX",
+            PressTriggerName(press.trigger), PressEntryName(press.entry), reason,
+            launcher, static_cast<unsigned long long>(state));
+    if (!launcher) {
+        // Nothing to call: the launcher is gone. The line above is the record.
+        return;
+    }
+    ++t_execCall;
+    switch (press.entry) {
+        case kPressEntryHotkey:
+            if (OnHotkeyInvoke_Original && outer) {
+                OnHotkeyInvoke_Original(outer, press.flags);
+            }
+            break;
+        case kPressEntryButton:
+            if (OnStartButtonPressed_Original) {
+                OnStartButtonPressed_Original(launcher, press.showMethod,
+                                              press.dismissMethod);
+            }
+            break;
+        case kPressEntryShow:
+            if (ShowStartView_Original) {
+                ShowStartView_Original(launcher, press.showMethod, press.flags);
+            }
+            break;
+        case kPressEntryDismiss:
+            if (Dismiss_Original) {
+                Dismiss_Original(launcher, press.dismissMethod);
+            }
+            break;
+        case kPressEntryHide:
+            if (HideStartAndCortana_Original) {
+                HideStartAndCortana_Original(OwnStateOf(launcher),
+                                             kDismissMethodClickAway);
+            }
+            break;
+        default:
+            break;
+    }
+    --t_execCall;
+}
 
 // ---------------------------------------------------------------------------
 // Launcher symbols
@@ -16052,6 +16449,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         KillTimer(window, kExecProbeTimer);
         KillTimer(window, kPressLatchTimer);
         KillTimer(window, kExecDismissProbeTimer);
+        KillTimer(window, kPressAckTimer);
         DestroyWindow(window);
         // The acknowledgement is set after DestroyWindow returns, not from
         // WM_NCDESTROY inside it: the class's window count is decremented when
@@ -16093,6 +16491,14 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
             // The hidden event ran on another thread; the slot and its timer
             // belong to this one.
             ArmLatchedServe();
+        }
+        return 0;
+    }
+    if (message == kExecIntentAckMessage) {
+        if (wParam == kExecIntentAckMagic) {
+            // The worker saw the intent ack event; the queue and its bound are
+            // owner-thread state.
+            HandlePressAck();
         }
         return 0;
     }
@@ -16178,6 +16584,11 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                 DropPressLatch(L"timer-failed", L"retry");
             }
         }
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kPressAckTimer) {
+        KillTimer(window, kPressAckTimer);
+        HandlePressAckTimeout();
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -16350,7 +16761,20 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
                 g_execWindow.load(std::memory_order_relaxed));
     }
 
-    HANDLE events[2] = {g_execStopEvent, g_ipc.execEvent};
+    // The worker waits on three things: the stop, a Start-side executor command,
+    // and the intent acknowledgement. The ack is a notification only: the worker
+    // cannot read the queue or the direction (those are launcher-thread state),
+    // so it posts a private message and the window's owner decides. This keeps
+    // the worker's wait event-driven; there is no poll for the ack.
+    HANDLE events[3] = {};
+    DWORD waitCount = 0;
+    events[waitCount++] = g_execStopEvent;
+    if (g_ipc.execEvent) {
+        events[waitCount++] = g_ipc.execEvent;
+    }
+    if (g_ipc.intentAckEvent) {
+        events[waitCount++] = g_ipc.intentAckEvent;
+    }
     for (;;) {
         // The only deadline this worker owns is the launcher symbol probe. HookSymbols
         // blocks on Windhawk's PDB fetch for twinui.pcshell.pdb, and running that on
@@ -16360,11 +16784,11 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
         // The probe is throttled by `g_execProbeNextTick` while an attempt is
         // pending, and it is over for good once the symbols resolved or the 240 s
         // budget refused them: at that point this wait has no timeout at all and the
-        // worker sleeps on its two events. The executor's own timers — the dismiss
-        // delay, the visibility confirmation and the press latch — are message
-        // timers on the launcher thread's window, which the worker never services,
-        // so they add no wake here; they are listed in the AGENTS contract so a
-        // later change does not turn this into a poll again.
+        // worker sleeps on its events. The executor's own timers — the dismiss
+        // delay, the visibility confirmation, the press latch and the press ack
+        // bound — are message timers on the launcher thread's window, which the
+        // worker never services, so they add no wake here; they are listed in the
+        // AGENTS contract so a later change does not turn this into a poll again.
         DWORD waitMs = INFINITE;
         if (!g_explorerSymbolsReady.load(std::memory_order_acquire) &&
             !g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
@@ -16373,7 +16797,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
                          ? static_cast<DWORD>(g_execProbeNextTick - now)
                          : static_cast<DWORD>(kExecSymbolProbeMs);
         }
-        const DWORD wait = WaitForMultipleObjects(2, events, FALSE, waitMs);
+        const DWORD wait = WaitForMultipleObjects(waitCount, events, FALSE, waitMs);
         if (wait == WAIT_OBJECT_0) {
             return 0;
         }
@@ -16385,7 +16809,21 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
             ProbeExplorerSymbolsFromWorker();
             continue;
         }
-        if (wait != WAIT_OBJECT_0 + 1) {
+        if (wait < WAIT_OBJECT_0 || wait >= WAIT_OBJECT_0 + waitCount) {
+            TraceLog(L"exec worker wait ended unexpectedly result=%u", wait);
+            return 0;
+        }
+        const HANDLE signalled = events[wait - WAIT_OBJECT_0];
+        if (signalled == g_ipc.intentAckEvent) {
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window &&
+                !PostMessageW(window, kExecIntentAckMessage,
+                              kExecIntentAckMagic, 0)) {
+                TraceLog(L"exec ack post failed err=%u", GetLastError());
+            }
+            continue;
+        }
+        if (signalled != g_ipc.execEvent) {
             TraceLog(L"exec worker wait ended unexpectedly result=%u", wait);
             return 0;
         }
@@ -16549,16 +16987,17 @@ void UnregisterExecutorClass() {
     g_execClassInstance = nullptr;
 }
 
-void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
-                         uint32_t flags) {
+LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
+                           uint32_t flags) {
     if (!g_ipc.state) {
-        return;
+        return 0;
     }
     if (kind == kSwipeIntentExternal) {
         // External ownership supersedes every reopen this mod still holds: the
-        // takeover is closing or replacing the menu, and a latched open would
-        // fire into it.
+        // takeover is closing or replacing the menu, and a latched open or a
+        // queued press would fire into it.
         DropPressLatch(L"external", L"intent");
+        DropPressQueue(L"external");
     }
     uint64_t open = 0;
     uint64_t openTick = 0;
@@ -16577,6 +17016,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                                                             : L"override")),
             static_cast<long long>(sequence),
             static_cast<unsigned long long>(open), method, flags);
+    return sequence;
 }
 
 
@@ -16584,6 +17024,14 @@ BOOL RoleInit() {
     SetTraceFileName(L"bridge.log");
     RefreshTraceSetting();
     Wh_Log(L"Legacy Start Swipe %s initializing (explorer role)", kModVersion);
+
+    // A re-enable starts with no press of the previous activation. The queue,
+    // its outstanding record and the latch belong to that activation's window and
+    // its channel; none of them may be served into the new one.
+    g_pressQueueHead = 0;
+    g_pressQueueCount = 0;
+    g_pressOutstanding = OutstandingPress{};
+    g_pressLatch = PressLatch{};
 
     // The channel to the Start side. Opening it here means the section and its
     // events exist before the first Hide, and a Start mod that attaches later

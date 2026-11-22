@@ -447,11 +447,13 @@ pending (`exec launcher symbols pending attempt=... waited=...ms
 deadline=240000ms`), never a refusal. The deadline produces `unresolved` and no
 launcher hook; a still-blocked fetch leaves the mod passive (the shell's own
 path serves every trigger) but never blocks Explorer. **Once the symbols resolve
-or the deadline terminally refuses them, the worker's wait is `INFINITE`**: it
-blocks on the stop and Exec events and wakes only for a command. The executor's
-own timers — the dismiss delay, the visibility confirmation and the press latch —
-are message timers on the launcher thread's window, which the worker never
-services, so a pending close adds no wake to it. Each resolved address is
+or the deadline terminally refuses them, the worker's wait has no timeout**: it
+blocks on the stop, Exec and IntentAck events and wakes only for a command or an
+intent answer. The executor's
+own timers — the dismiss delay, the visibility confirmation, the press latch and
+the press ack bound — are message timers on the launcher thread's window, which
+the worker never services, so a pending close or an outstanding press adds no wake
+to it. Each resolved address is
 logged against the reference RVA (`exec launcher symbol label=... rva=...
 expected=... match=0|1`); the set line
 `exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence
@@ -586,7 +588,8 @@ probe or timer failure is answered `unknown`.
   back from its live position. Only a close that has left the controller's reach
   latches the press — a hide already in flight (`InternalState` 9/11), or a
   `Dismiss` our executor has entered (`t_execCall`) — in
-  one slot, tick, trigger, and the epoch the admission was decided under. An
+  one slot, tick, the whole `QueuedPress`, and the epoch the admission was decided
+  under. An
   armed-but-not-dispatched executor dismiss is revocable, so it publishes the open
   rather than deferring it;
   the hidden event then arms a
@@ -595,8 +598,8 @@ probe or timer failure is answered `unknown`.
   so the deferral is the serve point. The arm is posted to the executor window
   when the hidden event runs off the launcher thread, so the slot and its timer
   stay owned by that thread. Supersession lives in the shared
-  `DispatchToggle`, so any newer press — Win key or either Start-button primitive
-  — discards the slot (`own press latch dropped reason=superseded`). The serve
+  `ServePress`, so any newer press — Win key, either Start-button primitive or the
+  click-away — discards the slot (`own press latch dropped reason=superseded`). The serve
   re-reads the peer and the epoch (`reason=peer-gone|peer-changed`), drops a latch
   whose dismiss was refused or expired (`reason=dismiss-refused|dismiss-expired`)
   or whose hide never landed, and expires after 1200 ms. Timer-arming failures are
@@ -609,7 +612,20 @@ probe or timer failure is answered `unknown`.
   `caller=unknown depth>0 reason=own-show`); otherwise the served open is
   hidden the instant it appears. The latch is a best-effort obligation, not a
   guarantee: a press can still be lost when the peer dies inside the detection
-  window, and a swallowed press has no shell fallback.
+  window.
+- **Press queue.** The channel has one intent record and one event, so two
+  presses that decided before the consumer ran used to overwrite each other and
+  both read the same direction. Admitted presses now wait in a four-entry FIFO on
+  the launcher thread: the first is published at once, and the next only when the
+  intent ack for the outstanding sequence arrives or its 1000 ms bound expires.
+  The ack is read on this thread; the executor worker (which can wait on the
+  `IntentAck` event) posts `kExecIntentAckMessage` and never reads the queue. The
+  direction is sampled when a press is published, so the press after a close
+  reads `2` and reopens. A queue overflow, an ack that never arrives and a press
+  past its 1500 ms wait run the shell's original primitive for that press under
+  `t_execCall` (`own press fallback ...`), so the shell keeps its toggle; the
+  queue's own lines are `own press queued|published|ack|ack timeout|dropped`. An
+  `external` intent clears both the queue and the latch.
 
 **Deleted here.** The retract request/plan wait, the arbitration hold, the
 close-record read/seed, `OwnDecideFrom` and its open/close/reopen helpers, the

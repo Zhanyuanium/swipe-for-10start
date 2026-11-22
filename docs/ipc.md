@@ -79,8 +79,21 @@ Published by `SwipeIpcPublishIntent` on the launcher thread, woken by the
 `Intent` event. The Start side ignores a sequence it already handled and answers
 with `SwipeIpcAnswerIntent(seq, state, durationMs, entryPercent, hr)` on
 `intentAckSeq`; `intentAckFor` echoes the intent. The Start side publishes the
-executor command first and then the ack: the ack reports the decision, it is not
-a barrier the bridge waits for before the command.
+executor command first and then the ack: the ack reports the decision, and the
+command does not wait for it.
+
+The ack is also the bridge's press serialisation point. The channel has **one**
+intent record, so two presses that decided before the Start side consumed the
+first would overwrite each other and both read the same direction. The bridge
+keeps a four-entry FIFO of admitted presses on the launcher thread; it publishes
+the first at once and publishes the next only when the ack for the outstanding
+sequence arrives (the worker waits on `IntentAck` and posts a private message to
+the executor window) or its 1000 ms bound expires. The next press therefore
+decides from the direction the controller published while applying the press
+before it. A press the queue cannot serve — full queue, an ack that never
+arrives, a press that waited past 1500 ms — runs the shell's own original
+primitive for that press under the executor guard (`own press fallback ...`); it
+is never silently lost. An `external` intent clears the queue and the latch.
 
 `method` is **evidence about the shell path that produced the trigger**, not an
 execution method. A click-away carries the Hide method `7`. The Start side maps
@@ -94,7 +107,11 @@ it publishes, so the shell never saw that press; when the Start side answers
 press is lost. The refusal is reserved for the case where nothing could run, and
 the line names it (`intent open refused entry=... reason=no-executor`,
 `intent close refused from=... reason=no-executor`); the bridge does not retry the
-original on an ack.
+original on an answered refusal. Only an **unanswered** decision is replayed: the
+outstanding press whose ack does not arrive inside its 1000 ms bound runs its
+original primitive (`own press fallback ... reason=no-ack`), because the press
+cannot be left with no toggle. The record may still be applied by a slow
+controller afterwards; no scheme can recall it, and the line names the trade.
 
 A landing reconciles an already-published `external` intent before it may issue a
 recovery: the idle timer and the intent event are two wait objects of the same
@@ -130,14 +147,15 @@ reads (`0x8` relaxes the foreground/context-menu check, `0x4` tolerates an open
 context menu).
 
 The producer validates the same vocabulary before it swallows a press: the Win
-key, the Start button, the launcher's `Dismiss`/`ShowStartView` and the
-click-away's close intent all check `SwipeShowAllowed`/`SwipeDismissAllowed`
-(or `SwipeCloseIntentAllowed` for the observed close method) at admission. An
+key, the Start button and the launcher's `Dismiss`/`ShowStartView` check
+`SwipeShowAllowed` for an open and `SwipeCloseIntentAllowed` for a close, because
+a close intent carries the observed shell method as evidence; the click-away
+uses the same dispatcher with 7 as that evidence. An
 unsupported combination goes to the shell's original (`own pass ...
 reason=unsupported`) instead of becoming an intent that the executor would
 refuse after the press was lost. The executor's check above is therefore defence
 in depth, not the only validation. The click-away's evidence method 7 is allowed
-as an intent and mapped to 6 at the producer; the executor never accepts 7.
+as an intent and mapped to 6 by the Start side; the executor never accepts 7.
 
 **Expiry.** The controller's budget is 400 ms: a show is answered within 400 ms
 of its publication, a dismiss within 400 ms of the deadline it was given. The
