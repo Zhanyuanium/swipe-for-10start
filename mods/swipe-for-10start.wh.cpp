@@ -13902,6 +13902,8 @@ void WaitForModuleEntriesOnly() {
         if (!haveEvent) {
             BlockUnload(L"module entry event missing");
         }
+        const int pending = g_moduleEntryCount.load(std::memory_order_acquire);
+        TraceLog(L"unload waiting for ui turns count=%d", pending);
         WaitForSingleObject(g_moduleEntriesGone, INFINITE);
     }
 }
@@ -18766,6 +18768,8 @@ void DestroyExecutorWindow() {
         DestroyWindow(window);
     } else {
         TraceLog(L"exec window teardown send hwnd=%p tid=%u", window,
+                static_cast<unsigned>(g_execThreadId));
+        TraceLog(L"exec window teardown wait hwnd=%p tid=%u", window,
                 static_cast<unsigned>(g_execThreadId));
         SendMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0);
     }
