@@ -170,7 +170,13 @@ could act, or before its confirmation could land).
   `reason=dismiss-refused` and stops retrying.
 - **G — landing order.** With Win+Tab immediately after a Win press, the landing
   logs `intent reconcile seq=... kind=external (before landing recovery)` and no
-  `intent open recovered`.
+  `intent open recovered`. On the shipping build the bridge now forwards
+  `Dismiss(5)` while it owns the panel: the line is
+  `exec pass dismiss method=5 caller=wintab state=... reason=external`, the Start
+  side answers `exec cancel request ... reason=external` and
+  `close ended ... reason=external`, Task View is the foreground window, and the
+  next Win press publishes exactly one open (`own press published ... kind=open`,
+  one `exec show`, `own state event=shown`).
 
 ## Round-3 runtime checks
 

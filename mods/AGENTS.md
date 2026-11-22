@@ -516,7 +516,11 @@ probe or timer failure is answered `unknown`.
 - `ShowStartView_Hook`: method 11 is the Start button's open trigger; any other
   show is swallowed only while the controller owns the panel (the duplicate edge
   gesture).
-- `Dismiss_Hook`: method 6 is the Start button's close trigger; any other
+- `Dismiss_Hook`: method 6 is the Start button's close trigger. Method 5
+  (Win+Tab) is the shell's takeover: while the controller owns the panel it is
+  not swallowed — the original runs (Task View appears) and the bridge publishes
+  `intent=external` first, so the controller retires the dismiss it had pending
+  (`exec pass dismiss method=5 caller=wintab reason=external`). Any other
   dismiss is swallowed only while the controller owns the panel. Both button
   methods go through the same dispatcher as the Win key, so a press during a
   retract is a reopen whatever primitive it entered through.

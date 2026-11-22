@@ -15902,6 +15902,22 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
+        if (method == kDismissMethodWinTab) {
+            // Win+Tab is the shell's own takeover. The controller owns the panel,
+            // but this close is not ours to animate or hold: the original shows
+            // Task View, and the external record retires whatever dismiss the
+            // controller still had pending for a menu it no longer owns. Without
+            // this the takeover was swallowed here and Task View never appeared.
+            TraceLog(L"exec pass dismiss method=%u caller=wintab state=%u "
+                    L"reason=external",
+                    method, own.state);
+            PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
+                                method, 0);
+            const HRESULT hr =
+                Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
+            OwnResyncFromState(OwnStateOf(launcher));
+            return hr;
+        }
         TraceLog(L"exec swallow dismiss method=%u state=%u reason=owning",
                 method, own.state);
         return S_OK;

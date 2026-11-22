@@ -37,7 +37,8 @@ closes a settled panel and reverses a close that is still in flight, exactly lik
 the other two presses; method 7 stays the click-away evidence in the intent and
 the Start side maps it to the executor's 6. External takeovers (Win+Tab, lock,
 display change, a forwarded modified Win press) publish `intent=external` and are
-never held.
+never held; Win+Tab's `Dismiss(5)` runs the shell's original (Task View) and the
+record retires the controller's pending dismiss.
 
 The bridge intercepts only while the Start side is alive. The bridge creates the
 channel, so a mapped section says nothing about the controller; the Start side

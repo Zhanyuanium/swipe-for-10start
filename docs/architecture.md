@@ -373,7 +373,10 @@ point for the next admitted press, not a barrier the command waits for:
 - external takeovers (Win+Tab, lock, display change, a modified forwarded Win
   press) publish `intent=external`: the Start side revokes both close schedules
   and the recovery ticket, ends the close record, drops the touch state and
-  resyncs from the cloak. The bridge publishes it at once and sets a barrier for
+  resyncs from the cloak. Win+Tab's `Dismiss(5)` is forwarded to the original by
+  the bridge instead of being swallowed, so Task View appears and the pending
+  dismiss is retired (`exec pass dismiss method=5 caller=wintab`). The bridge
+  publishes the takeover at once and sets a barrier for
   every later publication — a state, not a timer, so it stands even when the
   watchdog cannot be armed (`own external barrier seq=... armed|unarmed`) — so a
   following press cannot overwrite the takeover before Start reads it. The barrier
