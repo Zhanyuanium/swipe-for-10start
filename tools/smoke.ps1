@@ -7,17 +7,29 @@ One-pass regression smoke for the shipping pair, on whichever taskbar edge is li
 Drives the four triggers through their real paths and checks the mods' own log
 lines instead of pixels: a VK_LWIN tap opens and closes the menu, an injected
 edge pull opens it, an injected panel drag closes it, and a click on the desktop
-closes it. Every step is judged by the state report from start_menu.ps1 plus the
+closes it. It then interrupts three closes with a different trigger — a Win close
+with a desktop click, a Start-button close with a Win press, and a gesture close
+with a desktop click — and requires each to publish an open with dir=2, cancel the
+close's dismiss, end the close as `reason=open-cancel`, and leave the panel
+uncloaked. Every step is judged by the state report from start_menu.ps1 plus the
 decision and executor lines the pair wrote during that step, and the last step
 fails if the run produced any error-shaped line (a non-zero HRESULT, a timeout, a
 refusal, a dropped press, a lost latch).
 
 Each row requires the pair its claim rests on, not a substring: a touch open is
 `reveal pull qualified` plus the executor's ack for the exact show sequence the
-Start side published, a touch close is the method-1 dismiss with its ack, and the
-click-away is `intent close trigger=clickaway ... method=7` in the bridge log,
-the matching method-6 dismiss with its ack, and `win close observed`. A close
-the shell performed natively cannot satisfy the click-away row.
+Start side published; a touch close is the close's producer line and the executed
+method-1 dismiss (or the pointer-derived click-away's method-6 dismiss); and the
+click-away is `own toggle decide trigger=clickaway ... kind=close`, the
+`intent kind=close trigger=clickaway ... method=7` it publishes, the matching
+method-6 dismiss with its ack, and `win close observed`. A close the shell
+performed natively cannot satisfy the click-away row.
+
+The injected drag's producer is not fixed: it can reach the shell as the real HID
+close or as a pointer-derived click-away, so the touch close row labels its
+producer: `producer=hid` is the digitizer's own dismiss line,
+`producer=injected-pointer` is the pointer-derived click-away. A row whose
+producer is injected is never quoted as HID evidence.
 
 The mod writes those lines to disk only while its DiagnosticTrace setting is on
 (Wh_Log always receives them, but Windhawk's own debug logging is a separate
@@ -35,7 +47,8 @@ missing and the touch rows refuse to inject.
 
 Three details it encodes, each learned the hard way:
 - The auto-hidden bar cannot be opened through UIA, so the open step uses the
-  VK_LWIN tap the keyboard path uses; the Start button is a manual check.
+  VK_LWIN tap the keyboard path uses; the Start-button close finds the button
+  through `winapp ui search StartButton` and hovers the dock edge to reveal it.
 - A click-away is only decided once the window is past its presentation
   (state 1/3); clicking earlier is swallowed on purpose, so the step waits for the
   executor's own `exec visible ... visible=visible` confirmation before it clicks.
@@ -113,6 +126,14 @@ public static void WinTap() {
 public static void Click(int x, int y) {
     SetCursorPos(x, y);
     System.Threading.Thread.Sleep(60);
+    mouse_event(0x0002, 0, 0, 0, System.UIntPtr.Zero);
+    mouse_event(0x0004, 0, 0, 0, System.UIntPtr.Zero);
+}
+// The same click without the pointer-settle sleep: a click-away that must land
+// inside a retract has only a few hundred milliseconds, and the cursor move is
+// synchronous.
+public static void ClickNow(int x, int y) {
+    SetCursorPos(x, y);
     mouse_event(0x0002, 0, 0, 0, System.UIntPtr.Zero);
     mouse_event(0x0004, 0, 0, 0, System.UIntPtr.Zero);
 }
@@ -317,6 +338,76 @@ function Get-DragPoints { param($layout)
     }
 }
 
+# A point on the desktop, on the side opposite the taskbar. It is derived from
+# the measured panel rectangle and the screen size, not from fixed percentages:
+# on a top bar the panel reaches most of the way down, and a 15 % point would be
+# inside it. The midpoint of the strip between the panel and the screen edge is
+# desktop on every dock.
+function Get-DesktopPoint { param($layout)
+    $w = [Smoke.Native]::GetSystemMetrics(0); $h = [Smoke.Native]::GetSystemMetrics(1)
+    $s = if ($layout.Scale -ge 1) { $layout.Scale } else { 1 }
+    $wDip = $w / $s; $hDip = $h / $s
+    switch ($layout.Axis) {
+        0 { return @([int]((($layout.Right + $wDip) / 2) * $s), [int]($h / 2)) }
+        1 { return @([int]($w / 2), [int]((($layout.Bottom + $hDip) / 2) * $s)) }
+        2 { return @([int](($layout.Left / 2) * $s), [int]($h / 2)) }
+        default { return @([int]($w / 2), [int](($layout.Top / 2) * $s)) }
+    }
+}
+
+# The taskbar's Start button as UIA reports it. `winapp` is already the state
+# reader's dependency (start_menu.ps1), so this adds no new tool; the slug is
+# language independent and the rectangle is in physical pixels.
+function Get-StartButton {
+    try {
+        $out = & winapp ui search 'StartButton' -a explorer --type Button 2>&1
+    } catch { return $null }
+    foreach ($line in $out) {
+        $plain = $line -replace "`e\[[0-9;]*m", ''
+        $m = [regex]::Match($plain, '\((-?\d+),(-?\d+)\s+(\d+)x(\d+)\)')
+        if ($m.Success) {
+            return [pscustomobject]@{
+                X = [int]$m.Groups[1].Value; Y = [int]$m.Groups[2].Value
+                W = [int]$m.Groups[3].Value; H = [int]$m.Groups[4].Value
+            }
+        }
+    }
+    return $null
+}
+
+# An auto-hidden bar reveals from the screen edge it is docked to. Hover that
+# edge nearest the button first, then move onto the button and click.
+function Invoke-StartButtonClick {
+    $button = Get-StartButton
+    if (-not $button) { return $false }
+    $w = [Smoke.Native]::GetSystemMetrics(0); $h = [Smoke.Native]::GetSystemMetrics(1)
+    $cx = [int]($button.X + $button.W / 2)
+    $cy = [int]($button.Y + $button.H / 2)
+    if ($h - ($button.Y + $button.H) -lt 4) { [void][Smoke.Native]::SetCursorPos($cx, $h - 3) }
+    elseif ($button.Y -lt 4) { [void][Smoke.Native]::SetCursorPos($cx, 2) }
+    elseif ($button.X -lt 4) { [void][Smoke.Native]::SetCursorPos(2, $cy) }
+    else { [void][Smoke.Native]::SetCursorPos($w - 3, $cy) }
+    Start-Sleep -Milliseconds 650
+    [Smoke.Native]::Click($cx, $cy)
+    return $true
+}
+
+# The three mixed-trigger rows share one claim: the second trigger publishes an
+# open while the controller is closing, the first close's dismiss never runs,
+# and the panel ends open. The bridge's decision line names the direction, the
+# Start side's cancel line names the command (or the local slot), and the
+# landing line must be absent because the close never landed.
+function Test-InterruptedClose {
+    param([string]$bridge, [string]$start, [string]$opener)
+    $opened = $bridge -match ("own toggle decide trigger=$opener[^\r\n]*kind=open dir=2")
+    $intent = $bridge -match ("intent kind=open trigger=$opener")
+    $cancel = ($start -match 'exec cancel request target=\d+ reason=open-intent') -or
+        ($start -match 'close dismiss cancelled kind=')
+    $ended = $start -match 'close ended[^\r\n]*reason=open-cancel'
+    $landed = $start -match 'win close observed'
+    return ($opened -and $intent -and $cancel -and $ended -and -not $landed)
+}
+
 $runMark = Mark
 
 # 0. clean start
@@ -398,9 +489,14 @@ for ($i = 1; $i -le 3 -and -not $closed; $i++) {
     $clickClose = ($bridgeLines -match 'intent close trigger=clickaway[^\r\n]*method=7') -and
         (Test-ExecutedDismiss $l 6)
     $closed = $closed -and ($hidClose -or $clickClose)
-    if (-not $closed) { $detail = "attempt $i"; Start-Sleep -Milliseconds 400 }
+    if ($closed) {
+        $detail = if ($clickClose) { 'producer=injected-pointer' } else { 'producer=hid' }
+    } else {
+        $detail = "attempt $i"
+        Start-Sleep -Milliseconds 400
+    }
 }
-Add-Row 'touch close' $closed $detail
+Add-Row 'touch close (injected)' $closed $detail
 }
 
 # 5. a click on the desktop closes it, once the window is past its presentation
@@ -417,22 +513,116 @@ if ($SkipClickAway) {
         # wait for it; a time-based wait could click inside the uncloak.
         $shown = Wait-Log $m 'exec visible seq=\d+ [^\r\n]*visible=visible' 3000 $BridgeLog
         if (-not $shown) { Start-Sleep -Milliseconds 900 }
-        [Smoke.Native]::Click([int]([Smoke.Native]::GetSystemMetrics(0) * 0.85), [int]([Smoke.Native]::GetSystemMetrics(1) * 0.15))
+        $desk = if ($layout.Complete) { Get-DesktopPoint $layout } else {
+            @([int]([Smoke.Native]::GetSystemMetrics(0) * 0.85), [int]([Smoke.Native]::GetSystemMetrics(1) * 0.15))
+        }
+        [Smoke.Native]::Click($desk[0], $desk[1])
         $closed = Wait-For $false 3000
         # The landing, not just the closed state: `win close observed` is the line
         # that says the shell hid the window and the controller saw it.
         $landed = Wait-Log $m 'win close observed' 2500
         $startLines = (New-Lines $m) -join "`n"
         $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
-        # A native method-7 close is not this mod's close: it leaves no
-        # `intent close trigger=clickaway` line and this row fails.
-        $intent = $bridgeLines -match 'intent close trigger=clickaway[^\r\n]*method=7'
+        # The click is a toggle decision now. A native method-7 close is not this
+        # mod's close: it leaves neither the decision nor the intent, and the row
+        # fails. The close keeps 7 as evidence and the executor runs 6.
+        $decided = $bridgeLines -match 'own toggle decide trigger=clickaway[^\r\n]*kind=close'
+        $intent = $bridgeLines -match 'intent kind=close trigger=clickaway[^\r\n]*method=7'
         $executed = Test-ExecutedDismiss $startLines 6
-        Add-Row 'click-away' ($closed -and $landed -and $intent -and $executed) ''
+        Add-Row 'click-away' ($closed -and $landed -and $decided -and $intent -and $executed) ''
     }
 }
 
-# 6. nothing error-shaped was written during this run, in either log: a failed
+# 6-8. the mixed-trigger interruptions: a close that is still in flight is
+# reversed by a different trigger. Each row needs the close's own decision (or
+# dismissal line for the HID gesture), the reopen decision with dir=2, the
+# cancel that retired the close, `close ended ... reason=open-cancel`, no
+# `win close observed`, and the cloak ending open. These are the rows that fail
+# when a click or a press re-closes instead of reversing.
+function Open-Settled {
+    if (State) { [Smoke.Native]::WinTap(); Start-Sleep -Milliseconds 900 }
+    [Smoke.Native]::WinTap()
+    $ok = Wait-For $true 3000
+    Start-Sleep -Milliseconds 700
+    return $ok
+}
+
+# 6. a Windows-key close interrupted by a desktop click
+if ($SkipClickAway) {
+    Add-Row 'win close + click reopen' $true 'skipped'
+} elseif (-not $layout.Complete) {
+    Add-Row 'win close + click reopen' $false "layout incomplete: $layoutGap"
+} else {
+    $opened = Open-Settled
+    $m = Mark
+    $desk = Get-DesktopPoint $layout
+    [Smoke.Native]::WinTap()
+    Start-Sleep -Milliseconds 120
+    [Smoke.Native]::ClickNow($desk[0], $desk[1])
+    $ended = Wait-For $true 3000
+    Start-Sleep -Milliseconds 400
+    $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
+    $startLines = (New-Lines $m) -join "`n"
+    $first = $bridgeLines -match 'own toggle decide trigger=win[^\r\n]*kind=close'
+    $ok = $opened -and $ended -and $first -and
+        (Test-InterruptedClose $bridgeLines $startLines 'clickaway')
+    Add-Row 'win close + click reopen' $ok ''
+}
+
+# 7. a Start-button close interrupted by a Windows-key press
+$opened = Open-Settled
+$m = Mark
+if (-not (Invoke-StartButtonClick)) {
+    Add-Row 'start close + win reopen' $false 'winapp found no Start button'
+} else {
+    Start-Sleep -Milliseconds 120
+    [Smoke.Native]::WinTap()
+    $ended = Wait-For $true 3000
+    Start-Sleep -Milliseconds 400
+    $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
+    $startLines = (New-Lines $m) -join "`n"
+    $first = $bridgeLines -match 'own toggle decide trigger=startbutton[^\r\n]*kind=close'
+    $ok = $opened -and $ended -and $first -and
+        (Test-InterruptedClose $bridgeLines $startLines 'win')
+    Add-Row 'start close + win reopen' $ok ''
+}
+
+# 8. a gesture close interrupted by a desktop click. The drag reaches the shell
+# as the mod's own close (HID) or as a pointer-derived click-away; both are
+# accepted, and the cancel names the local slot or the executor command. The
+# click must land inside the retract, so a miss is retried from a fresh open.
+if ($SkipClickAway) {
+    Add-Row 'gesture close + click reopen' $true 'skipped'
+} elseif (-not $layout.Complete) {
+    Add-Row 'gesture close + click reopen' $false "layout incomplete: $layoutGap"
+} else {
+    $drag = Get-DragPoints $layout
+    $desk = Get-DesktopPoint $layout
+    $ok = $false
+    $detail = ''
+    for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+        $opened = Open-Settled
+        $m = Mark
+        & pwsh -NoProfile -File $inject -StartX $drag[0] -StartY $drag[1] -EndX $drag[2] -EndY $drag[3] -Steps 30 -DelayMs 8 | Out-Null
+        # The injector returns after the UP; the close is already accepted or
+        # about to be. Click at once, with no pointer-settle sleep: the retract is
+        # the only window in which the click is the reopen.
+        [Smoke.Native]::ClickNow($desk[0], $desk[1])
+        $ended = Wait-For $true 3000
+        Start-Sleep -Milliseconds 400
+        $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
+        $startLines = (New-Lines $m) -join "`n"
+        $first = ($startLines -match 'close accepted serial=\d+ kind=dismiss') -or
+            ($startLines -match 'close dismiss kind=') -or
+            ($bridgeLines -match 'own toggle decide trigger=clickaway[^\r\n]*kind=close')
+        $ok = $opened -and $ended -and $first -and
+            (Test-InterruptedClose $bridgeLines $startLines 'clickaway')
+        if (-not $ok) { $detail = "attempt $i" }
+    }
+    Add-Row 'gesture close + click reopen' $ok $detail
+}
+
+# 9. nothing error-shaped was written during this run, in either log: a failed
 # command or a refused trigger is reported by the side that answered it.
 $bad = @()
 foreach ($path in @($Log, $BridgeLog)) {

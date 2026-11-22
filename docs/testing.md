@@ -81,21 +81,24 @@
 
 `tools/inject_swipe.ps1` calls `InjectTouchInput`, but the contact reaches the
 shell as a pointer, and a press that dismisses the open panel is served by the
-shell's own click-away (`HideStartAndCortana`, method 7), which the bridge logs
-as `intent close trigger=clickaway method=7 state=...`. The mod's own gesture
-dismiss (`close dismiss kind=...`, the `RequestBridgeDismiss` at the close's end)
-is therefore exercised only by a real finger on the digitizer.
+shell's own click-away (`HideStartAndCortana`, method 7), which the bridge now
+runs through the one toggle decision: `own toggle decide trigger=clickaway ...
+kind=close dir=1`, then `intent kind=close trigger=clickaway ... method=7`. The
+mod's own gesture dismiss (`close dismiss kind=...`, the `RequestBridgeDismiss`
+at the close's end) is therefore exercised only by a real finger on the
+digitizer. The smoke labels the row's producer rather than calling both HID.
 
 A four-trigger smoke that checks only "the menu closed and an `exec dismiss` ran"
 cannot tell the two producers apart: both paths end in the same command. The
-producer is the line before it. On a real panel the HID close logs `close dismiss
-kind=<...>` and then `exec dismiss request ... method=1 open=<generation>`; no
-`intent close` belongs to it, and the bridge must not answer it `superseded
-menu=...` (the `open=` is the generation read by `SwipeIpcReadOpen`, not a tick).
-On the injected path the bridge logs `intent close trigger=clickaway method=7
-state=...` and the Start side logs `intent recv seq=... kind=close
-trigger=clickaway ...`, and no `close dismiss kind=` line appears. The manual
-check is that pair of lines, not only the close's outcome.
+producer is the line before it. On a real panel the HID close logs `close
+accepted ... kind=dismiss`, then `close dismiss kind=<...>` and `exec dismiss
+request ... method=1 open=<generation>`; no click-away decision belongs to it,
+and the bridge must not answer it `superseded menu=...` (the `open=` is the
+generation read by `SwipeIpcReadOpen`, not a tick). On the injected path the
+bridge logs `own toggle decide trigger=clickaway ... kind=close`, the intent
+line, and the Start side logs `intent recv seq=... kind=close trigger=clickaway
+...`, with no `close dismiss kind=` line. The manual check is that pair of lines,
+not only the close's outcome.
 
 ## Round-2 runtime checks
 
@@ -127,7 +130,8 @@ could act, or before its confirmation could land).
   reason=no-peer` appears at the first press; `own press latch dropped
   reason=peer-gone` appears when a latched press outlives its peer.
 - **D — capability.** On the shipping build, a click-away close logs
-  `intent close trigger=clickaway ...` only after the executor exists; with the
+  `own toggle decide trigger=clickaway ... kind=close` and then its intent only
+  after the executor exists; with the
   worker refused, `exec pass hide method=7 reason=no-executor` (or
   `no-window`/`wrong-thread`/`no-primitive`) and the shell's own close runs.
 - **E — expiry and confirmation.** A `dismiss` whose dispatch starts at or past
@@ -209,11 +213,26 @@ step: a VK_LWIN tap opens (`kind=open`, `exec show`) and closes (`kind=close`,
 `exec dismiss`); an injected edge pull opens only with `reveal pull qualified`
 and the executor's ack for the exact show sequence the Start side published; an
 injected panel drag closes only with its producer line (`close dismiss kind=...`
-for a real digitizer, `intent close trigger=clickaway ... method=7` for the
+for a real digitizer, the click-away decision and its `method=7` intent for the
 injected pointer) and the executed dismiss for the sequence that producer
-requested; and a desktop click closes only with the click-away intent, the
-matching method-6 dismiss and `win close observed` — a close the shell performed
-natively fails that row. The last step fails on any error-shaped line in the run —
+requested; and a desktop click closes only with `own toggle decide
+trigger=clickaway ... kind=close`, the matching method-6 dismiss and `win close
+observed` — a close the shell performed natively fails that row. The touch close
+row names its producer (`producer=hid` or `producer=injected-pointer`); an
+injected-pointer row is never quoted as HID evidence.
+
+Three mixed-trigger rows then interrupt a close with a different trigger: a Win
+close with a desktop click, a Start-button close with a Win press, and a gesture
+close with a desktop click. Each needs the close's own decision (or `close
+accepted ... kind=dismiss` for a gesture the click interrupts before its
+`close dismiss kind=` line), the reopen decision (`own toggle decide ... kind=open
+dir=2`), the cancel that retired the close (`exec cancel request target=...
+reason=open-intent`, or `close dismiss cancelled kind=...`), `close ended ...
+reason=open-cancel`, no `win close observed`, and the panel ending uncloaked.
+These are the rows that fail when a click or a press re-closes instead of
+reversing; the older smoke passed while the click did exactly that.
+
+The last step fails on any error-shaped line in the run —
 a non-zero
 `hr=`, `timeout`, `refused`, a lost press or a dropped latch. Run it before
 handing the tree to a review: two of the defects fixed during the M3.3 review
@@ -270,14 +289,16 @@ the band) that reaches 24 DIP at or below the entry logs
 What it does not cover, on purpose: the click-away step waits for the executor's
 `exec visible ... visible=visible` because a click inside the window's presentation
 (state 1/3) is swallowed; the open step uses the VK_LWIN tap because the
-auto-hidden bar cannot be opened through UIA; and the **HID dismiss** path
-(`close dismiss kind=...`) is unreachable from an injection, because every
-injected panel drag reaches the shell as a pointer-away click-away, so that line
-is the only thing separating the two producers. A real finger's panel drag is the
-only thing that writes it: capture `close dismiss kind=...` with its matching
-`exec dismiss request ... method=1 open=<generation>` once by hand. A pen by hand
-is still owed; one finger end to end, two fingers in both lift orders and the
-auto-hide reveal after a fresh logon passed on the shipping build.
+auto-hidden bar cannot be opened through UIA; and the producer of an injected
+panel drag is not fixed. On this build the injected drag produced the real HID
+close (`producer=hid`, `close dismiss kind=dismiss`), while other runs and the
+earlier captures produced the pointer-derived click-away; the row accepts both and
+names the one it saw. The HID producer is not proof of a human finger, and an
+injected-pointer producer is not HID evidence. A real finger's panel drag is
+still the field check for the HID path: capture `close dismiss kind=...` with its
+matching `exec dismiss request ... method=1 open=<generation>` once by hand. A pen
+by hand is still owed; one finger end to end, two fingers in both lift orders and
+the auto-hide reveal after a fresh logon passed on the shipping build.
 
 
 ## The panel's trailing edge
