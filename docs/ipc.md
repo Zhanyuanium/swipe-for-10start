@@ -1,6 +1,6 @@
 # IPC — the merged mod's channel
 
-> Mod 0.8.1 (one source, two process halves). One session-local section, five
+> Mod 0.8.2 (one source, two process halves). One session-local section, five
 > named events, every record a seqlock. There is no file, no mutex, no command
 > channel and no polling on either side.
 
@@ -439,3 +439,4 @@ intent and its ack, the executor command and its ack with outcome and visibility
 names, the controller direction/touch, the peer triple and `execCapable`. It
 refuses a section whose `initState` is not ready or whose magic or `layoutBytes`
 disagrees.
+

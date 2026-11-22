@@ -7,6 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
+| `v0.8.2` | 0.8.2 | — | 232 B | an unload proved on the owner threads: one UI rendezvous window, counted proofs on every path, adoption only by a pumping entry, an open during a close handed to the controller, the version gate before the PDB fetch |
 | `v0.8.1` | 0.8.1 | — | 232 B | the executor proves itself before either half intercepts: one `execCapable` word, one symbol attempt, an unowned show adopted, a close that moves from its first frame |
 | `v0.8.0` | 0.8.0 | — | 216 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
 | `v0.7.0` | 0.7.0 | — | 216 B | one mod, two processes: the collection's review answered (symbol hooks, no pin, deadline-driven wakeups, tap rejection, lean channel) |
@@ -22,6 +23,45 @@ pair that shipped before the merge.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.8.2 — an unload that can be proved
+
+Windhawk `@version` 0.8.2. The channel is unchanged (232 bytes, `SingleMod3`);
+this release is the lifecycle half of the same design.
+
+- **The unload runs on the owner threads, synchronously.** The Start side creates
+  its own message-only window on the UI thread before `Loaded` is registered; the
+  unload sends teardown, then one empty drain, then destroy, and each
+  `SendMessage` returns only after the handler and its delegate thunks have
+  returned. The executor window is destroyed the same way with its own private
+  message and handler. The dispatcher post, the completion events, the
+  window-gone event and every retry loop are gone; the entry wait is a count
+  predicate that a stale auto-reset signal cannot end.
+- **Every path proves the same two counts.** Entry count zero and XAML
+  registrations zero are required whether the teardown ran inline, ran through
+  the window, or could not run at all. A destroyed window is not read as a dead
+  UI thread. A proof that cannot be obtained blocks the unload once, with one
+  line, instead of a poll.
+- **Only an entry that pumps may adopt the launcher thread.** The Windows key,
+  the Start button and the manager's `Show` record an unknown launcher thread;
+  `Dismiss`/`ShowStartView` from a COM or taskbar caller that does not pump pass
+  natively, so the executor window is never stranded on a thread that cannot
+  destroy it.
+- **An open during a close is handed to the controller.** When the shell shows
+  the menu while a close is retracting it, both close schedules (local and
+  executor) are cancelled, the recovery ticket dropped, and the controller
+  publishes the open direction, so the next press closes instead of opening
+  again.
+- **The version check precedes the symbol work.** The launcher's fixed version is
+  read from the mapped image's `RT_VERSION`, not from the file path; a build
+  other than the reference is refused in one line and never starts the 33 MB PDB
+  fetch.
+
+Still owed, and named in `docs/limits.md`: the top and right docks are
+implemented but unmeasured on this machine, a pen by hand, a second display and
+rotation (untestable here), a finger or pen tap that cannot reverse a close
+(mouse only), and a consumed finger that is silent through a landing and then
+moves.
 
 ## v0.8.1 — the executor proves itself
 

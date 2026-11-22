@@ -1,6 +1,6 @@
 # M3.2 architecture — one controller, one executor
 
-> L3-level design record. Mod **0.8.1** (one source, two process halves),
+> L3-level design record. Mod **0.8.2** (one source, two process halves),
 > channel **232 B, no product version word** (`SingleMod3` namespace). The measured evidence is quoted with the build and the
 > layout it came from; everything below was run on this machine. **Layouts:**
 > *left docked* (live, measured 2026-11-21) = `axis=0`, work `48,0,1440,900`,
@@ -14,7 +14,7 @@
 
 One Windhawk mod, two process halves:
 
-- `mods/swipe-for-10start.wh.cpp` (0.8.1) is installed once and loaded into both
+- `mods/swipe-for-10start.wh.cpp` (0.8.2) is installed once and loaded into both
   hosts. Its `start` namespace runs in `StartMenuExperienceHost.exe` and owns the
   touch gesture, the claim on `Progress`, the settle planner, the gates and the
   decision state. It consumes executor intents, publishes executor commands, and
@@ -830,3 +830,5 @@ that window; the early-uncloak experiment found DWM attribute 13 returns
 set it before the shell's own uncloak. No early visibility is attempted. The M3
 gain is the decision and command latency (31 ms) and the removal of the shell's
 60–250 ms gesture wait, not the cloak.
+
+
