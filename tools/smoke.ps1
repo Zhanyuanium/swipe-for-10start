@@ -524,7 +524,7 @@ for ($i = 1; $i -le 3 -and -not $closed; $i++) {
     # an executed command for the exact sequence it published.
     $hidClose = ($l -match 'close dismiss kind=') -and
         (Test-ExecutedDismiss $l 1)
-    $clickClose = ($bridgeLines -match 'intent close trigger=clickaway[^\r\n]*method=7') -and
+    $clickClose = ($bridgeLines -match 'intent kind=close trigger=clickaway[^\r\n]*method=7') -and
         (Test-ExecutedDismiss $l 6)
     $closed = $closed -and ($hidClose -or $clickClose)
     if ($closed) {
