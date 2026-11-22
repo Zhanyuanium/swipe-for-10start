@@ -13060,6 +13060,19 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     CaptureCoreWindowHandle();
     if (!EnsureUiRendezvousWindow()) {
+        // A replacement root installs no handlers here, so the previous root's
+        // renderer must not stay advertised. The first attach has nothing to
+        // withdraw and stays quiet beyond the existing line.
+        const bool hadRenderer = g_root || g_dispatcher || RendererReady();
+        if (hadRenderer) {
+            static bool withdrawLogged = false;
+            ResetRenderer();
+            if (!withdrawLogged) {
+                withdrawLogged = true;
+                TraceLog(L"root renderer withdrawn "
+                        L"reason=no-rendezvous-window");
+            }
+        }
         static bool rendezvousFailureLogged = false;
         if (!rendezvousFailureLogged) {
             rendezvousFailureLogged = true;
