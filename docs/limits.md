@@ -43,8 +43,9 @@
   warm cache the join is immediate.
 - **The private launcher layout is enabled only for the verified twinui identity.**
   `launcher+0x160`, `state+0x28` and the state vtable `+0x70` were read from one
-  image. Before any symbol work, `InstallExplorerHooks` reads the module's fixed
-  file version. A version other than `10.0.26100.10068` is refused on the spot:
+  image. Before any symbol work, `InstallExplorerHooks` reads the mapped image's
+  fixed version from its `RT_VERSION` resource, not from the file path. A version
+  other than `10.0.26100.10068` is refused on the spot:
   `exec launcher layout unverified ... native=1 reason=version skipped=version`,
   no `HookSymbols` call, no PDB fetch, no hook. Only a matching version reaches
   the fetch, where all 13 named symbols must resolve at the reference RVAs. Any

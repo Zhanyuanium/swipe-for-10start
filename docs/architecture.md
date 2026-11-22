@@ -61,8 +61,10 @@ The offsets are reference-build facts, and a name alone does not prove them. The
 capability is enabled only when the loaded image is the identity those offsets
 were read from: fixed file version **10.0.26100.10068** (the display string still
 reads 9949) and all 13 named symbols at the reference RVAs.
-`ModuleFixedFileVersion` reads the fixed version through `version.dll` (resolved
-at runtime), and `InstallExplorerHooks` checks it before the symbol request. A
+`ModuleFixedFileVersion` reads the fixed version from the mapped module's
+`RT_VERSION` resource (through `version.dll`, resolved at runtime), not from its
+file path: a serviced file on disk and the still-mapped image can differ.
+`InstallExplorerHooks` checks it before the symbol request. A
 different image is refused without calling `HookSymbols`, so the PDB fetch never
 starts there; the same line reports `skipped=version`. Only the reference version
 reaches `HookSymbols`, whose 13 resolved RVAs are compared with the reference.

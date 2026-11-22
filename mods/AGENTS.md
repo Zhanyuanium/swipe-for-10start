@@ -471,8 +471,9 @@ expected=... match=0|1`); the set line
 `exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence
 line. One missing symbol refuses the whole set and the hooks are not applied: a
 toggle that can open but not close is worse than the shell's path. The private
-layout is gated on identity, not names: the fixed file version is read before
-`HookSymbols` and must be `10.0.26100.10068`; a different image logs
+layout is gated on identity, not names: the fixed file version is read from the
+mapped image's `RT_VERSION` resource before `HookSymbols` and must be
+`10.0.26100.10068`; a different image logs
 `exec launcher layout unverified ... reason=version skipped=version` and never
 starts the PDB fetch. On the reference version all 13 resolved RVAs must also
 match. On any other image the hooks pass, `LauncherNow` returns null, the

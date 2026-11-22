@@ -14141,45 +14141,37 @@ constexpr uint64_t kTwinuiReferenceVersion =
     (static_cast<uint64_t>(26100) << 16) | 10068;
 std::atomic<bool> g_launcherLayoutVerified{false};
 
-// The fixed file version of a loaded module, or 0 when it cannot be read.
-// version.dll is resolved at runtime, so the build gains no import.
+// The fixed file version of the mapped image, or 0 when it cannot be read.
+// The resource is read from `module` itself, never from the file on disk: a
+// serviced file and the still-mapped image can differ, and the private RVAs
+// describe the mapping the hooks will actually call. version.dll is resolved at
+// runtime, so the build gains no import.
 uint64_t ModuleFixedFileVersion(HMODULE module) {
-    using GetSize_t = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
-    using GetInfo_t = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
-    using Query_t = BOOL(WINAPI*)(LPVOID, LPCWSTR, LPVOID*, PUINT);
+    using Query_t = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
     static HMODULE versionDll = LoadLibraryW(L"version.dll");
-    static GetSize_t getSize =
-        versionDll ? reinterpret_cast<GetSize_t>(
-                         GetProcAddress(versionDll,
-                                        "GetFileVersionInfoSizeW"))
-                   : nullptr;
-    static GetInfo_t getInfo =
-        versionDll ? reinterpret_cast<GetInfo_t>(
-                         GetProcAddress(versionDll, "GetFileVersionInfoW"))
-                   : nullptr;
     static Query_t query =
         versionDll ? reinterpret_cast<Query_t>(
                          GetProcAddress(versionDll, "VerQueryValueW"))
                    : nullptr;
-    if (!getSize || !getInfo || !query) {
+    if (!module || !query) {
         return 0;
     }
-    WCHAR path[MAX_PATH] = {};
-    if (!GetModuleFileNameW(module, path, ARRAYSIZE(path))) {
+    const HRSRC resource = FindResourceW(
+        module, MAKEINTRESOURCEW(VS_VERSION_INFO), RT_VERSION);
+    if (!resource) {
         return 0;
     }
-    DWORD handle = 0;
-    const DWORD size = getSize(path, &handle);
-    if (size == 0) {
+    const HGLOBAL loaded = LoadResource(module, resource);
+    if (!loaded) {
         return 0;
     }
-    std::vector<BYTE> data(size);
-    if (!getInfo(path, 0, size, data.data())) {
+    const void* data = LockResource(loaded);
+    if (!data) {
         return 0;
     }
     VS_FIXEDFILEINFO* info = nullptr;
     UINT length = 0;
-    if (!query(data.data(), L"\\", reinterpret_cast<void**>(&info), &length) ||
+    if (!query(data, L"\\", reinterpret_cast<void**>(&info), &length) ||
         !info || length < sizeof(VS_FIXEDFILEINFO) ||
         info->dwSignature != 0xFEEF04BD) {
         return 0;
