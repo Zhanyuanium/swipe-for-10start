@@ -13255,16 +13255,16 @@ std::atomic<HMODULE> g_startUIModuleSeen{nullptr};
 std::atomic<HMODULE> g_startUIHookModule{nullptr};
 std::atomic<bool> g_loadHookMatchLogged{false};
 
-// The input thread's retry schedule for the root symbol. The first symbol load
-// also starts Windhawk's PDB fetch, which can take tens of seconds on a cold
-// cache; a false result before it finishes is `pending`, not a refusal. 120 s is
-// two full downloads at the measured ~600 KB/s for the 35 MB reference PDB, plus
-// the symbol parse, and still bounded before a user concludes the feature is
-// broken. Input thread only; a fresh image starts them at zero.
+// The input thread's module-wait schedule for the root symbol. The wait is
+// bounded at 120 s: StartUI_.dll can load late on the shell's own schedule, and
+// the bound is long enough to cover a normal logon before a user concludes the
+// feature is broken. Once the module is present the one HookSymbols call is
+// made; a false result is terminal, never a pending retry. Input thread only; a
+// fresh image starts them at zero.
 //
-// `kRootProbeMs` is the retry interval and, through NextInputDeadlineMs, the wait
-// planner's bootstrap deadline: while the answer is neither ready nor refused,
-// the thread has to come back for the probe.
+// `kRootProbeMs` is the module-poll interval and, through NextInputDeadlineMs,
+// the wait planner's bootstrap deadline: while the answer is neither ready nor
+// refused, the thread has to come back to see whether the module has loaded.
 // The input thread's module wait for the root symbol. The module may load late;
 // once it is present the symbol call is made exactly once, and the wait itself is
 // bounded by kRootPendingDeadlineMs.
@@ -13760,13 +13760,10 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
 // from the unload thread. A class left by an earlier image is a failure, not
 // something to adopt: its procedure would point into unmapped code.
 bool EnsureUiRendezvousWindow() {
-    const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
-    if (uiThread == 0 || uiThread != GetCurrentThreadId()) {
-        TraceLog(L"ui rendezvous refused off-thread tid=%u ui=%u",
-                static_cast<unsigned>(GetCurrentThreadId()),
-                static_cast<unsigned>(uiThread));
-        return false;
-    }
+    // Only PrepareRootElement_Hook calls this, on the UI thread, after it has
+    // recorded that thread. The owner is the caller by construction; no separate
+    // off-thread test is needed here.
+    const DWORD uiThread = GetCurrentThreadId();
     HWND existing = g_uiRendezvousHwnd.load(std::memory_order_acquire);
     if (existing) {
         if (IsWindow(existing)) {
@@ -14538,8 +14535,6 @@ std::atomic<bool> g_execReady{false};
 // the bridge's own copy of the shared word; every lifecycle point publishes it
 // through PublishExecutorCapability and the Start side reads only the word.
 std::atomic<bool> g_execCapable{false};
-// Set by WM_NCDESTROY on the launcher thread when the published window is
-// destroyed. The unload resets it before posting the teardown and waits on it
 // The hidden event does not publish the latched open from its own stack. A show
 // that ran at the hidden event's own tick was swallowed by the completing hide
 // (measured on the auto-hidden layout: `own state event=hidden`, show and
@@ -14592,11 +14587,9 @@ constexpr uint32_t kExecDismissRetryMs = 10;
 // State
 // ---------------------------------------------------------------------------
 
-// The twinui.pcshell.dll image the notification saw, the image an install
-// currently owns, and the resolution outcome. The bridge's worker probes the
-// recorded module; a false result while Windhawk's PDB fetch runs is pending,
-// not a refusal.
-std::atomic<HMODULE> g_explorerModuleSeen{nullptr};
+// The image an install currently owns and the resolution outcome. The worker
+// probes the module by name with a loader reference; no load notification is
+// needed.
 // The loader reference acquired for the one symbol attempt. Worker thread writes
 // it before the install; RoleUninit reads it after the worker join and releases
 // it once. It keeps the mapping alive across the resource read and HookSymbols.
@@ -14604,7 +14597,6 @@ HMODULE g_explorerModuleRef = nullptr;
 std::atomic<HMODULE> g_explorerSymbolClaim{nullptr};
 std::atomic<bool> g_explorerSymbolsReady{false};
 std::atomic<bool> g_explorerSymbolsRefused{false};
-std::atomic<bool> g_explorerLoadLogged{false};
 std::atomic<bool> g_afterInit{false};
 std::atomic<bool> g_disabled{false};
 // Serialises the symbol install against the stop: Wh_ModBeforeUninit takes it
@@ -15095,10 +15087,11 @@ bool ExecutorWindowOnThisThread() {
     return g_execThreadId == GetCurrentThreadId();
 }
 
-// Only the two decision entries are listed here. They serve an existing
-// capability/window and cannot bootstrap one: the manager's Show is the only
-// bootstrap. This gate is therefore a secondary guard, not the adoption rule.
-// A Dismiss/ShowStartView on an unknown thread never adopts and passes natively.
+// Only the two decision entries are listed here. They never bootstrap a
+// service: HandleOwnTrigger has already required a live peer and a started
+// worker, and the manager's Show is the entry that creates a window with
+// neither. A Dismiss/ShowStartView on an unknown thread never adopts and passes
+// natively.
 bool LauncherTriggerMayAdopt(const wchar_t* trigger) {
     return wcscmp(trigger, L"win") == 0 ||
            wcscmp(trigger, L"startbutton") == 0;
@@ -17389,33 +17382,12 @@ void RunPressOriginal(const QueuedPress& press, const wchar_t* reason) {
 // Launcher symbols
 // ---------------------------------------------------------------------------
 
-// The notification only records the image. Resolution runs on the executor
-// worker: HookSymbols starts Windhawk's PDB fetch for twinui.pcshell.pdb (33 MB)
-// and blocks until it finishes, and doing that on a thread Explorer owns would
-// freeze the shell -- the same failure the Start side measured and fixed.
-using LoadLibraryExW_t = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
-LoadLibraryExW_t LoadLibraryExW_Original = nullptr;
-
-HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
-                                   DWORD flags) {
-    HMODULE module = LoadLibraryExW_Original
-                         ? LoadLibraryExW_Original(fileName, file, flags)
-                         : nullptr;
-
-    // Filter on the returned module, not on the requested name: the call may
-    // have asked for another file and still brought twinui in, and a refused or
-    // redirected request must not look like a load. This mod never force-loads
-    // twinui.
-    if (module && module == GetModuleHandleW(kTwinuiModuleName)) {
-        g_explorerModuleSeen.store(module, std::memory_order_release);
-        if (!g_explorerLoadLogged.exchange(true)) {
-            TraceLog(L"exec launcher module seen module=%p", module);
-        }
-    }
-
-    return module;
-}
-
+// Resolution runs on the executor worker: HookSymbols starts Windhawk's PDB
+// fetch for twinui.pcshell.pdb (33 MB) and blocks until it finishes, and doing
+// that on a thread Explorer owns would freeze the shell -- the same failure the
+// Start side measured and fixed. The worker finds the current mapping by name
+// with a loader reference; a late load is therefore seen without a
+// LoadLibraryExW hook.
 // The proven caller wrappers: a thread-local category around the original call,
 // restoring the previous value. They never decide anything and always call the
 // original; the Hide hook reads the category.
@@ -17681,21 +17653,6 @@ ExplorerHookOutcome InstallExplorerHooks(HMODULE module) {
     return ExplorerHookOutcome::Settled;
 }
 
-// Records an already-loaded twinui. Called from init and AfterInit; it never
-// resolves anything (that is the worker's job, so the shell's thread is never
-// blocked by the PDB fetch).
-void NoteLoadedExplorerModule() {
-    if (g_disabled.load(std::memory_order_relaxed) ||
-        g_explorerSymbolsReady.load(std::memory_order_acquire) ||
-        g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
-        return;
-    }
-    HMODULE twinui = GetModuleHandleW(kTwinuiModuleName);
-    if (twinui) {
-        g_explorerModuleSeen.store(twinui, std::memory_order_release);
-    }
-}
-
 // Resolves the launcher symbols from the executor worker. One call per module
 // per install: HookSymbols blocks on the PDB fetch, and once it returns false
 // the session has no launcher hooks; a retry would only repeat the stall. The
@@ -17717,7 +17674,6 @@ void ProbeExplorerSymbolsFromWorker() {
             return;
         }
         g_explorerModuleRef = module;
-        g_explorerModuleSeen.store(module, std::memory_order_release);
     }
 
     // Claim the one attempt before the blocking call. A concurrent caller (there
@@ -18433,11 +18389,12 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
 }
 
 // The manager's Show is the bootstrap: it records the thread the shell called it
-// on and creates the executor window there. The Win and Start-button hooks only
-// serve a capability/window that already exists; they cannot create the first
-// one (nothing on this build calls OnStartButtonPressed). Dismiss/ShowStartView
-// never adopt; a non-pumping COM/taskbar caller passes natively, and if its
-// internal manager Show then runs on that thread, that Show is the adopter.
+// on and creates the executor window there, with no peer and no worker to gate
+// it. The Win and Start-button hooks cannot bootstrap: both run only after a
+// live peer and a started worker, so they never create a window for a service
+// that is not already answering. Dismiss/ShowStartView never adopt; a
+// non-pumping COM/taskbar caller passes natively, and if its internal manager
+// Show then runs on that thread, that Show is the adopter.
 DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     const DWORD tid = GetCurrentThreadId();
     DWORD known = g_launcherThread.load(std::memory_order_relaxed);
@@ -18459,10 +18416,10 @@ DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     return tid;
 }
 
-// The manager's Show is the one adoption point. It records the thread it runs on
-// (normally the launcher thread; a non-pumping caller can supply it if its own
-// ShowStartView passed natively and the shell called this Show there) and creates
-// the executor window on it. A Show on a thread this mod has already recorded on
+// The manager's Show is the bootstrap that creates a window with no peer. It
+// records the thread it runs on (normally the launcher thread; a non-pumping
+// caller can supply it if its own ShowStartView passed natively and the shell
+// called this Show there). A Show on a thread this mod has already recorded on
 // another entry is a mismatch and creates nothing.
 void EnsureExecutorOnLauncherThread(const wchar_t* source) {
     if (ExecutorWindowOnThisThread()) {
@@ -18553,8 +18510,8 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
     const DWORD target = g_launcherThread.load(std::memory_order_relaxed);
     if (target == 0) {
         // No launcher entry has run yet. A touch-first open falls back to the
-        // shell's own gesture; the first OnHotkeyInvoke, Dismiss, ShowStartView
-        // or manager Show creates the window.
+        // shell's own gesture; the manager's Show is the bootstrap that records
+        // the thread and creates the window.
         return false;
     }
     if (target == GetCurrentThreadId()) {
@@ -18574,6 +18531,9 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
            !(g_execStopEvent &&
              WaitForSingleObject(g_execStopEvent, 0) == WAIT_OBJECT_0) &&
            GetTickCount64() - start < timeoutMs) {
+        // Finite by construction: timeoutMs, and the stop event also ends it.
+        // This is a bounded wait for the launcher thread to pump the one-shot
+        // hook, not a periodic worker tick.
         Sleep(5);
     }
     UnhookWindowsHookEx(hook);
@@ -18684,6 +18644,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
         }
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         for (int i = 0; i < 50 && !window; ++i) {
+            // Finite: at most 50 ms for a window creation already in flight.
             Sleep(1);
             window = g_execWindow.load(std::memory_order_relaxed);
         }
@@ -18743,10 +18704,11 @@ void JoinExecutorWorker() {
     BlockBridgeUnload(L"executor worker join failed");
 }
 
-// A proof that cannot be obtained blocks the unload. The window is created only
-// on a recorded launcher entry, and Dismiss/ShowStartView no longer adopt an
-// unknown thread, so the non-pumping owner that used to make this wait forever is
-// removed. A genuine failure still has no safe return.
+// A proof that cannot be obtained blocks the unload. The window is created by
+// the manager's Show (or by a targeted WH_GETMESSAGE hook for an already
+// recorded launcher thread), never from Dismiss/ShowStartView, so the
+// non-pumping owner that used to make this wait forever is removed. A genuine
+// failure still has no safe return.
 [[noreturn]] void BlockBridgeUnload(const wchar_t* reason) {
     TraceLog(L"unload blocked reason=%s", reason);
     Wh_Log(L"Unload blocked: %s; the module image cannot be freed safely",
@@ -18758,7 +18720,8 @@ void JoinExecutorWorker() {
 // Destroys the one published window synchronously on its owner thread.
 // SendMessage returns only after the private teardown handler has run
 // DestroyWindow and WM_NCDESTROY; no completion event is needed. A destroyed
-// window means the owner thread is gone, not a hang.
+// window means this activation's window is gone, not that the owner thread is
+// gone; a window that does not answer blocks.
 void DestroyExecutorWindow() {
     HWND window = g_execWindow.load(std::memory_order_acquire);
     if (!window) {
@@ -18908,35 +18871,9 @@ BOOL RoleInit() {
         PublishExecutorCapability(L"init");
     }
 
-    // The acknowledgement event for the window's destruction. Created before
-    // any window can exist; the unload resets it before it posts the teardown
-    // and waits on it without a deadline.
     if (g_ipc.state) {
         StartExecutorWorker();
     }
-
-    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
-    auto loadLibraryExW = kernelBase
-                              ? reinterpret_cast<LoadLibraryExW_t>(
-                                    GetProcAddress(kernelBase,
-                                                   "LoadLibraryExW"))
-                              : nullptr;
-    if (!loadLibraryExW) {
-        Wh_Log(L"LoadLibraryExW not found; twinui.pcshell.dll hooks may not "
-               L"be installed");
-    } else if (!Wh_SetFunctionHook(
-                   reinterpret_cast<void*>(loadLibraryExW),
-                   reinterpret_cast<void*>(LoadLibraryExW_Hook),
-                   reinterpret_cast<void**>(&LoadLibraryExW_Original))) {
-        Wh_Log(L"Failed to hook LoadLibraryExW; twinui.pcshell.dll hooks may "
-               L"not be installed");
-    } else {
-        Wh_Log(L"Hooked LoadLibraryExW");
-    }
-
-    // Record the image if it is already loaded; resolution happens on the
-    // executor worker so the PDB fetch never blocks Explorer's thread.
-    NoteLoadedExplorerModule();
 
     g_initialised = true;
     return TRUE;
@@ -18947,7 +18884,6 @@ void RoleAfterInit() {
         return;
     }
     g_afterInit = true;
-    NoteLoadedExplorerModule();
     Wh_ApplyHookOperations();
 }
 

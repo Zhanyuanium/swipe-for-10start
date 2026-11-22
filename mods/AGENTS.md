@@ -456,8 +456,9 @@ hook's pointer.
 `HookSymbols` call on the loaded `twinui.pcshell.dll`. The names are DIA's
 undecorated public-symbol strings for 10.0.26100.10068. The fixed VAs, the
 file-version/timestamp compare, the executable-range check and the prologue/body
-probes are deleted. The `LoadLibraryExW` notification only records the returned
-module; the executor worker runs the resolution, because the first call starts
+probes are deleted. There is no `LoadLibraryExW` hook on this side: the executor
+worker finds the current `twinui.pcshell.dll` mapping by name with a loader
+reference, because the first call starts
 Windhawk's PDB fetch and blocking a thread Explorer owns freezes the shell. The
 worker waits 100 ms at a time only until it can start its **one** `HookSymbols`
 call; that is a wait for the module, not a retry of the fetch. A false result is
@@ -503,9 +504,10 @@ capability word.
 **Executor.** A hidden message-only window, class
 `WindhawkSwipeFor10Start.Executor` (fixed, registered under `&__ImageBase`),
 created by the manager's `Show` on the thread it runs on; that is the one
-bootstrap and thread adopter. A Win/Start-button entry only serves an existing
-capability/window and cannot create the first one; `OnStartButtonPressed` is not
-called on this build. `Dismiss`/`ShowStartView` on an unknown thread never adopt
+bootstrap, and it records the thread and creates the window with no peer and no
+worker. A Win/Start-button entry cannot bootstrap: both run only after a live
+peer and a started worker, and `OnStartButtonPressed` is not called on this
+build. `Dismiss`/`ShowStartView` on an unknown thread never adopt
 and pass natively; a non-pumping caller that reaches the manager `Show` makes
 that `Show` the adopter. A targeted `WH_GETMESSAGE` hook on an already recorded
 thread can create the window there; it does not adopt.

@@ -87,8 +87,10 @@ path), a window this activation created on that thread, a started worker, the
 verified layout, and for
 the directional close intent the callable `Dismiss` the command will need. A Hide never adopts an unproven thread
 (`reason=wrong-thread|no-window|no-capability|no-primitive`). The manager's
-`Show` is the one bootstrap that records a thread; Win/Start-button entries only
-serve an existing window, and `ShowStartView`/`Dismiss` never adopt.
+`Show` is the bootstrap that records a thread and creates the window with no
+peer; a Win/Start-button entry runs only after a live peer and a started worker
+and never creates a window for a service that is not already answering, and
+`ShowStartView`/`Dismiss` never adopt.
 A wrong-thread launcher call is not a clean error: never call from a hook frame,
 and the executor window is created only by the manager's `Show` (or a
 `WH_GETMESSAGE` hook on an already recorded launcher thread).
@@ -437,9 +439,9 @@ header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h`: one session-local section (232 bytes) and five named
-events (`State/Intent/IntentAck/Exec/ExecAck/Capability` — six objects), every
-record a
+`mods/swipe_ipc_shared.h`: one session-local section (`State`, 232 bytes) and
+five named events (`Intent/IntentAck/Exec/ExecAck/Capability` — six objects),
+every record a
 seqlock with its own counter and an `offsetof` assert, plus single-word
 claims (`controllerDirection`, `intentTaken`) and the bridge's `execCapable`.
 The names carry the merged

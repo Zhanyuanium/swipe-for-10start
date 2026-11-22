@@ -104,10 +104,11 @@ them explicitly on the UI thread.
    stop before the `Exec` event. The launcher hooks are applied inside the same
    lock as their resolution, so a stop either waits for the complete install or
    makes the install refuse; the worker never applies hooks after this point.
-2. **`Wh_ModUninit`** joins the posting worker **INFINITE**. The worker only
-   posts commands; it does not create the executor window. The join stops new
-   posts but says nothing about creation, which happens on the launcher thread
-   from a launcher entry. The window destruction recomputes the capability (the
+2. **`Wh_ModUninit`** joins the posting worker **INFINITE**. The worker posts
+   commands and installs a targeted `WH_GETMESSAGE` hook on an already recorded
+   launcher thread; that hook creates the executor window there, not on the
+   worker thread. The join stops posting but says nothing about creation or
+   destruction. The window destruction recomputes the capability (the
    line appears only on a change), and the class teardown writes the last
    recomputation before the section is closed.
 3. The one published HWND is destroyed synchronously on its owner thread:
@@ -128,21 +129,29 @@ them explicitly on the UI thread.
    release after disabling, not after removal. Worker/stop handles are closed,
    then the IPC view and its events.
 
-Only `OnHotkeyInvoke`, `OnStartButtonPressed` and the manager's `Show` may adopt
-an unknown launcher thread. `Dismiss`/`ShowStartView` called from a COM/taskbar
-thread that does not pump pass natively instead of creating an executor window
-there. While capability is 0 the Win hook passes its press natively too, so a
-Win entry alone cannot bootstrap adoption: the shell's own `ShowStartView` call
-reaches `CStartExperienceManager::Show`, whose hook records the launcher thread
-and creates the window; the next press is then the controller's.
+The manager's `Show` is the bootstrap: it is the only entry that records an
+unknown launcher thread and creates the window with no live peer and no worker.
+`Dismiss`/`ShowStartView` called from a COM/taskbar thread that does not pump
+pass natively instead of creating an executor window there. The Win and
+Start-button decision entries cannot bootstrap: both run only after a live peer
+and a started worker, so they serve a window that already exists and never
+create one for a service that is not answering (`OnStartButtonPressed` is not
+called on this build). While capability is 0 the Win hook passes its press
+natively. The shell's own `ShowStartView` call reaches
+`CStartExperienceManager::Show`, whose hook records the launcher thread and
+creates the window; the next press is then the controller's.
 
 The old creator reservation, admission flag, stop target, reaper, creator drain
 and `CloseCallLease` count are **gone**. The worker is joined before the window is
 destroyed, and the window is destroyed before the class is unregistered. The join
-stops posting, not creation; a creation that races the teardown leaves its window
-owned by the class, and the class unregister then blocks instead of freeing under
-it. The fixed class ownership also keeps a second activation from starting while
-the first still owns the class.
+stops posting, not creation: a creation that already passed its flag check holds
+the admission shared while it registers the class and creates the window, and
+the unload's exclusive waits for it. Once the unload holds the exclusive, every
+later creation path's shared try fails and returns, so nothing can be created
+under the teardown. The launcher-thread `WH_GETMESSAGE` hook also uses the
+try-shared side, so the teardown `SendMessage` cannot deadlock against the
+writer; the WndProc takes no admission lock. The fixed class ownership also
+keeps a second activation from starting while the first still owns the class.
 
 ## The host's boundary
 

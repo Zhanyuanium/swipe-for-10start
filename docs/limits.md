@@ -123,6 +123,21 @@
   it. A press already swallowed and then lost (peer or epoch changed before the
   serve) has no shell path left; it is dropped, not passed on.
 
+## Configuration and channel
+
+- **The legacy Start mode is a documented prerequisite, not a runtime gate.**
+  The mod targets ExplorerPatcher's classic Start
+  (`Start_ShowClassicMode=1`) hosting `StartUI_.dll`. No code reads that value:
+  it is a prerequisite, and behaviour on the Windows 11 Start is unmeasured,
+  not adapted.
+- **The channel is trusted by name, not authenticated.** The section and the
+  five events live under `Local\SwipeFor10Start_SingleMod3_*`, so any process in
+  the same session that opens those names can read every record and publish any
+  record. `peerState`, `peerTick` and `peerEpoch` prove that a Start half is
+  alive and which activation it is; they do not prove that the writer is the
+  Start host. The names are a contract between the two halves, not a security
+  boundary, and a hostile same-session process is outside the threat model.
+
 ## Presses and claims
 
 - **A hard kill while a press is claimed holds the slot.** `peerState` stays

@@ -117,14 +117,14 @@ not rely on the asymmetry: every command runs on the launcher thread.
 
 Shape: a hidden message-only window owned by the mod, created by the manager's
 `Show` on the thread it runs on. That `Show` is the one bootstrap: it records the
-launcher thread and creates the window. A Win or Start-button entry only serves
-an existing capability/window and cannot create the first one; nothing on this
-build calls `OnStartButtonPressed`. `Dismiss`/`ShowStartView` never adopt: a
+launcher thread and creates the window with no peer and no worker. A Win or
+Start-button entry cannot bootstrap: both run only after a live peer and a
+started worker, and nothing on this build calls `OnStartButtonPressed`.
+`Dismiss`/`ShowStartView` never adopt: a
 non-pumping COM or taskbar caller passes natively, and if its internal manager
 `Show` then runs on that thread, that `Show` is the adopter. A targeted
 `WH_GETMESSAGE` hook on an already recorded launcher thread can create the window
-there; it does not adopt. A window is never created from the `LoadLibraryExW`
-hook, which runs on whichever thread loaded twinui. A worker waits on the channel event
+there; it does not adopt. The worker never creates it. A worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
 an empty stack. The window class is one fixed name
 (`WindhawkSwipeFor10Start.Executor`) registered under `&__ImageBase`;
@@ -142,8 +142,11 @@ and the channel close last. A destroyed window says this activation's window is
 gone, not that the launcher thread is gone. The old creator reservation,
 admission flag, creator
 drain, reaper and `CloseCallLease` count are gone. The join stops posting, not
-creation: a creation that races the teardown leaves its window owned by the
-class, so the unregister blocks instead of freeing under it. A window or worker
+creation: a creation that already passed its check holds the admission shared
+through class registration and `CreateWindowExW`, and the unload's exclusive
+waits for it; once the exclusive is held, a late creation's try-shared fails and
+returns, and the launcher-thread hook uses the same try, so the teardown
+`SendMessage` cannot deadlock. A window or worker
 that does not go away blocks the
 unload rather than returning success into an image it still points at. The
 procedure also refuses every ordinary dispatch for an HWND other than the
@@ -757,9 +760,10 @@ whole fetch.
 The explorer half moved the same way. The launcher entry points, the
 `s_pLauncher` slot and `IsVisible` are resolved by one `HookSymbols` call on
 `twinui.pcshell.dll`; the fixed VAs, the `twinui` file-version/timestamp gate,
-the executable-range check and the prologue/body probes are deleted. The
-`LoadLibraryExW` notification only records the returned image; the executor
-worker runs the resolution **once per module per install** (the 100 ms wait is
+the executable-range check and the prologue/body probes are deleted. No module
+load notification remains on this side: the executor worker finds the current
+`twinui.pcshell.dll` mapping by name with a loader reference and runs the
+resolution **once per module per install** (the 100 ms wait is
 only for the module to be present). A still-blocked PDB fetch leaves the mod
 passive — every press runs
 the shell's own path — and never blocks `explorer.exe`, because the fetch runs

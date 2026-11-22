@@ -51,6 +51,16 @@ size 232
 The debug command channel is **gone**: its record, mutex, event and parser were
 deleted in 0.7.0, and `tools/ipc.ps1` is read-only.
 
+## Trust boundary
+
+The channel is trusted by name, not authenticated. `Local\` scopes the objects
+to the logon session, and any process in that session that opens these names can
+read every record and publish any record. The mod has no caller identity to
+check: `peerState`, `peerTick` and `peerEpoch` prove that a Start half is alive
+and which activation it is, not that the writer is the Start host. The names are
+a contract between the two halves, not a security boundary; a hostile
+same-session process is outside the threat model.
+
 ## Seqlocks
 
 A writer calls `SwipeIpcBeginWrite(&seq)` (the counter goes odd), writes the
