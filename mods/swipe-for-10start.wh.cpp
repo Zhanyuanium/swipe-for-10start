@@ -3036,7 +3036,7 @@ bool BeginGestureSettle(float from, float to, float velocity,
     const float distance =
         std::max(ReadGestureGeometry().distance(), 0.0f);
     const float remaining = std::fabs(target - start) * distance;
-    int64_t durationMs = std::clamp(
+    const int64_t durationMs = std::clamp(
         static_cast<int64_t>(std::llround(
             static_cast<double>(remaining) /
             static_cast<double>(kSettleSpeedDipPerMs))),
@@ -13177,8 +13177,9 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
         }
 
         // The first registration is below. Re-read the stop immediately before
-        // it: the lease already keeps the unload waiting, and this check keeps a
-        // hook that saw the flag late from adding a delegate at all.
+        // it: the shared admission lock already keeps the unload waiting, and
+        // this check keeps a hook that saw the flag late from adding a delegate
+        // at all.
         if (g_unloading.load(std::memory_order_relaxed)) {
             TraceLog(L"root registration skipped reason=unloading");
             return result;
@@ -14132,6 +14133,12 @@ void RoleUninit() {
         return;
     }
 
+    // An uninit that skipped BeforeUninit must still close admission before it
+    // takes the exclusive admission lock: a hook that fails its shared try may
+    // otherwise read the flag as clear, block on the lock and deadlock against
+    // the teardown send. The normal path already set it there.
+    g_unloading = true;
+
     // The bridge's interception precondition fails here, before anything below
     // is freed: from this point no intent is consumed, so no trigger may be
     // swallowed for one. The withdrawal already ran in BeforeUninit, before the
@@ -14182,8 +14189,8 @@ void RoleUninit() {
     //     was ever used (a dispatcher turn or the settle batch), two zero reads
     //     cannot prove the last destructor returned, so the unload blocks
     //     instead of freeing under a destructor still running. The root hook's
-    //     admission lease does not set this flag: a hook that failed to create
-    //     the window and registered nothing can still complete. The
+    //     shared admission lock does not set this flag: a hook that failed to
+    //     create the window and registered nothing can still complete. The
     //     never-attached case (no hook, no entries) also completes.
     if (!inlineUnload && !uiWindow &&
         g_uiTurnEverUsed.load(std::memory_order_acquire)) {
