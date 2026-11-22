@@ -57,7 +57,10 @@
   blocks on the public PDB fetch (measured up to 571 s) and is called once per
   module per install on the executor worker. A false result is terminal for the
   session (`exec launcher symbols unresolved attempts=1 ...`); there is no retry
-  storm and no press waits on the fetch. A resolved set with an unverified layout
+  storm and no press waits on the fetch. On the Start side the input thread waits
+  up to 120 s for `StartUI_.dll`, makes **one** `HookSymbols` attempt, and on
+  failure logs `startui root symbol unresolved ...` and publishes no renderer;
+  it never retries. A resolved set with an unverified layout
   is a separate, equally terminal state: the capability stays 0 and the shell
   serves every trigger.
 - **A teardown that cannot be proved gone blocks the unload.** The image is not

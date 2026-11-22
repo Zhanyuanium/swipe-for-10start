@@ -747,12 +747,12 @@ fetch. The apply (`Wh_ApplyHookOperations`) is inside the same symbol-install
 lock as the resolution, so `BeforeUninit` either waits for the complete install or
 makes it refuse before `HookSymbols`; no root hook can become live after the stop.
 The `LoadLibraryExW` notification only records the returned module, and so
-do the init and AfterInit probes (`GetModuleHandleW` only): the input thread's
-first tick installs from the record, which keeps the warm case fast without any
-symbol work on a shell thread. A
-false result while the fetch runs is pending with a 120 s deadline, and only the
-deadline logs `unresolved`, installs no root hook and withholds the controller
-service. The shell keeps pumping for the whole fetch.
+do the init and AfterInit probes (`GetModuleHandleW` only): the input thread waits
+for `StartUI_.dll` (bounded at 120 s) and then makes one attempt, which keeps any
+symbol work off a shell thread. A
+false result is terminal: `startui root symbol unresolved ... attempts=1`, no
+retry, no root hook and no controller service. The shell keeps pumping for the
+whole fetch.
 
 The explorer half moved the same way. The launcher entry points, the
 `s_pLauncher` slot and `IsVisible` are resolved by one `HookSymbols` call on

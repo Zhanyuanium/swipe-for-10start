@@ -417,16 +417,17 @@ the unload once rather than returning success. The root hook is resolved by
 public symbol
 (`StartUI::App::PrepareRootElement`): the `LoadLibraryExW` notification and the
 init/AfterInit probes only record the module handle (`GetModuleHandleW`), and
-the input thread runs `HookSymbols` on its first tick, because
-the first call starts Windhawk's PDB fetch and blocking the shell's loader
+the input thread waits (up to 120 s) for `StartUI_.dll`, then runs one
+`HookSymbols` attempt, because
+the call starts Windhawk's PDB fetch and blocking the shell's loader
 thread makes the menu host look hung. The apply (`Wh_ApplyHookOperations`) runs
 inside the same symbol-install lock, before the lock is released: `BeforeUninit`
 either waits for the complete install or takes the lock first and makes the
 install refuse before `HookSymbols`, so no root hook becomes live after the
-stop. A false result while the fetch runs is
-pending (logged with its attempt, elapsed time and the 120 s deadline) and is
-retried; only the deadline produces `unresolved`, no root hook and no peer
-service. The peer is published only once the root is attached: `PublishPeerReady`
+stop. A false result is terminal:
+`startui root symbol unresolved ... attempts=1`, no retry, no root hook and no
+peer service. The peer is published only once the root is attached:
+`PublishPeerReady`
 requires `g_rendererReady` as well as the hook, so a session that missed
 `PrepareRootElement` (the cold fetch) advertises nothing and every press stays
 native until the host restarts. The reference address `module+0xAD730` is

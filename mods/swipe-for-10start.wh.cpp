@@ -737,11 +737,10 @@ constexpr uint64_t kPeerHeartbeatMs = kSwipePeerTickIntervalMs;
 // thread parks. It is never a steady poll (2 s, once per activation).
 constexpr int kRendererWaitRetries = 20;
 
-// The input thread's root-symbol retry interval (StartUI_'s PrepareRootElement).
-// It is also the wait planner's bootstrap deadline: while the answer is neither
-// ready nor terminally refused, the thread has to come back for the probe, so a
-// module that loads late is still noticed. See kRootPendingDeadlineMs for the
-// budget this retry runs inside.
+// The input thread's module-wait interval for StartUI_.dll. It is also the wait
+// planner's bootstrap deadline: while the answer is neither ready nor terminally
+// refused, the thread comes back to see whether the module has loaded.
+// kRootPendingDeadlineMs bounds that wait; HookSymbols itself is attempted once.
 constexpr uint64_t kRootProbeMs = 100;
 
 // A fallback for a channel whose capability event could not be created: while
@@ -13266,10 +13265,15 @@ std::atomic<bool> g_loadHookMatchLogged{false};
 // `kRootProbeMs` is the retry interval and, through NextInputDeadlineMs, the wait
 // planner's bootstrap deadline: while the answer is neither ready nor refused,
 // the thread has to come back for the probe.
+// The input thread's module wait for the root symbol. The module may load late;
+// once it is present the symbol call is made exactly once, and the wait itself is
+// bounded by kRootPendingDeadlineMs.
 constexpr uint64_t kRootPendingDeadlineMs = 120000;
 uint64_t g_rootProbeNextTick = 0;
 uint64_t g_rootProbeFirstTick = 0;
-int g_rootProbeAttempts = 0;
+// Set before the one HookSymbols call. A false result is terminal for the
+// session, never a retry.
+std::atomic<bool> g_startUIAttempted{false};
 
 // Serialises the symbol install against the stop. Wh_ModBeforeUninit takes it
 // before it sets g_disabled, so an install either finishes first or sees the
@@ -13278,15 +13282,12 @@ int g_rootProbeAttempts = 0;
 SRWLOCK g_startUIHookLock = SRWLOCK_INIT;
 
 // Attempts the root hook. This must never run on a thread the shell owns: the
-// first call starts Windhawk's PDB fetch and blocks for its duration, and
-// blocking the loader thread makes the menu host look hung to the shell's
-// watchdog, which then restarts it and the fetch starts over. The input thread
-// drives every attempt (the init probe only runs when StartUI_ is already
-// loaded, which is the warm case).
+// call starts Windhawk's PDB fetch and blocks for its duration, and blocking
+// the loader thread makes the menu host look hung to the shell's watchdog.
+// The input thread makes the one attempt after StartUI_.dll is present.
 //
-// Returns true only when this call installed the hook, so a caller applies the
-// queued hook operations only for an install it owns. A false result is
-// `pending`: the caller decides when it becomes a refusal.
+// Returns true only when this call installed the hook. A false result is
+// terminal for the session: the caller refuses the root hook and never retries.
 bool InstallStartUIHooks(HMODULE module) {
     if (!module) {
         return false;
@@ -13331,8 +13332,8 @@ bool InstallStartUIHooks(HMODULE module) {
     const uintptr_t resolved =
         reinterpret_cast<uintptr_t>(PrepareRootElement_Original);
     if (!hooked || !resolved) {
-        // Pending, not refused: while the engine is fetching or parsing the PDB
-        // this is the expected answer, and the input thread retries.
+        // The one attempt failed. The caller writes the terminal refusal; there
+        // is no retry to clear this claim for.
         g_startUIHookModule.store(nullptr, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_startUIHookLock);
         return false;
@@ -13387,16 +13388,42 @@ void RecordLoadedStartUIModule() {
     }
 }
 
-// Resolves the root hook from the mod's own input thread. Called on every loop
-// tick: immediate when the module is first known, then throttled while the
-// result is pending. The shell keeps pumping for the whole fetch because no
-// symbol work ever runs on its threads.
+// Resolves the root hook from the mod's own input thread. The thread polls only
+// for the module to load; once it is present this makes one HookSymbols attempt.
+// A false result is terminal for the session. The shell keeps pumping for the
+// whole fetch because no symbol work ever runs on its threads.
 void ProbeRootSymbolFromInputThread() {
     if (g_rootHookReady.load(std::memory_order_acquire) ||
         g_rootHookRefused.load(std::memory_order_acquire) ||
         g_disabled.load(std::memory_order_relaxed)) {
         return;
     }
+
+    const uint64_t now = GetTickCount64();
+    if (g_rootProbeFirstTick == 0) {
+        g_rootProbeFirstTick = now;
+    }
+    if (now - g_rootProbeFirstTick >= kRootPendingDeadlineMs) {
+        g_rootHookRefused.store(true, std::memory_order_release);
+        TraceLog(L"startui root symbol unresolved name=StartUI::App::"
+                L"PrepareRootElement attempts=%d waited=%llums "
+                L"deadline=%llums",
+                g_startUIAttempted.load(std::memory_order_acquire) ? 1 : 0,
+                static_cast<unsigned long long>(now - g_rootProbeFirstTick),
+                static_cast<unsigned long long>(kRootPendingDeadlineMs));
+        Wh_Log(L"StartUI::App::PrepareRootElement could not be resolved in "
+               L"StartUI_.dll within the %llu ms module wait; the root hook is "
+               L"refused and the controller advertises no service",
+               static_cast<unsigned long long>(kRootPendingDeadlineMs));
+        PublishPeerGone(L"root-hook-refused");
+        return;
+    }
+
+    if (now < g_rootProbeNextTick) {
+        return;
+    }
+    g_rootProbeNextTick = now + kRootProbeMs;
+
     HMODULE module = g_startUIModuleSeen.load(std::memory_order_acquire);
     if (!module) {
         module = GetModuleHandleW(kStartUIModuleName);
@@ -13406,16 +13433,11 @@ void ProbeRootSymbolFromInputThread() {
         g_startUIModuleSeen.store(module, std::memory_order_release);
     }
 
-    const uint64_t now = GetTickCount64();
-    const bool first = g_rootProbeFirstTick == 0;
-    if (!first && now < g_rootProbeNextTick) {
+    // One attempt per module per install. The claim is set before the blocking
+    // call; a second pass never asks the engine for symbols again.
+    if (g_startUIAttempted.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
-    g_rootProbeNextTick = now + kRootProbeMs;
-    if (first) {
-        g_rootProbeFirstTick = now;
-    }
-
     if (InstallStartUIHooks(module)) {
         // The install applied its own queued hook under the lock.
         return;
@@ -13425,27 +13447,15 @@ void ProbeRootSymbolFromInputThread() {
         return;
     }
 
-    g_rootProbeAttempts++;
-    const uint64_t waited = GetTickCount64() - g_rootProbeFirstTick;
-    if (waited >= kRootPendingDeadlineMs) {
-        g_rootHookRefused.store(true, std::memory_order_release);
-        TraceLog(L"startui root symbol deadline attempts=%d waited=%llums "
-                L"deadline=%llums",
-                g_rootProbeAttempts, static_cast<unsigned long long>(waited),
-                static_cast<unsigned long long>(kRootPendingDeadlineMs));
-        TraceLog(L"startui root symbol unresolved name=StartUI::App::"
-                L"PrepareRootElement (symbol, signature or hook refused)");
-        Wh_Log(L"StartUI::App::PrepareRootElement could not be resolved in "
-               L"StartUI_.dll within the %llu ms pending deadline; the root "
-               L"hook is refused and the controller advertises no service",
-               static_cast<unsigned long long>(kRootPendingDeadlineMs));
-        PublishPeerGone(L"root-hook-refused");
-        return;
-    }
-    TraceLog(L"startui root symbol pending attempt=%d waited=%llums "
-            L"deadline=%llums",
-            g_rootProbeAttempts, static_cast<unsigned long long>(waited),
-            static_cast<unsigned long long>(kRootPendingDeadlineMs));
+    g_rootHookRefused.store(true, std::memory_order_release);
+    TraceLog(L"startui root symbol unresolved name=StartUI::App::"
+            L"PrepareRootElement attempts=1 waited=%llums",
+            static_cast<unsigned long long>(GetTickCount64() -
+                                            g_rootProbeFirstTick));
+    Wh_Log(L"StartUI::App::PrepareRootElement could not be resolved in "
+           L"StartUI_.dll on the one attempt this session makes; the root hook "
+           L"is refused and the controller advertises no service");
+    PublishPeerGone(L"root-hook-refused");
 }
 
 // ---------------------------------------------------------------------------
