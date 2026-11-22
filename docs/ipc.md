@@ -102,11 +102,13 @@ line and is never executed ahead of the queue; a press still unpublished past
 (`own press fallback ...`). An `external` intent clears the queue and the latch,
 is published at once, and sets the same barrier as a state, not a timer: it
 stands even when the watchdog cannot be armed (`own external barrier ... armed`
-or `unarmed`) and is cleared only by its ack (`own external ack ... reconciled`)
-or by a peer that is gone/stale (`own external barrier ... released
+or `unarmed`) and is cleared only by its ack (`own external ack ... reconciled`),
+by a changed epoch (`released reason=epoch-changed`), or by a peer that is
+gone/stale (`own external barrier ... released
 reason=peer-gone`, checked at the reserve poll and at the next admission). A live
 but silent peer keeps it, and the timeout line is `decision=reserved`; the bridge
-never guesses a reconciliation.
+never guesses a reconciliation, and the reserve poll runs any held press past its
+queue bound.
 
 `method` is **evidence about the shell path that produced the trigger**, not an
 execution method. A click-away carries the Hide method `7`. The Start side maps
@@ -129,7 +131,10 @@ If the abort succeeded and the claim is not this sequence, the original runs onc
 (`decision=replay reason=revoked`); if the claim landed after the abort the record
 can no longer be copied, so nothing runs (`decision=none
 reason=claim-after-abort`); a record that already moved cannot be aborted
-(`decision=superseded reason=record-moved`). The peer words are evidence; the
+(`decision=superseded reason=record-moved`). A different `peerEpoch` means the
+activation that was asked is gone: a taken press is consumed without its ack
+(`reason=epoch-changed`), an untaken one is aborted and replayed, and the queue
+advances. The peer words are evidence; the
 abort and the claim are the proof. A take is never replayed: at most one
 execution, one native execution when the record is aborted before any claim, and
 a press lost rather than duplicated if the controller dies after the take.

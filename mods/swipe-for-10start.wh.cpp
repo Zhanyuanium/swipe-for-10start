@@ -15160,6 +15160,11 @@ struct OutstandingPress {
     // until Start reconciles the takeover, and its timeout has no press to
     // replay.
     bool external = false;
+    // The Start activation alive when the record was published. A different one
+    // at the watchdog means the activation that could have applied this record is
+    // gone: the replacement seeds past it (OpenIpcChannel) and will never answer,
+    // so the record is reconciled by the epoch, not by waiting for an ack.
+    uint32_t publishedEpoch = 0;
 };
 OutstandingPress g_pressOutstanding;  // launcher thread only
 
@@ -15245,6 +15250,40 @@ void RequeuePressFront(const QueuedPress& press) {
     ++g_pressQueueCount;
 }
 
+// Dequeues the head press and runs the shell's own primitive for it, under the
+// executor guard. Used for the queue-age fallback while the outstanding slot is
+// unreachable, and when the poll that enforces that bound cannot be armed.
+void ServeQueuedOriginal(const wchar_t* reason) {
+    if (g_pressQueueCount == 0) {
+        return;
+    }
+    const QueuedPress press = g_pressQueue[g_pressQueueHead];
+    g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
+    --g_pressQueueCount;
+    TraceLog(L"own press fallback trigger=%s entry=%s reason=%s wait=%llu q=%d",
+            PressTriggerName(press.trigger), PressEntryName(press.entry), reason,
+            static_cast<unsigned long long>(GetTickCount64() -
+                                            press.admittedTick),
+            g_pressQueueCount);
+    RunPressOriginal(press, reason);
+}
+
+// Runs the oldest queued press natively once it has outlived the queue bound.
+// True means one press was dequeued and served.
+bool AgeOutQueuedPress() {
+    if (g_pressQueueCount == 0) {
+        return false;
+    }
+    const QueuedPress& head = g_pressQueue[g_pressQueueHead];
+    const uint64_t now = GetTickCount64();
+    if (now <= head.admittedTick ||
+        now - head.admittedTick <= kPressQueueWaitMs) {
+        return false;
+    }
+    ServeQueuedOriginal(L"queue-wait");
+    return true;
+}
+
 // Publishes one decision and makes it the outstanding press. The ack timer is
 // armed before the record is published: a timer that cannot be armed means the
 // wait has no bound, so the press is not published and the caller serves it with
@@ -15265,6 +15304,10 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
     }
     const uint32_t method =
         kind == kSwipeIntentClose ? press.dismissMethod : press.showMethod;
+    // The activation the record is published for. Read before the publication: a
+    // restart after it leaves this epoch behind, and the watchdog reconciles the
+    // record instead of waiting for an ack the replacement will never send.
+    const uint32_t publishedEpoch = PeerEpochNow();
     const LONG64 sequence =
         PublishBridgeIntent(kind, press.trigger, method, press.flags);
     if (sequence <= 0) {
@@ -15273,8 +15316,12 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
                 PressTriggerName(press.trigger));
         return 0;
     }
-    g_pressOutstanding = OutstandingPress{true, sequence, GetTickCount64(),
-                                          press};
+    g_pressOutstanding = OutstandingPress{};
+    g_pressOutstanding.pending = true;
+    g_pressOutstanding.seq = sequence;
+    g_pressOutstanding.publishedTick = GetTickCount64();
+    g_pressOutstanding.press = press;
+    g_pressOutstanding.publishedEpoch = publishedEpoch;
     TraceLog(L"own press published trigger=%s entry=%s seq=%lld kind=%s q=%d "
             L"source=%s",
             PressTriggerName(press.trigger), PressEntryName(press.entry),
@@ -15563,6 +15610,11 @@ void HandlePressAck() {
 //   and nothing is replayed;
 // - a record that has already moved cannot be aborted, so nothing is replayed.
 //
+// A different peer epoch means the activation that was asked is gone. The
+// replacement seeded past the record and will never answer, so a taken press is
+// consumed without its ack, an untaken record is aborted and replayed under the
+// same rule, and the external barrier is released.
+//
 // The peer words are evidence in the line; the abort and the claim are the proof.
 // A crash after the take loses that press rather than duplicating it.
 void HandlePressAckTimeout() {
@@ -15604,24 +15656,51 @@ void HandlePressAckTimeout() {
     const wchar_t* peer =
         !haveChannel ? L"absent" : (peerAlive ? L"alive" : L"stale");
     const LONG64 taken = SwipeIpcTakenIntent(&g_ipc);
+    const uint32_t epochNow = PeerEpochNow();
+    const bool epochChanged =
+        press.publishedEpoch != 0 && epochNow != press.publishedEpoch;
     const uint64_t wait = GetTickCount64() - press.publishedTick;
     if (press.external) {
         // The takeover itself is native and has no original to replay. Its
-        // barrier is cleared by its ack above, or by a peer that can no longer
-        // answer — never by this timer, and never by a guess: a live peer that is
-        // silent may still reconcile the record.
+        // barrier is cleared by its ack, by a changed activation that can no
+        // longer answer it, or by a peer that is gone/stale — never by this
+        // timer and never by a guess: a live peer that is silent may still
+        // reconcile the record.
+        if (epochChanged) {
+            g_pressOutstanding = OutstandingPress{};
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                KillTimer(window, kPressAckTimer);
+            }
+            TraceLog(L"own external barrier seq=%lld wait=%llu peer=%s age=%u "
+                    L"epoch=%u->%u decision=released reason=epoch-changed",
+                    static_cast<long long>(press.seq),
+                    static_cast<unsigned long long>(wait), peer, peerAge,
+                    press.publishedEpoch, epochNow);
+            ServeNextPress(L"epoch");
+            return;
+        }
         if (peerAlive) {
             TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
                     L"epoch=%u decision=reserved",
                     static_cast<long long>(press.seq),
                     static_cast<unsigned long long>(wait), peer, peerAge,
-                    PeerEpochNow());
+                    epochNow);
+            // The presses held behind the barrier still reach their own bound
+            // while it stands; the poll that re-checks the barrier is also the
+            // wake that bound uses.
+            AgeOutQueuedPress();
             HWND window = g_execWindow.load(std::memory_order_relaxed);
             if (!window ||
                 SetTimer(window, kPressAckTimer,
                          static_cast<UINT>(kPressReservePollMs), nullptr) == 0) {
+                // No wake for the queue-age bound: give the held presses their
+                // natively served turns on this one.
                 TraceLog(L"own external reserve timer failed err=%u seq=%lld",
                         GetLastError(), static_cast<long long>(press.seq));
+                while (g_pressQueueCount > 0) {
+                    ServeQueuedOriginal(L"timer-failed");
+                }
             }
             return;
         }
@@ -15634,26 +15713,29 @@ void HandlePressAckTimeout() {
                 L"epoch=%u decision=released reason=peer-gone",
                 static_cast<long long>(press.seq),
                 static_cast<unsigned long long>(wait), peer, peerAge,
-                PeerEpochNow());
+                epochNow);
         ServeNextPress(L"timeout");
         return;
     }
     if (taken == press.seq) {
         // The controller claimed this exact sequence before acting. A replay
         // now would be a second execution, whether the answer is merely late or
-        // the controller is stalled after the take.
+        // the controller is stalled after the take. A changed epoch means the
+        // claim belongs to an activation that is gone: no ack is coming.
         g_pressOutstanding = OutstandingPress{};
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         if (window) {
             KillTimer(window, kPressAckTimer);
         }
         TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-                L"taken=%lld peer=%s age=%u epoch=%u decision=consumed",
+                L"taken=%lld peer=%s age=%u epoch=%u->%u decision=consumed%s",
                 static_cast<long long>(press.seq),
                 PressTriggerName(press.press.trigger),
                 PressEntryName(press.press.entry),
                 static_cast<unsigned long long>(wait),
-                static_cast<long long>(taken), peer, peerAge, PeerEpochNow());
+                static_cast<long long>(taken), peer, peerAge,
+                press.publishedEpoch, epochNow,
+                epochChanged ? L" reason=epoch-changed" : L"");
         ServeNextPress(L"taken");
         return;
     }
@@ -15669,13 +15751,14 @@ void HandlePressAckTimeout() {
     }
     if (!revoked) {
         TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-                L"taken=%lld peer=%s age=%u epoch=%u "
+                L"taken=%lld peer=%s age=%u epoch=%u->%u "
                 L"decision=superseded reason=record-moved",
                 static_cast<long long>(press.seq),
                 PressTriggerName(press.press.trigger),
                 PressEntryName(press.press.entry),
                 static_cast<unsigned long long>(wait),
-                static_cast<long long>(taken), peer, peerAge, PeerEpochNow());
+                static_cast<long long>(taken), peer, peerAge,
+                press.publishedEpoch, epochNow);
         ServeNextPress(L"timeout");
         return;
     }
@@ -15684,24 +15767,25 @@ void HandlePressAckTimeout() {
         // succeed (the record is odd), so neither actor runs and nothing is
         // replayed: the rule refuses a replay once the sequence was claimed.
         TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-                L"taken=%lld peer=%s age=%u epoch=%u "
+                L"taken=%lld peer=%s age=%u epoch=%u->%u "
                 L"decision=none reason=claim-after-abort",
                 static_cast<long long>(press.seq),
                 PressTriggerName(press.press.trigger),
                 PressEntryName(press.press.entry),
                 static_cast<unsigned long long>(wait),
                 static_cast<long long>(takenAfter), peer, peerAge,
-                PeerEpochNow());
+                press.publishedEpoch, epochNow);
         ServeNextPress(L"timeout");
         return;
     }
     TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-            L"taken=%lld peer=%s age=%u epoch=%u decision=replay reason=revoked",
+            L"taken=%lld peer=%s age=%u epoch=%u->%u decision=replay reason=%s",
             static_cast<long long>(press.seq),
             PressTriggerName(press.press.trigger),
             PressEntryName(press.press.entry),
             static_cast<unsigned long long>(wait),
-            static_cast<long long>(taken), peer, peerAge, PeerEpochNow());
+            static_cast<long long>(taken), peer, peerAge, press.publishedEpoch,
+            epochNow, epochChanged ? L"epoch-changed" : L"revoked");
     RunPressOriginal(press.press, L"no-ack");
     ServeNextPress(L"timeout");
 }
@@ -17480,6 +17564,10 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
     uint64_t open = 0;
     uint64_t openTick = 0;
     SwipeIpcReadOpen(&g_ipc, &open, &openTick);
+    // Captured before the record goes out: a restart after this leaves this
+    // epoch behind, and the barrier is released by the epoch instead of waiting
+    // for an ack from an activation that seeded past the record.
+    const uint32_t publishedEpoch = PeerEpochNow();
     const LONG64 sequence =
         SwipeIpcPublishIntent(&g_ipc, kind, trigger, method, flags, open);
     TraceLog(L"intent kind=%s trigger=%s seq=%lld open=%llu method=%u flags=%u",
@@ -17500,8 +17588,12 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
         // with an intent the takeover has already made obsolete. The barrier is a
         // state, not a timer: it stands whether or not the watchdog could be
         // armed, and only its ack or a peer that can no longer answer clears it.
-        g_pressOutstanding = OutstandingPress{true, sequence, GetTickCount64(),
-                                              QueuedPress{}, true};
+        g_pressOutstanding = OutstandingPress{};
+        g_pressOutstanding.pending = true;
+        g_pressOutstanding.seq = sequence;
+        g_pressOutstanding.publishedTick = GetTickCount64();
+        g_pressOutstanding.external = true;
+        g_pressOutstanding.publishedEpoch = publishedEpoch;
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         if (window && SetTimer(window, kPressAckTimer,
                                static_cast<UINT>(kPressAckTimeoutMs),

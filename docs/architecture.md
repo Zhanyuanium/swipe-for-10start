@@ -389,7 +389,10 @@ An unanswered intent is resolved by the record, not by the heartbeat. The Start
 side claims the sequence before copying and re-checks the claim after the copy.
 The bridge's timeout either accepts a taken sequence as consumed or aborts the
 record (its counter goes odd, so no consumer can copy or claim it) and re-reads
-the claim before any replay. The peer words stay in the line as evidence.
+the claim before any replay. A changed `peerEpoch` at the watchdog is a restart:
+the replacement seeded `g_lastIntentSeq` past the record and will never answer, so
+the record is aborted, replayed if no claim exists, and the queue advances. The
+peer words stay in the line as evidence.
 
 Fallbacks, each logged once:
 

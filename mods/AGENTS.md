@@ -651,24 +651,30 @@ probe or timer failure is answered `unknown`.
   reads `2` and reopens. A queue overflow drops the arriving press with the depth
   in its line (`reason=queue-full`) and never executes it ahead of the queue; a
   press still unpublished past its 1500 ms wait runs the shell's original
-  primitive under `t_execCall` (`reason=queue-wait`). The Start side claims the
+  primitive under `t_execCall` (`reason=queue-wait`), and the reserve poll
+  re-evaluates that bound so a press behind a held slot does not wait for a serve.
+  The Start side claims the
   sequence before it copies the record and re-checks the claim after the copy
   (`intent drop ... reason=record-gone` on a revocation). An ack timeout is then
   resolved by proof: `taken == seq` is `decision=consumed` with no replay;
   `taken != seq` aborts the record (`SwipeIpcAbortIntent`, the counter's odd
   state), re-reads the claim, and only replays when the abort succeeded and the
-  claim is not this sequence (`decision=replay reason=revoked`). A claim that
-  landed after the abort is `decision=none reason=claim-after-abort` and a record
-  that already moved is `decision=superseded reason=record-moved`. The queue's own
-  lines are
+  claim is not this sequence (`decision=replay reason=revoked|epoch-changed`). A
+  claim that landed after the abort is `decision=none reason=claim-after-abort`
+  and a record that already moved is `decision=superseded reason=record-moved`.
+  A changed `peerEpoch` at the watchdog is a restart: a taken press is consumed
+  without its ack (`reason=epoch-changed`), an untaken one is aborted and
+  replayed, and the queue advances. The queue's own lines are
   `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch, is published at once,
   and sets the same barrier as a state, not a timer: it stands even when
   `SetTimer` fails (`own external barrier seq=... armed|unarmed`) and is cleared
-  only by its ack (`own external ack ... reconciled`) or by a peer that is
-  gone/stale (`own external barrier ... released reason=peer-gone`, checked on the
-  reserve poll and at the next admission). A live but silent peer keeps it; the
-  timeout line is `decision=reserved`, never a reconciliation guess.
+  only by its ack (`own external ack ... reconciled`), by a changed epoch
+  (`released reason=epoch-changed`), or by a peer that is gone/stale
+  (`released reason=peer-gone`, checked on the reserve poll and at the next
+  admission). A live but silent peer keeps it; the timeout line is
+  `decision=reserved`, never a reconciliation guess, and the poll runs any held
+  press past its bound.
 
 **Deleted here.** The retract request/plan wait, the arbitration hold, the
 close-record read/seed, `OwnDecideFrom` and its open/close/reopen helpers, the

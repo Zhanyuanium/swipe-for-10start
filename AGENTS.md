@@ -138,7 +138,9 @@ never waits. A press the queue cannot serve is handled by its state, not by a
 replay: the arriving press on a full queue is dropped with the depth in its line
 (`reason=queue-full`), never executed ahead of the four already queued; a press
 still unpublished past its 1500 ms wait runs the shell's own original primitive
-under the executor guard (`reason=queue-wait`). The Start side claims the
+under the executor guard (`reason=queue-wait`), and that bound is evaluated by
+the reserve poll as well, so a press behind a held slot does not wait for a
+serve. The Start side claims the
 sequence **before** it copies the record and re-checks the claim after the copy;
 a record the bridge aborted in between is dropped (`intent drop ...
 reason=record-gone`). The ack timeout then decides by proof, not by the
@@ -154,7 +156,12 @@ heartbeat:
 - a record that has already moved cannot be aborted (`decision=superseded
   reason=record-moved`), so nothing is replayed.
 
-The peer words are evidence in the line; the abort and the claim are the proof.
+A different `peerEpoch` at the watchdog means the activation that was asked is
+gone: the replacement seeds `g_lastIntentSeq` past the record and will never
+answer, so a taken press is consumed without its ack (`reason=epoch-changed`), an
+untaken record is aborted and replayed under the same rule, and the external
+barrier is released. The peer words are evidence in the line; the abort and the
+claim are the proof.
 A take is never replayed: one execution at most, one native execution when the
 record is aborted before any claim, and a press lost rather than duplicated if
 the controller dies after the take. An
@@ -162,10 +169,12 @@ external takeover is published at once and clears the queue and latch; it then
 sets the same barrier for the presses that follow, because its record is the one
 Start must reconcile before another intent may overwrite it. That barrier is a
 state, not a timer: it is set whether or not the watchdog could be armed
-(`own external barrier ... armed|unarmed`), and it is cleared only by its ack or
-by a peer that is gone/stale (`own external barrier ... released
+(`own external barrier ... armed|unarmed`), and it is cleared only by its ack, by
+a changed epoch (`released reason=epoch-changed`), or by a peer that is
+gone/stale (`own external barrier ... released
 reason=peer-gone`), never by a timeout and never by an arm failure. A live but
-silent peer keeps it, and a following press waits; a reserve poll re-checks it.
+silent peer keeps it, and a following press waits; a reserve poll re-checks it
+and runs any held press that has outlived its queue bound.
 
 The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user

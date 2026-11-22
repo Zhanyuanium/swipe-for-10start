@@ -218,6 +218,14 @@ could act, or before its confirmation could land).
   open), the log shows `exec dismiss unconfirmed ... visible=visible at_call=...`
   and the Start side follows with a released direction; the next press opens.
 
+## Round-5 runtime checks
+
+- **Restart with an outstanding intent (B).** Publish one or two presses, kill and
+  relaunch the host before it takes them. The watchdog sees the replacement's
+  epoch and logs `decision=replay reason=epoch-changed`; the queued press drains
+  (`reason=peer-gone`) rather than waiting for an ack the replacement never sends,
+  and the next press is one intent with one toggle.
+
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges
