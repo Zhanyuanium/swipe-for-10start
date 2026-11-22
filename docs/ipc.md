@@ -84,7 +84,10 @@ command does not wait for it.
 
 The ack is also the bridge's press serialisation point. The channel has **one**
 intent record, so two presses that decided before the Start side consumed the
-first would overwrite each other and both read the same direction. The bridge
+first would overwrite each other and both read the same direction. One writer
+path publishes it: the Win key, the Start button's two primitives, the
+click-away, and the ordinary `HideStartAndCortana` close (entry `hide`, a forced
+close kind) all enter the FIFO. The bridge
 keeps a four-entry FIFO of admitted presses on the launcher thread; it publishes
 the first at once and publishes the next only when the ack for the outstanding
 sequence arrives (the worker waits on `IntentAck` and posts a private message to

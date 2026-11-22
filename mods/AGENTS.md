@@ -531,7 +531,11 @@ probe or timer failure is answered `unknown`.
   click-away evidence, so an **ordinary** caller's
   method-7 Hide passes to the shell (`reason=caller-scope`) instead of becoming a
   click decision — the number alone never makes a click ours, and the 7→6 mapping
-  on the Start side needs the click-away trigger as well as the method. The
+  on the Start side needs the click-away trigger as well as the method. An
+  ordinary caller's close (method 1/6) is the shell's close decision, not a
+  toggle: it enters the same FIFO with entry `hide` and a forced `kind=close`, so
+  it cannot overwrite an outstanding press's record; a full queue drops it with
+  the depth in the line. The
   own-show
   exception requires the executor's own stack, an unattributed caller and state
   1/3 (`caller=unknown method=7 state=1|3 depth>0 reason=own-show`). Every

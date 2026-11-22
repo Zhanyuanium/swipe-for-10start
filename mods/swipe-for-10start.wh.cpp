@@ -14649,10 +14649,21 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         OwnResyncFromState(self);
         return;
     }
-    PublishBridgeIntent(kSwipeIntentClose, trigger, method, 0);
-    TraceLog(L"intent close trigger=%s caller=%s method=%u state=%u depth=%d",
-            trigger == kSwipeTriggerClickAway ? L"clickaway" : L"win",
-            OwnCallerName(caller), method, currentState, t_execCall);
+    // An ordinary Hide is the shell's own close decision, not a user toggle, so
+    // it keeps its close kind; but it enters the same FIFO as every other
+    // publication. Without that, it could overwrite an outstanding press's single
+    // intent record before the Start side read it.
+    const OwnSnapshot own = OwnSyncState(self);
+    if (!own.ready) {
+        TraceLog(L"intent pass close trigger=win caller=%s method=%u "
+                L"reason=state-not-ready",
+                OwnCallerName(caller), method);
+        callOriginal();
+        OwnResyncFromState(self);
+        return;
+    }
+    DispatchToggle(own, kSwipeTriggerWin, 0, method, 0, PeerEpochNow(),
+                   kPressEntryHide);
 }
 // ---------------------------------------------------------------------------
 // The decision hooks: Windows key, Start button, and the two state events
@@ -15158,7 +15169,13 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
     // line. Reading it twice could log a direction the decision never used.
     const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
     int32_t kind = kSwipeIntentOpen;
-    if (press.trigger == kSwipeTriggerClickAway) {
+    if (press.entry == kPressEntryHide &&
+        press.trigger != kSwipeTriggerClickAway) {
+        // An ordinary Hide is the shell's close decision, not a toggle: it keeps
+        // its close kind even while the controller publishes closing. It is
+        // serialised, but not re-decided.
+        kind = kSwipeIntentClose;
+    } else if (press.trigger == kSwipeTriggerClickAway) {
         // A click-away is not a close by definition. The controller's closing
         // direction is the whole reversal rule; a panel it owns (or the shell's
         // own open) is the close the click has always been. A callback with no
@@ -15681,7 +15698,7 @@ void RunPressOriginal(const QueuedPress& press, const wchar_t* reason) {
         case kPressEntryHide:
             if (HideStartAndCortana_Original) {
                 HideStartAndCortana_Original(OwnStateOf(launcher),
-                                             kDismissMethodClickAway);
+                                             press.dismissMethod);
             }
             break;
         default:
