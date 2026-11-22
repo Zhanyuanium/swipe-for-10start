@@ -293,10 +293,14 @@ and its timer stay owned by the launcher thread. A second
 press is appended (`own press latch owed count=2`), not replacing the first; the
 serve logs `own press served ... owed=2`, publishes the first open, then queues
 the remainder so the ack barrier makes the next press the opposite direction.
-The remainder waits for the open's cloak to read open (`reason=open-landing`, a
-bounded 20 ms one-shot) before it is published; a close sent into the uncloak is
-ended by the Start side's fresh-open rule and would lose the second press
-(bottom auto-hidden medians: 219 ms Win close, 210 ms
+Every published open arms the open-generation gate against the generation read
+just before it; the next close is held (`own press held ... reason=open-gen`, a
+bounded 20 ms one-shot) until the Start side publishes a different open
+generation, or for at most 900 ms, or until `SetTimer` fails — then it is served
+at once, so the queue never parks. A close sent before that record exists would
+name the previous menu and be ended by the fresh-open rule; the gate replaces the
+cloak watch and also covers an ordinary open from closed (bottom auto-hidden
+medians: 219 ms Win close, 210 ms
 Start-button, 234 ms click-away; the gesture latch is rare and measured 94 ms).
 The 400 ms timer is only the fallback for a landing the event missed. A latch
 past its bound is expired with all its owed presses

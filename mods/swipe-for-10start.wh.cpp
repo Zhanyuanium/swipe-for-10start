@@ -13856,12 +13856,11 @@ constexpr UINT_PTR kExecProbeTimer = 0x5359;
 constexpr UINT_PTR kPressLatchTimer = 0x535A;
 constexpr UINT_PTR kExecDismissProbeTimer = 0x535B;
 constexpr UINT_PTR kPressAckTimer = 0x535C;
-// The landing watch for a latched open's remainder: a bounded one-shot that
-// checks whether the open has reached the screen before the next owed press is
-// published.
-constexpr UINT_PTR kPressLandingTimer = 0x535D;
-constexpr uint64_t kPressLandingPollMs = 20;
-constexpr uint64_t kPressLandingMaxWaitMs = 900;
+// The open-generation gate for a press that follows a show: a bounded one-shot
+// that reads the section's open record instead of the cloak.
+constexpr UINT_PTR kPressOpenGenTimer = 0x535D;
+constexpr uint64_t kPressOpenGenPollMs = 20;
+constexpr uint64_t kPressOpenGenMaxWaitMs = 900;
 constexpr uint64_t kPressLatchTimeoutMs = 400;
 constexpr uint64_t kPressLatchRetryMs = 100;
 // One outstanding press. The ack normally arrives in the consumer's own turn
@@ -14785,12 +14784,102 @@ struct PressLatch {
 };
 
 PressLatch g_pressLatch;  // launcher thread only
-// After a latch serves its first open, the remainder waits here until that show
-// has actually put the window on screen. A close published into the uncloak is
-// ended by the Start side's fresh-open rule, so the second owed press would be
-// lost. Launcher thread only.
-bool g_pressOpenLandingPending = false;
-uint64_t g_pressOpenLandingDeadline = 0;
+// The open generation an open press was published against. The next press is
+// held until the START SECTION publishes a different generation, so a close
+// cannot be published into the open it belongs to. Not IsVisible, not the queue
+// depth; the section's open record is the controller's own statement that the
+// new menu exists. Launcher thread only.
+bool g_pressOpenGenPending = false;
+bool g_pressOpenGenHeld = false;
+uint64_t g_pressOpenGenBefore = 0;
+uint64_t g_pressOpenGenDeadline = 0;
+
+// The section's current open generation, or 0 when no open has been published.
+uint64_t CurrentOpenGeneration() {
+    uint64_t generation = 0;
+    uint64_t tick = 0;
+    if (!SwipeIpcReadOpen(&g_ipc, &generation, &tick)) {
+        return 0;
+    }
+    return generation;
+}
+
+// True once the controller has published a different menu open. A generation of
+// 0 is not a menu, so it never advances the gate.
+bool OpenGenerationAdvanced() {
+    const uint64_t generation = CurrentOpenGeneration();
+    return generation != 0 && generation != g_pressOpenGenBefore;
+}
+
+void BeginPressOpenGeneration(uint64_t before) {
+    g_pressOpenGenPending = true;
+    g_pressOpenGenHeld = false;
+    g_pressOpenGenBefore = before;
+    g_pressOpenGenDeadline = 0;  // starts when the following press is held
+}
+
+void ClearPressOpenGeneration() {
+    g_pressOpenGenPending = false;
+    g_pressOpenGenHeld = false;
+    g_pressOpenGenBefore = 0;
+    g_pressOpenGenDeadline = 0;
+}
+
+// One bounded re-check. False means no window or SetTimer refused; the caller
+// clears the gate and serves the held press rather than parking it.
+bool ArmPressOpenGenTimer() {
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    return window && SetTimer(window, kPressOpenGenTimer,
+                              static_cast<UINT>(kPressOpenGenPollMs),
+                              nullptr) != 0;
+}
+
+// The gate's one check, taken when a close has been decided (or re-checked at the
+// queue head). False means the close may be published: the controller has
+// published a different menu open, the bound expired, or the timer could not be
+// armed. True means it stays parked, and a timer will ask again. The bound starts
+// at the first hold, not at the open's publication: a late ack must not shorten
+// the menu's budget.
+bool OpenGenerationGateHolds() {
+    if (!g_pressOpenGenPending) {
+        return false;
+    }
+    const uint64_t now = GetTickCount64();
+    if (g_pressOpenGenDeadline == 0) {
+        g_pressOpenGenDeadline = now + kPressOpenGenMaxWaitMs;
+    }
+    const uint64_t wait =
+        now - (g_pressOpenGenDeadline - kPressOpenGenMaxWaitMs);
+    if (OpenGenerationAdvanced()) {
+        TraceLog(L"own press open gen ready gen=%llu wait=%llu",
+                static_cast<unsigned long long>(CurrentOpenGeneration()),
+                static_cast<unsigned long long>(wait));
+        ClearPressOpenGeneration();
+        return false;
+    }
+    if (now >= g_pressOpenGenDeadline) {
+        // The controller never published the new menu this close belongs to. The
+        // close is served anyway: a press the user made must not vanish, and the
+        // Start side answers a close that names no live menu as superseded.
+        TraceLog(L"own press open gen expired before=%llu wait=%llu",
+                static_cast<unsigned long long>(g_pressOpenGenBefore),
+                static_cast<unsigned long long>(wait));
+        ClearPressOpenGeneration();
+        return false;
+    }
+    if (!ArmPressOpenGenTimer()) {
+        // No executor window, or the timer could not be armed. A hold with no
+        // guaranteed callback would park the queue past its 900 ms bound, so the
+        // close is served on this turn instead.
+        TraceLog(L"own press open gen timer failed err=%u before=%llu wait=%llu",
+                GetLastError(),
+                static_cast<unsigned long long>(g_pressOpenGenBefore),
+                static_cast<unsigned long long>(wait));
+        ClearPressOpenGeneration();
+        return false;
+    }
+    return true;
+}
 // Why the timer that will serve g_pressLatch was armed: the hidden event's
 // deferral ("hidden") or the 400 ms fallback ("timeout"). The serve line names
 // it. Launcher thread only, like the latch.
@@ -14998,17 +15087,14 @@ bool ServeLatchedPress(const wchar_t* reason) {
     // outstanding press, so the remainder waits behind its ack and the first
     // press that follows is the opposite direction. A failed publication runs the
     // first press's own primitive, and the remainder still keeps its order.
+    // The generation the open is published against. The following press, latched
+    // remainder or not, is held until the controller publishes a different one.
+    const uint64_t openBefore = CurrentOpenGeneration();
     const LONG64 sequence = PublishPressIntent(kSwipeIntentOpen, first, L"latch");
     if (sequence <= 0) {
         RunPressOriginal(first, L"latch-publish");
-    } else if (latch.count > 1) {
-        // The first open's show is still in flight when its ack arrives. The
-        // remainder must wait for the window to be on screen, or its close is
-        // ended by the fresh-open rule and the second press is lost. The bound
-        // starts when the ack (or the timeout) first releases the queue, not at
-        // this publication: a late ack must not shorten the show's budget.
-        g_pressOpenLandingPending = true;
-        g_pressOpenLandingDeadline = 0;
+    } else {
+        BeginPressOpenGeneration(openBefore);
     }
     for (int i = 1; i < latch.count; ++i) {
         QueuePress(latch.presses[i], L"latch");
@@ -15051,10 +15137,10 @@ OutstandingPress g_pressOutstanding;  // launcher thread only
 // thread only.
 void DropPressQueue(const wchar_t* reason) {
     int dropped = 0;
-    g_pressOpenLandingPending = false;
-    HWND landingWindow = g_execWindow.load(std::memory_order_relaxed);
-    if (landingWindow) {
-        KillTimer(landingWindow, kPressLandingTimer);
+    ClearPressOpenGeneration();
+    HWND gateWindow = g_execWindow.load(std::memory_order_relaxed);
+    if (gateWindow) {
+        KillTimer(gateWindow, kPressOpenGenTimer);
     }
     while (g_pressQueueCount > 0) {
         const QueuedPress& press = g_pressQueue[g_pressQueueHead];
@@ -15117,6 +15203,16 @@ bool QueuePress(const QueuedPress& press, const wchar_t* source) {
     return true;
 }
 
+// Puts an already-dequeued press back at the head of the FIFO. The dequeue freed
+// its slot, so this cannot fail, and the press keeps its admission tick: the
+// queue-wait bound counts from when the user pressed. Launcher thread only.
+void RequeuePressFront(const QueuedPress& press) {
+    g_pressQueueHead =
+        (g_pressQueueHead + kPressQueueCapacity - 1) % kPressQueueCapacity;
+    g_pressQueue[g_pressQueueHead] = press;
+    ++g_pressQueueCount;
+}
+
 // Publishes one decision and makes it the outstanding press. The ack timer is
 // armed before the record is published: a timer that cannot be armed means the
 // wait has no bound, so the press is not published and the caller serves it with
@@ -15160,7 +15256,9 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
 // behind an outstanding one is decided from the direction the controller
 // published while applying the press before it. `admission` is the hook's own
 // snapshot for the immediate press; a queued press reacquires it on this thread.
-void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
+// Returns false when the press was put back at the head of the queue: it is a
+// close parked on the open-generation gate, and the gate's timer owns its turn.
+bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
     const uint64_t now = GetTickCount64();
     if (now > press.admittedTick && now - press.admittedTick > kPressQueueWaitMs) {
         TraceLog(L"own press fallback trigger=%s entry=%s reason=queue-wait "
@@ -15168,7 +15266,7 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
                 static_cast<unsigned long long>(now - press.admittedTick));
         RunPressOriginal(press, L"queue-wait");
-        return;
+        return true;
     }
     if (!PeerAliveNow() || PeerEpochNow() != press.admittingEpoch ||
         !BridgeCanServe()) {
@@ -15177,7 +15275,7 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
                 static_cast<unsigned long long>(now - press.admittedTick));
         RunPressOriginal(press, L"peer-gone");
-        return;
+        return true;
     }
     uint64_t state = 0;
     void* launcher = LauncherNow(&state);
@@ -15187,7 +15285,7 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
                 static_cast<unsigned long long>(state));
         RunPressOriginal(press, L"not-ready");
-        return;
+        return true;
     }
     const OwnSnapshot own = admission ? *admission : OwnSync(launcher);
     if (!own.ready) {
@@ -15195,14 +15293,14 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 L"reason=state-not-ready",
                 PressTriggerName(press.trigger), PressEntryName(press.entry));
         RunPressOriginal(press, L"state-not-ready");
-        return;
+        return true;
     }
     if (g_pressLatch.pending) {
         // The latch is earlier presses the landing still owes, not a stale slot
         // for this one to replace. Appending keeps the count and the order: the
         // serve publishes the first open and the remainder follows it.
         LatchPress(own, press);
-        return;
+        return true;
     }
     // One sample of the controller's direction drives both the decision and its
     // line. Reading it twice could log a direction the decision never used.
@@ -15232,7 +15330,7 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                     L"reason=no-panel state=%u dir=%d",
                     own.state, direction);
             RunPressOriginal(press, L"no-panel");
-            return;
+            return true;
         }
     } else {
         kind = IntentShouldClose(own, direction) ? kSwipeIntentClose
@@ -15259,7 +15357,22 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 kind == kSwipeIntentClose ? L"close" : L"open", method,
                 press.flags);
         RunPressOriginal(press, L"unsupported");
-        return;
+        return true;
+    }
+    if (kind == kSwipeIntentClose && OpenGenerationGateHolds()) {
+        // The menu this close belongs to is not in the section's open record yet.
+        // Publishing now would name the previous menu, and the Start side's
+        // fresh-open rule would end the close. The press goes back to the head of
+        // the queue, and the gate's timer serves it when the new generation
+        // exists (or when the bound expires, or when the timer cannot be armed).
+        g_pressOpenGenHeld = true;
+        RequeuePressFront(press);
+        TraceLog(L"own press held trigger=%s entry=%s reason=open-gen before=%llu "
+                L"q=%d",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                static_cast<unsigned long long>(g_pressOpenGenBefore),
+                g_pressQueueCount);
+        return false;
     }
     // One decision line for every trigger, written when the press actually
     // decides. A press queued behind another therefore logs its own direction,
@@ -15280,50 +15393,42 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
         // latched. A show from either of these states is served at the landing
         // instead of being published into a no-op.
         LatchPress(own, press);
-        return;
+        return true;
+    }
+    if (kind == kSwipeIntentOpen && direction != kSwipeDirectionClosing) {
+        // A fresh menu: the shell read closed, so the controller's show publishes
+        // a new open generation. The close that follows is gated on that
+        // generation, captured before the intent can be served. A reopen from
+        // `closing` is the same menu restored, publishes no new generation, and
+        // arms nothing (the latch above is the show-after-hide case, which does
+        // publish one).
+        const uint64_t openBefore = CurrentOpenGeneration();
+        if (PublishPressIntent(kind, press, L"press") <= 0) {
+            RunPressOriginal(press, L"publish");
+        } else {
+            BeginPressOpenGeneration(openBefore);
+        }
+        return true;
     }
     if (PublishPressIntent(kind, press, L"press") <= 0) {
         RunPressOriginal(press, L"publish");
     }
+    return true;
 }
 
 // Drains the queue while nothing is outstanding. A latch, a drop and a fallback
 // leave no ack to wait for, so the next press is served on this same turn; a
 // published press stops the loop at its ack.
 void ServeNextPress(const wchar_t* reason) {
-    if (g_pressOpenLandingPending) {
-        // The ack of a latched open can arrive before its show reaches the
-        // screen. Publishing the owed close into the uncloak would be ended by
-        // the Start side's fresh-open rule, so the remainder waits for the
-        // window's cloak to read open, bounded by one show's budget.
-        const uint64_t now = GetTickCount64();
-        if (g_pressOpenLandingDeadline == 0) {
-            g_pressOpenLandingDeadline = now + kPressLandingMaxWaitMs;
-        }
-        uint64_t state = 0;
-        void* launcher = LauncherNow(&state);
-        bool open = false;
-        if (launcher) {
-            const OwnSnapshot own = OwnSync(launcher);
-            open = own.ready && own.open;
-        }
-        if (!open && now < g_pressOpenLandingDeadline) {
-            HWND window = g_execWindow.load(std::memory_order_relaxed);
-            if (window) {
-                SetTimer(window, kPressLandingTimer,
-                         static_cast<UINT>(kPressLandingPollMs), nullptr);
-            } else {
-                g_pressOpenLandingPending = false;
-            }
+    if (g_pressOpenGenHeld) {
+        // A close is parked at the head of the queue waiting for the menu it
+        // belongs to. Re-check it here, without a dequeue line per poll; the
+        // check re-arms the timer or clears the gate.
+        if (g_pressQueueCount == 0) {
+            ClearPressOpenGeneration();
+        } else if (OpenGenerationGateHolds()) {
             return;
         }
-        if (!open) {
-            TraceLog(L"own press open landing expired wait=%llu",
-                    static_cast<unsigned long long>(
-                        now - (g_pressOpenLandingDeadline -
-                               kPressLandingMaxWaitMs)));
-        }
-        g_pressOpenLandingPending = false;
     }
     while (!g_pressOutstanding.pending && g_pressQueueCount > 0) {
         const QueuedPress press = g_pressQueue[g_pressQueueHead];
@@ -15335,7 +15440,10 @@ void ServeNextPress(const wchar_t* reason) {
                 g_pressQueueCount, reason,
                 static_cast<unsigned long long>(GetTickCount64() -
                                                 press.admittedTick));
-        ServePress(press, nullptr);
+        if (!ServePress(press, nullptr)) {
+            // The press is back at the head, parked on the open-generation gate.
+            return;
+        }
     }
 }
 
@@ -15344,6 +15452,8 @@ void ServeNextPress(const wchar_t* reason) {
 // is dropped, never executed out of order; nothing waits on the launcher hook.
 void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
+        // A held close is requeued by ServePress and served by the gate's timer;
+        // its false return needs no action here.
         ServePress(press, &own);
         return;
     }
@@ -16740,7 +16850,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         KillTimer(window, kPressLatchTimer);
         KillTimer(window, kExecDismissProbeTimer);
         KillTimer(window, kPressAckTimer);
-        KillTimer(window, kPressLandingTimer);
+        KillTimer(window, kPressOpenGenTimer);
         DestroyWindow(window);
         // The acknowledgement is set after DestroyWindow returns, not from
         // WM_NCDESTROY inside it: the class's window count is decremented when
@@ -16882,9 +16992,9 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         HandlePressAckTimeout();
         return 0;
     }
-    if (message == WM_TIMER && wParam == kPressLandingTimer) {
-        KillTimer(window, kPressLandingTimer);
-        ServeNextPress(L"open-landing");
+    if (message == WM_TIMER && wParam == kPressOpenGenTimer) {
+        KillTimer(window, kPressOpenGenTimer);
+        ServeNextPress(L"open-gen");
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -17347,7 +17457,7 @@ BOOL RoleInit() {
     g_pressQueueCount = 0;
     g_pressOutstanding = OutstandingPress{};
     g_pressLatch = PressLatch{};
-    g_pressOpenLandingPending = false;
+    ClearPressOpenGeneration();
 
     // The channel to the Start side. Opening it here means the section and its
     // events exist before the first Hide, and a Start mod that attaches later

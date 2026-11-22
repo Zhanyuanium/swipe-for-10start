@@ -158,10 +158,10 @@ could act, or before its confirmation could land).
   live). Both are latched; the second is appended, not replacing the first
   (`own press latched ... owed=1`, then `own press latch owed count=2`). The serve
   publishes the first open (`own press served ... owed=2`), queues the remainder,
-  and the ack barrier makes the next press the opposite direction. The remainder
-  waits for the open's cloak to read open (`own press dequeued ...
-  reason=open-landing`) so a close sent into the uncloak is not ended by the
-  fresh-open rule; the final
+  and the ack barrier makes the next press the opposite direction. That close is
+  held until the Start side publishes the open generation it belongs to
+  (`own press held ... reason=open-gen`, then `own press open gen ready`) so it is
+  not ended by the fresh-open rule; the final
   state is flipped twice (open, then closed), not left open by a lost press. A
   latch filled to four entries drops the arriving press
   (`reason=latch-full`) rather than executing it out of order. The old

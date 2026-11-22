@@ -99,9 +99,17 @@ shell hide in flight (`InternalState` 9/11), or a `Dismiss` our own executor has
 already entered, latches the press in a counted slot: the first press is the
 reopen the landing owes, each further press is appended, and the serve publishes
 the first open and then the remainder in order, so their directions alternate.
-The remainder is published only after the open's cloak reads open (a bounded
-landing watch), because a close sent into the uncloak is ended by the Start side's
-fresh-open rule. The slot keeps the first press's tick and **the epoch the
+Every open the bridge publishes becomes the generation gate: the generation it
+was published against is captured before the publication, and the next press,
+latched remainder or an ordinary press after an open, waits until the Start side
+publishes a different open generation. That record is the controller's own
+statement that the new menu exists; `IsVisible` and the queue depth are not used.
+The wait is bounded (900 ms from the first hold), and a `SetTimer` that cannot be
+armed clears the gate and serves the press at once, so the queue never parks past
+its bound. Only a close waits: a reopen from `closing` restores the same menu and
+publishes no new generation, and an open is never held. A parked close is put
+back at the head of the FIFO, so the order and the admission tick are kept.
+The slot keeps the first press's tick and **the epoch the
 admission was decided under**. A dismiss that is only armed is not that case: it
 is still revocable, so the press publishes the open, the Start side revokes the
 command and settles the panel back from its live position. The hidden event arms

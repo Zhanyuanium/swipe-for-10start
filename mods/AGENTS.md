@@ -451,7 +451,7 @@ or the deadline terminally refuses them, the worker's wait has no timeout**: it
 blocks on the stop, Exec and IntentAck events and wakes only for a command or an
 intent answer. The executor's
 own timers — the dismiss delay, the visibility confirmation, the press latch,
-the press ack bound and the bounded landing watch — are message timers on the
+the press ack bound and the open-generation gate — are message timers on the
 launcher thread's window, which
 the worker never services, so a pending close or an outstanding press adds no wake
 to it. Each resolved address is
@@ -599,10 +599,18 @@ probe or timer failure is answered `unknown`.
   admission was decided under. A second press is appended, never allowed to
   replace the first (`own press latch owed count=2`); the serve publishes the
   first open, queues the remainder, and the ack barrier makes the second the
-  opposite direction. The remainder waits for the open's cloak to read open (a
-  bounded 20 ms one-shot landing watch, `reason=open-landing`) before it is
-  published: a close sent into the uncloak is ended by the Start side's
-  fresh-open rule and would lose the second press. An
+  opposite direction. Every published open arms the generation gate with the
+  section's open generation read just before its publication; the next close —
+  latched remainder or an ordinary press after an open — is held until the Start
+  side publishes a different open generation (the controller's own statement that
+  the new menu exists), with a bounded 20 ms one-shot
+  (`own press held ... reason=open-gen`), never `IsVisible` and never the queue
+  depth. The bound is 900 ms from the first hold; an expired gate logs
+  `own press open gen expired` and serves the close, and a `SetTimer` that cannot
+  be armed logs `open gen timer failed` and serves it at once, so the queue never
+  parks past its bound. Only a close waits; an open, and a reopen from `closing`
+  that restores the same menu without a new generation, pass at once. A held
+  close goes back to the head of the FIFO and keeps its admission tick. An
   armed-but-not-dispatched executor dismiss is revocable, so it publishes the open
   rather than deferring it;
   the hidden event then arms a
