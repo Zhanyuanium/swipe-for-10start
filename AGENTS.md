@@ -17,7 +17,7 @@ CHANGELOG.zh-CN.md - the Chinese page of the release history
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.4, 0.8.2, one mod)
+## What ships (M3.4, 0.8.3, one mod)
 
 One mod, two processes. `mods/swipe-for-10start.wh.cpp` is installed once and
 loaded into `StartMenuExperienceHost.exe` (namespace `start`) and into
@@ -545,4 +545,5 @@ checked by hand, and the table lists the sessions with captured numbers.
   of the file you changed.
 
 [PROTOCOL]: Update this header on change, then check AGENTS.md
+
 

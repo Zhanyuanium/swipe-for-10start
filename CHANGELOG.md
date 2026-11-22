@@ -7,6 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
+| `v0.8.3` | 0.8.3 | — | 232 B | one drag-intent setting for every side, a mod page composed from both guides with localized names and settings, and two full-screen demos |
 | `v0.8.2` | 0.8.2 | — | 232 B | an unload proved on the owner threads: one UI rendezvous window, counted proofs on every path, the manager's `Show` as the one adoption bootstrap, an open during a close handed to the controller, the version gate before the PDB fetch |
 | `v0.8.1` | 0.8.1 | — | 232 B | the executor proves itself before either half intercepts: one `execCapable` word, one symbol attempt, an unowned show adopted, a close that moves from its first frame |
 | `v0.8.0` | 0.8.0 | — | 216 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
@@ -23,6 +24,37 @@ pair that shipped before the merge.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.8.3 — the drag distance is yours
+
+Windhawk `@version` 0.8.3. The channel and the two-process design are unchanged;
+this release makes one gesture threshold adjustable and brings the Windhawk page
+in line with the guides.
+
+- **One drag-intent distance.** `CommitDistancePercent` (default 10, range 1-50)
+  is the share of the panel's travel a release must cover toward the target to
+  commit. A shorter pull springs back closed; a shorter close drag reverses back
+  open. The same value applies on every taskbar side, and a quick flick still
+  commits regardless. Before this release the code used 10 % on top/bottom and
+  20 % on left/right.
+- **The mod page is built from the guides.** `tools/make_store_mods.ps1`
+  composes `==WindhawkModReadme==` from `README.md`, a separator and
+  `README.zh-CN.md`, dropping the repository's language-switch line and
+  pointing the demo images at the repository. The name, description and all
+  four settings carry `:zh-CN` fields, so the Windhawk page shows the same
+  Chinese text as the guides.
+- **Two full-screen demos.** `docs/images/demo-bottom.gif` and
+  `docs/images/demo-left.gif` record the same gesture on a bottom and a left
+  taskbar: the pull follows the finger, a close is reversed, then a plain close.
+- **Docs that describe the current build.** All four taskbar sides are listed
+  without a right-side caveat; the idle-wake paragraph and the
+  `exec launcher symbols pending` line, which the code no longer writes, are
+  gone.
+
+Still owed, and named in `docs/limits.md`: rotation is not supported — the raw
+digitizer coordinates are mapped without the display orientation, so a rotated
+panel puts the edge band and travel in the wrong place — a pen by hand, a second
+display, and a finger or pen tap that cannot reverse a close.
 
 ## v0.8.2 — an unload that can be proved
 

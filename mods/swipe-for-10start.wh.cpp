@@ -4,7 +4,7 @@
 // @name:zh-CN      Swipe for 10Start
 // @description     Touch and pen swipe gestures for ExplorerPatcher's legacy Windows 10 Start menu: pull it out with your finger, drag it back to close, with the same animation on the Windows key.
 // @description:zh-CN 为 ExplorerPatcher 恢复的 Windows 10 经典开始菜单加上触摸与手写笔滑动：手指拉出、拖回关闭，Win 键开合播放同一套动画。
-// @version         0.8.2
+// @version         0.8.3
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
@@ -482,7 +482,7 @@ bool SwipeCloseIntentAllowed(uint32_t method) {
 // the mod's @version metadata, so this is the one authored copy; the metadata
 // block above and this constant change in the same commit. A role-start line that
 // says a different release is a bug, not history.
-constexpr wchar_t kModVersion[] = L"0.8.2";
+constexpr wchar_t kModVersion[] = L"0.8.3";
 
 namespace start {
 
@@ -19090,4 +19090,5 @@ void Wh_ModSettingsChanged() {
         g_modRole->modSettingsChanged();
     }
 }
+
 
