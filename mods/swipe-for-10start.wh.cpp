@@ -13810,28 +13810,33 @@ HWND TeardownUiOnUiThread() {
     return nullptr;
 }
 
-// Waits for the last counted entry and requires every XAML registration to be
-// gone. This is the same proof on every path: inline teardown, a message that
-// ran, or a window that could not run it. The event is auto-reset and a signal
-// can still be pending from an earlier transition to zero, so the count is the
-// predicate: consume a signal, re-check, and wait again until the count is
-// actually zero. No timeout and no polling.
-//
-// `waitForEntries` is false only for an unload that already runs on the UI
-// owner: a lease can then be held by a dispatcher turn that can only run on the
-// thread doing the waiting. A non-zero count is a self-deadlock, not a wait.
+// Waits for the admitted module entries alone. This is the first half of the
+// unload proof: a PrepareRootElement hook may already hold its lease while it is
+// still between publishing the owner and publishing the rendezvous window. The
+// unload must let that setup finish before it decides that no window exists; the
+// registration check belongs after the teardown. The event is auto-reset and a
+// pending signal from an earlier zero is not trusted: the count is the
+// predicate. No timeout and no polling.
+void WaitForModuleEntriesOnly() {
+    const bool haveEvent = g_moduleEntriesGone != nullptr;
+    for (;;) {
+        if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        if (!haveEvent) {
+            BlockUnload(L"module entry event missing");
+        }
+        WaitForSingleObject(g_moduleEntriesGone, INFINITE);
+    }
+}
+
+// Requires the entry count and every XAML registration to be gone. On the
+// off-owner path the count is waited for first; on the owner path a non-zero
+// count is a self-deadlock and blocks instead. `waitForEntries` is false only
+// for an unload that already runs on the UI owner.
 void RequireNoModuleCallbacks(bool waitForEntries) {
     if (waitForEntries) {
-        const bool haveEvent = g_moduleEntriesGone != nullptr;
-        for (;;) {
-            if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
-                break;
-            }
-            if (!haveEvent) {
-                BlockUnload(L"module entry event missing");
-            }
-            WaitForSingleObject(g_moduleEntriesGone, INFINITE);
-        }
+        WaitForModuleEntriesOnly();
     } else if (g_moduleEntryCount.load(std::memory_order_acquire) != 0) {
         BlockUnload(L"unload on ui thread with pending entries");
     }
@@ -14083,20 +14088,34 @@ void RoleUninit() {
         }
     }
 
-    // 3. One synchronous UI turn: revoke the XAML handlers and the settle
-    //    batch, restore resting progress and neutral translation, drop the
-    //    UI-owned objects. SendMessage returns only after TeardownUi has
-    //    returned, so no dispatcher lambda or its delegate thunk outlives it.
-    //    The owner id is read before TeardownUi clears it, so the inline path is
-    //    known even when no window was involved.
-    const DWORD uiOwner = g_uiThreadId.load(std::memory_order_relaxed);
-    HWND uiWindow = TeardownUiOnUiThread();
-    const bool inlineUnload =
+    // 3a. Count-only before the teardown decision. An admitted
+    //     PrepareRootElement may have published the owner and its lease but not
+    //     the rendezvous window yet; waiting on the count lets that setup finish
+    //     before this code can call the absence of a window a lost one. The
+    //     owner is re-read after the wait because the hook may have published it
+    //     in that window.
+    DWORD uiOwner = g_uiThreadId.load(std::memory_order_relaxed);
+    bool inlineUnload =
         uiOwner != 0 && uiOwner == GetCurrentThreadId();
+    if (!inlineUnload) {
+        const int admitted = g_moduleEntryCount.load(std::memory_order_acquire);
+        if (admitted != 0) {
+            TraceLog(L"unload waits for admitted root count=%d", admitted);
+        }
+        WaitForModuleEntriesOnly();
+        uiOwner = g_uiThreadId.load(std::memory_order_relaxed);
+        inlineUnload = uiOwner != 0 && uiOwner == GetCurrentThreadId();
+    }
     if (inlineUnload) {
         TraceLog(L"unload inline on ui thread entries=%d",
                 g_moduleEntryCount.load(std::memory_order_acquire));
     }
+
+    // 3b. One synchronous UI turn: revoke the XAML handlers and the settle
+    //     batch, restore resting progress and neutral translation, drop the
+    //     UI-owned objects. SendMessage returns only after TeardownUi has
+    //     returned, so no dispatcher lambda or its delegate thunk outlives it.
+    HWND uiWindow = TeardownUiOnUiThread();
 
     // 4a. Without a window there is no empty-turn barrier. If any entry was ever
     //     used, two zero reads cannot prove the last destructor returned, so the
@@ -14107,10 +14126,10 @@ void RoleUninit() {
         BlockUnload(L"no window to drain module entries");
     }
 
-    // 4b. The same proof on every path: no counted entry and no registered XAML
-    //     handler. On the owner thread a non-zero count is a self-deadlock (the
-    //     turn holding it can only run here), so it blocks; off the owner the
-    //     count is the predicate.
+    // 4b. After the teardown, require both counts: no counted entry and no
+    //     registered XAML handler. On the owner thread a non-zero count is a
+    //     self-deadlock (the turn holding it can only run here), so it blocks;
+    //     off the owner the count is the predicate.
     RequireNoModuleCallbacks(!inlineUnload);
 
     // 5. One more synchronous empty turn when a window exists, so the UI thread
@@ -14125,8 +14144,8 @@ void RoleUninit() {
         }
         TraceLog(L"unload ui drained ack=1");
     } else {
-        DrainUiThread(nullptr);
-        TraceLog(L"unload teardown without a window; counts clear");
+        // everUsed with no window blocked above; this is the never-attached case.
+        TraceLog(L"unload teardown without a window; never entered");
     }
 
     // 6. The window and then its class: the class must not outlive the image,
