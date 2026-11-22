@@ -191,7 +191,9 @@ the executor's `Dismiss` runs. Reading the shell there made a press during the
 retract a second close, and the owner's press did nothing. The click-away runs
 the same rule and only guards the case the shell cannot produce — a method-7
 callback with no open panel and no close to reverse — by passing it to the shell
-(`intent pass clickaway … reason=no-panel`). No trigger has its own branch.
+(`own press pass trigger=clickaway entry=hide reason=no-panel`), with the original
+running under the executor guard for an immediate and a queued click alike. No
+trigger has its own branch.
 
 **One intent at a time.** The channel has one intent record and one event, so a
 second admitted press that decided before the Start side consumed the first would

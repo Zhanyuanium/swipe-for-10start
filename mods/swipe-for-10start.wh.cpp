@@ -14612,15 +14612,9 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
             OwnResyncFromState(self);
             return;
         }
-        const int32_t direction = SwipeIpcControllerDirection(&g_ipc);
-        if (direction != kSwipeDirectionClosing && !clickOwn.open) {
-            TraceLog(L"intent pass clickaway method=%u state=%u dir=%d "
-                    L"reason=no-panel",
-                    method, clickOwn.state, direction);
-            callOriginal();
-            OwnResyncFromState(self);
-            return;
-        }
+        // A click with no panel and no close is decided by the same dispatcher as
+        // an immediate or a queued one: its no-panel branch calls the original
+        // under the executor guard, once, with the same line either way.
         // `showMethod` is the Start button's Show(11); the click's ShowStartView
         // reopens through the executor. The close keeps 7 as evidence in the
         // intent; the Start side maps it to the executor's 6.
@@ -15198,9 +15192,13 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                    own.state == 5) {
             kind = kSwipeIntentClose;
         } else {
-            TraceLog(L"own press dropped trigger=clickaway entry=hide "
+            // One policy for an immediate and a queued click: the shell's own
+            // Hide(7) runs under the executor guard, once, with the same line.
+            // Reporting success without it would drop the shell's close.
+            TraceLog(L"own press pass trigger=clickaway entry=hide "
                     L"reason=no-panel state=%u dir=%d",
                     own.state, direction);
+            RunPressOriginal(press, L"no-panel");
             return true;
         }
     } else {

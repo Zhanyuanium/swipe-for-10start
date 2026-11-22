@@ -524,8 +524,10 @@ probe or timer failure is answered `unknown`.
   a close by definition: it reaches the one dispatcher, so `closing` makes it the
   reopen and a panel the controller owns makes it the close (method 7 stays the
   click-away evidence, mapped to 6 on the Start side). A click with no panel to
-  close and no close to reverse passes to the shell (`intent pass clickaway ...
-  reason=no-panel`). The click-away's
+  close and no close to reverse passes to the shell through the dispatcher's one
+  no-panel branch (`own press pass trigger=clickaway entry=hide reason=no-panel`),
+  which runs the original under the executor guard for an immediate and a queued
+  click alike. The click-away's
   opening suppression (state 1/3, `reason=opening`) and the `controllerTouch`
   suppression require `caller=clickaway`, not the number 7 alone. Method 7 is
   click-away evidence, so an **ordinary** caller's
