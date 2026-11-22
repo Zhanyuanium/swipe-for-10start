@@ -66,9 +66,12 @@
   threads `INFINITE`, sends the UI teardown to the module's own hidden window on
   the XAML UI thread (the call returns after the turn), waits on the entry count
   as a predicate (a stale auto-reset signal is re-checked, not trusted), then
-  runs one more empty message so the releasing destructor has returned. The
+  runs one more empty message so the releasing destructor has returned. If no
+  window exists and any entry was ever used, or the unload already runs on the
+  owner with a pending entry, it blocks instead of treating a count as the
+  destructor's return. The
   executor window is destroyed by a synchronous `SendMessage` whose handler
-  calls `DestroyWindow`, and the class unregister is one checked call. A
+  calls `DestroyWindow`, and each fixed class unregister is one checked call. A
   permanently hung UI thread, a worker that
   does not exit or a class that cannot be unregistered therefore blocks the
   disable instead of corrupting the process. There is no bounded-wait success

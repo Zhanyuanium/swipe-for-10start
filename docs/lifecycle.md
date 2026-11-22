@@ -50,7 +50,12 @@ reachable.
    hidden message-only window on the XAML UI thread (created by
    `PrepareRootElement` before `Loaded`; the CoreWindow is only read for the cloak
    and bounds), or runs the turn inline when the unload already is that thread.
-   The turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated` and scroller
+   `PrepareRootElement` is itself an admitted, counted module entry from its
+   first instruction: it takes a lease, re-reads the unload flag before touching
+   module state and again immediately before its first registration, and
+   registers nothing if either check sees a stop or the rendezvous window could
+   not be created. The turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated`
+   and scroller
    `ViewChanged` handlers, detaches the settle batch's `Completed`, stops the
    animations, restores resting `Progress` and the neutral translation, resets
    the scroller watches and drops the UI-owned composition/root/dispatcher
@@ -63,7 +68,11 @@ reachable.
    registration must also be zero. One empty synchronous turn on the same window
    follows when it exists, so the UI thread has left the releasing destructor and
    every earlier callback; a window that is gone skips only that turn, never the
-   counts. A genuine XAML revoke failure blocks once
+   counts. If no window exists and any entry was ever used, the off-owner unload
+   blocks (`no window to drain module entries`) instead of treating zero as the
+   destructor's return. An unload already on the owner thread never waits: a
+   non-zero count blocks (`unload on ui thread with pending entries`). A genuine
+   XAML revoke failure blocks once
    (`unload blocked reason=xaml revokes remain`); it is not polled.
 5. The rendezvous window is destroyed with its own message, its class is
    unregistered under `&__ImageBase`, and only then are the IPC view and the

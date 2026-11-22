@@ -402,8 +402,12 @@ unregisters raw input, releases the
 returned as success. Registration is fixed-name and treats
 `ERROR_CLASS_ALREADY_EXISTS` as failure, exactly as the executor's class does.
 `Wh_ModUninit` sends the UI teardown to this module's own hidden window on the
-XAML UI thread recorded before `Loaded` was registered, or runs it inline there:
-it revokes the XAML handlers and the settle batch, restores resting progress and
+XAML UI thread recorded before `Loaded` was registered, or runs it inline there.
+The root hook is an admitted counted entry from its first instruction: it takes
+the lease, re-reads the stop before touching module state and again before its
+first registration, and registers nothing when either check sees a stop or the
+window cannot be created. The teardown
+revokes the XAML handlers and the settle batch, restores resting progress and
 the neutral translation, resets the scroller watches and drops the UI-owned
 objects (`[[clang::no_destroy]]` protects a skipped uninit, not a normal one).
 The counted module entries are waited for as a predicate and followed by one
@@ -803,11 +807,14 @@ and the destructive first-frame work remain.
 **Lifecycle.** No pin, no instance guard, no re-enable state. The Start side joins
 its input thread `INFINITE` in BeforeUninit, sends the UI teardown to its own
 window on the recorded UI thread, waits on the counted batch entries as a
-predicate and follows with one empty turn, then closes the channel.
+predicate and follows with one empty turn. If the window is unavailable and any
+entry was ever used, the off-owner unload blocks; an unload already on the owner
+blocks on a non-zero count instead of waiting. It then closes the channel.
 The bridge joins its posting worker `INFINITE`, destroys the one published window
 on the launcher thread with a synchronous `SendMessage(kExecTeardownMessage)`
 (its handler calls `DestroyWindow`; no window-gone event exists), unregisters the
-fixed class with one checked call under `&__ImageBase`, then closes the handles
+fixed class with one checked call under `&__ImageBase`, releases the twinui
+loader reference taken for the symbol attempt, then closes the handles
 and the channel. A proof that cannot be obtained (a thread that does not exit, a
 delegate that does not revoke, a window that does not go away) blocks the unload
 once; there is no residual success, no deferred close and no retry loop.

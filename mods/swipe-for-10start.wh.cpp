@@ -13666,9 +13666,9 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-// Creates the one window on the recorded XAML UI thread. Called from
-// PrepareRootElement before Loaded, never from the unload thread and never from
-// a shell hook frame. A class left by an earlier image is a failure, not
+// Creates the one window on the recorded XAML UI thread. Called directly from
+// the PrepareRootElement hook on that thread before Loaded is registered; never
+// from the unload thread. A class left by an earlier image is a failure, not
 // something to adopt: its procedure would point into unmapped code.
 bool EnsureUiRendezvousWindow() {
     const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
