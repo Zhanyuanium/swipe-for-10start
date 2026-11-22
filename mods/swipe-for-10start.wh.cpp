@@ -1206,12 +1206,12 @@ std::shared_ptr<ModuleEntryLease> g_settleLease;
 // The panel controller
 //
 // One object owns the panel's motion: the scalar the composition expression
-// reads, the target the current motion is heading for, the last measured or
-// committed speed in Progress per millisecond, and the phase that says which
-// motion owns the value. The animation record (samples, start, duration) and the
-// coast's line are the controller's evidence: the base value is only a target
-// while a motion runs, and `TakeProgressNow` is the one reader that turns that
-// evidence into where the panel actually is.
+// reads and the phase that says which motion owns the value. The animation record
+// (samples, start, duration) and the coast's line are the controller's evidence:
+// the base value is only a start while a motion runs, and `TakeProgressNow` is
+// the one reader that turns that evidence into where the panel actually is. The
+// end value and the seam speed live in the arguments and in the animation
+// record; no duplicate member mirrors them.
 //
 // The four intents are the only way an input adapter changes the panel. M1 keeps
 // the touch adapter as the only caller; the non-touch paths still use their old
@@ -1244,8 +1244,6 @@ struct PanelController {
     std::atomic<float> progress{kProgressRest};
     std::atomic<bool> coasting{false};
     // Guarded by g_compositionMutex, like the animation record below.
-    float target = kProgressRest;
-    float velocity = 0.0f;  // Progress per millisecond, signed along the axis
     PanelPhase phase = PanelPhase::Idle;
     float samples[kSettleMaxFrames] = {};
     int frames = 0;
@@ -2215,8 +2213,6 @@ bool ShowAtRest() {
         g_panel.coasting.store(false, std::memory_order_relaxed);
         g_state.InsertScalar(L"Progress", kProgressRest);
         g_panel.progress.store(kProgressRest, std::memory_order_relaxed);
-        g_panel.target = kProgressRest;
-        g_panel.velocity = 0.0f;
         g_panel.phase = PanelPhase::Idle;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Composition reset failed: %08X %s", e.code(),
@@ -2253,8 +2249,6 @@ bool InsertProgress(float progress) {
         }
         g_state.InsertScalar(L"Progress", progress);
         g_panel.progress.store(progress, std::memory_order_relaxed);
-        g_panel.target = progress;
-        g_panel.velocity = 0.0f;
         g_panel.phase = PanelPhase::Drag;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress update failed: %08X %s", e.code(),
@@ -2320,7 +2314,6 @@ bool AnimateProgressTo(float to, std::chrono::milliseconds duration,
         g_state.StartAnimation(L"Progress", animation);
         g_panel.progress.store(std::clamp(to, 0.0f, 1.0f),
                             std::memory_order_relaxed);
-        g_panel.target = std::clamp(to, 0.0f, 1.0f);
         g_panel.phase = PanelPhase::Settle;
         // This animation replaces whatever owned Progress: an older batch's
         // completion must not stop it, and no dismiss settle is still running.
@@ -2505,8 +2498,6 @@ float TakeProgressNow(const wchar_t* caller) {
     g_panel.frames = 0;
     g_panel.durationMs = 0;
     g_panel.coasting.store(false, std::memory_order_relaxed);
-    g_panel.target = value;
-    g_panel.velocity = 0.0f;
     g_panel.phase = PanelPhase::Idle;
     RevokeDismissBatchLocked();
     InvalidateDismissBatchLocked();
@@ -2569,7 +2560,6 @@ bool ProgressMotionActive() {
         if (g_panel.phase == PanelPhase::Settle ||
             g_panel.phase == PanelPhase::Coast) {
             g_panel.phase = PanelPhase::Idle;
-            g_panel.velocity = 0.0f;
         }
         return false;
     }
@@ -2579,7 +2569,6 @@ bool ProgressMotionActive() {
     if (elapsed >= g_panel.durationMs) {
         if (g_panel.phase == PanelPhase::Settle) {
             g_panel.phase = PanelPhase::Idle;
-            g_panel.velocity = 0.0f;
         }
         return false;
     }
@@ -2630,9 +2619,6 @@ bool StartCoast(float from, float to) {
     g_panel.coastTo = to;
     g_panel.coastStartQpc = qpcNow;
     g_panel.coasting.store(true, std::memory_order_relaxed);
-    g_panel.target = to;
-    g_panel.velocity =
-        (to - from) / static_cast<float>(kCoastDuration.count());
     g_panel.phase = PanelPhase::Coast;
     return true;
 }
@@ -2665,7 +2651,6 @@ bool StopCoast(float& value) {
         InvalidateDismissBatchLocked();
         g_state.InsertScalar(L"Progress", value);
         g_panel.progress.store(value, std::memory_order_relaxed);
-        g_panel.target = value;
         g_panel.phase = PanelPhase::Drag;
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"Progress coast stop failed: %08X %s", e.code(),
@@ -2685,14 +2670,12 @@ bool StopCoast(float& value) {
 // The four intents. Each records what the controller is doing before the motion
 // itself starts, so a diagnostic can name the phase without reconstructing it
 // from the animation record. A caller never waits for a previous motion: the
-// value the panel has now is the value the animation was handed.
+// value the panel has now is the value the animation was handed. The end value
+// and the seam speed are the caller's arguments and the log's; nothing is kept
+// on the controller besides the phase.
 void PanelController::Begin(const float* position) {
     {
         std::lock_guard lock(g_compositionMutex);
-        if (position) {
-            target = std::clamp(*position, 0.0f, 1.0f);
-        }
-        velocity = 0.0f;
         phase = PanelPhase::Drag;
     }
     if (position) {
@@ -2709,7 +2692,6 @@ bool PanelController::Move(float position) {
         return false;
     }
     std::lock_guard lock(g_compositionMutex);
-    target = value;
     phase = PanelPhase::Drag;
     return true;
 }
@@ -2717,8 +2699,6 @@ bool PanelController::Move(float position) {
 void PanelController::End(float to, float endVelocity) {
     {
         std::lock_guard lock(g_compositionMutex);
-        target = std::clamp(to, 0.0f, 1.0f);
-        velocity = endVelocity;
         phase = PanelPhase::Settle;
     }
     TraceLog(L"panel intent=end progress=%.3f velocity=%.2f target=%.0f",
@@ -2732,8 +2712,6 @@ void PanelController::End(float to, float endVelocity) {
 void PanelController::Commit(float to) {
     {
         std::lock_guard lock(g_compositionMutex);
-        target = std::clamp(to, 0.0f, 1.0f);
-        velocity = 0.0f;
         phase = PanelPhase::Settle;
     }
     TraceLog(L"panel intent=commit progress=%.3f target=%.0f",
@@ -13177,8 +13155,6 @@ void ResetComposition() {
             g_state.InsertScalar(L"Progress", kProgressRest);
             g_panel.progress.store(kProgressRest, std::memory_order_relaxed);
         }
-        g_panel.target = kProgressRest;
-        g_panel.velocity = 0.0f;
         g_panel.phase = PanelPhase::Idle;
         if (g_visual) {
             g_visual.StopAnimation(L"Translation");
