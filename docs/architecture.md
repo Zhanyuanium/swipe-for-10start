@@ -390,7 +390,10 @@ serialisation point for the next admitted press — the take alone is not:
 An unanswered intent is resolved by the record, not by the heartbeat. The Start
 side claims the sequence before copying and re-checks the claim after the copy; a
 claimed record it cannot apply is answered as superseded, so the publisher is
-never left waiting. Any claim keeps the bridge's slot open: the press waits for
+never left waiting. A superseded answer to a record the bridge aborted proves
+that no intent ran; the publisher then runs the original once
+(`reason=revoked-before-copy`), so a press caught before the copy is neither lost
+nor duplicated. Any claim keeps the bridge's slot open: the press waits for
 the ack (the take proves execution, not that the direction is visible; every
 branch publishes the direction before the ack), and the next press's queue-age
 bound is paused, so no later press can be reordered ahead of it. Only a changed

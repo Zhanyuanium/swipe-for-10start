@@ -200,9 +200,11 @@ opened the shell leaves the arriving press closing it, not opening a second
 time). A failed re-read runs the original only when no older press is left. The
 peer words are evidence in the line;
 the abort and the claim are the proof.
-A take is never replayed: one execution at most, one native execution when the
-record is aborted before any claim, and a press lost rather than duplicated if
-the controller dies after the take. An
+An execution is never duplicated: an applied press is not replayed, and a press
+is lost rather than duplicated if the controller dies after the take. When the
+bridge's abort lands before Start's copy, Start answers superseded and no intent
+ran; the bridge then runs the original once (`reason=revoked-before-copy`), so
+the press is neither lost nor duplicated. An
 external takeover is published at once and clears the queue and latch; it then
 sets the same barrier for the presses that follow, because its record is the one
 Start must reconcile before another intent may overwrite it. That barrier is a

@@ -8313,8 +8313,9 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
 
 // Answers a sequence this activation claimed but cannot apply. The publisher's
 // timeout keeps its slot until this answer, so a revoked record must not be
-// dropped silently: state=superseded says no action ran, and the ack releases the
-// queue without a replay.
+// dropped silently: state=superseded says no action ran. If the bridge aborted
+// the record after the claim, that answer is the proof for one native replay
+// (`reason=revoked-before-copy`); otherwise it only releases the queue.
 void AnswerRevokedIntent(LONG64 sequence) {
     TraceLog(L"intent revoked seq=%lld", static_cast<long long>(sequence));
     SwipeIpcAnswerIntent(&g_ipc, sequence, kSwipeAckSuperseded, 0, 0, S_OK);
@@ -15224,6 +15225,10 @@ struct OutstandingPress {
     // until Start reconciles the takeover, and its timeout has no press to
     // replay.
     bool external = false;
+    // The bridge aborted this record (the counter went odd). A later superseded
+    // ack then proves Start copied nothing, so the press still owes its one
+    // native execution.
+    bool aborted = false;
     // The Start activation alive when the record was published. A different one
     // at the watchdog means the activation that could have applied this record is
     // gone: the replacement seeds past it (OpenIpcChannel) and will never answer,
@@ -15722,6 +15727,9 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     bool replay = false;
     if (!press.external) {
         const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+        if (revoked) {
+            g_pressOutstanding.aborted = true;
+        }
         const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
         if (takenAfter == press.seq && !epochChanged && PeerStateAliveNow()) {
             // The claim landed between the read above and the abort. The record
@@ -15740,6 +15748,9 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
         // Both keep the barrier reserved; only an aborted record with no claim
         // after the re-read releases it.
         const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+        if (revoked) {
+            g_pressOutstanding.aborted = true;
+        }
         const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
         if (takenAfter == press.seq) {
             HoldOutstandingAtAdmission(press, L"claim-after-abort", epochNow,
@@ -15863,6 +15874,11 @@ void HandlePressAck() {
         return;
     }
     const OutstandingPress press = g_pressOutstanding;
+    // A record the bridge aborted, answered superseded, was copied by nobody:
+    // the one execution is still owed to the original. An executed ack means
+    // Start acted, so no replay follows.
+    const bool replayed = !press.external && press.aborted &&
+                          ack.state == kSwipeAckSuperseded;
     g_pressOutstanding = OutstandingPress{};
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (window) {
@@ -15882,6 +15898,12 @@ void HandlePressAck() {
                 PressEntryName(press.press.entry),
                 static_cast<unsigned long long>(GetTickCount64() -
                                                 press.publishedTick));
+    }
+    if (replayed) {
+        // The abort landed before Start's copy, and its superseded answer is the
+        // proof: no intent ran and the shell never saw this press. Run the one
+        // native execution before the queue advances.
+        RunPressOriginal(press.press, L"revoked-before-copy");
     }
     ResumePressQueueAge();
     ServeNextPress(L"ack");
@@ -15949,7 +15971,10 @@ void HandlePressAckTimeout() {
     SwipeIpcIntentAck ack{};
     if (SwipeIpcReadIntentAck(&g_ipc, &ack) && ack.intent == press.seq) {
         // The answer won the race with the timer. It is the same path as an
-        // ordinary ack, not a replay.
+        // ordinary ack, not a replay — unless the bridge aborted the record and
+        // Start answered superseded, which proves nothing was copied.
+        const bool replayed = !press.external && press.aborted &&
+                              ack.state == kSwipeAckSuperseded;
         g_pressOutstanding = OutstandingPress{};
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         if (window) {
@@ -15969,6 +15994,9 @@ void HandlePressAckTimeout() {
                     PressEntryName(press.press.entry),
                     static_cast<unsigned long long>(GetTickCount64() -
                                                     press.publishedTick));
+        }
+        if (replayed) {
+            RunPressOriginal(press.press, L"revoked-before-copy");
         }
         ResumePressQueueAge();
         ServeNextPress(L"late-ack");
@@ -16022,6 +16050,9 @@ void HandlePressAckTimeout() {
             releaseReason = L"peer-gone";
         } else {
             const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+            if (revoked) {
+                g_pressOutstanding.aborted = true;
+            }
             const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
             claimedNow = takenAfter == press.seq;
             if (!PeerStateAliveNow()) {
@@ -16125,6 +16156,9 @@ void HandlePressAckTimeout() {
     // makes the record unreachable, so a claim that lands afterwards cannot copy
     // it. A record that already moved cannot be aborted and is never replayed.
     const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+    if (revoked) {
+        g_pressOutstanding.aborted = true;
+    }
     const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
     if (!revoked) {
         g_pressOutstanding = OutstandingPress{};

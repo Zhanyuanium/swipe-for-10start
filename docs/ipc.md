@@ -163,9 +163,11 @@ an immediately servable press re-reads the launcher state after the replay or
 drain, so an old native open is followed by a close, not a second open. The peer
 words are
 evidence;
-the abort and the claim are the proof. A take is never replayed: at most one
-execution, one native execution when the record is aborted before any claim, and
-a press lost rather than duplicated if the controller dies after the take.
+the abort and the claim are the proof. An execution is never duplicated: an
+applied press is not replayed, and a press is lost rather than duplicated if the
+controller dies after the take. When the bridge's abort lands before Start's
+copy, Start answers superseded, which proves no intent ran; the bridge then runs
+the original once (`reason=revoked-before-copy`).
 
 A landing reconciles an already-published `external` intent before it may issue a
 recovery: the idle timer and the intent event are two wait objects of the same
