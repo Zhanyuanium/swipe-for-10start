@@ -51,6 +51,7 @@ state has:
 | band candidate's watchdog | QPC | `kCandidateIdleHoldMs`, 120 ms |
 | contact latch and tracked identity expiry | tick | the same 18 ms |
 | the armed close tap | tick | the settle's end (`ScheduleCloseTap`) |
+| the close record's repair bound | tick | `kRestoreSuppressMs`, 600 ms after acceptance (`RepairExpiredClose`) |
 | a show's executor budget | tick | `kBridgeAckTimeoutMs`, 400 ms |
 | a dismiss's executor budget | tick | `executeAt + 400 ms` |
 | the settled measurement's guaranteed turn | tick | `kSettledMeasureDeadlineMs`, 400 ms |
@@ -67,9 +68,11 @@ later of its 8 ms report gap and the 50 ms entry guard, so the wake is one the
 coast can actually use. The one deadline published from the UI thread (the
 scroller retry) posts a wake to the input window, so a planner that already read
 the previous value re-reads it. A release that is held —
-a touch show in flight, or a close in flight with a contact owning the panel —
-contributes nothing: its hold ends on a cloak event or an executor answer, and a
-deadline that cannot act would spin the thread.
+a touch show in flight, or the close record owning the panel with a contact
+owning the panel edge — contributes nothing: its hold ends on a cloak event or an
+executor answer, and a deadline that cannot act would spin the thread. The close
+record's own repair bound is the one deadline that ends a close whose landing never
+came; nothing polls for it.
 
 The open/close state is pushed, not polled: `SetWinEventHook(EVENT_OBJECT_CLOAKED,
 EVENT_OBJECT_UNCLOAKED)` is installed on this thread for its own process and
@@ -160,6 +163,23 @@ logs `hid identity expired slot=... latch=0` when no contact latch held it, so
 a refused admission cannot strand a name and make every later finger be
 rejected as another contact.
 
+A contact a close consumed is the exception, because the digitizer's quiet
+through the hide is not a lift. While a close is in flight neither the latch nor
+the identity expires on silence at all. A consumed contact whose name can answer
+— a Contact Identifier — stays tracked until its lift report or until a report
+names a different asserted identifier; the decoder ends it there, logs
+`hid consumed ended slot=... id=... reason=new-contact`, and follows the new
+contact. Another device's asserted contact is the same evidence
+(`reason=device`), and so is a different asserted node on a device without
+Contact Identifiers. A node index
+can be handed to the next finger and the coordinate-only path has no name, so
+those two keep the idle fallbacks (the 120 ms candidate watchdog, then the
+18 ms latch) once the close has ended; its risk is a consumed finger that
+stays silent past the landing and then resumes, read as a new down. A Contact
+Identifier never expires by
+silence, so its residual is the opposite: a device that reuses an identifier
+after a lost lift makes the next finger a continuation until it lifts.
+
 ## Release detection
 
 The digitizer keeps reporting while the finger rests (measured 255 reports in a
@@ -176,8 +196,10 @@ only the fallback for a device that goes silent or a contact that leaves
 without a lift report (`src=idle`). A report that carries only a contact count,
 or no contact field for the tracked slot, says nothing about it, so a
 count-only lift no longer ends a tracked contact; the idle expiry does, with
-`src=idle`, and once no session owns the contact the same 18 ms latch clears
-the contact flag and forgets the tracked identity. A report that names the
+`src=idle`. Once no session owns the contact the same 18 ms latch clears the
+contact flag and forgets the tracked identity, except through a close: a close
+in flight suspends both, and a consumed contact with a Contact Identifier is
+never ended by silence (see Contact identity). A report that names the
 tracked contact and asserts it (`TipSwitch` down or `InRange`, or a slot state
 of Contact) but carries no point is not silence: it refreshes the liveness
 clock and the identity's evidence clock, and moves nothing.

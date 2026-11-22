@@ -29,6 +29,21 @@ report's log line all describe one panel. The legacy `reveal panelTrail=...`
 line prints that derived edge with the axis, the rect, the work area, the band
 it was tested against and the generation.
 
+The rect answers two questions about a point, and a hit test needs both. Along
+the gesture the trail edge is the boundary: a point whose mapped progress is at
+or above the panel's live progress is on the surface the retract still shows, and
+one behind that edge is on the area the retract has already left. Across the
+gesture there is no progress at all — `RevealProgressDip` reads only the axis
+coordinate, so a point perpendicular to the panel maps to a plausible progress
+while standing entirely outside it. The cross range is therefore read from the
+same rect: on a horizontal axis (left or right taskbar) the panel slides along
+`x`, so the cross range is `top..bottom`; on a vertical axis it is `left..right`
+(`PanelCrossContains`, with the same 2 DIP the rect's border allows). A shown
+panel is 575 DIP tall on the live left docked layout (`60,151..1053,726`), so a
+point below `y=728` is off the panel whatever progress its `x` maps to. A panel
+that was never measured places no point: the trail fallback and the band decide,
+as in `PanelContainsPress`.
+
 A measurement is accepted only when the rect lies on the monitor and its
 taskbar-side edge lies inside the band the taskbar itself defines: the bar's
 reserved strip at the screen edge, extended by one bar thickness toward the

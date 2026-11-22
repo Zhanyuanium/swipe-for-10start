@@ -3,8 +3,8 @@
 C++ / Windhawk 2.0 mods + PowerShell 7 test tools
 <directory>
 mods/ - Windhawk mod sources (4 sources + 1 header: swipe-for-10start, touch-gesture-probe, msgprobe, inputprobe; swipe_ipc_shared.h)
-tools/ - PowerShell probes, injectors, animation harnesses, the regression smoke, the store packager and the local installer (15 scripts + AGENTS.md)
-artifacts/ - captured measurements (6 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
+tools/ - PowerShell probes, injectors, animation harnesses, the panel-edge tracker, the regression smoke, the store packager and the local installer (16 scripts + AGENTS.md)
+artifacts/ - captured measurements (20 CSVs + AGENTS.md; `inputprobe.dll` is an untracked local build output of `mods/inputprobe.wh.cpp`)
 docs/ - technical documentation (architecture, input, gesture, animation, geometry, ipc, lifecycle, testing, limits, store, README + AGENTS.md)
 </directory>
 <config>
@@ -17,7 +17,7 @@ CHANGELOG.zh-CN.md - the Chinese page of the release history
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (M3.3, 0.7.0, one mod)
+## What ships (M3.4, 0.8.0, one mod)
 
 One mod, two processes. `mods/swipe-for-10start.wh.cpp` is installed once and
 loaded into `StartMenuExperienceHost.exe` (namespace `start`) and into
@@ -88,9 +88,12 @@ cannot be recalled; the window hides, and the landing reissues that open once
 arrived with the landing (applying the record it examined, not a second read),
 because the cloak event and the intent event are separate wakes and the landing
 reads the intent record itself. A
-shell hide in flight (`InternalState` 9/11), or an executor dismiss already armed
-at the bridge, latches the press (one slot, with its tick and **the epoch the
-admission was decided under**). The hidden event arms a 50 ms timer and the timer
+shell hide in flight (`InternalState` 9/11), or a `Dismiss` our own executor has
+already entered, latches the press (one slot, with its tick and **the epoch the
+admission was decided under**). A dismiss that is only armed is not that case: it
+is still revocable, so the press publishes the open, the Start side revokes the
+command and settles the panel back from its live position. The hidden event arms
+a 50 ms timer and the timer
 serves the same open intent after the event's stack has unwound; a show at the
 event's own tick was swallowed (state stuck at 3, no Shown). The arm is posted to
 the executor window when the event runs off the launcher thread. Supersession
@@ -136,26 +139,98 @@ already inside the shell; an entered dismiss is handled by the landing rules.
 The open runs from the band contact, but only after travel: admission records the
 contact and its down point, and the one `exec show` of that contact is requested
 on the first positioned report whose signed inward travel reaches 24 DIP
-(`reveal pull qualified ...` then `reveal show request ...`). A tap anywhere in
-the band — twice the taskbar's thickness — requests nothing and stays a native
-press; the shell's own edge gesture (from about 20 DIP) remains the fallback and
-an open it performs is adopted. One attempt per contact: a refused request is
-not retried. The content settle starts at `RevealEntryProgress`, and the reveal
-takeover chases the mapped finger at 2.2 DIP/ms, then follows (`behind=0.000`).
+(`reveal pull qualified ... grab=none` then `reveal show request ...`). A tap
+anywhere in the band — twice the taskbar's thickness — requests nothing and stays
+a native press; the shell's own edge gesture (from about 20 DIP) remains the
+fallback, and the open it performs is adopted by the band down that authored it
+(`g_contactOrigin.author`): adoption needs an author, so a finger that landed on
+the desktop or inside the panel is never bound to a keyboard open, and a down on
+the open panel is the dismiss and is never promoted. One attempt per contact: a
+refused
+request is not retried. The content settle starts at `RevealEntryProgress`, and
+the reveal takeover chases the mapped finger at 2.2 DIP/ms, then follows
+(`behind=0.000`).
+A pull that takes a live retract over does not start at the entry: the transfer
+takes the panel's position once and pins it, the follow binds to that same value
+on the same report (`reveal takeover ... live=1`, no second `motion sample`),
+keeps the finger-to-panel offset it took over and begins its chase at that
+sample. No settle stands between the cancel and the follow's first move: the
+press cancel (`intent open cancel from=...`) is the path that still settles the
+panel back from its live position, because a press has no finger to bind to. That
+pull is a grab, and while a close owns the panel a down is admitted only when it
+lands in the band or on the surface the retract still shows — its mapped progress
+at or below the panel's live one, because the panel's trail edge is then at or
+beyond the point, **and** the point inside the panel rectangle's cross range
+(`PanelCrossContains`: top..bottom on a horizontal axis, left..right on a
+vertical one, from the same snapshot rect). A point in the area the retract has
+left, or one perpendicular to and outside the panel, is refused
+(`reveal admit ... reason=offsurface`) and muted for its contact. The grab spends
+its one opportunity at its 24 DIP report: `CancelCloseForQualifiedPull` revokes
+both schedules (the local slot and the armed `exec dismiss`), ends the close
+record, arms the same
+recovery ticket an explicit open request arms, and takes the retract over there
+(`grab=taken`). A
+refused transfer — the dismiss already
+inside the shell, its published dismiss at or past its deadline (the bridge may
+already be inside the call, `reason=dispatch`), no distance, nothing left to
+cancel, or a down on the retract's surface with the retract already at or below
+the entry or with the close already ended (`reason=no-close`) — consumes the
+contact (`grab=refused reason=...`): it keeps no open
+right until it lifts, every later report is inert, and its release leaves no
+record. A down **in the band** at that same point is the same request a press
+makes, with the finger still on it: the attempt shares the press's cancel body
+(`grab=open`) — both schedules dropped, the close record ended, the open direction
+published, the recovery ticket armed — but not its settle. The grant is spent, so
+the same report starts the follow at `RevealEntryProgress` and chases the mapped
+finger at 2.2 DIP/ms; a window the retract has already hidden gets the ordinary
+show and the follow binds at that entry. A close that has already ended is the
+same request with nothing left to cancel: a band down asks for the open the
+ordinary way (`grab=open window=open|hidden entry=... reason=no-close`), and only
+a down on the surface the retract had shown keeps no open right. A refused
+transfer runs one transition:
+the reveal session and its timing go, panel
+ownership is republished, and the contact keeps the mute a down refused at
+admission gets, so only a lift or a report that proves a new contact ends it. A
+landing retires no grant: a contact still on its way to its own 24 DIP report
+keeps its open right. A
+close also consumes every contact that was already on the glass when it started.
 While a touch show or a close is in flight the 18 ms idle release is held,
 because the digitizer goes quiet during the uncloak and during the key/hide. A
-pull that is still down and qualified when a close lands (or that lifted within
-its readiness window: the release on a closed menu, the landing for a deferred
-record) is the pull that takes the menu back: after `win close
-observed` the controller issues the same show the qualified pull would, and the
-open adopts the live contact or the release record (`reveal reopen after close
-pull=1 late=0`). "Qualified" is the same 24 DIP at the contact's last positioned
-report; a finger merely resting in the band through the retract is not reopened.
+contact the close consumed keeps its latch and its mute through that quiet:
+silence never ends them. While a close is in flight no idle expiry runs at all,
+and a consumed contact ends only on its lift report or on a report that proves a
+new contact (another device, a different identifier, or a different asserted node
+on a device that names no contacts;
+`hid consumed ended ... reason=new-contact|device`). One with a Contact
+Identifier also survives silence. A node index
+can be handed to the next finger and the coordinate-only path has no name, so
+those keep the idle fallbacks (the candidate's 120 ms watchdog, then the 18 ms
+latch) once the close has ended.
+A landing adopts no finger: after `win close observed` the controller issues no
+touch show, and no hover, carried travel or release record turns a landed close
+into a Show; a contact the close consumed is inert until it lifts (`win close
+observed ... muted=1`). A grab whose grant is still unspent is not consumed: it
+spends that grant after the landing and, for a band down, opens the menu as any
+pull on a closed menu. The only open a landing still owes is the
+explicit, independently
+owed request — a press, or a band pull whose cancel armed the ticket — (`intent open
+recovered ...`) with its epoch and close
+identity, unchanged.
 An intent close is
 `TakeProgressNow()` + the mirrored settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
-`Dismiss` on the launcher thread. The close suppression keeps the visibility
-service from healing the retracted panel before the dismiss lands.
+`Dismiss` on the launcher thread. The close record — one accepted close with its
+serial, acceptance tick, the menu it was accepted against, a phase and the 600 ms
+repair bound — keeps the visibility service from healing the retracted panel
+before the dismiss lands, and it is the only answer to "is a close in flight?":
+no reader asks a clock. The record is retired by its landing, a pull cancel, an
+external takeover, a terminal repair, or the repair bound. The bound's ending is
+a repair, not an expiry: it logs one `close ended ... reason=repair-deadline`
+line, releases the published direction so the bridge's next toggle reads the
+cloak, and leaves the dismiss command and the recovery ticket naming the hide
+that may still land; the unhealed heal waits for that command to answer
+(`CloseHideMayLand`), so a slow hide does not land on a panel that was just
+restored under it.
 
 The close is judged by behaviour: the shell's hidden event (`own state
 event=hidden open=0`), the executor's `confirmed` (hidden) at its bounded 300 ms
@@ -177,18 +252,23 @@ quoted.
 
 Deleted in M3: the `VK_LWIN` tap, the close record and its publishes, the retract
 request/answer and its cancel answer, the arbitration hold, the deferred
-candidate **as an arbitration mechanism**, and the reveal claim. The deferred
-candidate still has one live use, and it is not arbitration:
-`BeginEdgeCandidate` (the touch show's band admission) calls `StartRevealFollow`
-with `deferred=true` while `CloseInFlight`, so a contact that lands during a
-close is tracked without writing `Progress`; the landing (`LandClosedMenu`, run
-by the visibility service and by the executor's confirmation) releases it.
-`CloseInFlight` remains only as the
-suppression-window predicate: the settle owns the motion. The
+candidate **as an arbitration mechanism**, and the reveal claim. The one live
+use the old candidate left is not arbitration: `BeginEdgeCandidate` (the down's
+admission) calls `StartRevealFollow` with `granted=true` while the close record
+owns the panel,
+so a grab is tracked without writing `Progress`; its one transfer attempt is the
+pull cancel, and a refused transfer consumes it — the landing no longer releases
+it. The reveal flag that says so is `granted` (not `deferred`), and the claim
+attempt is `claimAttempted`. The late-release record's `deferred` and `readyQpc`
+fields are deleted: its window is measured from the release, and no landing
+consumes a record. The panel-ownership clock (`g_suppressRestoreUntil`) is gone
+with the close record: a phase, not an age, answers `CloseInFlight`, and the
+settle owns the motion. The
 `win open continued` ticket went with them: its only stamp sat behind the same
 `CloseInFlight` early return that guards the follow, so it could never fire; the
-pull-reopen and the press latch are the reopen paths that remain. M3.1 also
-removes the retired v2 close/retract slots from the header.
+press cancel, the press latch and the landing's press recovery are the reopen
+paths that remain. M3.1 also removes the retired v2 close/retract slots from the
+header.
 
 ## Channel
 
@@ -212,19 +292,29 @@ the peer epoch.
 
 Windows 11 10.0.26100.9949, ExplorerPatcher legacy Start
 (`Start_ShowClassicMode=1`), 2880x1800 physical at 200 % (1440x900 DIP).
-**Current layout: left, docked** (`axis=0`): work `48,0,1440,900`, the bar at
-`0,0..48,900` (96 physical wide), band `0..96`, panel `60,151..1053,726`, trail
-1053, Distance 1392; measured 2026-11-21. The bottom docked layout (work
-`0,0,1440,852`, tray `0,852..1440,900`, band `804..900`, Distance 852), the
-bottom auto-hidden layout (work `0,0,1440,900`, band `804..900`, panel
-`236,265..1229,840`, trail 265) and the earlier bottom auto-hidden variant (panel
-`236,167..1229,840`, trail 167) are historical; their numbers are not the current
-ones. The smoke reads the axis, band, panel rectangle and scale from the mod's own
-log lines, so it runs on whichever edge is live.
+**The bar is not pinned to an edge.** The controller derives the axis, band, panel
+rectangle, `Distance` and scale from the live geometry on every read, and the
+tools read the same numbers from the mod's own lines (`reveal panelTrail`,
+`gesture geometry`, the `dismiss` bar thickness), so the mod, the smoke and the
+edge tracker run on whichever edge the user docks to. Measured on this machine,
+each on the layout it names:
+
+| layout | axis | work | band | panel rect | trail | Distance | measured |
+|---|---|---|---|---|---|---|---|
+| left, docked | 0 | `48,0,1440,900` | `0..96` | `60,151..1053,726` | 1053 | 1392 | 2026-11-21 |
+| bottom, docked | 3 | `0,0,1440,852` | `804..900` | `236,265..1229,840` | 265 | 852 | 2026-11-20 |
+| bottom, auto-hidden | 3 | `0,0,1440,900` | `804..900` | `236,279..1229,840` | 279 | 900 | 2026-11-22 |
+
+The bottom auto-hidden entry is 0.310 at the work edge and 0.363 at the bar's
+inner edge; an earlier auto-hidden run measured panel `236,167..1229,840` with
+trail 167, and its numbers are historical. Top (`axis=1`) and right (`axis=2`)
+are implemented and **unverified on this machine**: the code path is the same
+`TrailEdge`/`AxisDirection` mapping, but no run has measured them.
 
 ## Rules
 
-- One data source per claim: the cloak decides the shell state, the controller's
+- One data source per claim: the cloak decides the shell state, the close record
+  decides whether a close is in flight, the controller's
   published direction decides the toggle, the geometry snapshot decides the mapping.
 - No period. The Start side's input thread arms one high-resolution one-shot for
   the soonest deadline it has and disarms it when that is served; the open/close

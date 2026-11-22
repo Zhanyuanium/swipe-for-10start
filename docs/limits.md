@@ -73,14 +73,20 @@
   procedure, so the Start input thread refuses to run and the executor refuses
   to create its window. A failed unregister is retried instead of returning
   success into an image the class still points at.
-- **A press that lands inside the shell's hide is a no-op show.** The bridge
-  latches it (one slot, tick, the epoch the admission was decided under) and, 50 ms after the hidden event,
+- **A press that lands inside the shell's hide is a no-op show.** Once the shell
+  is hiding (`InternalState` 9/11), or our own executor has entered its `Dismiss`
+  call, the bridge latches the press (one slot, tick, the epoch the admission was
+  decided under) and, 50 ms after the hidden event,
   serves it as the same open intent (`own press served wait=...`). The
   deferral is measured: a show at the hidden event's own tick was swallowed
-  (state stuck at 3) while a show 16 ms later opened. The shell still owns the
-  245–268 ms cloak after the serve, and a press that lands after the hide is a
-  normal open. The latch is bounded, not a guarantee: a newer press supersedes it,
-  a refused or expired dismiss invalidates it, a serve whose peer is gone or
+  (state stuck at 3) while a show 16 ms later opened. An armed-but-not-yet-run
+  dismiss is not latched: it is revocable, so the press publishes the open and the
+  Start side cancels the command. A press that lands after the dismiss returned
+  but before the hide is observed publishes the open too; if the hide then lands,
+  the Start side's recovery ticket reissues that open once. The shell still owns
+  the 245–268 ms cloak after the serve, and a press that lands after the hide is
+  a normal open. The latch is bounded, not a guarantee: a newer press supersedes
+  it, a refused or expired dismiss invalidates it, a serve whose peer is gone or
   replaced drops it, and it expires after 1200 ms. A press lost to the 600 ms
   liveness budget is served by the shell — but only if the bridge never swallowed
   it. A press already swallowed and then lost (peer or epoch changed before the
@@ -122,17 +128,51 @@ run never writes that line. A band pull that the shell opens natively, without
 a show request from this mod, opens the same watch when the contact is admitted,
 so it is covered too.
 
-**A late hide costs latency, not the pull.** The 600 ms suppression window
-(`kRestoreSuppressMs`) governs admission and the unhealed rule, not the
-landing's identity: the landing is this mod's close when its dismiss command is
-still queued/armed or executed-unconfirmed, or when the open-cancel ticket names
-that command. Measured on this machine, close takeover → `win close observed`
-was **562–593 ms over ten maximum-duration (520 ms settle) closes**, mean 578,
-so the worst sample sat 7 ms inside the window — a busy
-launcher can pass it; a pull held through such a close is still released and
-reopened (`reveal reopen after close pull=1 late=0`). A landing with no command
+**A late hide costs latency, not the pull.** The close record, not a clock, owns
+the retracted panel: one accepted close (serial, acceptance tick, the menu it was
+accepted against, a phase and a repair bound) is retired by its landing, a pull
+cancel, an external takeover, a terminal repair, or the repair bound itself
+(`kRestoreSuppressMs`, 600 ms after acceptance). The landing's identity is still
+its dismiss command and its open generation: the landing is this mod's close when
+its dismiss command is still queued/armed or executed-unconfirmed, or when the
+open-cancel ticket names that command. Measured on this machine, close takeover →
+`win close observed` was **562–593 ms over ten maximum-duration (520 ms settle)
+closes**, mean 578, so the worst sample sat 7 ms inside the 600 ms bound — a busy
+launcher can pass it, which is why the bound is a repair and never the answer to
+"is a close in flight". The repair ending is deliberate: it logs one `close ended
+... reason=repair-deadline` line, releases the published direction so the bridge's
+next toggle reads the cloak and the internal state again, and leaves the dismiss
+command and the ticket naming the hide that may still land — the unhealed heal
+waits for that command to answer, so a slow hide does not land on a panel that
+was just restored under it.
+A landing
+with no command
 of ours is an external close (Win+Tab, lock, a shell hide this mod did not ask
-for) and the pull is dropped by design.
+for) and the contact is dropped by design.
+
+**The last part of a retract is a pull, not a press.** A pull held through the
+close can still take it over while the command is cancellable: the transfer
+cancels it and hands the panel to the finger (`grab=taken`). Once the retract is
+at or below the entry there is no panel on screen to take: a down on the surface
+the retract had shown, or in the area it has already left, is refused and consumed
+(`grab=refused reason=offsurface`), and a down on that surface whose close has
+already ended is refused the same way (`reason=no-close`); no touch Show is issued
+at the landing. A down **in the band** is not refused by either: it is the same
+request a press makes in that same moment, so the close is cancelled through the
+press's cancel body (`grab=open`), or, when the close is already over, the same
+open is asked for with nothing left to cancel (`grab=open window=hidden` when the
+window has hidden). Only that body is shared: the pull keeps its finger,
+spends the grant, and the follow starts the panel at the reveal entry and chases
+the mapped position at 2.2 DIP/ms, so the panel's motion is the finger's and not a
+settle. A window the retract has already hidden gets the ordinary show instead,
+and the follow binds at the entry. The pull cannot recall a `Dismiss` already
+inside the shell: the recovery ticket is its one fallback, and if that hide still
+lands the landing reissues the open once (`intent open recovered entry=...`).
+A landing retires no unspent grant: a band pull that outlives the close it was
+granted against is still a pull on a closed menu, and the same finger opens it.
+A finger whose grab was refused keeps no open right until it lifts, and a pull
+that qualifies while the close is still cancellable cancels the command, so no
+landing follows.
 
 **No transition is not a stuck close.** A dismiss can be confirmed on a window
 the shell had already hidden (a native hide won the race, the hide arrived
@@ -158,10 +198,27 @@ Win press opens exactly once; the transition itself is never synthesized.
 - **The digitizer may go quiet during the uncloak and during a close.** The
   idle release would end the contact before the open adopts it; while a
   touch show is in flight (`controllerTouch`/`g_intentOpenActive`), or a close
-  is in flight with a reveal candidate, the idle is skipped. A real lift is a
+  owns the panel with a reveal candidate, the idle is skipped. A real lift is a
   report and still ends the gesture with `src=report`; a genuine silence after
   those windows ends it with `src=idle`. A held release arms no deadline at all:
-  the hold ends on the cloak event or on the executor's answer.
+  the hold ends on the cloak event or on the executor's answer. A close that is
+  still owed its landing holds the release until that ending arrives, and the
+  close's repair bound (600 ms) is the one deadline the record arms.
+- **Silence is not a lift for a contact a close consumed.** The latch and the
+  dismiss mute survive the quiet through the hide: while a close owns the panel no
+  idle expiry runs at all. A consumed contact ends on its lift report or on a
+  report that proves a new contact (another device, a different asserted
+  identifier, or a different asserted node on a device that names no contacts;
+  `hid consumed ended ... reason=new-contact|device`). One with a Contact
+  Identifier also survives silence. A node index can be
+  handed to the next finger and the coordinate-only path has no name, so those
+  two fall back to the idle fallbacks once the close has ended (the 120 ms
+  candidate watchdog, then the 18 ms latch). Its risk is the
+  original defect, narrowed to those devices: a consumed finger that stays
+  silent past the landing and then resumes is read as a new down. On a Contact
+  Identifier the mute holds until evidence, so the residual there is the other
+  way: a device that reuses an identifier after a lost lift makes the next
+  finger a continuation until it lifts.
 - **The cold entry is 0.000.** The first open after a host start has no settled
   geometry (the measurement is deferred while the panel is owned), so the settle
   starts at 0 and the takeover chases. A warm bottom auto-hidden open uses 0.255
@@ -169,7 +226,11 @@ Win press opens exactly once; the transition itself is never synthesized.
 - **The chase is rate-limited at 2.2 DIP/ms.** A 0.558 inherited gap takes
   ~254 ms to close; the panel is glued only after it (`behind=0.000`). The first
   visible frame is the entry, not the finger's mapped position; this is the
-  accepted cap, not a lost frame. A held finger settles to the mapped position:
+  accepted cap, not a lost frame. A pull that takes a live retract over skips the
+  entry entirely: it starts at the panel's position and keeps the finger-to-panel
+  offset it found (`live=1`), so an interrupted close reverses from where it is
+  and a full pull still reaches 1 (the target is clamped). A held finger settles
+  to the mapped position:
   bottom auto-hidden `progress=0.96` at 300 DIP (the edge 1.8 px from the
   finger) and `progress=0.90` at 350 DIP (0.4 px); the bottom docked 300 DIP hold
   measured 2 px.
@@ -210,6 +271,13 @@ Win press opens exactly once; the transition itself is never synthesized.
   finger's panel drag is its only producer, but no `close dismiss kind=…` excerpt
   was captured. Take one the next time the mod is touched: that line is the only
   evidence separating the HID producer from the click-away one.
+- **Still owed:** a consumed finger that is silent through a landing and then
+  resumes. The virtual digitizer cannot deliver it (an injected contact that stops
+  moving decays and answers `InjectTouchInput failed: 1460`), so the rule is
+  supported by the decode path and the mute, not by a capture: a report that names
+  the consumed contact is inert, and only a proven different contact ends the
+  mute (`hid consumed ended ... reason=new-contact|device`). A real finger resting
+  through a Win close and then moving is the one run that closes it.
 
 ## Not attempted
 

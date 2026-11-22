@@ -5,17 +5,20 @@ The project's memory: what was measured, what was falsified, and why each
 decision was taken. The user-facing quick start is `../README.md` /
 `../README.zh-CN.md`.
 
-architecture.md: M3.3, the shipping design. The launcher read (`s_pLauncher`
+architecture.md: M3.4, the shipping design. The launcher read (`s_pLauncher`
 outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`
 checked again at the post-call resync),
 the executor thread (the `OnHotkeyInvoke` thread, not the taskbar thread), the
 window lifetime (worker joined, the one window destroyed on its owner thread,
 the fixed class unregistered under `&__ImageBase`), one
 decision/one executor per trigger, the controller-direction toggle rule (closing
-published at the close's start), the close cancel/recovery for a press during a
-retract (the ticket only for a published command, bounded by its deadline), the
-bounded press latch for a hide in flight, the click-away guards of an
-opening window, the qualified pull-reopen at a close's landing, the command-expiry rule
+published at the close's start), the close cancel/recovery for an explicit open
+request during a retract (the ticket only for a published command, bounded by its
+deadline), the bounded press latch for a hide in flight, the click-away guards of an
+opening window, the grab's one transfer attempt (a band pull at or below the entry
+takes the press's cancel body and follows from the entry) and the explicit
+request's obligation a
+landing still serves, the command-expiry rule
 (one `>=` comparison, no lease on the call), the executed/confirmed outcome split, the
 auto-hidden timing/interruption chains (the bottom docked numbers are named as
 historical; the live left docked layout is a separate set), the
@@ -38,16 +41,28 @@ liveness and idle rules, the release deadlines, and what wakes the input thread
 peer heartbeat) with the measured idle cost.
 
 gesture.md: the `Progress` model, the dismiss/reveal sessions, the band admission
-and its 24 DIP qualified open claim (a tap requests nothing), the reveal entry
-and the 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored
-settle → scheduled `exec dismiss`), the qualified pull-reopen on a closing panel,
-the gates and settle ownership.
+and its 24 DIP qualified open claim (a tap requests nothing), the down's author
+(only a band down or a grab may be adopted or promoted), the reveal entry
+and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
+from the panel's position), the one close path (`TakeProgressNow` → mirrored
+settle → scheduled `exec dismiss`), the close record (serial, acceptance tick, the
+menu, a phase, the 600 ms repair bound) and its endings including the logged
+repair, the grab's down hit-test (the trail along the axis **and** the panel
+rect's cross range) and its one
+transfer attempt (a taken transfer follows from the live position, a band down
+whose retract is already past the entry shares the press's cancel body but follows
+from the entry, a band down whose close has already ended asks for the open like
+any pull on a closed menu, any
+refusal consumes the contact, the landing retires no unspent grant and adopts no
+finger, and silence never releases a consumed contact), the gates and settle
+ownership.
 
 animation.md: the damped spring (ζ 1.72 / 0.9), the travel-planned duration, the
 start-speed seam, the mirrored close, the coast, and the measured lines.
 
 geometry.md: the `GestureGeometry` snapshot and its lock, the panel-trail
-measurement and band, the taskbar axis probe, the deferred measurement, the
+measurement and band, the axial and cross-axis halves of a point's hit test, the
+taskbar axis probe, the deferred measurement, the
 scroll survey, and the measured layouts.
 
 ipc.md: the merged mod's channel — names, 216-byte layout, seqlocks, open
@@ -65,7 +80,9 @@ the smoke's `DiagnosticTrace` precondition and the tap tests.
 
 limits.md: the measured limits — the shell cap, the launcher readiness, the
 launcher thread, the 24 DIP band threshold with the native-gesture trade-off,
-the touch-show idle suppression, the cold entry, the taskbar auto-hide state,
+the close's 600 ms repair bound (and why a late hide costs latency, not the
+pull), the touch-show idle suppression, the cold entry, the taskbar auto-hide
+state,
 the engine's symbol cache layout and four-hour error cache, and the hardware
 still owed.
 

@@ -187,11 +187,14 @@ reads the cloak on the next poll; `executed` alone is never taken as a hide.
 `controllerDirection` becomes `2` in `TakeCloseOwnership`, before the close's
 settle starts; it is not deferred to the dismiss. That is what lets the bridge's
 one toggle rule see the whole retract as a close while the shell still reports
-state 5 and the cloak still reports open. A pull that cancels a gesture close
-before its dismiss is requested republishes `1` at the cancel. The bridge reads
+state 5 and the cloak still reports open. A cancel republishes `1` — a press's
+open intent for any close, and the qualified pull for every close whose dismiss
+is still a revocable command. The bridge reads
 that single word: `2` makes a press a reopen, `1` makes it a close, and `0` falls
-back to the shell's cloak and internal state. A hide in flight (9/11) or an armed
-executor dismiss still latches the press instead of publishing into a no-op show.
+back to the shell's cloak and internal state. A hide in flight (9/11) or a
+`Dismiss` our own executor has entered still latches the press instead of
+publishing into a no-op show; an armed dismiss does not, because the Start side
+cancels it.
 `controllerTouch` is the only trigger-level reason a `HideStartAndCortana(7)`
 is not published as a close; the peer gate sits before every close intent, so a
 call with no live controller passes to the shell instead.

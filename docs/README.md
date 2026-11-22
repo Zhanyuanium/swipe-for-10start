@@ -29,7 +29,7 @@ names it.
 |---|---|
 | [architecture.md](architecture.md) | M3: the launcher read (`s_pLauncher` outer + `0x18` interface, `[+0x160]` state), the executor thread and the taskbar-thread crash, the one-decision/one-executor contract, the measured open/close/interruption chains, the accepted 245–268 ms cap, and the list of deleted M2 mechanisms. |
 | [input.md](input.md) | Why Raw HID: the falsified data sources, the report decode (report IDs, `TipSwitch`/`InRange`, contact identity and its evidence clock, the coordinate-only fallback), release detection and its timers. |
-| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the reopen on a closing panel, the gates and the settle ownership. |
+| [gesture.md](gesture.md) | The `Progress` model, the dismiss and reveal state machines, the band and the once-per-open show request, the live takeover's visible entry and 2.2 DIP/ms chase, the one close path (`TakeProgressNow` → mirrored settle → scheduled `exec dismiss`), the grab's down hit-test and one transfer attempt (a refusal consumes the contact; the landing adopts no finger), the gates and the settle ownership. |
 | [animation.md](animation.md) | The damped-spring settle, both damping regimes, the 2.2 DIP/ms duration plan, the start-speed seam, the mirrored close, the scheduled dismiss, and the measured lines. |
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
 | [ipc.md](ipc.md) | The merged mod's shared-memory channel: names, 216-byte layout, seqlocks, the open generation, intents and acks, executor commands and acks with their admission vocabulary and expiry rules, the controller direction, peer liveness and activation identity (600 ms is a detection budget), and the init handshake. |
@@ -49,16 +49,21 @@ One mod ships, in one source with two process halves (full member list in
   whole gesture, follow and animation, the controller that consumes executor
   intents and publishes executor commands, the closing direction it publishes
   before the settle's first frame, the open that cancels a close still on
-  screen, the pull-reopen at a close's landing, the one close path (a mirrored
+  screen, the grab that aborts a cancellable close and takes the
+  retract over from its live position, the landing that serves only the explicit
+  request's obligation (no touch open of its own), the
+  one close path (a mirrored
   settle from the live position, then `dismiss`), the recovery ticket that
-  exists only for a published command, and the peer liveness
+  exists only for a published command and is armed by one helper for both the
+  press and the pull, and the peer liveness
   (intent-consumer readiness) the executor gates on.
 - The `bridge` namespace runs in `explorer.exe`; it executes
   `ShowStartView`/`Dismiss`/`IsVisible` on the launcher's own thread from a
   hidden window, turns the Win key, the Start button and the click-away into
   intents, reads the toggle direction from the controller's flags and never from
-  the shell's lagging state, latches a press that lands inside the shell's hide
-  and serves it at the landing, swallows the shell's duplicate calls and the
+  the shell's lagging state, latches a press that lands once the shell is hiding
+  or the executor's own `Dismiss` call is live, and serves it at the landing,
+  swallows the shell's duplicate calls and the
   pointer-away close of an opening window, passes every trigger when the Start
   side is not alive, and never decides a toggle itself. It reads the shell's
   state only when the controller publishes no direction: the shell's cloak and
