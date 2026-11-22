@@ -17330,8 +17330,9 @@ HRESULT OnStartHidden_Hook(void* self, void* manager, void* inspectable) {
 // with no decision-hook frame; the close arrives as method 6 through
 // DismissStartAndCortana). These two hooks are the decision layer for such a
 // caller: method 11 is the Start button's open and method 6 its close; any
-// other call is swallowed while the controller owns the panel, or passed with a
-// cloak resync. Our own decision calls are excluded by the thread-local guard.
+// other call is forwarded with an External intent while the controller owns the
+// panel, so the caller's request is not acknowledged and dropped. Our own
+// decision calls are excluded by the thread-local guard.
 //
 // Both Start-button methods go through DispatchToggle, so a physical press is
 // one decision whichever primitive the shell used: during a retract the same
@@ -17379,9 +17380,14 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
             OwnResyncFromState(OwnStateOf(launcher));
             return hr;
         }
-        TraceLog(L"exec swallow dismiss method=%u state=%u reason=owning",
+        TraceLog(L"exec pass dismiss method=%u state=%u reason=external",
                 method, own.state);
-        return S_OK;
+        PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride, method,
+                            0);
+        const HRESULT hr =
+            Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
+        OwnResyncFromState(OwnStateOf(launcher));
+        return hr;
     }
     const HRESULT hr =
         Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
@@ -17422,9 +17428,15 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
-        TraceLog(L"exec swallow show method=%u flags=%u state=%u reason=owning",
+        TraceLog(L"exec pass show method=%u flags=%u state=%u reason=external",
                 method, flags, own.state);
-        return S_OK;
+        PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride, method,
+                            flags);
+        const HRESULT hr = ShowStartView_Original
+                               ? ShowStartView_Original(launcher, method, flags)
+                               : E_FAIL;
+        OwnResyncFromState(OwnStateOf(launcher));
+        return hr;
     }
     const HRESULT hr = ShowStartView_Original
                            ? ShowStartView_Original(launcher, method, flags)
