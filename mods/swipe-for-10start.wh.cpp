@@ -13700,19 +13700,22 @@ HWND TeardownUiOnUiThread(bool* threadGone) {
     BlockUnload(L"teardown send failed");
 }
 
-// Waits once for the last counted entry. The last lease sets the event; the
-// caller follows with a UI round trip because the lease is released inside its
-// destructor, before the rest of the delegate chain has unwound.
+// Waits for the last counted entry. The event is auto-reset and a signal can
+// still be pending from an earlier transition to zero, so the count is the
+// predicate: consume a signal, re-check, and wait again until the count is
+// actually zero. No timeout and no polling. The caller follows with a UI round
+// trip because the lease is released inside its destructor, before the rest of
+// the delegate chain has unwound.
 void WaitForModuleEntries() {
-    if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
-        return;
-    }
-    if (!g_moduleEntriesGone) {
-        BlockUnload(L"module entry event missing");
-    }
-    WaitForSingleObject(g_moduleEntriesGone, INFINITE);
-    if (g_moduleEntryCount.load(std::memory_order_acquire) != 0) {
-        BlockUnload(L"module entries remain after the last lease");
+    const bool haveEvent = g_moduleEntriesGone != nullptr;
+    for (;;) {
+        if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        if (!haveEvent) {
+            BlockUnload(L"module entry event missing");
+        }
+        WaitForSingleObject(g_moduleEntriesGone, INFINITE);
     }
 }
 
