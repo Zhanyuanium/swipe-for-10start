@@ -14637,11 +14637,11 @@ HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
     TraceLog(L"show a=%u b=%u c=%u tid=%u", static_cast<unsigned int>(a),
             static_cast<unsigned int>(b), static_cast<unsigned int>(c),
             GetCurrentThreadId());
-    // The manager's Show runs on the launcher thread. It is the touch-first
-    // path's first launcher entry: creating the window here keeps a band open
-    // working when no Win/Start-button hook ran yet. The gate adopts the thread
-    // only when no entry has been seen, and never creates a second window on a
-    // thread that is not that one.
+    // The manager's Show is the bootstrap. It runs on whichever thread the shell
+    // called it on (normally the launcher thread); recording that thread and
+    // creating the window here is what lets a touch-first open work. It is not a
+    // general "any pumping thread" test: a non-pumping caller can reach this hook
+    // after its own ShowStartView passed natively.
     EnsureExecutorOnLauncherThread(L"show");
 
     return Show_Original ? Show_Original(self, a, b, c) : S_OK;
@@ -15083,12 +15083,10 @@ bool ExecutorWindowOnThisThread() {
     return g_execThreadId == GetCurrentThreadId();
 }
 
-// Only entries that are known to run on the launcher thread's own message loop
-// may adopt it. Dismiss/ShowStartView can be called by a COM/taskbar caller that
-// does not pump messages; adopting that thread made the executor window
-// unreachable at unload. A dismissed first entry passes natively; the manager's
-// Show (EnsureExecutorOnLauncherThread, source `show`) or the Win key records
-// the real launcher thread on the next entry.
+// Only the two decision entries are listed here. They serve an existing
+// capability/window and cannot bootstrap one: the manager's Show is the only
+// bootstrap. This gate is therefore a secondary guard, not the adoption rule.
+// A Dismiss/ShowStartView on an unknown thread never adopts and passes natively.
 bool LauncherTriggerMayAdopt(const wchar_t* trigger) {
     return wcscmp(trigger, L"win") == 0 ||
            wcscmp(trigger, L"startbutton") == 0;
@@ -18422,14 +18420,12 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-// The launcher thread is the thread that runs OnHotkeyInvoke (measured tid=7108
-// and 11096 after an explorer restart); Dismiss, ShowStartView and the manager's
-// Show are that same thread's own calls. The first of these entries adopts the
-// thread; a later one on a different thread logs the mismatch and creates
-// nothing, because a window on any other thread never pumps this thread's
-// messages. The library-load hook is deliberately not an entry: it runs on
-// whichever thread loaded twinui, and the taskbar thread is the one measured as
-// an explorer fail-fast for a show.
+// The manager's Show is the bootstrap: it records the thread the shell called it
+// on and creates the executor window there. The Win and Start-button hooks only
+// serve a capability/window that already exists; they cannot create the first
+// one (nothing on this build calls OnStartButtonPressed). Dismiss/ShowStartView
+// never adopt; a non-pumping COM/taskbar caller passes natively, and if its
+// internal manager Show then runs on that thread, that Show is the adopter.
 DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     const DWORD tid = GetCurrentThreadId();
     DWORD known = g_launcherThread.load(std::memory_order_relaxed);
@@ -18451,10 +18447,11 @@ DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     return tid;
 }
 
-// The manager's Show is the shell's own open on the launcher thread, and it is
-// the first launcher entry of a touch-first open. It is an adoption point like
-// the decision entries: the thread test comes before anything is created, so a
-// Show on a thread this mod has not recorded cannot create the executor there.
+// The manager's Show is the one adoption point. It records the thread it runs on
+// (normally the launcher thread; a non-pumping caller can supply it if its own
+// ShowStartView passed natively and the shell called this Show there) and creates
+// the executor window on it. A Show on a thread this mod has already recorded on
+// another entry is a mismatch and creates nothing.
 void EnsureExecutorOnLauncherThread(const wchar_t* source) {
     if (ExecutorWindowOnThisThread()) {
         return;  // already created on this thread

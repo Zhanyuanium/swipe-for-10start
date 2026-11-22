@@ -501,12 +501,13 @@ capability word.
 
 **Executor.** A hidden message-only window, class
 `WindhawkSwipeFor10Start.Executor` (fixed, registered under `&__ImageBase`),
-created only from a known launcher entry: `OnHotkeyInvoke`,
-`OnStartButtonPressed`, the manager's `Show` or the worker's targeted
-`WH_GETMESSAGE` adopts that thread (`exec launcher thread`); a
-`Dismiss`/`ShowStartView` on an unknown thread never adopts and passes natively,
-and a hook on any other thread logs `exec launcher thread mismatch` and creates
-nothing. The library-load hook never creates the window.
+created by the manager's `Show` on the thread it runs on; that is the one
+bootstrap and thread adopter. A Win/Start-button entry only serves an existing
+capability/window and cannot create the first one; `OnStartButtonPressed` is not
+called on this build. `Dismiss`/`ShowStartView` on an unknown thread never adopt
+and pass natively; a non-pumping caller that reaches the manager `Show` makes
+that `Show` the adopter. A targeted `WH_GETMESSAGE` hook on an already recorded
+thread can create the window there; it does not adopt.
 `ERROR_CLASS_ALREADY_EXISTS` is a failure, never adopted. Shutdown is an order:
 BeforeUninit clears readiness and signals the stop; Uninit joins the worker
 **INFINITE**, destroys the one published window synchronously on its owner

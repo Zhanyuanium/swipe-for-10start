@@ -115,16 +115,16 @@ crashed `explorer.exe` in `twinui.pcshell.dll+0x1BB010` with `0xC0000409`
 (fail-fast). A `Dismiss` on that thread happened to work, but the executor does
 not rely on the asymmetry: every command runs on the launcher thread.
 
-Shape: a hidden message-only window owned by the mod, created only from a known
-launcher entry — `OnHotkeyInvoke`, `OnStartButtonPressed`, the manager's `Show`
-or a targeted `WH_GETMESSAGE` hook already installed for the recorded launcher
-thread (`exec launcher thread`); a `Dismiss`/`ShowStartView` on an unknown thread
-never does, and a
-window is never created from the `LoadLibraryExW` hook,
-which runs on whichever thread loaded twinui. While capability is 0 the Win hook
-passes its press natively, so a Win entry alone cannot bootstrap adoption; the
-shell's forwarded `Show` reaches the manager's `Show` hook, which records the
-thread and creates the window. A worker waits on the channel event
+Shape: a hidden message-only window owned by the mod, created by the manager's
+`Show` on the thread it runs on. That `Show` is the one bootstrap: it records the
+launcher thread and creates the window. A Win or Start-button entry only serves
+an existing capability/window and cannot create the first one; nothing on this
+build calls `OnStartButtonPressed`. `Dismiss`/`ShowStartView` never adopt: a
+non-pumping COM or taskbar caller passes natively, and if its internal manager
+`Show` then runs on that thread, that `Show` is the adopter. A targeted
+`WH_GETMESSAGE` hook on an already recorded launcher thread can create the window
+there; it does not adopt. A window is never created from the `LoadLibraryExW`
+hook, which runs on whichever thread loaded twinui. A worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
 an empty stack. The window class is one fixed name
 (`WindhawkSwipeFor10Start.Executor`) registered under `&__ImageBase`;

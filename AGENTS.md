@@ -85,11 +85,13 @@ The bridge's gate proves a capability, not just a peer: the recorded launcher
 thread (checked **before** any launcher-local field, including the existing-window
 path), a window this activation created on that thread, a started worker, the
 verified layout, and for
-the directional close intent the callable `Dismiss` the command will need. A Hide
-never adopts an unproven thread
-(`reason=wrong-thread|no-window|no-capability|no-primitive`).
+the directional close intent the callable `Dismiss` the command will need. A Hide never adopts an unproven thread
+(`reason=wrong-thread|no-window|no-capability|no-primitive`). The manager's
+`Show` is the one bootstrap that records a thread; Win/Start-button entries only
+serve an existing window, and `ShowStartView`/`Dismiss` never adopt.
 A wrong-thread launcher call is not a clean error: never call from a hook frame,
-and the executor window is created only from a known launcher entry.
+and the executor window is created only by the manager's `Show` (or a
+`WH_GETMESSAGE` hook on an already recorded launcher thread).
 
 Launcher symbols are resolved once per module per install, on the executor
 worker, never in a hook. `HookSymbols` blocks on Windhawk's PDB fetch (measured

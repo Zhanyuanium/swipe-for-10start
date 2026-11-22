@@ -7,7 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
-| `v0.8.2` | 0.8.2 | — | 232 B | an unload proved on the owner threads: one UI rendezvous window, counted proofs on every path, adoption only by a pumping entry, an open during a close handed to the controller, the version gate before the PDB fetch |
+| `v0.8.2` | 0.8.2 | — | 232 B | an unload proved on the owner threads: one UI rendezvous window, counted proofs on every path, the manager's `Show` as the one adoption bootstrap, an open during a close handed to the controller, the version gate before the PDB fetch |
 | `v0.8.1` | 0.8.1 | — | 232 B | the executor proves itself before either half intercepts: one `execCapable` word, one symbol attempt, an unowned show adopted, a close that moves from its first frame |
 | `v0.8.0` | 0.8.0 | — | 216 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
 | `v0.7.0` | 0.7.0 | — | 216 B | one mod, two processes: the collection's review answered (symbol hooks, no pin, deadline-driven wakeups, tap rejection, lean channel) |
@@ -42,11 +42,13 @@ this release is the lifecycle half of the same design.
   the window, or could not run at all. A destroyed window is not read as a dead
   UI thread. A proof that cannot be obtained blocks the unload once, with one
   line, instead of a poll.
-- **Only an entry that pumps may adopt the launcher thread.** The Windows key,
-  the Start button and the manager's `Show` record an unknown launcher thread;
-  `Dismiss`/`ShowStartView` from a COM or taskbar caller that does not pump pass
-  natively, so the executor window is never stranded on a thread that cannot
-  destroy it.
+- **The manager's `Show` is the one launcher-thread bootstrap.** It records the
+  thread the shell called it on and creates the executor window there. The
+  Win/Start-button hooks only serve an existing capability/window; they cannot
+  create the first one (`OnStartButtonPressed` is not called on this build).
+  `Dismiss`/`ShowStartView` never adopt: a non-pumping COM or taskbar caller
+  passes natively, and if its internal manager `Show` then runs on that thread,
+  that `Show` is the adopter.
 - **An open during a close is handed to the controller.** When the shell shows
   the menu while a close is retracting it, both close schedules (local and
   executor) are cancelled, the recovery ticket dropped, and the controller
