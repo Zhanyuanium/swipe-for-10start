@@ -30,7 +30,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_SingleMod_State'
+$StateName = 'Local\SwipeFor10Start_SingleMod2_State'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -69,7 +69,8 @@ $OffsetControllerTouch = 200
 $OffsetPeerTick = 204
 $OffsetPeerState = 208
 $OffsetPeerEpoch = 212
-$StateBytes = 216
+$OffsetIntentTaken = 216
+$StateBytes = 224
 
 # The ack outcome and visibility words are shared constants (swipe_ipc_shared.h).
 # A missing key prints a blank name, the number is still shown beside it.
@@ -144,7 +145,7 @@ try {
     $magic = $view.ReadUInt32($OffsetMagic)
     $layoutBytes = $view.ReadInt32($OffsetLayoutBytes)
     $initState = $view.ReadInt32($OffsetInitState)
-    if ($initState -ne 2 -or $magic -ne 0x53313053 -or
+    if ($initState -ne 2 -or $magic -ne 0x53323053 -or
         $layoutBytes -ne $StateBytes) {
         $detail = ('magic=0x{0:X8} layoutBytes={1} initState={2}') -f
                   $magic, $layoutBytes, $initState
@@ -204,6 +205,7 @@ try {
         intent      = $(if ($intent) { "kind=$($intent.Value.kind) trigger=$($intent.Value.trigger) method=$($intent.Value.method) flags=$($intent.Value.flags) open=$($intent.Value.open)" } else { 'unstable' })
         intentAckSeq = $(if ($intentAck) { $intentAck.Seq } else { 'unstable' })
         intentAck   = $(if ($intentAck) { "for=$($intentAck.Value.for) state=$($intentAck.Value.state) duration=$($intentAck.Value.duration) entry=$($intentAck.Value.entry) hr=$($intentAck.Value.hr)" } else { 'unstable' })
+        intentTaken = $view.ReadInt64($OffsetIntentTaken)
         execSeq     = $(if ($exec) { $exec.Seq } else { 'unstable' })
         exec        = $(if ($exec) { "kind=$($exec.Value.kind) method=$($exec.Value.method) flags=$($exec.Value.flags) executeAt=$($exec.Value.executeAt) open=$($exec.Value.open) target=$($exec.Value.target)" } else { 'unstable' })
         execAckSeq  = $(if ($execAck) { $execAck.Seq } else { 'unstable' })

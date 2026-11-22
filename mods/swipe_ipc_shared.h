@@ -13,15 +13,16 @@
 // number, and a reader accepts a record only when that number did not move
 // while the record was being copied.
 //
-//   Local\SwipeFor10Start_SingleMod_State      SwipeIpcState
-//   Local\SwipeFor10Start_SingleMod_Intent     auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod_IntentAck  auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod_Exec       auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod_ExecAck    auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod2_State      SwipeIpcState
+//   Local\SwipeFor10Start_SingleMod2_Intent     auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod2_IntentAck  auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod2_Exec       auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod2_ExecAck    auto-reset, bridge -> Start
 //
 // The names are session-local because both processes run as the same user in the
 // same session. There is no product version word: the ABI namespace *is* the
-// layout identity. A future incompatible layout changes the prefix, so an old
+// layout identity. The `2` marks the 224-byte layout that added `intentTaken`; a
+// future incompatible layout changes the prefix again, so an old
 // pinned development image can never join this channel and a same-size change is
 // never reinterpreted across a staggered update. Only a single shipping mod
 // uses these names.
@@ -126,17 +127,17 @@
 // stale. That window is a detection budget, not a delivery guarantee.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_SingleMod_State";
+    L"Local\\SwipeFor10Start_SingleMod2_State";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod_Intent";
+    L"Local\\SwipeFor10Start_SingleMod2_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod_IntentAck";
+    L"Local\\SwipeFor10Start_SingleMod2_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod_Exec";
+    L"Local\\SwipeFor10Start_SingleMod2_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod_ExecAck";
+    L"Local\\SwipeFor10Start_SingleMod2_ExecAck";
 
-constexpr uint32_t kSwipeIpcMagic = 0x53313053;  // 'S' '0' '1' 'S', LE
+constexpr uint32_t kSwipeIpcMagic = 0x53323053;  // 'S' '0' '2' 'S', LE
 
 // M3 intents, executor commands and acknowledgements.
 constexpr int32_t kSwipeIntentOpen = 0;
@@ -291,6 +292,13 @@ struct SwipeIpcState {
     volatile LONG peerTick;
     volatile LONG peerState;
     volatile LONG peerEpoch;
+
+    // Start -> bridge: the sequence of the intent the consumer has taken for
+    // processing. The Start side writes it before it acts, so a publisher whose
+    // ack timed out can tell "the controller has this record" from "the record
+    // is still untaken". One atomic word, not a seqlock: it is a claim, not a
+    // record with fields that must agree.
+    volatile LONG64 intentTaken;
 };
 
 static_assert(offsetof(SwipeIpcState, magic) == 0, "layout");
@@ -330,7 +338,8 @@ static_assert(offsetof(SwipeIpcState, controllerTouch) == 200, "layout");
 static_assert(offsetof(SwipeIpcState, peerTick) == 204, "layout");
 static_assert(offsetof(SwipeIpcState, peerState) == 208, "layout");
 static_assert(offsetof(SwipeIpcState, peerEpoch) == 212, "layout");
-static_assert(sizeof(SwipeIpcState) == 216, "layout");
+static_assert(offsetof(SwipeIpcState, intentTaken) == 216, "layout");
+static_assert(sizeof(SwipeIpcState) == 224, "layout");
 
 struct SwipeIpcChannel {
     SwipeIpcState* state;
@@ -695,6 +704,19 @@ inline bool SwipeIpcReadIntent(SwipeIpcChannel* channel, SwipeIpcIntent* out) {
     record.seq = sequence;
     *out = record;
     return sequence != 0;
+}
+
+// The consumer's claim: "I have this intent sequence and am about to act on it".
+// Written before the action, so a publisher whose answer is late can prove that
+// a replay would be a second execution. 0 means no claim has been made.
+inline void SwipeIpcTakeIntent(SwipeIpcChannel* channel, LONG64 seq) {
+    if (channel->state && seq > 0) {
+        InterlockedExchange64(&channel->state->intentTaken, seq);
+    }
+}
+
+inline LONG64 SwipeIpcTakenIntent(SwipeIpcChannel* channel) {
+    return channel->state ? SwipeIpcLoad64(&channel->state->intentTaken) : 0;
 }
 
 inline bool SwipeIpcAnswerIntent(SwipeIpcChannel* channel, LONG64 intentSeq,

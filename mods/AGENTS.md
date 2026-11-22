@@ -640,10 +640,14 @@ probe or timer failure is answered `unknown`.
   in its line (`reason=queue-full`) and never executes it ahead of the queue; a
   press still unpublished past its 1500 ms wait runs the shell's original
   primitive under `t_execCall` (`reason=queue-wait`). An ack timeout is
-  resolved by proof, not by replay: a late ack is consumed, a live-but-silent peer
-  is treated as consumed (`own press ack timeout ... peer=alive ... decision=consumed`),
-  and only a gone/stale peer is replayed (`peer=stale ... decision=replay`,
-  `reason=no-ack`). The queue's own lines are
+  resolved by the Start side's take, not by a guess: the consumer writes
+  `intentTaken = seq` before it acts. `taken == seq` is
+  `decision=consumed` with no replay; `taken != seq` with the record still the
+  same sequence and a live peer is `decision=reserved` and is polled
+  (`kPressReservePollMs`, bounded by `kSwipePeerStaleMs`), so the outstanding
+  sequence is never overwritten; a gone/stale peer or a moved record is
+  `decision=replay`, `reason=no-ack`. A taken sequence is never replayed. The
+  queue's own lines are
   `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch, is published at once,
   and arms the same barrier: a following press waits for its ack or bound

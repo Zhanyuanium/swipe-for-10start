@@ -122,8 +122,10 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   per command; one decision line and one executor line per trigger. One intent
  *   is outstanding at a time: an admitted press waits in a four-entry FIFO until
  *   the intent ack for the press before it (or its 1000 ms bound) and then decides
- *   from the direction the controller published by then; an ack timeout is
- *   replayed only for a gone or stale peer, while a live silent peer is consumed.
+ *   from the direction the controller published by then; an ack timeout reads
+ *   the Start side's `intentTaken` claim: a taken sequence is consumed, an
+ *   untaken current record with a live peer is reserved (never overwritten), and
+ *   only a moved record or a gone/stale peer is replayed.
  *   A queue overflow drops the arriving press with the depth and keeps the
  *   queue's order; a press still unpublished past its wait runs the shell's own
  *   primitive under the executor guard. Every
@@ -8150,6 +8152,10 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         return;
     }
     g_lastIntentSeq = intent.seq;
+    // The claim the bridge's timeout reads: this sequence is now being acted on.
+    // It is written before the first action (the log is not an action), so a
+    // replay after the take would be a second execution.
+    SwipeIpcTakeIntent(&g_ipc, intent.seq);
     const wchar_t* kind = intent.kind == kSwipeIntentOpen
                               ? L"open"
                               : (intent.kind == kSwipeIntentClose ? L"close"
@@ -13864,6 +13870,11 @@ constexpr uint64_t kPressLatchRetryMs = 100;
 // press may spend behind older presses (four entries, each at most the ack bound)
 // before its own decision is served by the shell for the same reason.
 constexpr uint64_t kPressAckTimeoutMs = 1000;
+// While a timed-out press is reserved (not taken, peer still alive), the
+// publisher re-checks its claim at this cadence. The peer's own staleness window
+// is the outer bound: once the controller stops ticking it cannot take the
+// record and the native replay is safe.
+constexpr uint64_t kPressReservePollMs = 100;
 constexpr uint64_t kPressQueueWaitMs = 1500;
 constexpr int kPressQueueCapacity = 4;
 // The controller's own budget for one command (its kBridgeAckTimeoutMs): a show
@@ -15379,19 +15390,22 @@ void HandlePressAck() {
 // The ack did not arrive inside its bound. A missing ack is not proof that the
 // controller did nothing: the close may have landed and only its notification
 // been late, and replaying the original then reopens the menu. The timeout
-// therefore reads the ack once more and the peer's liveness words:
+// therefore reads the ack once more, the consumer's `intentTaken` claim, the
+// shared intent record and the peer's liveness words:
 //
 // - a late ack for this sequence is the answer, and only advances the queue;
-// - a live peer that is silent is treated as having consumed the record: no
-//   original runs, because the alternative is a second toggle for a press that
-//   already happened. The line names the trade;
-// - a gone or stale peer cannot consume the record, so running the original is
-//   the only way the press still reaches the shell.
+// - `taken == seq` means the controller has the record and may already have
+//   acted: the press is consumed, no replay, whichever the peer is doing;
+// - `taken != seq` with the record still this sequence and a live peer means the
+//   controller may take it at any moment: the slot is reserved and the check
+//   repeats, so no newer publication can overwrite it;
+// - a gone/stale peer or a record that has moved past this sequence means the
+//   controller cannot take it any more: the original is the only actor left.
 //
-// There is no consumer-set "taken" word: the ack record plus the peer triple is
-// the cheap proof that exists, and a new field would still race the consumer's
-// turn. The cost is one press in the alive-but-hung case; the timeout line says
-// which case it chose.
+// The take is written before the controller acts, so a replay can never follow
+// a taken sequence: one execution at most, and one native execution when the
+// controller is gone before taking. The reserve is bounded by the peer window;
+// a crash after the take loses that press rather than duplicating it.
 void HandlePressAckTimeout() {
     if (!g_pressOutstanding.pending) {
         return;
@@ -15430,17 +15444,18 @@ void HandlePressAckTimeout() {
     const uint32_t peerAge = PeerTickAgeMs();
     const wchar_t* peer =
         !haveChannel ? L"absent" : (peerAlive ? L"alive" : L"stale");
-    g_pressOutstanding = OutstandingPress{};
-    HWND window = g_execWindow.load(std::memory_order_relaxed);
-    if (window) {
-        KillTimer(window, kPressAckTimer);
-    }
+    const LONG64 taken = SwipeIpcTakenIntent(&g_ipc);
     const uint64_t wait = GetTickCount64() - press.publishedTick;
     if (press.external) {
         // The takeover itself is native and has no original to replay. A live
         // peer that is silent is treated as having reconciled it so the held
         // presses can start; a gone/stale peer means they cannot be published,
         // and their own turns run them natively under the usual timeout policy.
+        g_pressOutstanding = OutstandingPress{};
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
         TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
                 L"epoch=%u decision=%s",
                 static_cast<long long>(press.seq),
@@ -15449,19 +15464,80 @@ void HandlePressAckTimeout() {
         ServeNextPress(L"timeout");
         return;
     }
+    if (taken == press.seq) {
+        // The controller claimed this exact sequence before acting. A replay
+        // now would be a second execution, whether the answer is merely late or
+        // the controller is stalled after the take.
+        g_pressOutstanding = OutstandingPress{};
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
+        TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
+                L"taken=%lld record=%lld peer=%s age=%u epoch=%u "
+                L"decision=consumed",
+                static_cast<long long>(press.seq),
+                PressTriggerName(press.press.trigger),
+                PressEntryName(press.press.entry),
+                static_cast<unsigned long long>(wait),
+                static_cast<long long>(taken),
+                static_cast<long long>(press.seq), peer, peerAge,
+                PeerEpochNow());
+        ServeNextPress(L"taken");
+        return;
+    }
+    // Not taken. The only safe replay is when the record can no longer be taken:
+    // the peer is gone/stale, or the shared record has moved past this sequence.
+    // Keep the slot reserved while the record is still current and the peer is
+    // alive; a newer publication would overwrite a press the controller may take
+    // at any moment.
+    SwipeIpcIntent current{};
+    const bool haveRecord = SwipeIpcReadIntent(&g_ipc, &current);
+    const bool recordMoved = haveRecord && current.seq != press.seq;
+    if (!peerAlive || recordMoved) {
+        g_pressOutstanding = OutstandingPress{};
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
+        TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
+                L"taken=%lld record=%lld peer=%s age=%u epoch=%u "
+                L"decision=replay reason=%s",
+                static_cast<long long>(press.seq),
+                PressTriggerName(press.press.trigger),
+                PressEntryName(press.press.entry),
+                static_cast<unsigned long long>(wait),
+                static_cast<long long>(taken),
+                static_cast<long long>(haveRecord ? current.seq : 0), peer,
+                peerAge, PeerEpochNow(),
+                recordMoved ? L"superseded" : L"peer-gone");
+        RunPressOriginal(press.press, L"no-ack");
+        ServeNextPress(L"timeout");
+        return;
+    }
+    // Reserved: the record is still current and the controller is alive. The
+    // outstanding sequence stays, so no newer publication can overwrite it. A
+    // later poll sees the take, a superseded record, or a stale peer.
     TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-            L"peer=%s age=%u epoch=%u decision=%s",
+            L"taken=%lld record=%lld peer=%s age=%u epoch=%u "
+            L"decision=reserved",
             static_cast<long long>(press.seq),
             PressTriggerName(press.press.trigger),
             PressEntryName(press.press.entry),
-            static_cast<unsigned long long>(wait), peer, peerAge, PeerEpochNow(),
-            peerAlive ? L"consumed" : L"replay");
-    if (!peerAlive) {
-        // No live consumer can take this record, so the shell's own primitive is
-        // the only actor left for the press.
-        RunPressOriginal(press.press, L"no-ack");
+            static_cast<unsigned long long>(wait),
+            static_cast<long long>(taken),
+            static_cast<long long>(haveRecord ? current.seq : 0), peer, peerAge,
+            PeerEpochNow());
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (!window ||
+        SetTimer(window, kPressAckTimer, static_cast<UINT>(kPressReservePollMs),
+                 nullptr) == 0) {
+        // Keep the reservation: an ack still clears it through the worker's
+        // event, and a later admission checks the peer. Dropping it here would
+        // allow a second publication over a record the controller may take.
+        TraceLog(L"own press reserve timer failed err=%u seq=%lld",
+                GetLastError(), static_cast<long long>(press.seq));
     }
-    ServeNextPress(L"timeout");
 }
 
 // The one toggle dispatcher for the three physical entries: the bare Windows

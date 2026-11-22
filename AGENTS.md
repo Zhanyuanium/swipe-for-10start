@@ -129,11 +129,17 @@ never waits. A press the queue cannot serve is handled by its state, not by a
 replay: the arriving press on a full queue is dropped with the depth in its line
 (`reason=queue-full`), never executed ahead of the four already queued; a press
 still unpublished past its 1500 ms wait runs the shell's own original primitive
-under the executor guard (`reason=queue-wait`); and the ack timeout is stricter
-than both: a live peer that is silent is treated as having consumed the record
-(`decision=consumed`), because replaying a close that landed would reopen the
-menu; only a gone or stale peer is replayed (`decision=replay`, `reason=no-ack`).
-The timeout line carries the sequence, the wait, the peer age and the epoch. An
+under the executor guard (`reason=queue-wait`). The ack timeout is stricter: the
+Start side writes `intentTaken = seq` before it acts, and the timeout reads that
+claim. `taken == seq` is `decision=consumed` with no replay; `taken != seq` with
+the record still this sequence and a live peer is `decision=reserved` and is
+re-checked, so no newer publication can overwrite a press the controller may
+take; only a gone/stale peer or a record that has moved past the sequence is
+replayed (`decision=replay reason=peer-gone|superseded`, `reason=no-ack`). A take
+is never replayed: one execution at most, one native execution when the
+controller is gone before taking, and that press lost rather than duplicated if
+the controller dies after the take. The timeout line carries the sequence, the
+wait, the take, the peer age and the epoch. An
 external takeover is published at once and clears the queue and latch; it then
 arms the same barrier for the presses that follow, because its record is the one
 Start must reconcile before another intent may overwrite it. A held press follows
@@ -306,18 +312,21 @@ header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h`: one session-local section (216 bytes) and four named
+`mods/swipe_ipc_shared.h`: one session-local section (224 bytes) and four named
 events (`State/Intent/IntentAck/Exec/ExecAck` — five objects), every record a
-seqlock with its own counter and an `offsetof` assert. The names carry the merged
-mod's own prefix (`SwipeFor10Start_SingleMod_`) and there is **no product version
+seqlock with its own counter and an `offsetof` assert, plus two single-word
+claims (`controllerDirection`, `intentTaken`). The names carry the merged
+mod's own prefix with the layout identity (`SwipeFor10Start_SingleMod2_`) and
+there is **no product version
 word**: the namespace is the ABI identity, so an older development image cannot
 join, and a future layout changes the prefix. The records are the open
-generation, the intent and its ack (the ack is the bridge's next-press barrier),
-the executor command and its ack, one
+generation, the intent and its ack and the taken sequence (the ack is the
+bridge's next-press barrier; the take is the timeout's proof), the executor
+command and its ack, one
 controller direction word plus the touch flag, and the liveness triple
-`peerTick` (204) / `peerState` (208) / `peerEpoch` (212). The debug command
+`peerTick` (204) / `peerState` (208) / `peerEpoch` (212) / `intentTaken` (216). The debug command
 channel — its record, mutex, event and parser — is **gone**.
-`tools/ipc.ps1` is read-only: `-State` reads 216 bytes and prints the records and
+`tools/ipc.ps1` is read-only: `-State` reads 224 bytes and prints the records and
 the peer epoch.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
 `initState` are refused, never waited on. Each role opens the channel at its

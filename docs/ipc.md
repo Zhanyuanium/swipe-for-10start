@@ -7,16 +7,18 @@
 ## Names and layout
 
 ```
-Local\SwipeFor10Start_SingleMod_State      SwipeIpcState (216 bytes)
-Local\SwipeFor10Start_SingleMod_Intent     auto-reset, bridge -> Start
-Local\SwipeFor10Start_SingleMod_IntentAck  auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod_Exec       auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod_ExecAck    auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod2_State      SwipeIpcState (224 bytes)
+Local\SwipeFor10Start_SingleMod2_Intent     auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod2_IntentAck  auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod2_Exec       auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod2_ExecAck    auto-reset, bridge -> Start
 ```
 
-`kSwipeIpcMagic = 0x53313053` (`S01S`). There is no product version word: the
-**namespace is the ABI identity**. A future incompatible layout changes the
-prefix, so an old pinned development image can never join this channel and a
+`kSwipeIpcMagic = 0x53323053` (`S02S`). There is no product version word: the
+**namespace is the ABI identity**. The `2` in the prefix is the layout identity:
+the `intentTaken` word made the section 224 bytes, so the old 216-byte namespace
+must never be joined. A future incompatible layout changes the
+prefix again, so an old pinned development image can never join this channel and a
 same-size change is never reinterpreted across a staggered update. Every field's
 offset is pinned by a `static_assert` in `mods/swipe_ipc_shared.h`;
 `layoutBytes` publishes `sizeof(SwipeIpcState)` and a reader that sees a
@@ -40,7 +42,8 @@ layout.
 196  controllerDirection
 200  controllerTouch
 204  peerTick         208  peerState        212  peerEpoch
-size 216
+216  intentTaken
+size 224
 ```
 
 The debug command channel is **gone**: its record, mutex, event and parser were
@@ -113,20 +116,41 @@ it publishes, so the shell never saw that press; when the Start side answers
 press is lost. The refusal is reserved for the case where nothing could run, and
 the line names it (`intent open refused entry=... reason=no-executor`,
 `intent close refused from=... reason=no-executor`); the bridge does not retry the
-original on an answered refusal. An **unanswered** decision is not simply
-replayed. At the 1000 ms bound the bridge re-reads the ack and the peer's state,
-tick and epoch. A live peer that is silent is treated as having consumed the
-record (`own press ack timeout ... peer=alive ... decision=consumed`): the close
-may have landed and only the answer been late, and replaying its original would
-reopen the menu. Only a gone or stale peer, which cannot consume the record,
-replays it (`peer=stale ... decision=replay`, `own press fallback ... reason=no-ack`).
-A record applied after a peer-gone replay is the residual double action; no scheme
-can recall a record, and the line names which case it chose.
+original on an answered refusal. An **unanswered** decision is not replayed on a
+guess. At the 1000 ms bound the bridge re-reads the ack, `intentTaken`, the
+shared intent record and the peer's state/tick/epoch. A taken sequence is
+consumed (`decision=consumed`, no replay). An untaken record that is still the
+current sequence with a live peer is reserved (`decision=reserved`, rechecked
+every 100 ms), so no newer publication can overwrite it. Only a record that has
+moved past the sequence, or a gone/stale peer, is replayed (`decision=replay
+reason=superseded|peer-gone`, `own press fallback ... reason=no-ack`). A take is
+never replayed: at most one execution, one native execution when the controller
+is gone before taking, and a press lost rather than duplicated if the controller
+dies after the take. No scheme can recall a record already taken; the take is
+written before the act so the two can never both run.
 
 A landing reconciles an already-published `external` intent before it may issue a
 recovery: the idle timer and the intent event are two wait objects of the same
 thread, and the timer has the lower index, so the landing can otherwise run
 before the takeover that arrived with it.
+
+### Intent take — Start -> bridge
+
+`intentTaken` is one 64-bit atomic word, written by the Start side with the
+sequence it has just read, **before it acts**. It is the publisher's proof on an
+ack timeout:
+
+- `taken == seq`: the controller has the record; the press is consumed, never
+  replayed, and the queue advances;
+- `taken != seq`, the shared record is still `seq`, and the peer is alive: the
+  controller may be about to take it, so the outstanding press stays reserved and
+  the check repeats; no newer publication can overwrite it;
+- `taken != seq` and the record is no longer `seq`, or the peer is gone/stale:
+  the controller cannot take this sequence, so the publisher may run the original
+  (one native execution) and advance.
+
+`0` means no claim has been made. The word is not a seqlock: it is a claim, and no
+two fields must agree.
 
 ### Executor command — Start -> bridge
 
