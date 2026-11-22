@@ -108,8 +108,11 @@ no transition is outstanding.
 
 The only idle wake is the peer heartbeat: while `peerState=alive`, the wait times
 out every 100 ms to refresh `peerTick`; with the peer withheld or gone it is
-`INFINITE`. Before its first publication the thread additionally wakes every
-100 ms until the renderer attaches, which is the net under the renderer event.
+`INFINITE`. A renderer that has not attached is an event, not a poll: the input
+thread waits on the renderer-usability event, and the root bootstrap keeps its own
+deadline until the symbol answer is ready or refused. If that event could not be
+created, the readiness check runs once per heartbeat for a bounded 20 wakeups and
+then the thread parks with no timer; there is no unbounded renderer poll.
 Measured with the menu closed, the old build woke 190.6 times/s and queried
 `DwmGetWindowAttribute` 32 times/s; this one wakes 9.2 times/s and queries it
 zero times, and the Start host's idle CPU fell from 0.625 % to 0.026 % of one

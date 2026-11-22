@@ -714,6 +714,10 @@ constexpr uint64_t kOpenCheckIntervalMs = 20;
 // to kSwipePeerTickIntervalMs (100) in the shared header. Ten wakes a second on
 // this event alone, none of them a timer, are the price of a live controller.
 constexpr uint64_t kPeerHeartbeatMs = kSwipePeerTickIntervalMs;
+// Startup-only retry for a host whose renderer event could not be created: the
+// readiness check runs once per wakeup for this many heartbeats, then the input
+// thread parks. It is never a steady poll (2 s, once per activation).
+constexpr int kRendererWaitRetries = 20;
 
 // The input thread's root-symbol retry interval (StartUI_'s PrepareRootElement).
 // It is also the wait planner's bootstrap deadline: while the answer is neither
@@ -10053,6 +10057,10 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // the loading thread.
     bool peerAnnounced = false;
     bool rendererWaitLogged = false;
+    // The bounded startup retry and its one park line, both only reached when the
+    // renderer event could not be created. They are not the peer heartbeat.
+    int rendererWaitRetries = 0;
+    bool rendererParkLogged = false;
     // Whether this activation has taken its first visibility sample since the
     // peer service became available. The state is a sample, not an event's
     // payload: without the seed, a menu that was already on screen at attach
@@ -10147,14 +10155,30 @@ DWORD WINAPI HidInputThread(LPVOID) {
             fallbackPeriod = 0;
         }
 
-        // Nothing armed for the deadline means nothing will wake this thread at
-        // it: no event, no timer. That includes the root bootstrap, which has
-        // neither a peer heartbeat nor a renderer wait yet. Bound the wait by the
-        // deadline itself; a successfully armed timer keeps the pure event wait.
+        // Only an advertised peer has an idle heartbeat. The root bootstrap has
+        // its own deadline (NextInputDeadlineMs), and a renderer that has not
+        // attached is woken by g_rendererEvent when it does. With no event to
+        // wait on, a startup retry runs for a bounded number of wakeups and then
+        // the thread parks with no timer: nothing exists that could change the
+        // fact it is waiting on. An unadvertised renderer is never polled.
+        bool rendererRetry = false;
+        if (!g_peerPublished.load(std::memory_order_relaxed) && !g_rendererEvent) {
+            const bool rendererPending =
+                !peerAnnounced &&
+                g_rootHookReady.load(std::memory_order_acquire) &&
+                !RendererReady();
+            if (rendererPending) {
+                if (rendererWaitRetries < kRendererWaitRetries) {
+                    ++rendererWaitRetries;
+                    rendererRetry = true;
+                } else if (!rendererParkLogged) {
+                    rendererParkLogged = true;
+                    TraceLog(L"ipc peer withheld reason=no-renderer-event");
+                }
+            }
+        }
         DWORD waitMs = (g_peerPublished.load(std::memory_order_relaxed) ||
-                        (!peerAnnounced &&
-                         g_rootHookReady.load(std::memory_order_acquire) &&
-                         !RendererReady()))
+                        rendererRetry)
                            ? static_cast<DWORD>(kPeerHeartbeatMs)
                            : INFINITE;
         if (deadlineMs != 0 && !timerArmed) {
