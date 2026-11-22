@@ -177,7 +177,13 @@ last read: reconciliation reads the claim again, and a claim found there on the
 same epoch with the state alive keeps the slot under
 `reason=claimed-at-admission` — nothing is served until its ack. A claim that
 lands after that read and before the abort is `reason=claim-after-abort` and
-holds the same way. A different `peerEpoch` at the watchdog **or at the
+holds the same way. An **external** record at that admission is the same hard
+case with no replay: the claim is read, the record is aborted, and the claim is
+read again. A claim before or after the abort keeps the barrier reserved
+(`reason=claimed-at-admission|claim-after-abort`, `claimed=1
+decision=reserved`); a record that cannot be aborted also keeps it
+(`reason=record-moved`, `claimed=0`). Only an aborted record with no claim after
+the re-read is released (`reason=stale-unclaimed`). A different `peerEpoch` at the watchdog **or at the
 next admission** means the activation that was asked is gone: the replacement
 seeds `g_lastIntentSeq` past the record and will never answer, so a taken press
 is consumed without its ack (`reason=epoch-changed`), an untaken record is
@@ -204,8 +210,10 @@ state, not a timer: it is set whether or not the watchdog could be armed
 (`own external barrier ... armed|unarmed`), and it is cleared only by its ack, by
 a changed epoch (`released reason=epoch-changed`), or by its peer's state going
 away (`released reason=peer-gone|stale-unclaimed`), never by a timeout and never
-by an arm failure. A claimed barrier is held through a stale heartbeat; an
-unclaimed one is released when the tick goes stale. A live but
+by an arm failure. A claimed barrier is held through a stale heartbeat. At the
+watchdog an unclaimed barrier is released when the tick goes stale; at admission
+it is released only after a successful abort and a claim re-read that finds no
+claim. A live but
 silent peer keeps it, and a following press waits; a reserve poll re-checks it
 and runs any held press that has outlived its queue bound.
 

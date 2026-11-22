@@ -15656,21 +15656,22 @@ void ServeNextPress(const wchar_t* reason) {
 }
 
 // Keeps the outstanding slot when Start claimed the record during admission
-// reconciliation. The take proves a validated copy may be in hand; the controller
-// will publish its direction and answer. Serving the queue here would let the next
-// press choose before that direction exists, so this is the timeout's claimed
-// case without a timer: only the ack, a changed epoch, or the withdrawn state
-// releases it. Launcher thread only.
-void HoldClaimedPressAtAdmission(const OutstandingPress& press,
-                                 const wchar_t* reason, uint32_t epochNow,
-                                 uint64_t wait) {
+// reconciliation, or when an external barrier's record cannot be proved gone.
+// A take proves a validated copy may be in hand; the controller will publish its
+// direction and answer. Serving the queue here would let the next press choose
+// before that direction exists, so this is the timeout's claimed case without a
+// timer: only the ack, a changed epoch, or the withdrawn state releases it.
+// Launcher thread only.
+void HoldOutstandingAtAdmission(const OutstandingPress& press,
+                                const wchar_t* reason, uint32_t epochNow,
+                                uint64_t wait, bool claimed) {
     g_pressOutstanding.consumedAwaitingAck = true;
     if (press.external) {
         TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
                 L"claimed=%d decision=reserved reason=%s",
                 static_cast<long long>(press.seq),
                 static_cast<unsigned long long>(wait), press.publishedEpoch,
-                epochNow, 1, reason);
+                epochNow, claimed ? 1 : 0, reason);
     } else {
         TraceLog(L"own press abandoned seq=%lld trigger=%s entry=%s "
                 L"wait=%llu epoch=%u->%u decision=consumed awaiting=ack "
@@ -15694,15 +15695,17 @@ void HoldClaimedPressAtAdmission(const OutstandingPress& press,
 // A publication from a healthy replacement proves the activation that owned the
 // outstanding record is gone (or was replaced) before it answered. The watchdog
 // applies the same rule at its bound; this is the timer-free path, for a watchdog
-// that could not be armed or an unarmed external barrier. The rule is the
-// timeout's: an external has no original and is released; a normal press is
-// consumed when it was claimed, otherwise aborted and replayed only when the
-// abort succeeded and no claim landed. The claim is read here, after the caller
-// decided to reconcile: a claim that lands in between is the timeout's claimed
-// case, so the slot is kept awaiting its ack and nothing is served. Returns true
-// when the slot was reconciled; the caller must then re-read the launcher,
-// because the replay or drain may have changed it. False means the slot still
-// belongs to the controller.
+// that could not be armed or an unarmed external barrier. Same epoch and a live
+// state is the hard case: release needs proof that Start can no longer apply the
+// record, so the claim is read, the record is aborted, and the claim is read
+// again. A claim found here or after the abort keeps the slot awaiting its ack
+// and nothing is served. An external barrier has no original to replay; an
+// unabortable record is not proof it is gone, so the barrier stays reserved. A
+// normal press is consumed when it was claimed, otherwise aborted and replayed
+// only when the abort succeeded and no claim landed. Returns true when the slot
+// was reconciled; the caller must then re-read the launcher, because the replay
+// or drain may have changed it. False means the slot still belongs to the
+// controller.
 bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     const OutstandingPress press = g_pressOutstanding;
     const uint64_t wait = GetTickCount64() - press.publishedTick;
@@ -15712,8 +15715,8 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     if (taken == press.seq && !epochChanged && PeerStateAliveNow()) {
         // The caller read no claim before this call and Start claimed and
         // validated the copy during it.
-        HoldClaimedPressAtAdmission(press, L"claimed-at-admission", epochNow,
-                                    wait);
+        HoldOutstandingAtAdmission(press, L"claimed-at-admission", epochNow,
+                                   wait, true);
         return false;
     }
     bool replay = false;
@@ -15724,11 +15727,30 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
             // The claim landed between the read above and the abort. The record
             // may now be unreachable to the controller's copy re-check, but the
             // copy is in hand and will answer; the slot waits for that answer.
-            HoldClaimedPressAtAdmission(press, L"claim-after-abort", epochNow,
-                                        wait);
+            HoldOutstandingAtAdmission(press, L"claim-after-abort", epochNow,
+                                       wait, true);
             return false;
         }
         replay = revoked && takenAfter != press.seq;
+    } else if (!epochChanged && PeerStateAliveNow()) {
+        // The takeover is native and has no original to replay, so the abort is
+        // the only proof that Start can no longer apply this record. The claim
+        // is re-read after it: a take before the abort leaves a validated copy
+        // that will answer, and a record that moved cannot be aborted at all.
+        // Both keep the barrier reserved; only an aborted record with no claim
+        // after the re-read releases it.
+        const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+        const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
+        if (takenAfter == press.seq) {
+            HoldOutstandingAtAdmission(press, L"claim-after-abort", epochNow,
+                                       wait, true);
+            return false;
+        }
+        if (!revoked) {
+            HoldOutstandingAtAdmission(press, L"record-moved", epochNow, wait,
+                                       false);
+            return false;
+        }
     }
     g_pressOutstanding = OutstandingPress{};
     HWND window = g_execWindow.load(std::memory_order_relaxed);

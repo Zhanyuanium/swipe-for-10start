@@ -150,7 +150,13 @@ admission (`reason=stale-unclaimed`) but never a claimed one. That is the
 caller's pre-check, not the last read: reconciliation reads the claim again, and
 a claim found there on the same epoch with the state alive keeps the slot
 (`reason=claimed-at-admission`) until its ack; a claim between that read and the
-abort holds as `reason=claim-after-abort`. When admission
+abort holds as `reason=claim-after-abort`. An **external** record gets the same
+evidence at admission: its claim is read, the record is aborted, and the claim is
+read again. A claim before or after the abort keeps the barrier reserved
+(`decision=reserved`, `reason=claimed-at-admission|claim-after-abort`); a record
+that cannot be aborted keeps it too (`reason=record-moved`); only an aborted
+record with no claim after the re-read is released (`reason=stale-unclaimed`).
+When admission
 reconciles, it decides FIFO placement before any snapshot: if the drain published
 an older press, the arriving press queues and reads the launcher at its turn. Only
 an immediately servable press re-reads the launcher state after the replay or

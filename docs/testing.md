@@ -303,6 +303,19 @@ could act, or before its confirmation could land).
   `kind=close`; the order is older `published`, older `ack`, then the arriving
   `published`, never the arriving press first.
 
+## Round-9 runtime check
+
+- **External claim after the first read.** Publish an unarmed external barrier
+  with a press queued behind it. A Start-side test hook holds the external claim
+  until the admission has read `intentTaken`; a test hook then pauses the
+  admission before its abort. Release the claim so Start validates and applies
+  the record, then let the admission continue. The abort re-read finds the claim
+  and logs `own external barrier ... claimed=1 decision=reserved
+  reason=claim-after-abort`; the queued press is not served until `own external
+  ack`, then publishes in the correct direction. A second run with Start dropping
+  the external record before its claim logs `released reason=stale-unclaimed` at
+  admission: the abort succeeded and the claim re-read found none.
+
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges

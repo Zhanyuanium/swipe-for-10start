@@ -677,7 +677,13 @@ probe or timer failure is answered `unknown`.
   claim itself: a claim found there on the same epoch with the state alive keeps
   the slot (`reason=claimed-at-admission`, `decision=consumed awaiting=ack`) and
   serves nothing until its ack; a claim that lands between that read and the
-  abort holds as `reason=claim-after-abort`. Every
+  abort holds as `reason=claim-after-abort`. An `external` record uses the same
+  evidence at admission: its claim is read, the record is aborted, and the claim
+  is read again. A claim before or after the abort keeps the barrier reserved
+  (`claimed=1 decision=reserved`, `reason=claimed-at-admission|claim-after-abort`);
+  a record that cannot be aborted keeps it too (`reason=record-moved`,
+  `claimed=0`); only an aborted record with no claim after the re-read is
+  released (`reason=stale-unclaimed`). Every
   Start branch publishes the resulting direction before its ack, so the press
   after an ack reads the new direction (close then reopen, not two closes).
   `taken != seq` aborts the record (`SwipeIpcAbortIntent`, the counter's odd
@@ -703,8 +709,11 @@ probe or timer failure is answered `unknown`.
   only by its ack (`own external ack ... reconciled`), by a changed epoch
   (`released reason=epoch-changed`), or by its peer's state going away
   (`released reason=peer-gone`), with an unclaimed barrier also released by a
-  stale tick (`released reason=stale-unclaimed`, checked on the reserve poll and
-  at the next admission). A claimed barrier is held through a stale heartbeat; a
+  stale tick on the reserve poll (`released reason=stale-unclaimed`). At
+  admission that release needs the abort proof: the claim is read, the record is
+  aborted, and the claim is read again; a claim before or after the abort keeps
+  the barrier reserved (`decision=reserved`), as does a record that cannot be
+  aborted (`reason=record-moved`). A claimed barrier is held through a stale heartbeat; a
   live but silent peer keeps it; the timeout line is
   `decision=reserved`, never a reconciliation guess, and the poll runs any held
   press past its bound.

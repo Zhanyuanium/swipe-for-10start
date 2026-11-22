@@ -397,7 +397,11 @@ ack; a stale tick never releases a claimed press, it only reconciles an unclaime
 record. The admission pre-check is not the last read: reconciliation reads the
 claim again, and a claim found there on the same epoch with the state alive keeps
 the slot (`reason=claimed-at-admission`); a claim between that read and the abort
-holds as `reason=claim-after-abort`. An untaken
+holds as `reason=claim-after-abort`. An external record uses the same evidence at
+admission: the claim is read, the record is aborted, and the claim is read again.
+A claim before or after the abort keeps the barrier reserved, and so does a
+record that cannot be aborted (`reason=record-moved`); only an aborted record
+with no claim after the re-read releases it. An untaken
 record is aborted (its counter goes odd, so no consumer can copy or claim it) and
 re-read before any replay. A changed epoch at the watchdog **or at the next
 admission** is a restart: the replacement seeded `g_lastIntentSeq` past the record
