@@ -15659,8 +15659,10 @@ void ServeNextPress(const wchar_t* reason) {
 // that could not be armed or an unarmed external barrier. The rule is the
 // timeout's: an external has no original and is released; a normal press is
 // consumed when it was claimed, otherwise aborted and replayed only when the
-// abort succeeded and no claim landed.
-void ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
+// abort succeeded and no claim landed. Returns true when the slot was reconciled;
+// the caller must then re-read the launcher, because the replay or drain may have
+// changed it.
+bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     const OutstandingPress press = g_pressOutstanding;
     const uint64_t wait = GetTickCount64() - press.publishedTick;
     g_pressOutstanding = OutstandingPress{};
@@ -15694,12 +15696,14 @@ void ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     }
     ResumePressQueueAge();
     ServeNextPress(L"abandoned");
+    return true;
 }
 
 // One admitted press. The immediate press decides on this hook's own snapshot;
 // a press behind it is queued and decides later. A press that cannot be queued
 // is dropped, never executed out of order; nothing waits on the launcher hook.
 void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
+    OwnSnapshot current = own;
     if (g_pressOutstanding.pending) {
         // A replacement or a withdrawn peer proves the record's activation is
         // gone. A stale tick alone does not release a claimed record: the
@@ -15719,12 +15723,35 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
                 epochChanged ? L"epoch-changed"
                              : (peerGone ? L"peer-gone" : L"stale-unclaimed"),
                 epochNow);
+            // The replay or the drain may have run a native toggle after this
+            // hook's snapshot. Re-read the launcher before deciding this press,
+            // or the arriving toggle can repeat the replay's direction.
+            uint64_t state = 0;
+            void* launcher = LauncherNow(&state);
+            if (!launcher) {
+                TraceLog(L"own press pass trigger=%s entry=%s "
+                        L"reason=state-after-replay state=0x%llX",
+                        PressTriggerName(press.trigger),
+                        PressEntryName(press.entry),
+                        static_cast<unsigned long long>(state));
+                RunPressOriginal(press, L"state-after-replay");
+                return;
+            }
+            current = OwnSync(launcher);
+            if (!current.ready) {
+                TraceLog(L"own press pass trigger=%s entry=%s "
+                        L"reason=state-after-replay state=%u",
+                        PressTriggerName(press.trigger),
+                        PressEntryName(press.entry), current.state);
+                RunPressOriginal(press, L"state-after-replay");
+                return;
+            }
         }
     }
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
         // A held close is requeued by ServePress and served by the gate's timer;
         // its false return needs no action here.
-        ServePress(press, &own);
+        ServePress(press, &current);
         return;
     }
     QueuePress(press, L"press");

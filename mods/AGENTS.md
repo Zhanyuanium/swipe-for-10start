@@ -682,7 +682,12 @@ probe or timer failure is answered `unknown`.
   `peerEpoch` at the watchdog **or at the next admission** is a restart: a taken
   press is consumed without its ack (`reason=epoch-changed`), an untaken one is
   aborted and replayed, the external barrier is released, and the queue advances
-  without needing a timer (`own press abandoned ...`). The queue's own lines are
+  without needing a timer (`own press abandoned ...`). When the admission
+  reconciles, it re-reads the launcher (readiness and open/visible) after the
+  replay or drain and before deciding the arriving press, so an old native open
+  leaves the arriving press closing, not opening again
+  (`own press pass ... reason=state-after-replay` if the read fails). The queue's
+  own lines are
   `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch, is published at once,
   and sets the same barrier as a state, not a timer: it stands even when

@@ -275,6 +275,12 @@ could act, or before its confirmation could land).
   Withdrawing the peer state instead logs the second line
   `decision=consumed reason=peer-gone`; a hard kill without the withdrawal leaves
   the claimed slot held (the epoch change at the next attach reconciles it).
+- **Post-replay snapshot (B).** Force the external watchdog to fail, queue an
+  old-epoch press behind the barrier, restart the host, then press. Admission
+  releases the barrier (`released reason=epoch-changed`), drains the old press
+  natively (`fallback ... reason=peer-gone`, an open from closed), and the
+  arriving press re-reads the launcher and chooses `kind=close` — the opposite
+  of the replay. Without the re-read it chooses open again.
 
 ## The one-pass smoke
 

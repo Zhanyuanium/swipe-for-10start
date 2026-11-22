@@ -146,7 +146,10 @@ watchdog **or at the next admission** means the activation that was asked is
 gone: a taken press is consumed without its ack
 (`reason=epoch-changed`), an untaken one is aborted and replayed, and the queue
 advances without a timer. A stale tick reconciles an **unclaimed** record at
-admission (`reason=stale-unclaimed`) but never a claimed one. The peer words are
+admission (`reason=stale-unclaimed`) but never a claimed one. When admission
+reconciles, it re-reads the launcher state after the replay or drain before
+deciding the arriving press, so an old native open is followed by a close, not a
+second open. The peer words are
 evidence;
 the abort and the claim are the proof. A take is never replayed: at most one
 execution, one native execution when the record is aborted before any claim, and
