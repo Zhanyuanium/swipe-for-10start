@@ -14439,6 +14439,10 @@ constexpr uint32_t kExecDismissRetryMs = 10;
 // recorded module; a false result while Windhawk's PDB fetch runs is pending,
 // not a refusal.
 std::atomic<HMODULE> g_explorerModuleSeen{nullptr};
+// The loader reference acquired for the one symbol attempt. Worker thread writes
+// it before the install; RoleUninit reads it after the worker join and releases
+// it once. It keeps the mapping alive across the resource read and HookSymbols.
+HMODULE g_explorerModuleRef = nullptr;
 std::atomic<HMODULE> g_explorerSymbolClaim{nullptr};
 std::atomic<bool> g_explorerSymbolsReady{false};
 std::atomic<bool> g_explorerSymbolsRefused{false};
@@ -17548,12 +17552,15 @@ void ProbeExplorerSymbolsFromWorker() {
         g_explorerSymbolsRefused.load(std::memory_order_acquire)) {
         return;
     }
-    HMODULE module = g_explorerModuleSeen.load(std::memory_order_acquire);
+    HMODULE module = g_explorerModuleRef;
     if (!module) {
-        module = GetModuleHandleW(kTwinuiModuleName);
-        if (!module) {
+        // By name, so this is the mapping currently loaded, and with a loader
+        // reference held across the resource read and HookSymbols. A missing
+        // module leaves the attempt unclaimed: the worker stays pending.
+        if (!GetModuleHandleExW(0, kTwinuiModuleName, &module) || !module) {
             return;
         }
+        g_explorerModuleRef = module;
         g_explorerModuleSeen.store(module, std::memory_order_release);
     }
 
@@ -18823,6 +18830,15 @@ void RoleUninit() {
     // instance that registered it. A class that outlives the image would point
     // at an unmapped WndProc.
     UnregisterExecutorClass();
+
+    // The loader reference taken for the one symbol attempt is no longer
+    // needed: the worker is joined, the window is gone and no path reads the
+    // launcher mapping again. One release for the one acquisition.
+    if (g_explorerModuleRef) {
+        FreeLibrary(g_explorerModuleRef);
+        g_explorerModuleRef = nullptr;
+        TraceLog(L"exec launcher module released");
+    }
 
     // No executor exists past the window teardown. Write the clear one last time
     // before the section is closed, so the Start side never reads this
