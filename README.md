@@ -1,12 +1,14 @@
 **English** | [简体中文](README.zh-CN.md)
 
-# swipe-for-10start
+# Swipe for 10Start
 
 Touch and pen swipe gestures for the legacy Windows 10 Start menu that
 ExplorerPatcher restores on Windows 11. Swipe in from the taskbar edge and the
 menu opens following your finger; drag the open menu back toward that edge and
 it slides away and closes. Keyboard opens and closes get the same animation.
-By Zhanyuanium, distributed as Windhawk mods.
+By Zhanyuanium, distributed as a Windhawk mod.
+
+![Following the finger and reversing a close](docs/images/demo.gif)
 
 ## What you need
 
@@ -36,32 +38,25 @@ in StartMenuExperienceHost and the executor in Explorer.
   retract left it; a press inside the shell's hide is latched and served when
   the hide lands. A pull during the close does the same at 24 DIP of inward
   travel. When it grabbed the panel while some of it was still on screen, the
-  armed dismiss is cancelled and the panel
-  reverses from where the retract reached instead of finishing and then popping
-  open. A pull that began in the band and reaches 24 DIP only after the close has
-  finished is still an open: `ShowStartView` is requested and the panel follows
-  the finger from the entry. A pull that lands where the panel has already left,
-  or one on the retract's surface that the close outruns, gets no second chance:
-  it must lift, and the menu stays closed until a
-  new pull. Recovery is best
-  effort, not a guarantee: a press the bridge
-  already swallowed has no native replay left, so a peer that dies between the
-  gate and the serve loses that press.
-  Win+Tab, the lock screen and a display
-  change pass through untouched, so a lock never waits. If the executor half is
-  refused — the Explorer build does not match, or the launcher's public symbols
-  cannot be resolved — the menu still opens and closes, but the close is instant.
-  The launcher hooks are found by public symbol, and their private layout is
-  enabled only on the verified reference image (the fixed file version and all
-  13 reference RVAs); any other build keeps the shell's own path. While the
-  symbols are being fetched, Explorer keeps working and every press runs the
-  shell's own path; with `DiagnosticTrace` on, the log shows
-  `exec launcher symbols pending ...` and then
-  `exec launcher symbols resolved ... match=1`.
-  The Start half withdraws its interception whenever it has no usable renderer:
-  while the menu's root is being replaced or a failed geometry write has
-  invalidated it, a press runs the shell's own path exactly once, and the mod
-  resumes when a usable root is attached.
+  armed dismiss is cancelled and the panel reverses from where the retract
+  reached instead of finishing and then popping open. A pull that began in the
+  band and reaches 24 DIP only after the close has finished is still an open:
+  `ShowStartView` is requested and the panel follows the finger from the entry.
+  A pull that lands where the panel has already left, or one on the retract's
+  surface that the close outruns, gets no second chance: it must lift, and the
+  menu stays closed until a new pull. Recovery is best effort, not a guarantee:
+  a press the bridge already swallowed has no native replay left, so a peer that
+  dies between the gate and the serve loses that press.
+  Win+Tab, the lock screen and a display change pass through untouched, so a
+  lock never waits. If the executor half is refused — the Explorer build does
+  not match, or the launcher's public symbols cannot be resolved — the menu
+  still opens and closes, but the close is instant. The launcher hooks are found
+  by public symbol, and their private layout is enabled only on the verified
+  reference image (the fixed file version and all 13 reference RVAs); any other
+  build keeps the shell's own path. The Start half withdraws its interception
+  whenever it has no usable renderer: while the menu's root is being replaced or
+  a failed geometry write has invalidated it, a press runs the shell's own path
+  exactly once, and the mod resumes when a usable root is attached.
 
 ## Install
 
@@ -102,18 +97,22 @@ without an Explorer restart on this build.
   faster, 0 always starts the animation from a standstill. A finger that was
   held still starts from rest whatever this says, and Windows-key opens always
   start from rest — this setting does not affect them.
+- **Drag intent distance (% of travel)** (`CommitDistancePercent`,
+  default 10, range 1-50) — how far a drag must go toward the target before
+  releasing commits it. A pull that travels less than this springs back closed;
+  a close drag that travels less than this reverses back open. The same value
+  applies on every taskbar side, and a quick flick commits even when it is
+  shorter.
 - **Write a diagnostic trace file** (`DiagnosticTrace`, default off) — turns on
   the decision log described below. Leave it off for everyday use; a bug report
   or a maintainer will ask for it.
 
 ## What works where
 
-- Taskbar on the **left**, **top** or **bottom** — verified. The **right**
-  side runs the same code path and was exercised earlier but is not verified on
-  the current setup. **Auto-hide** is supported (it is the daily
-  configuration).
-- **One upright display.** A taskbar on a secondary monitor or a rotated display
-  is unverified and unsupported; every measurement is the primary panel.
+- Taskbar on the **left**, **top**, **right** or **bottom**. **Auto-hide** is
+  supported.
+- **One display.** A taskbar on a secondary monitor or a rotated display is not
+  supported; every measurement is the primary panel.
 - **Touch** works. **Pen** input is decoded (hover is ignored) but has not yet
   been exercised by hand.
 - On a top or bottom taskbar, a vertical swipe inside the open menu scrolls
@@ -125,8 +124,8 @@ without an Explorer restart on this build.
   background does not request a touch open: the mod asks for the menu only after
   the finger has travelled 24 DIP away from the edge. A tap on a pinned app,
   the clock or the tray stays a native press; a tap on the Start button still
-  opens the menu, as it always does. A pull that starts further
-  in does not open it: only the taskbar edge does that.
+  opens the menu, as it always does. A pull that starts further in does not open
+  it: only the taskbar edge does that.
 - Mouse drag is deliberately not enabled.
 
 ## Try it
@@ -137,9 +136,9 @@ without an Explorer restart on this build.
   before the menu appears still carries its speed into the opening motion, and
   the menu rises from the bottom edge instead of appearing part-way open. A
   short or reversed pull springs back; a longer pull or a flick keeps it open.
-- With the menu open, drag it toward the taskbar edge to dismiss it — past a
-  tenth of the way on a top or bottom taskbar (a fifth on a side one), or with
-  a flick, it commits and slides out.
+- With the menu open, drag it toward the taskbar edge to dismiss it — past the
+  drag-intent distance (a tenth of the panel's travel by default), or with a
+  flick, it commits and slides out.
 - Press the Windows key: the same animation plays on open and on close.
 
 ## If something looks wrong
@@ -162,16 +161,6 @@ without an Explorer restart on this build.
 - While the menu is being dragged, its contents still receive touches at their
   original positions — a known limit, along with the assumption that the touch
   panel covers the primary monitor.
-- **The mod is asleep when nothing is happening.** No periodic 5 ms timer runs:
-  one high-resolution one-shot is armed only while a gesture, a settle, a
-  scheduled close or a pending executor command needs it, and the open/closed
-  state arrives as a window event instead of a 20 ms poll. Measured with the
-  menu closed and nothing touching the screen: **9.2 wakes a second (was 190)**
-  and **no cloak queries (was 32 a second)**; the Start host's idle CPU fell
-  from 0.625 % to 0.026 % of one core. The one recurring wake is the 100 ms
-  liveness tick the Explorer half needs while the mod is serving it. If a cloak
-  event is ever missed, a slow 100 ms fallback poll lands the state inside a
-  bounded watch.
 - The full technical documentation — what was measured, what was falsified,
   and every design decision — lives in [docs/](docs/README.md), including the
   complete [known-limits list](docs/limits.md).

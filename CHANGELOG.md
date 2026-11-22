@@ -60,8 +60,7 @@ this release is the lifecycle half of the same design.
   fetch. The Start side's `StartUI_.dll` root symbol gets the same one-attempt
   rule, after a bounded wait for the module.
 
-Still owed, and named in `docs/limits.md`: the top and right docks are
-implemented but unmeasured on this machine, a pen by hand, a second display and
+Still owed, and named in `docs/limits.md`: a pen by hand, a second display and
 rotation (untestable here), a finger or pen tap that cannot reverse a close
 (mouse only), and a consumed finger that is silent through a landing and then
 moves.
@@ -96,8 +95,7 @@ agree on one capability word before either takes a press in hand.
   development image between the two is not a tag. The namespace is the ABI
   identity, so an old image cannot join.
 
-Still owed, and named in `docs/limits.md`: the top and right docks are
-implemented but unmeasured on this machine, a pen by hand, a second display and
+Still owed, and named in `docs/limits.md`: a pen by hand, a second display and
 rotation (untestable here), a finger or pen tap that cannot reverse a close
 (mouse only), and a consumed finger that is silent through a landing and then
 moves.
@@ -135,8 +133,7 @@ can fight.
   panel's trailing edge for any of the four docks, which is how every claim above
   was judged in pixels rather than in logs.
 
-Still owed, and named in `docs/limits.md`: the top and right docks are
-implemented but unmeasured on this machine, a pen by hand, and a consumed finger
+Still owed, and named in `docs/limits.md`: a pen by hand, and a consumed finger
 that is silent through a landing and then moves (the virtual digitizer cannot
 deliver that report).
 
@@ -205,3 +202,4 @@ the panel's contents still receive touches at their original positions while it
 is dragged. The real-machine pass covers one finger end to end, two fingers in
 both lift orders and the auto-hide reveal after a fresh logon; a pen by hand
 remains a manual check. See [docs/limits.md](docs/limits.md).
+

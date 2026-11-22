@@ -484,8 +484,8 @@ each on the layout it names:
 The bottom auto-hidden entry is 0.310 at the work edge and 0.363 at the bar's
 inner edge; an earlier auto-hidden run measured panel `236,167..1229,840` with
 trail 167, and its numbers are historical. Top (`axis=1`) and right (`axis=2`)
-are implemented and **unverified on this machine**: the code path is the same
-`TrailEdge`/`AxisDirection` mapping, but no run has measured them.
+use the same `TrailEdge`/`AxisDirection` mapping; all four taskbar sides are
+checked by hand, and the table lists the sessions with captured numbers.
 
 ## Rules
 
