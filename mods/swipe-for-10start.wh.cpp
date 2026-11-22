@@ -13621,6 +13621,12 @@ struct UiTeardownCall {
     bool ran;
 };
 
+// Caller-owned acknowledgement for the drain turn. The handler sets it only for
+// an accepted message from this activation's published window.
+struct UiDrainCall {
+    bool ran;
+};
+
 LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
                                   LPARAM lParam) {
     if (message == kUiTeardownMessage) {
@@ -13641,9 +13647,14 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
         return 0;
     }
     if (message == kUiDrainMessage) {
+        auto* call = reinterpret_cast<UiDrainCall*>(lParam);
         if (wParam != kUiDrainMagic ||
             hwnd != g_uiRendezvousHwnd.load(std::memory_order_acquire)) {
             TraceLog(L"ui rendezvous drain ignored hwnd=%p", hwnd);
+            return 0;
+        }
+        if (call) {
+            call->ran = true;
         }
         return 0;
     }
@@ -13830,18 +13841,22 @@ void RequireNoModuleCallbacks(bool waitForEntries) {
 }
 
 // Sends one more synchronous empty turn when a window exists, so the UI thread
-// cannot still be inside an earlier callback or delegate destructor. A window
-// that is gone cannot provide that barrier; the counts are then the only proof,
-// and RequireNoModuleCallbacks runs even after WindowGone.
-void DrainUiThread(HWND hwnd) {
+// cannot still be inside an earlier callback or delegate destructor. Returns
+// whether this activation's window accepted and ran the turn. A window that is
+// gone or refused it cannot provide that barrier; the counts are re-checked
+// either way, and the caller blocks when an off-owner drain did not run.
+bool DrainUiThread(HWND hwnd) {
+    UiDrainCall call{false};
     if (hwnd) {
         if (!IsWindow(hwnd)) {
             TraceLog(L"unload drain window gone; counts decide");
         } else {
-            SendMessageW(hwnd, kUiDrainMessage, kUiDrainMagic, 0);
+            SendMessageW(hwnd, kUiDrainMessage, kUiDrainMagic,
+                         reinterpret_cast<LPARAM>(&call));
         }
     }
     RequireNoModuleCallbacks(true);
+    return call.ran;
 }
 
 BOOL RoleInit() {
@@ -14105,8 +14120,10 @@ void RoleUninit() {
         // TeardownUi ran on this thread and the counts above are zero; no turn
         // is needed and none can be sent anywhere.
     } else if (uiWindow) {
-        DrainUiThread(uiWindow);
-        TraceLog(L"unload ui drained");
+        if (!DrainUiThread(uiWindow)) {
+            BlockUnload(L"ui drain not acknowledged");
+        }
+        TraceLog(L"unload ui drained ack=1");
     } else {
         DrainUiThread(nullptr);
         TraceLog(L"unload teardown without a window; counts clear");
