@@ -14480,16 +14480,26 @@ bool OnRecordedLauncherThread() {
 // this value, not a fresh read: a restart between this decision and the latch
 // creation would otherwise label an old press with the new activation's epoch,
 // and the serve would accept it.
+bool PressQueueHeld();
+
 bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
                                     uint32_t* epochOut) {
     if (epochOut) {
         *epochOut = 0;
     }
     if (!PeerAliveNow()) {
-        // No controller: the caller forwards to the shell. One line per press
-        // names the trigger and says why nothing was decided.
-        TraceLog(L"own pass trigger=%s reason=no-peer", trigger);
-        return false;
+        // A stale tick normally goes native: the controller cannot answer this
+        // press. With an older press outstanding or queued, a native pass would
+        // run this press ahead of that older one; let the hook reach admission,
+        // which reconciles the old record or queues this press. Nothing is
+        // published before its turn.
+        if (PressQueueHeld()) {
+            TraceLog(L"own pass trigger=%s reason=peer-stale-queued", trigger);
+        } else {
+            // No controller and nothing held: the caller forwards to the shell.
+            TraceLog(L"own pass trigger=%s reason=no-peer", trigger);
+            return false;
+        }
     }
     const uint32_t epoch = PeerEpochNow();
     if (!BridgeCanServe()) {
@@ -14522,8 +14532,15 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
 // over the controller's retracted panel.
 bool HideCanServeClose(const wchar_t** reason) {
     if (!PeerAliveNow()) {
-        *reason = L"no-peer";
-        return false;
+        // Same rule as the decision gate: a native close would pass over an
+        // older press. With one outstanding or queued, let the close reach the
+        // dispatcher, which reconciles or queues it.
+        if (PressQueueHeld()) {
+            TraceLog(L"exec hide peer-stale-queued");
+        } else {
+            *reason = L"no-peer";
+            return false;
+        }
     }
     if (!g_callersVerified.load(std::memory_order_relaxed)) {
         // The caller wrappers are the only thing that tells a lock screen from
@@ -15246,6 +15263,12 @@ struct OutstandingPress {
     bool consumedAwaitingAck = false;
 };
 OutstandingPress g_pressOutstanding;  // launcher thread only
+
+// Whether an older press still owns the queue. The hook gates use this to keep a
+// stale-period press out of the native path when it would overtake that press.
+bool PressQueueHeld() {
+    return g_pressOutstanding.pending || g_pressQueueCount > 0;
+}
 
 // Removes every queued press and the outstanding one. The outstanding intent may
 // still be applied by the Start side (no scheme recalls a record), but nothing

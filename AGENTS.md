@@ -56,7 +56,10 @@ terminal withdrawal share one critical section; a flag check followed by an
 independent store let the startup write `alive` after the unload wrote `gone`. A
 trigger with no live peer logs `own pass trigger=... reason=no-peer` (the close
 intent logs `exec pass hide method=... reason=no-peer`) and calls the original, so
-the shell's own toggle works exactly once. A few presses during a start or a stop
+the shell's own toggle works exactly once. With an older press outstanding or
+queued, the stale gate instead logs `own pass trigger=... reason=peer-stale-queued`
+and lets the press reach admission, which reconciles or queues it; a native pass
+would run it ahead of the older press. A few presses during a start or a stop
 are passed natively; that is the intended trade. 600 ms is a detection budget, not
 a delivery guarantee.
 

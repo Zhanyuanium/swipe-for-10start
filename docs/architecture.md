@@ -219,7 +219,9 @@ controller that was not listening. Every consuming hook (`OnHotkeyInvoke`,
 clock taken after the tick. Otherwise it logs one
 `own pass trigger=... reason=no-peer` line (the hide logs
 `exec pass hide method=... reason=no-peer`) and calls the original, so the
-shell's own toggle serves the press exactly once.
+shell's own toggle serves the press exactly once. If an older press is outstanding
+or queued, a stale peer instead logs `reason=peer-stale-queued` and lets the press
+reach admission; a native pass would overtake the queue.
 
 Availability belongs to the activation that serves. The Start side claims a
 `peerEpoch` at attach, withdraws `gone` and resets the shared direction and touch
@@ -425,7 +427,10 @@ Fallbacks, each logged once:
   not the recorded launcher thread, a missing window or a missing primitive: the
   trigger passes through untouched
   (`own pass trigger=... reason=no-peer|no-executor|wrong-thread|no-window`, and
-  `exec pass hide ... reason=no-primitive`), the shell's own path serves it;
+  `exec pass hide ... reason=no-primitive`), the shell's own path serves it; an
+  outstanding or queued press changes the stale-peer case only:
+  `reason=peer-stale-queued` reaches admission instead, so the press cannot
+  overtake the queue;
 - launcher not attached: `exec show`/`exec dismiss` is refused, one repair
   releases the direction entry, `controllerTouch` and the pending open entry, so
   the controller state resyncs from the cloak, and the shell's own gesture opens

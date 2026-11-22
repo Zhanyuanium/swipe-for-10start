@@ -586,7 +586,10 @@ probe or timer failure is answered `unknown`.
   between admission and latch creation cannot relabel an old press. Without the
   gate the trigger passes to the
   shell (`own pass trigger=... reason=no-peer` and the other reasons); nothing is
-  swallowed for a command nobody would execute. The channel alone is not the
+  swallowed for a command nobody would execute. With an older press outstanding or
+  queued, a stale peer is not a pass: the gate logs `reason=peer-stale-queued` and
+  lets the press reach admission, which reconciles or queues it, so it cannot
+  overtake the earlier press. The channel alone is not the
   condition: this mod creates it, so it stays valid with the Start mod disabled.
   A failed worker startup is the same case for the life of the attachment. 600 ms
   is a detection budget, not a delivery guarantee.
