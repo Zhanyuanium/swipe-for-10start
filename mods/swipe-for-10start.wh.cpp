@@ -14530,6 +14530,11 @@ constexpr uint64_t kPressLatchRetryMs = 100;
 // press may spend behind older presses (four entries, each at most the ack bound)
 // before its own decision is served by the shell for the same reason.
 constexpr uint64_t kPressAckTimeoutMs = 1000;
+// A claimed record whose controller stops heartbeating is treated as gone for
+// the claim too. The threshold is three times the 600 ms detection budget and
+// three times the 1000 ms ack bound, so a paused but live Start host keeps its
+// claim; a killed one is released without a replay (the press may have run).
+constexpr uint32_t kClaimedPeerStaleMs = 3000;
 // While a timed-out press is reserved (not taken, peer still alive), the
 // publisher re-checks its claim at this cadence. The peer's own staleness window
 // is the outer bound: once the controller stops ticking it cannot take the
@@ -16542,6 +16547,38 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     const bool epochChanged =
         press.publishedEpoch != 0 && epochNow != press.publishedEpoch;
     const LONG64 taken = SwipeIpcTakenIntent(&g_ipc);
+    const uint32_t peerAge = PeerTickAgeMs();
+    if (taken == press.seq && peerAge >= kClaimedPeerStaleMs &&
+        !epochChanged && PeerStateAliveNow()) {
+        // The claim still reads alive only because a hard-killed Start host
+        // cannot withdraw peerState. Three seconds without a heartbeat is the
+        // proof that the claim is dead; the press may already have run, so it is
+        // consumed without a replay and the queue is released.
+        g_pressOutstanding = OutstandingPress{};
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
+        if (press.external) {
+            TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
+                    L"decision=released reason=peer-stale-claimed",
+                    static_cast<long long>(press.seq),
+                    static_cast<unsigned long long>(wait), press.publishedEpoch,
+                    epochNow);
+        } else {
+            TraceLog(L"own press abandoned seq=%lld trigger=%s entry=%s "
+                    L"wait=%llu epoch=%u->%u decision=consumed "
+                    L"reason=peer-stale-claimed",
+                    static_cast<long long>(press.seq),
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(wait), press.publishedEpoch,
+                    epochNow);
+        }
+        ResumePressQueueAge();
+        ServeNextPress(L"admission");
+        return true;
+    }
     if (taken == press.seq && !epochChanged && PeerStateAliveNow()) {
         // The caller read no claim before this call and Start claimed and
         // validated the copy during it.
@@ -16641,10 +16678,15 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
         const bool claimed =
             SwipeIpcTakenIntent(&g_ipc) == g_pressOutstanding.seq;
         const bool staleUnclaimed = !claimed && !PeerAliveNow();
-        if (epochChanged || peerGone || staleUnclaimed) {
+        const bool staleClaimed =
+            claimed && PeerTickAgeMs() >= kClaimedPeerStaleMs;
+        if (epochChanged || peerGone || staleUnclaimed || staleClaimed) {
             reconciled = ReconcileOutstandingAtAdmission(
-                epochChanged ? L"epoch-changed"
-                             : (peerGone ? L"peer-gone" : L"stale-unclaimed"),
+                epochChanged
+                    ? L"epoch-changed"
+                    : (peerGone ? L"peer-gone"
+                                : (staleClaimed ? L"peer-stale-claimed"
+                                                : L"stale-unclaimed")),
                 epochNow);
         }
     }
@@ -16688,6 +16730,19 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
     ServePress(press, &current);
 }
 
+// Whether an intent answer proves the Start side did nothing with the press.
+// `Refused` is only written on the four branches that return before any action
+// (no capability, open with no executor, close with no settle, close whose
+// dismiss was not published); `Superseded` proves it only when this side's own
+// abort landed first.
+bool AckProvesNothingRan(const OutstandingPress& press, int32_t state) {
+    if (press.external) {
+        return false;
+    }
+    return state == kSwipeAckRefused ||
+           (press.aborted && state == kSwipeAckSuperseded);
+}
+
 // The intent ack for the outstanding press. The worker posts this to the
 // executor window; the record is read here, on the launcher thread, and the next
 // press is published with the direction the controller has by now.
@@ -16703,10 +16758,10 @@ void HandlePressAck() {
     }
     const OutstandingPress press = g_pressOutstanding;
     // A record the bridge aborted, answered superseded, was copied by nobody:
-    // the one execution is still owed to the original. An executed ack means
-    // Start acted, so no replay follows.
-    const bool replayed = !press.external && press.aborted &&
-                          ack.state == kSwipeAckSuperseded;
+    // the one execution is still owed to the original. A refused answer is the
+    // same proof for all four refusal branches; an executed ack means Start
+    // acted, so no replay follows either way.
+    const bool replayed = AckProvesNothingRan(press, ack.state);
     g_pressOutstanding = OutstandingPress{};
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (window) {
@@ -16810,10 +16865,10 @@ void HandlePressAckTimeout() {
     SwipeIpcIntentAck ack{};
     if (SwipeIpcReadIntentAck(&g_ipc, &ack) && ack.intent == press.seq) {
         // The answer won the race with the timer. It is the same path as an
-        // ordinary ack, not a replay — unless the bridge aborted the record and
-        // Start answered superseded, which proves nothing was copied.
-        const bool replayed = !press.external && press.aborted &&
-                              ack.state == kSwipeAckSuperseded;
+        // ordinary ack, not a replay — unless the Start side refused before
+        // acting, or the bridge aborted the record and Start answered
+        // superseded, both of which prove nothing was copied.
+        const bool replayed = AckProvesNothingRan(press, ack.state);
         g_pressOutstanding = OutstandingPress{};
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         if (window) {
@@ -16882,14 +16937,21 @@ void HandlePressAckTimeout() {
             return;
         }
         const bool claimed = taken == press.seq;
-        if (peerAlive || (claimed && PeerStateAliveNow())) {
+        // A claim on a heartbeat that has been stale for kClaimedPeerStaleMs is
+        // treated as gone. The takeover has no original to replay, so the
+        // barrier is released without one.
+        const bool staleClaimed = claimed && peerAge >= kClaimedPeerStaleMs;
+        if (!staleClaimed &&
+            (peerAlive || (claimed && PeerStateAliveNow()))) {
             ReserveExternalBarrier(press, peer, peerAge, epochNow, wait, claimed,
                                    peerAlive ? L"peer-alive" : L"claimed");
             return;
         }
         const wchar_t* releaseReason = nullptr;
         bool claimedNow = claimed;
-        if (!PeerStateAliveNow()) {
+        if (staleClaimed) {
+            releaseReason = L"peer-stale-claimed";
+        } else if (!PeerStateAliveNow()) {
             releaseReason = L"peer-gone";
         } else {
             const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
@@ -16947,6 +17009,27 @@ void HandlePressAckTimeout() {
                     press.publishedEpoch, epochNow);
             ResumePressQueueAge();
             ServeNextPress(L"epoch");
+            return;
+        }
+        if (peerAge >= kClaimedPeerStaleMs) {
+            // The claimed record's activation has not heartbeated for three
+            // seconds. It may have applied the press, so there is no replay; the
+            // slot is released and the next press may proceed.
+            g_pressOutstanding = OutstandingPress{};
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                KillTimer(window, kPressAckTimer);
+            }
+            TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s "
+                    L"wait=%llu taken=%lld peer=%s age=%u epoch=%u "
+                    L"decision=consumed reason=peer-stale-claimed",
+                    static_cast<long long>(press.seq),
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(wait),
+                    static_cast<long long>(taken), peer, peerAge, epochNow);
+            ResumePressQueueAge();
+            ServeNextPress(L"timeout");
             return;
         }
         if (!g_pressOutstanding.consumedAwaitingAck) {
