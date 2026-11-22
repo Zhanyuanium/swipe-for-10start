@@ -62,12 +62,16 @@ capability is enabled only when the loaded image is the identity those offsets
 were read from: fixed file version **10.0.26100.10068** (the display string still
 reads 9949) and all 13 named symbols at the reference RVAs.
 `ModuleFixedFileVersion` reads the fixed version through `version.dll` (resolved
-at runtime), and `InstallExplorerHooks` compares every resolved RVA. On any other
-image the capability is off: the decision hooks pass their original,
+at runtime), and `InstallExplorerHooks` checks it before the symbol request. A
+different image is refused without calling `HookSymbols`, so the PDB fetch never
+starts there; the same line reports `skipped=version`. Only the reference version
+reaches `HookSymbols`, whose 13 resolved RVAs are compared with the reference.
+On any other image the capability is off: the decision hooks pass their original,
 `LauncherNow` returns null, the executor refuses its command, and the shell
 serves the press. One line states it:
-`exec launcher layout unverified version=... matches=... native=1 reason=version|rva`;
-the verified image logs `exec launcher layout verified ... native=0`.
+`exec launcher layout unverified version=... matches=... native=1 reason=version|rva`
+(`skipped=version` when no fetch ran); the verified image logs
+`exec launcher layout verified ... native=0`.
 
 Measured in explorer on 2026-11-22 (10.0.26100.10068); the 13 symbols resolve at
 the reference RVAs and the private layout is the one this gate requires:
@@ -284,12 +288,15 @@ retracted panel.
 
 **Symbol work is one attempt.** `HookSymbols` blocks on Windhawk's PDB fetch
 (measured up to 571 s), so the executor worker runs it, never a hook, and makes
-exactly one attempt per module per install. A false result is terminal:
+exactly one attempt per module per install. The fixed version is checked before
+that call: a different `twinui.pcshell.dll` is refused with
+`... reason=version skipped=version` and no PDB is fetched. A false result on
+the reference version is terminal:
 `exec launcher symbols unresolved attempts=1 ...`, no retry, and every press
-stays native. A resolved symbol set whose fixed version or RVAs are not the
-reference identity is `exec launcher layout unverified ... native=1` and the
-capability stays 0; that is not a fetch failure and is not retried, because the
-loaded module cannot change under the session.
+stays native. A resolved symbol set whose RVAs are not the reference identity is
+`exec launcher layout unverified ... native=1 reason=rva` and the capability
+stays 0; that is not a fetch failure and is not retried, because the loaded
+module cannot change under the session.
 
 `peerState` is still a detection budget, not a delivery guarantee. A decision
 taken inside the 600 ms window can be published after the peer died, and a press

@@ -43,20 +43,22 @@
   warm cache the join is immediate.
 - **The private launcher layout is enabled only for the verified twinui identity.**
   `launcher+0x160`, `state+0x28` and the state vtable `+0x70` were read from one
-  image. The mod requires the fixed file version `10.0.26100.10068` and all 13
-  named symbols at the reference RVAs before it enables the decision hooks or
-  lets the executor read the launcher. Any other image — even one that keeps all
-  13 names — runs the shell's own path; the one line
-  `exec launcher layout unverified ... native=1 reason=version|rva` states why.
-  This is deliberately version-locked: a monthly update needs a new reference
-  check, not a sentinel probe.
-- **Symbol resolution is one attempt.** `HookSymbols` blocks on the public PDB
-  fetch (measured up to 571 s) and is called once per module per install on the
-  executor worker. A false result is terminal for the session
-  (`exec launcher symbols unresolved attempts=1 ...`); there is no retry storm
-  and no press waits on the fetch. A resolved set with an unverified layout is a
-  separate, equally terminal state: the capability stays 0 and the shell serves
-  every trigger.
+  image. Before any symbol work, `InstallExplorerHooks` reads the module's fixed
+  file version. A version other than `10.0.26100.10068` is refused on the spot:
+  `exec launcher layout unverified ... native=1 reason=version skipped=version`,
+  no `HookSymbols` call, no PDB fetch, no hook. Only a matching version reaches
+  the fetch, where all 13 named symbols must resolve at the reference RVAs. Any
+  other image — even one that keeps all 13 names — runs the shell's own path;
+  `exec launcher layout unverified ... native=1 reason=rva` states why. This is
+  deliberately version-locked: a monthly update needs a new reference check, not
+  a sentinel probe.
+- **Symbol resolution is one attempt, after the version gate.** `HookSymbols`
+  blocks on the public PDB fetch (measured up to 571 s) and is called once per
+  module per install on the executor worker. A false result is terminal for the
+  session (`exec launcher symbols unresolved attempts=1 ...`); there is no retry
+  storm and no press waits on the fetch. A resolved set with an unverified layout
+  is a separate, equally terminal state: the capability stays 0 and the shell
+  serves every trigger.
 - **A teardown that cannot be proved gone blocks the unload.** The image is not
   pinned, so returning while a mod-owned thread, delegate or owner window is
   still reachable would hand it unmapped code. The unload joins the two owned

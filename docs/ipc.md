@@ -397,13 +397,17 @@ reader takes the steady value. A channel whose `Capability` event could not be
 created falls back to a 100 ms read while the peer is unadvertised; with the
 event present, no timer is armed for it.
 
-The symbol attempt is part of this capability, not a retry loop. `HookSymbols`
+The symbol attempt is part of this capability, not a retry loop. The fixed
+`twinui.pcshell.dll` version is checked before `HookSymbols`; a different image
+logs `exec launcher layout unverified ... reason=version skipped=version` and no
+PDB is fetched for it. On the reference version, `HookSymbols`
 blocks on the PDB fetch (measured up to 571 s), so the worker makes **one attempt
 per module per install**. A false result is terminal for the session:
 `exec launcher symbols unresolved attempts=1 ...` and every trigger stays
-native. A resolved symbol set whose layout is not the reference identity stays
-`exec launcher layout unverified ... native=1` and the capability remains 0; it is
-not retried, because the image cannot change under the loaded module.
+native. A resolved symbol set whose RVAs are not the reference identity stays
+`exec launcher layout unverified ... native=1 reason=rva` and the capability
+remains 0; it is not retried, because the image cannot change under the loaded
+module.
 
 ## Initialisation
 

@@ -76,7 +76,10 @@ Start side through the `Capability` event. The Start side withdraws the peer on 
 1 -> 0 transition (`ipc peer gone reason=capability-lost`), releases any gesture or
 close it was driving and restores `Progress` at the rest the cloak shows. It never
 advertises, settles or requests a show without the word. A missing capability
-event falls back to a 100 ms read only while the peer is unadvertised.
+event falls back to a 100 ms read only while the peer is unadvertised. The fixed
+`twinui.pcshell.dll` version is checked before the one `HookSymbols` attempt: an
+unsupported build is `symbols-refused` with `... skipped=version` and never
+downloads a PDB.
 
 The bridge's gate proves a capability, not just a peer: the recorded launcher
 thread (checked **before** any launcher-local field, including the existing-window

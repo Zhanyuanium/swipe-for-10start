@@ -116,7 +116,8 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   APIs for Progress, and swipe_ipc_shared.h for the intents, executor
  *   commands and acks, the open generation, the controller direction and peer
  *   liveness. In explorer.exe (namespace bridge): twinui.pcshell.dll
- *   10.0.26100.9949 (the launcher singleton, ShowStartView, Dismiss, IsVisible,
+ *   fixed 10.0.26100.10068 (display string 9949; the launcher singleton,
+ *   ShowStartView, Dismiss, IsVisible,
  *   XamlLauncher::OnHotkeyInvoke, XamlLauncherState::OnStartShown/
  *   OnStartHidden/HideStartAndCortana, CStartExperienceManager::Show), the same
  *   channel from the other end.
@@ -145,7 +146,9 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   Wh_ModInit
  *   selects exactly one role table from the host executable name
  *   (start::Role or bridge::Role), and the four Windhawk entry points forward
- *   to that table.
+ *   to that table. The bridge reads the loaded twinui fixed file version before
+ *   its one symbol attempt: any other image is refused with
+ *   `exec launcher layout unverified ... skipped=version` and no PDB fetch.
  * [POS]: the single shipping source. The two halves were two mods before 0.7.0
  *   and keep their two runtime lifetimes: explorer outlives a Start restart, and
  *   a touch-first open can reach the launcher before any Win or Start-button
@@ -17162,22 +17165,61 @@ HRESULT ActiveZBand_Hook(void* self, unsigned long a, unsigned long b,
                                 : E_FAIL;
 }
 
-// One resolution attempt. Returns true only when this call installed every hook;
-// a false result while the PDB fetch runs is pending, and the worker retries.
-bool InstallExplorerHooks(HMODULE module) {
+// One resolution attempt. `Settled` means the one attempt finished (hooks
+// installed, with the layout gate deciding the capability); `VersionRefused`
+// means the image itself is not the reference and no symbol work was started;
+// `Unresolved` means the attempt failed and no second one exists.
+enum class ExplorerHookOutcome {
+    Settled,
+    VersionRefused,
+    Unresolved,
+};
+
+ExplorerHookOutcome InstallExplorerHooks(HMODULE module) {
     if (!module) {
-        return false;
+        return ExplorerHookOutcome::Unresolved;
     }
 
     AcquireSRWLockExclusive(&g_explorerSymbolLock);
     HMODULE expected = nullptr;
     if (!g_explorerSymbolClaim.compare_exchange_strong(expected, module)) {
         ReleaseSRWLockExclusive(&g_explorerSymbolLock);
-        return false;
+        return ExplorerHookOutcome::Unresolved;
     }
     if (g_disabled.load(std::memory_order_relaxed)) {
         ReleaseSRWLockExclusive(&g_explorerSymbolLock);
-        return false;
+        return ExplorerHookOutcome::Unresolved;
+    }
+
+    // The fixed file version is checked before HookSymbols, not after: the call
+    // blocks on Windhawk's PDB fetch, and the private RVAs describe one file
+    // version only. An unsupported build is refused here, so it never downloads
+    // a PDB, installs a hook or probes a guessed layout. The terminal line has
+    // the same shape as the post-fetch refusal and names the skip.
+    const uint64_t version = ModuleFixedFileVersion(module);
+    if (version != kTwinuiReferenceVersion) {
+        g_launcherLayoutVerified.store(false, std::memory_order_release);
+        g_explorerSymbolsRefused.store(true, std::memory_order_release);
+        TraceLog(L"exec launcher layout unverified version=%u.%u.%u.%u matches=0 "
+                L"native=1 reason=version skipped=version",
+                static_cast<unsigned>((version >> 48) & 0xFFFF),
+                static_cast<unsigned>((version >> 32) & 0xFFFF),
+                static_cast<unsigned>((version >> 16) & 0xFFFF),
+                static_cast<unsigned>(version & 0xFFFF));
+        Wh_Log(L"twinui.pcshell.dll fixed version %u.%u.%u.%u is not the "
+               L"verified reference %u.%u.%u.%u; symbols were not requested and "
+               L"every press stays native",
+               static_cast<unsigned>((version >> 48) & 0xFFFF),
+               static_cast<unsigned>((version >> 32) & 0xFFFF),
+               static_cast<unsigned>((version >> 16) & 0xFFFF),
+               static_cast<unsigned>(version & 0xFFFF),
+               static_cast<unsigned>((kTwinuiReferenceVersion >> 48) & 0xFFFF),
+               static_cast<unsigned>((kTwinuiReferenceVersion >> 32) & 0xFFFF),
+               static_cast<unsigned>((kTwinuiReferenceVersion >> 16) & 0xFFFF),
+               static_cast<unsigned>(kTwinuiReferenceVersion & 0xFFFF));
+        ReleaseSRWLockExclusive(&g_explorerSymbolLock);
+        PublishExecutorCapability(L"symbols-refused");
+        return ExplorerHookOutcome::VersionRefused;
     }
     TraceLog(L"exec launcher symbols begin module=%p", module);
 
@@ -17242,7 +17284,7 @@ bool InstallExplorerHooks(HMODULE module) {
         !ActiveZBand_Original || !g_launcherSlot || !g_launcherIsVisible) {
         g_explorerSymbolClaim.store(nullptr, std::memory_order_release);
         ReleaseSRWLockExclusive(&g_explorerSymbolLock);
-        return false;
+        return ExplorerHookOutcome::Unresolved;
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(module);
@@ -17288,7 +17330,6 @@ bool InstallExplorerHooks(HMODULE module) {
             reinterpret_cast<uintptr_t>(symbol.address) - base;
         matches += rva == symbol.expectedRva ? 1 : 0;
     }
-    const uint64_t version = ModuleFixedFileVersion(module);
     const bool layoutVerified =
         matches == static_cast<int>(ARRAYSIZE(resolved)) &&
         version == kTwinuiReferenceVersion;
@@ -17348,7 +17389,7 @@ bool InstallExplorerHooks(HMODULE module) {
            L"RVAs); launcher hooks installed layout=%d",
            reinterpret_cast<void*>(base), matches,
            static_cast<int>(ARRAYSIZE(resolved)), layoutVerified ? 1 : 0);
-    return true;
+    return ExplorerHookOutcome::Settled;
 }
 
 // Records an already-loaded twinui. Called from init and AfterInit; it never
@@ -17390,11 +17431,11 @@ void ProbeExplorerSymbolsFromWorker() {
     // Claim the one attempt before the blocking call. A concurrent caller (there
     // is none but the unload) sees the claim and does not start a second fetch.
     g_explorerSymbolAttempted.store(true, std::memory_order_release);
-    if (InstallExplorerHooks(module)) {
-        // The install applied its own queued hooks under the lock and published
-        // the resulting capability. A resolved symbol set with an unverified
-        // layout is still "resolved": the layout gate, not a retry, decides
-        // whether the capability is on.
+    const ExplorerHookOutcome outcome = InstallExplorerHooks(module);
+    if (outcome != ExplorerHookOutcome::Unresolved) {
+        // Settled: the layout gate, not a retry, decides whether the capability
+        // is on. VersionRefused: the terminal line was already written under the
+        // lock and no symbol work was started.
         return;
     }
     if (g_disabled.load(std::memory_order_relaxed)) {

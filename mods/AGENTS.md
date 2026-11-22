@@ -398,16 +398,18 @@ thread; `Wh_ModBeforeUninit` withdraws the peer, signals the thread and joins it
 the published cloak handle, closes the cloak event and the deadline timer,
 unregisters raw input, releases the
 1 ms timer period, destroys its window and unregisters its fixed class under
-`&__ImageBase` before exiting; a failed unregister is retried, never returned as
-success. Registration is fixed-name and treats `ERROR_CLASS_ALREADY_EXISTS` as
-failure, exactly as the executor's class does.
-`Wh_ModUninit` runs one UI teardown turn on the captured dispatcher: revokes the
+`&__ImageBase` before exiting; a failed unregister blocks the unload once, never
+returned as success. Registration is fixed-name and treats
+`ERROR_CLASS_ALREADY_EXISTS` as failure, exactly as the executor's class does.
+`Wh_ModUninit` runs the UI teardown as one synchronous `SendMessage` round trip
+on the CoreWindow thread recorded before `Loaded` was registered: it revokes the
 XAML handlers and the settle batch, restores resting progress and the neutral
 translation, resets the scroller watches and drops the UI-owned objects
-(`[[clang::no_destroy]]` protects a skipped uninit, not a normal one). Counted
-module entries are drained through their event; the IPC view and handles close
-last. A revoke or thread proof that cannot be obtained keeps waiting rather than
-returning success. The root hook is resolved by public symbol
+(`[[clang::no_destroy]]` protects a skipped uninit, not a normal one). The counted
+module entries are waited once and followed by one empty round trip; the IPC view
+and handles close last. A revoke or thread proof that cannot be obtained blocks
+the unload once rather than returning success. The root hook is resolved by
+public symbol
 (`StartUI::App::PrepareRootElement`): the `LoadLibraryExW` notification and the
 init/AfterInit probes only record the module handle (`GetModuleHandleW`), and
 the input thread runs `HookSymbols` on its first tick, because
@@ -469,10 +471,12 @@ expected=... match=0|1`); the set line
 `exec launcher symbols resolved ... count=13 matches=13 match=1` is the evidence
 line. One missing symbol refuses the whole set and the hooks are not applied: a
 toggle that can open but not close is worse than the shell's path. The private
-layout is gated on identity, not names: the fixed file version must be
-`10.0.26100.10068` and all 13 resolved RVAs must match the reference. On any
-other image the hooks pass, `LauncherNow` returns null, the executor refuses
-and the shell serves the press; one
+layout is gated on identity, not names: the fixed file version is read before
+`HookSymbols` and must be `10.0.26100.10068`; a different image logs
+`exec launcher layout unverified ... reason=version skipped=version` and never
+starts the PDB fetch. On the reference version all 13 resolved RVAs must also
+match. On any other image the hooks pass, `LauncherNow` returns null, the
+executor refuses and the shell serves the press; one
 `exec launcher layout unverified ... native=1 reason=...` line states it, and
 the verified image logs `exec launcher layout verified ... native=0`. The apply
 (`Wh_ApplyHookOperations`) is inside the symbol-install critical section, before
@@ -481,7 +485,8 @@ takes the lock first and makes the install refuse before `HookSymbols`, so no
 hook can become live after the stop.
 
 **One attempt.** `HookSymbols` blocks on the public PDB fetch (measured up to
-571 s), so the worker calls it once per module per install. A false result is
+571 s), so the worker calls it once per module per install, and only after the
+version gate above. A false result is
 terminal: `exec launcher symbols unresolved attempts=1 ...`, no retry, and every
 trigger stays native. A resolved set with an unverified layout is the other
 terminal state; the image cannot change under the loaded module, so retrying the
