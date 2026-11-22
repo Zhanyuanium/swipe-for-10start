@@ -59,13 +59,17 @@ reachable.
    holds it through `TeardownUiOnUiThread`; an in-flight hook finishes first, and
    a hook arriving after the flag sees it and registers nothing. This also lets
    the teardown revoke a gesture close's settle batch instead of waiting for a
-   lease only that teardown can release. The turn revokes the `Loaded`,
+   lease only that teardown can release. A top-level handler runs the turn
+   immediately. A XAML handler on the stack defers it with
+   `g_uiTeardownPending`; the last `UiDepthGuard` unwinds, runs the turn and sets
+   `g_uiTeardownAck`, and the unload waits for that event instead of returning
+   into the handler. The turn revokes the `Loaded`,
    `SizeChanged`, `LayoutUpdated` and scroller
    `ViewChanged` handlers, detaches the settle batch's `Completed`, stops the
    animations, restores resting `Progress` and the neutral translation, resets
    the scroller watches and drops the UI-owned composition/root/dispatcher
    references. The message returns only after the turn and its delegate thunks
-   have returned.
+   have returned, or after a deferred turn acknowledged.
 4. **After the teardown the UI-turn count and the registration count must be
    zero, and the drain must acknowledge.** The admission lock is not part of this
    count. No UI-turn entry and no registered XAML handler may remain. Off the
@@ -105,17 +109,24 @@ them explicitly on the UI thread.
    lock as their resolution, so a stop either waits for the complete install or
    makes the install refuse; the worker never applies hooks after this point.
 2. **`Wh_ModUninit`** joins the posting worker **INFINITE**. The worker posts
-   commands and installs a targeted `WH_GETMESSAGE` hook on an already recorded
-   launcher thread; that hook creates the executor window there, not on the
-   worker thread. The join stops posting but says nothing about creation or
+   commands. A targeted `WH_GETMESSAGE` hook creates the executor window on its
+   first message on the launcher thread — the thread the manager's `Show`
+   proposed, or one a Win/Start-button entry recorded — not on the worker thread.
+   The hook commits a proposed thread only after that message proves the loop
+   pumps; a caller that never pumps leaves it uncommitted and capability 0. The
+   join stops posting but says nothing about creation or
    destruction. The window destruction recomputes the capability (the
    line appears only on a change), and the class teardown writes the last
    recomputation before the section is closed.
 3. The one published HWND is destroyed synchronously on its owner thread:
    directly when the unload already runs there, otherwise with
-   `SendMessage(kExecTeardownMessage)`, which kills the dismiss/probe/latch
-   timers and calls `DestroyWindow`; the call returns after `WM_NCDESTROY` and
-   the window publication is cleared. No completion event or wait is used. A
+   `SendMessage(kExecTeardownMessage)`. A top-level handler kills the
+   dismiss/probe/latch timers and calls `DestroyWindow`; a handler that lands
+   while a WndProc or `RunPressOriginal` frame is on the stack marks the
+   teardown pending, and that frame's outermost unwind completes it. The unload
+   waits on the acknowledgement event, so a nested send cannot return into an
+   outer frame that can still call the shell. The window publication is cleared
+   at `WM_NCDESTROY`. A
    destroyed window means this activation's window is gone, not that the
    launcher thread is gone; a window that does not answer blocks.
 4. The fixed window class is unregistered under the same instance that registered
@@ -129,17 +140,18 @@ them explicitly on the UI thread.
    release after disabling, not after removal. Worker/stop handles are closed,
    then the IPC view and its events.
 
-The manager's `Show` is the bootstrap: it is the only entry that records an
-unknown launcher thread and creates the window with no live peer and no worker.
-`Dismiss`/`ShowStartView` called from a COM/taskbar thread that does not pump
-pass natively instead of creating an executor window there. The Win and
-Start-button decision entries cannot bootstrap: both run only after a live peer
-and a started worker, so they serve a window that already exists and never
-create one for a service that is not answering (`OnStartButtonPressed` is not
+The manager's `Show` is the bootstrap: it proposes an unknown launcher thread
+with no live peer and no worker, and a targeted `WH_GETMESSAGE` hook fires on
+that thread, commits it and creates the window. A `Dismiss`/`ShowStartView`
+called from a COM/taskbar thread that does not pump passes natively; the `Show`
+running there never fires the hook, so capability stays 0. The Win and
+Start-button decision entries adopt the thread directly and create the window,
+but only after a live peer and a started worker, so they never serve a service
+that is not answering (`OnStartButtonPressed` is not
 called on this build). While capability is 0 the Win hook passes its press
 natively. The shell's own `ShowStartView` call reaches
-`CStartExperienceManager::Show`, whose hook records the launcher thread and
-creates the window; the next press is then the controller's.
+`CStartExperienceManager::Show`, whose hook proposes the launcher thread; the
+next press is then the controller's.
 
 The old creator reservation, admission flag, stop target, reaper, creator drain
 and `CloseCallLease` count are **gone**. The worker is joined before the window is

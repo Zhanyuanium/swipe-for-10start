@@ -86,7 +86,10 @@ finger.
 The dismiss axis and the panel-acceptance band come from the taskbar itself,
 never the Start window's rect. `SHAppBarMessage(ABM_GETTASKBARPOS)` is the
 primary source (`uEdge` and its docked rectangle, reported unchanged while the
-bar is hidden); the `Shell_TrayWnd`/`Shell_SecondaryTrayWnd` rectangle is the
+bar is hidden); the input thread reads it at startup and refreshes the cache on
+`WM_SETTINGCHANGE`/`WM_DISPLAYCHANGE`, and every XAML path reads the cache so no
+handler makes a cross-process call. The `Shell_TrayWnd`/`Shell_SecondaryTrayWnd`
+rectangle is the
 cross-check (the bar must be flush to the edge **and** thin across it, so a
 full-width bottom bar is not mistaken for a side one); the work-area inset
 names the axis only when it truly insets, because auto-hide makes it zero by

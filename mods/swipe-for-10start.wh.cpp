@@ -1100,7 +1100,9 @@ std::atomic<bool> g_stopDismissCallback{false};
 //   2. Uninit runs one UI teardown turn: revoke the XAML handlers and the
 //      settle batch, stop the animations, restore resting progress and neutral
 //      translation, drop the UI-owned objects. The turn signals completion and
-//      the wait is on that signal, not on a registration count.
+//      the wait is on that signal, not on a registration count. A XAML handler
+//      on the stack defers the turn to its outermost unwind; the unload waits
+//      for that acknowledgement instead of freeing under the handler.
 //   3. The counted module entries (a batch completion already dispatched) are
 //      drained through their event. Only then are the IPC view and the handles
 //      closed.
@@ -1139,6 +1141,12 @@ std::atomic<DWORD> g_hidThreadId{0};
 // `Wh_ModUninit` revokes first, so no new entry can start, and then waits for the
 // count to reach zero. That is the invariant: every entry into module code from
 // the compositor or the dispatcher is counted from before it can run.
+//
+// XAML event handlers are the exception, and they use the UI depth counter
+// above: a handler can run inside a shell call that pumps sent messages, and the
+// unload's teardown message is dispatched nested there. The guard defers that
+// teardown to the outermost handler, and the unload waits for its own
+// acknowledgement event, not for the count.
 // ---------------------------------------------------------------------------
 std::atomic<int> g_moduleEntryCount{0};
 // Set by the first UI-turn lease ever constructed: a dispatcher turn or the
@@ -1147,6 +1155,14 @@ std::atomic<int> g_moduleEntryCount{0};
 // below, not this count. The first turn logs once, so a trace shows the guard's
 // flag is live.
 std::atomic<bool> g_uiTurnEverUsed{false};
+
+// Module code on the XAML UI thread: the XAML handlers and the scroller
+// ViewChanged callback. A teardown message that arrives while one is on the
+// stack is deferred to the outermost unwind; the unload waits for the
+// acknowledgement instead of freeing under a nested handler.
+std::atomic<int> g_uiOwnerDepth{0};
+std::atomic<bool> g_uiTeardownPending{false};
+HANDLE g_uiTeardownAck = nullptr;        // created in RoleInit
 
 // The root hook's admission gate. The hook takes it shared; unload takes it
 // exclusive before it chooses a teardown, waits for an in-flight hook, and holds
@@ -1217,6 +1233,33 @@ class ModuleEntryLease {
 
     ModuleEntryLease(const ModuleEntryLease&) = delete;
     ModuleEntryLease& operator=(const ModuleEntryLease&) = delete;
+};
+
+void TeardownUi();
+
+// Counts one entry of module code on the XAML UI thread. A deferred teardown
+// runs when the last guard unwinds, after the handler that was on the stack has
+// returned, and then acknowledges the unload. The destructor must not unwind.
+class UiDepthGuard {
+  public:
+    UiDepthGuard() { ++g_uiOwnerDepth; }
+    ~UiDepthGuard() {
+        if (--g_uiOwnerDepth > 0 || !g_uiTeardownPending) {
+            return;
+        }
+        g_uiTeardownPending = false;
+        try {
+            TeardownUi();
+        } catch (...) {
+            // A handler must not unwind into the shell's message loop.
+        }
+        if (g_uiTeardownAck) {
+            SetEvent(g_uiTeardownAck);
+        }
+    }
+
+    UiDepthGuard(const UiDepthGuard&) = delete;
+    UiDepthGuard& operator=(const UiDepthGuard&) = delete;
 };
 
 // ---------------------------------------------------------------------------
@@ -2145,6 +2188,8 @@ std::atomic<bool> g_measureDeferred{false};
 void RevokeHandlers();
 void ResetComposition();
 void ResetRenderer();
+void TeardownUi();
+void RefreshTaskbarAppBarCache();
 HWND FindStartCoreWindow();
 
 // Defined with the UI-thread publication below. The one geometry measurement and
@@ -10158,6 +10203,7 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         case WM_SETTINGCHANGE:
             if (wParam == SPI_SETWORKAREA) {
                 TraceLog(L"work area changed");
+                RefreshTaskbarAppBarCache();
                 PostGeometryMeasurement(
                     StartMeasureRequest(!g_hidSession.active &&
                                         !g_reveal.edgeCandidate),
@@ -10166,6 +10212,7 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
             return 0;
         case WM_DISPLAYCHANGE:
             TraceLog(L"work area changed");
+            RefreshTaskbarAppBarCache();
             PostGeometryMeasurement(
                 StartMeasureRequest(!g_hidSession.active &&
                                     !g_reveal.edgeCandidate),
@@ -10244,6 +10291,9 @@ void UnregisterHidWindowClass(HINSTANCE instance) {
 
 DWORD WINAPI HidInputThread(LPVOID) {
     g_hidThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // The appbar dock record is a cross-process call; read it here, not in the
+    // XAML handlers. Every later refresh is a broadcast on this thread.
+    RefreshTaskbarAppBarCache();
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = HidWindowProc;
@@ -10789,6 +10839,33 @@ struct DisplayRectDip {
     float bottom = 0.0f;
 };
 
+// The shell's appbar dock record, cached off the XAML UI thread. SHAppBarMessage
+// is a synchronous message to Explorer's taskbar; calling it from SizeChanged
+// can block the UI thread inside a sent-message loop and let the unload's
+// teardown run nested. The input thread refreshes this cache at startup and on
+// the work-area/display broadcast; ProbeTaskbar reads it without a cross-process
+// call.
+SRWLOCK g_taskbarAppBarLock = SRWLOCK_INIT;
+bool g_taskbarAppBarValid = false;
+uint32_t g_taskbarAppBarEdge = 0;
+RECT g_taskbarAppBarRect{};
+
+void RefreshTaskbarAppBarCache() {
+    APPBARDATA data{};
+    data.cbSize = sizeof(data);
+    const bool valid = SHAppBarMessage(ABM_GETTASKBARPOS, &data) != 0;
+    const uint32_t edge = valid ? data.uEdge : 0;
+    const RECT rect = valid ? data.rc : RECT{};
+    AcquireSRWLockExclusive(&g_taskbarAppBarLock);
+    g_taskbarAppBarValid = valid;
+    g_taskbarAppBarEdge = edge;
+    g_taskbarAppBarRect = rect;
+    ReleaseSRWLockExclusive(&g_taskbarAppBarLock);
+    TraceLog(L"taskbar appbar cache valid=%d edge=%u rect=%ld,%ld,%ld,%ld",
+            valid ? 1 : 0, edge, rect.left, rect.top, rect.right, rect.bottom);
+}
+
+
 // ---------------------------------------------------------------------------
 // Which edge the taskbar is docked to
 //
@@ -11039,20 +11116,23 @@ TaskbarProbe ProbeTaskbar(const MONITORINFO& info, float scale) {
     const RECT& monitorRect = info.rcMonitor;
 
     if (info.dwFlags & MONITORINFOF_PRIMARY) {
-        APPBARDATA data{};
-        data.cbSize = sizeof(data);
-        if (SHAppBarMessage(ABM_GETTASKBARPOS, &data)) {
-            DismissAxis appBarAxis = DismissAxis::Bottom;
-            if (AxisFromAppBarEdge(data.uEdge, appBarAxis)) {
-                probe.appBar = true;
-                probe.appBarEdge = data.uEdge;
-                probe.appBarRect = data.rc.right > data.rc.left &&
-                                   data.rc.bottom > data.rc.top;
-                probe.appBarRectPx = data.rc;
-                probe.decided = true;
-                probe.edge = appBarAxis;
-                probe.source = L"appbar";
-            }
+        bool valid = false;
+        uint32_t edge = 0;
+        RECT rect{};
+        AcquireSRWLockShared(&g_taskbarAppBarLock);
+        valid = g_taskbarAppBarValid;
+        edge = g_taskbarAppBarEdge;
+        rect = g_taskbarAppBarRect;
+        ReleaseSRWLockShared(&g_taskbarAppBarLock);
+        DismissAxis appBarAxis = DismissAxis::Bottom;
+        if (valid && AxisFromAppBarEdge(edge, appBarAxis)) {
+            probe.appBar = true;
+            probe.appBarEdge = edge;
+            probe.appBarRect = rect.right > rect.left && rect.bottom > rect.top;
+            probe.appBarRectPx = rect;
+            probe.decided = true;
+            probe.edge = appBarAxis;
+            probe.source = L"appbar";
         }
     }
 
@@ -11739,6 +11819,7 @@ void ArmLayoutWatch(const SettledMeasureRequest& request) {
             [watchSerial, request](
                 winrt::Windows::Foundation::IInspectable const&,
                 winrt::Windows::Foundation::IInspectable const&) {
+                UiDepthGuard depth;
                 try {
                     if (watchSerial != g_layoutWatchSerial) {
                         return;  // a callback that outlived its revoke
@@ -12527,6 +12608,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
                 try {
                     watch.token = viewer.ViewChanged(
                         [viewer](auto const&, auto const&) {
+                            UiDepthGuard depth;
                             RefreshScrollerOffsets(viewer);
                         });
                     if (watch.token.value) {
@@ -13025,6 +13107,7 @@ bool Setup(wux::FrameworkElement const& root) {
         g_sizeToken = root.SizeChanged(
             [sizeGeneration](winrt::Windows::Foundation::IInspectable const&,
                              wux::SizeChangedEventArgs const&) {
+                UiDepthGuard depth;
                 try {
                     // A callback from a root this renderer no longer owns must
                     // touch nothing: its revoke failed once, and the state it
@@ -13242,6 +13325,7 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
                 [weak, generation](
                     winrt::Windows::Foundation::IInspectable const& sender,
                     wux::RoutedEventArgs const&) {
+                    UiDepthGuard depth;
                     try {
                         if (generation != g_setupGeneration.load(
                                               std::memory_order_relaxed)) {
@@ -13742,6 +13826,19 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
             TraceLog(L"ui rendezvous teardown ignored hwnd=%p", hwnd);
             return 0;
         }
+        if (g_uiOwnerDepth > 0) {
+            // A XAML handler is on this thread's stack and may still touch the
+            // root after this nested message returns. Defer to the outermost
+            // unwind; the unload waits for the acknowledgement, not for this
+            // SendMessage alone.
+            g_uiTeardownPending = true;
+            TraceLog(L"ui teardown deferred depth=%d",
+                    g_uiOwnerDepth.load(std::memory_order_relaxed));
+            if (call) {
+                call->ran = true;
+            }
+            return 0;
+        }
         try {
             TeardownUi();
         } catch (...) {
@@ -13749,6 +13846,9 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
         }
         if (call) {
             call->ran = true;
+        }
+        if (g_uiTeardownAck) {
+            SetEvent(g_uiTeardownAck);
         }
         return 0;
     }
@@ -13875,6 +13975,11 @@ void DestroyUiRendezvousWindow() {
 HWND TeardownUiOnUiThread() {
     const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
     if (uiThread != 0 && uiThread == GetCurrentThreadId()) {
+        if (g_uiOwnerDepth > 0) {
+            // The unload is running inside a XAML handler. It cannot wait for
+            // itself; a nested teardown would free under the outer frame.
+            BlockUnload(L"teardown while ui handler is on the stack");
+        }
         TeardownUi();
         return nullptr;
     }
@@ -13898,10 +14003,25 @@ HWND TeardownUiOnUiThread() {
         BlockUnload(L"teardown has no UI window");
     }
 
+    if (!g_uiTeardownAck) {
+        BlockUnload(L"UI teardown acknowledgement event missing");
+    }
+    ResetEvent(g_uiTeardownAck);
+    g_uiTeardownPending = false;
+
     UiTeardownCall call{false};
     SendMessageW(hwnd, kUiTeardownMessage, kUiTeardownMagic,
                  reinterpret_cast<LPARAM>(&call));
     if (call.ran) {
+        // A handler on the stack defers the teardown to its outermost unwind;
+        // the event is set there. A top-level teardown sets it before the send
+        // returns. Waiting here is what makes the count later see a returned
+        // handler, not a nested one.
+        TraceLog(L"unload teardown wait hwnd=%p depth=%d", hwnd,
+                g_uiOwnerDepth.load(std::memory_order_relaxed));
+        if (WaitForSingleObject(g_uiTeardownAck, INFINITE) != WAIT_OBJECT_0) {
+            BlockUnload(L"UI teardown acknowledgement failed");
+        }
         return hwnd;
     }
     if (IsWindow(hwnd)) {
@@ -13973,6 +14093,11 @@ BOOL RoleInit() {
     TraceLog(L"mod init");
     Wh_Log(L"Swipe for 10Start %s initializing (start role)", kModVersion);
 
+    // The appbar dock record feeds the axis and band and is read from the XAML
+    // handlers. Fill it here, on this init thread, and refresh it from the input
+    // thread's broadcasts; no UI path makes the cross-process call.
+    RefreshTaskbarAppBarCache();
+
     LoadAnimationStyle();
     LoadGestureStartSpeed();
     LoadCommitDistance();
@@ -13997,6 +14122,14 @@ BOOL RoleInit() {
     g_moduleEntriesGone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_moduleEntriesGone) {
         TraceLog(L"module entry event failed err=%u",
+                static_cast<unsigned>(GetLastError()));
+    }
+    // The deferred-teardown acknowledgement: the UI handler sets it after the
+    // outermost module frame on the XAML thread has unwound. Manual reset: the
+    // unload clears it before the send and waits once.
+    g_uiTeardownAck = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_uiTeardownAck) {
+        TraceLog(L"ui teardown event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
     // The cross-process channel: without it a gesture close still runs its
@@ -14218,8 +14351,9 @@ void RoleUninit() {
 
         // One synchronous UI turn: revoke the XAML handlers and the settle
         // batch, restore resting progress and neutral translation, drop the
-        // UI-owned objects. SendMessage returns only after TeardownUi has
-        // returned, so no dispatcher lambda or its delegate thunk outlives it.
+        // UI-owned objects. A handler on the stack defers the turn to its
+        // outermost unwind; the send returns before that, so the call waits for
+        // the acknowledgement before it leaves this block.
         uiWindow = TeardownUiOnUiThread();
     }
 
@@ -14273,6 +14407,10 @@ void RoleUninit() {
         CloseHandle(g_rendererEvent);
         g_rendererEvent = nullptr;
     }
+    if (g_uiTeardownAck) {
+        CloseHandle(g_uiTeardownAck);
+        g_uiTeardownAck = nullptr;
+    }
     if (g_moduleEntriesGone) {
         CloseHandle(g_moduleEntriesGone);
         g_moduleEntriesGone = nullptr;
@@ -14310,6 +14448,9 @@ namespace bridge {
 void EnsureExecutorWindow();
 DWORD NoteLauncherThread(const wchar_t* source, bool adopt);
 void EnsureExecutorOnLauncherThread(const wchar_t* source);
+LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam);
+bool EnsureExecutorThreadHook(DWORD target);
+void RemoveExecutorThreadHook();
 void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr);
 LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                            uint32_t flags);
@@ -14450,6 +14591,42 @@ DWORD g_execThreadId = 0;
 std::atomic<DWORD> g_launcherThread{0};
 thread_local int t_execCall = 0;
 HANDLE g_execStopEvent = nullptr;
+// The deferred-teardown acknowledgement: set by the executor window's
+// outermost module frame after it destroys the window. A nested teardown only
+// marks pending; the unload waits here instead of returning into an outer frame.
+HANDLE g_execTeardownAck = nullptr;
+int g_execOwnerDepth = 0;          // launcher thread only
+bool g_execTeardownPending = false;  // launcher thread only
+// The one targeted WH_GETMESSAGE hook that proves a proposed launcher thread
+// pumps. The manager's Show proposes the thread; the hook fires there, commits
+// it and creates the window on its first message.
+std::atomic<HHOOK> g_execThreadHook{nullptr};
+std::atomic<DWORD> g_execThreadHookTarget{0};
+
+void CompleteExecutorTeardown(HWND window);
+// Counts one module frame on the launcher thread. A teardown that arrives
+// nested marks pending and is completed by the outermost unwind.
+class ExecDepthGuard {
+  public:
+    ExecDepthGuard() { ++g_execOwnerDepth; }
+    ~ExecDepthGuard() {
+        if (--g_execOwnerDepth > 0 || !g_execTeardownPending) {
+            return;
+        }
+        HWND window = g_execWindow.load(std::memory_order_acquire);
+        if (window) {
+            CompleteExecutorTeardown(window);
+        } else {
+            g_execTeardownPending = false;
+            if (g_execTeardownAck) {
+                SetEvent(g_execTeardownAck);
+            }
+        }
+    }
+
+    ExecDepthGuard(const ExecDepthGuard&) = delete;
+    ExecDepthGuard& operator=(const ExecDepthGuard&) = delete;
+};
 HANDLE g_execWorker = nullptr;
 DWORD g_execWorkerId = 0;
 // The fixed window class. It is registered under this image's `&__ImageBase`,
@@ -14677,10 +14854,11 @@ HRESULT Show_Hook(void* self, uint8_t a, uint8_t b, uint32_t c) {
             static_cast<unsigned int>(b), static_cast<unsigned int>(c),
             GetCurrentThreadId());
     // The manager's Show is the bootstrap. It runs on whichever thread the shell
-    // called it on (normally the launcher thread); recording that thread and
-    // creating the window here is what lets a touch-first open work. It is not a
-    // general "any pumping thread" test: a non-pumping caller can reach this hook
-    // after its own ShowStartView passed natively.
+    // called it on (normally the launcher thread) and records that thread. The
+    // hidden window is created later, from the targeted WH_GETMESSAGE hook, when
+    // that thread proves it pumps. It is not a general "any pumping thread" test:
+    // a non-pumping caller can reach this hook after its own ShowStartView passed
+    // natively, and it then leaves capability 0.
     EnsureExecutorOnLauncherThread(L"show");
 
     return Show_Original ? Show_Original(self, a, b, c) : S_OK;
@@ -17456,6 +17634,10 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
 // reopen from Dismiss(6) falls back to Dismiss(6), not to a toggle it never
 // called.
 void RunPressOriginal(const QueuedPress& press, const wchar_t* reason) {
+    // This can run from a hook frame, not only from the executor window; the
+    // guard makes a teardown that lands while the shell call pumps wait for this
+    // frame to return.
+    ExecDepthGuard depth;
     uint64_t state = 0;
     void* outer = nullptr;
     void* launcher = LauncherNow(&state, &outer);
@@ -18349,6 +18531,23 @@ void ExecutePendingCommand() {
     }
 }
 
+// The owner-thread teardown, run at the outermost module frame. Killing the
+// timers and destroying the window is safe only after any handler that may
+// still touch the root has returned; the acknowledgement releases the unload.
+void CompleteExecutorTeardown(HWND window) {
+    g_execTeardownPending = false;
+    KillTimer(window, kExecDismissTimer);
+    KillTimer(window, kExecProbeTimer);
+    KillTimer(window, kPressLatchTimer);
+    KillTimer(window, kExecDismissProbeTimer);
+    KillTimer(window, kPressAckTimer);
+    KillTimer(window, kPressOpenGenTimer);
+    DestroyWindow(window);
+    if (g_execTeardownAck) {
+        SetEvent(g_execTeardownAck);
+    }
+}
+
 LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                                     LPARAM lParam) {
     if (message == kExecTeardownMessage) {
@@ -18361,18 +18560,18 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
             TraceLog(L"exec teardown ignored hwnd=%p", window);
             return 0;
         }
-        KillTimer(window, kExecDismissTimer);
-        KillTimer(window, kExecProbeTimer);
-        KillTimer(window, kPressLatchTimer);
-        KillTimer(window, kExecDismissProbeTimer);
-        KillTimer(window, kPressAckTimer);
-        KillTimer(window, kPressOpenGenTimer);
-        DestroyWindow(window);
-        // DestroyWindow returns after WM_NCDESTROY and the class's window count
-        // are complete. SendMessage from the unload thread returns after this
-        // handler, so no completion event is needed.
+        if (g_execOwnerDepth > 0) {
+            // A shell call, a command dispatch or a prior window message is on
+            // this thread's stack. That frame may still touch the launcher after
+            // this nested send returns; destroy at the outermost unwind instead.
+            g_execTeardownPending = true;
+            TraceLog(L"exec teardown deferred depth=%d", g_execOwnerDepth);
+            return 0;
+        }
+        CompleteExecutorTeardown(window);
         return 0;
     }
+    ExecDepthGuard depth;
     if (message == WM_NCDESTROY) {
         // The destructor of the one published window. Any other window of this
         // class (there is none: the class is owned and unregistered) must not
@@ -18385,6 +18584,9 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         PublishExecutorCapability(L"window-gone");
         TraceLog(L"exec window gone hwnd=%p identified=%d tid=%u", window,
                 identified ? 1 : 0, GetCurrentThreadId());
+        if (g_execTeardownAck) {
+            SetEvent(g_execTeardownAck);
+        }
         return 0;
     }
     // A window this activation did not publish is not a dispatcher. A survivor
@@ -18512,13 +18714,12 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-// The manager's Show is the bootstrap: it records the thread the shell called it
-// on and creates the executor window there, with no peer and no worker to gate
-// it. The Win and Start-button hooks cannot bootstrap: both run only after a
-// live peer and a started worker, so they never create a window for a service
-// that is not already answering. Dismiss/ShowStartView never adopt; a
-// non-pumping COM/taskbar caller passes natively, and if its internal manager
-// Show then runs on that thread, that Show is the adopter.
+// Only a thread this mod knows to run the launcher may adopt with no proof: the
+// Win key (OnHotkeyInvoke) and the Start button. The manager's Show proposes a
+// thread instead; the targeted WH_GETMESSAGE hook commits it after it pumps.
+// Dismiss/ShowStartView never adopt; a non-pumping COM/taskbar caller passes
+// natively, and if its internal manager Show then runs on that thread, that
+// Show only proposes it.
 DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     const DWORD tid = GetCurrentThreadId();
     DWORD known = g_launcherThread.load(std::memory_order_relaxed);
@@ -18540,19 +18741,80 @@ DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     return tid;
 }
 
-// The manager's Show is the bootstrap that creates a window with no peer. It
-// records the thread it runs on (normally the launcher thread; a non-pumping
-// caller can supply it if its own ShowStartView passed natively and the shell
-// called this Show there). A Show on a thread this mod has already recorded on
-// another entry is a mismatch and creates nothing.
+// The one targeted hook's lifetime. A Show candidate may differ from a later
+// Show candidate until one of them proves it pumps; install and remove under
+// this lock so two candidates cannot both leave a hook behind.
+SRWLOCK g_execThreadHookLock = SRWLOCK_INIT;
+
+void RemoveExecutorThreadHookLocked() {
+    HHOOK hook = g_execThreadHook.exchange(nullptr, std::memory_order_acq_rel);
+    g_execThreadHookTarget.store(0, std::memory_order_release);
+    if (hook && !UnhookWindowsHookEx(hook)) {
+        TraceLog(L"exec thread hook remove failed err=%u", GetLastError());
+    }
+}
+
+// The target is the thread proposed by the manager's Show; it is not committed
+// to g_launcherThread until this hook fires there. That message is the proof
+// that the thread pumps, which a blocking shell call cannot supply.
+bool EnsureExecutorThreadHook(DWORD target) {
+    if (target == 0) {
+        return false;
+    }
+    AcquireSRWLockExclusive(&g_execThreadHookLock);
+    if (g_execThreadHook.load(std::memory_order_acquire) &&
+        g_execThreadHookTarget.load(std::memory_order_acquire) == target) {
+        ReleaseSRWLockExclusive(&g_execThreadHookLock);
+        return true;
+    }
+    RemoveExecutorThreadHookLocked();
+    HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, ExecutorThreadHook, nullptr,
+                                   target);
+    if (!hook) {
+        ReleaseSRWLockExclusive(&g_execThreadHookLock);
+        TraceLog(L"exec thread hook failed target=%u err=%u", target,
+                GetLastError());
+        return false;
+    }
+    g_execThreadHook.store(hook, std::memory_order_release);
+    g_execThreadHookTarget.store(target, std::memory_order_release);
+    ReleaseSRWLockExclusive(&g_execThreadHookLock);
+    TraceLog(L"exec thread hook target=%u", target);
+    return true;
+}
+
+void RemoveExecutorThreadHook() {
+    AcquireSRWLockExclusive(&g_execThreadHookLock);
+    RemoveExecutorThreadHookLocked();
+    ReleaseSRWLockExclusive(&g_execThreadHookLock);
+}
+
+// The manager's Show is the bootstrap. It runs on whichever thread the shell
+// called it on, and that thread may be a COM or taskbar caller that never
+// pumps. It therefore only proposes the thread: the targeted WH_GETMESSAGE
+// hook fires there, commits the thread and creates the window on that same
+// thread. A Show on a non-pumping caller leaves capability 0 and the press
+// native; a Win or Start-button entry on the real launcher thread commits and
+// creates it directly.
 void EnsureExecutorOnLauncherThread(const wchar_t* source) {
     if (ExecutorWindowOnThisThread()) {
-        return;  // already created on this thread
+        return;
     }
-    if (NoteLauncherThread(source, true) == 0) {
-        return;  // not the launcher thread: never create a window here
+    const DWORD tid = GetCurrentThreadId();
+    const DWORD known = g_launcherThread.load(std::memory_order_acquire);
+    if (known != 0) {
+        if (known != tid) {
+            TraceLog(L"exec launcher thread mismatch known=%u tid=%u source=%s",
+                    known, tid, source);
+            return;
+        }
+        // The thread is proven; this Show is the retry for a window that its
+        // first attempt could not create.
+        EnsureExecutorThreadHook(tid);
+        return;
     }
-    EnsureExecutorWindow();
+    TraceLog(L"exec launcher thread candidate tid=%u source=%s", tid, source);
+    EnsureExecutorThreadHook(tid);
 }
 
 void EnsureExecutorWindow() {
@@ -18614,12 +18876,26 @@ void EnsureExecutorWindow() {
 }
 
 LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION && !g_execWindow.load(std::memory_order_relaxed) &&
-        GetCurrentThreadId() == g_launcherThread.load(std::memory_order_relaxed)) {
-        // A WH_GETMESSAGE hook installed for the recorded launcher thread runs
-        // only on that thread; the test states the invariant the window's
-        // lifetime depends on.
-        EnsureExecutorWindow();
+    if (code == HC_ACTION &&
+        GetCurrentThreadId() ==
+            g_execThreadHookTarget.load(std::memory_order_acquire)) {
+        const DWORD tid = GetCurrentThreadId();
+        DWORD known = g_launcherThread.load(std::memory_order_acquire);
+        if (known == 0) {
+            if (g_launcherThread.compare_exchange_strong(
+                    known, tid, std::memory_order_acq_rel)) {
+                TraceLog(L"exec launcher thread tid=%u source=show-pump", tid);
+                known = tid;
+            }
+        }
+        if (known == tid) {
+            // The loop pumps: this is the same entry the Win and Start-button
+            // hooks take, and the window is created on this thread.
+            EnsureExecutorWindow();
+        }
+        // One proposal, one attempt. A failed creation is retried by the next
+        // Show or trigger, never by a hook that fires on every message.
+        RemoveExecutorThreadHook();
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
@@ -18634,8 +18910,9 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
     const DWORD target = g_launcherThread.load(std::memory_order_relaxed);
     if (target == 0) {
         // No launcher entry has run yet. A touch-first open falls back to the
-        // shell's own gesture; the manager's Show is the bootstrap that records
-        // the thread and creates the window.
+        // shell's own gesture; the manager's Show proposes the thread, and the
+        // targeted hook commits it and creates the window from its first
+        // message.
         return false;
     }
     if (target == GetCurrentThreadId()) {
@@ -18643,10 +18920,7 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
         return g_execWindow.load(std::memory_order_relaxed) != nullptr;
     }
 
-    HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, ExecutorThreadHook, nullptr,
-                                   target);
-    if (!hook) {
-        TraceLog(L"exec window hook failed err=%u", GetLastError());
+    if (!EnsureExecutorThreadHook(target)) {
         return false;
     }
     const ULONGLONG start = GetTickCount64();
@@ -18660,12 +18934,14 @@ bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
         // hook, not a periodic worker tick.
         Sleep(5);
     }
-    UnhookWindowsHookEx(hook);
     const bool ready = g_execWindow.load(std::memory_order_relaxed) != nullptr;
     if (!ready) {
         TraceLog(L"exec window deferred: launcher thread %u did not pump in "
                 L"%llu ms",
                 target, static_cast<unsigned long long>(timeoutMs));
+        // The hook stays installed: the thread may pump later, and the first
+        // message is still the proof. RemoveExecutorThreadHook takes it at
+        // unload. A non-pumping caller thus leaves capability 0.
     }
     return ready;
 }
@@ -18684,10 +18960,11 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
 
     // The executor must live on explorer's launcher thread -- the thread that
     // runs OnHotkeyInvoke and the shell's own ShowStartView/Dismiss, not the
-    // thread that owns Shell_TrayWnd. Creating the window from a hook frame puts
-    // it on whichever thread called that hook; the one-shot WH_GETMESSAGE hook
-    // below is targeted at the launcher thread the hooks observed, so the window
-    // is created there and that thread's loop dispatches its messages.
+    // thread that owns Shell_TrayWnd. A Win or Start-button entry may have
+    // committed it already; the manager's Show only proposes it. The targeted
+    // WH_GETMESSAGE hook installed there (or by this call) fires on its first
+    // message, which is the proof that the loop pumps, commits the thread and
+    // creates the window there.
     CreateExecutorWindowOnUiThread(2000);
 
     // Availability is published HERE, not by the thread that called
@@ -18842,23 +19119,36 @@ void JoinExecutorWorker() {
 }
 
 // Destroys the one published window synchronously on its owner thread.
-// SendMessage returns only after the private teardown handler has run
-// DestroyWindow and WM_NCDESTROY; no completion event is needed. A destroyed
-// window means this activation's window is gone, not that the owner thread is
-// gone; a window that does not answer blocks.
+// A top-level teardown runs the private handler, DestroyWindow and
+// WM_NCDESTROY before the send returns. A teardown that lands while a module
+// frame is on the stack marks pending and is completed by that frame's
+// outermost unwind; the acknowledgement event releases this call only then. A
+// destroyed window means this activation's window is gone, not that the owner
+// thread is gone; a window that does not answer blocks.
 void DestroyExecutorWindow() {
     HWND window = g_execWindow.load(std::memory_order_acquire);
     if (!window) {
         return;
     }
     if (g_execThreadId == GetCurrentThreadId()) {
-        DestroyWindow(window);
+        if (g_execOwnerDepth > 0) {
+            BlockBridgeUnload(L"executor teardown while a module frame is active");
+        }
+        CompleteExecutorTeardown(window);
     } else {
+        if (!g_execTeardownAck) {
+            BlockBridgeUnload(L"executor teardown event missing");
+        }
+        ResetEvent(g_execTeardownAck);
+        g_execTeardownPending = false;
         TraceLog(L"exec window teardown send hwnd=%p tid=%u", window,
                 static_cast<unsigned>(g_execThreadId));
         TraceLog(L"exec window teardown wait hwnd=%p tid=%u", window,
                 static_cast<unsigned>(g_execThreadId));
         SendMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0);
+        if (WaitForSingleObject(g_execTeardownAck, INFINITE) != WAIT_OBJECT_0) {
+            BlockBridgeUnload(L"executor teardown acknowledgement failed");
+        }
     }
     if (g_execWindow.load(std::memory_order_acquire) == window) {
         if (!IsWindow(window)) {
@@ -18995,6 +19285,13 @@ BOOL RoleInit() {
         PublishExecutorCapability(L"init");
     }
 
+    g_execTeardownAck = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_execTeardownAck) {
+        TraceLog(L"exec teardown event failed err=%u", GetLastError());
+    }
+    g_execOwnerDepth = 0;
+    g_execTeardownPending = false;
+
     if (g_ipc.state) {
         StartExecutorWorker();
     }
@@ -19046,6 +19343,10 @@ void RoleUninit() {
     // this there already.
     g_disabled = true;
 
+    // The thread hook can create the window from the launcher thread; take it
+    // down before the exclusive admission so no new creation can start.
+    RemoveExecutorThreadHook();
+
     // The posting worker first. It never calls the launcher synchronously, so
     // the join does not depend on the launcher thread; it sees the stop event
     // set in BeforeUninit.
@@ -19089,6 +19390,10 @@ void RoleUninit() {
     if (g_execStopEvent) {
         CloseHandle(g_execStopEvent);
         g_execStopEvent = nullptr;
+    }
+    if (g_execTeardownAck) {
+        CloseHandle(g_execTeardownAck);
+        g_execTeardownAck = nullptr;
     }
 
     // The channel last: no hook path and no worker reads it after this point.

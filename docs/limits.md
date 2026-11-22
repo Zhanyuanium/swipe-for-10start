@@ -69,7 +69,9 @@
   threads `INFINITE`. Off the owner it takes the root admission lock exclusive
   before choosing the teardown, sends the UI teardown to the module's own hidden
   window on the
-  XAML UI thread (the call returns after the turn), then requires the UI-turn and
+  XAML UI thread (the call returns after the turn; a XAML handler on the stack
+  defers the turn and the unload waits for its acknowledgement event), then
+  requires the UI-turn and
   registration counts
   and one acknowledged empty drain; a drain that did not run blocks
   (`ui drain not acknowledged`), because zero alone does not prove the releasing
@@ -79,8 +81,11 @@
   runs on the
   owner with a pending entry, it blocks instead of treating a count as the
   destructor's return. The
-  executor window is destroyed by a synchronous `SendMessage` whose handler
-  calls `DestroyWindow`, and each fixed class unregister is one checked call. A
+  executor window is destroyed by a synchronous `SendMessage`; a top-level
+  handler calls `DestroyWindow`, and a handler that lands while a WndProc or
+  `RunPressOriginal` frame is on the stack defers the destruction to that frame's
+  outermost unwind, with the unload waiting for the acknowledgement. Each fixed
+  class unregister is one checked call. A
   permanently hung UI thread, a worker that
   does not exit or a class that cannot be unregistered therefore blocks the
   disable instead of corrupting the process. There is no bounded-wait success
@@ -91,11 +96,12 @@
   opens the menu and creates the executor window for the next one.
 - **The launcher thread is not the taskbar thread.** A `ShowStartView` on the
   taskbar thread fail-fasts explorer (`0xC0000409` at `twinui+0x1BB010`);
-  measured. The executor creates its window only on a thread that entered
-  through `OnHotkeyInvoke`, `OnStartButtonPressed` or the manager's `Show`, and
-  refuses a window on any other. A `Dismiss`/`ShowStartView` on an unknown
-  thread (a COM/taskbar caller that does not pump) passes natively; it never
-  adopts.
+  measured. A Win or Start-button entry adopts the thread it runs on and creates
+  the executor window there; the manager's `Show` proposes its thread and a
+  targeted `WH_GETMESSAGE` hook commits it only after a message proves the loop
+  pumps. A window on any other thread is refused. A `Dismiss`/`ShowStartView` on
+  an unknown thread (a COM/taskbar caller that does not pump) passes natively;
+  it never adopts.
 - **A reinstalled Windhawk image does not inherit its window classes.** Both
   fixed classes (`WindhawkLegacyStartSwipeRawInputWindow`,
   `WindhawkSwipeFor10Start.Executor`) are registered under `&__ImageBase` and

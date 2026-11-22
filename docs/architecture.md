@@ -115,16 +115,15 @@ crashed `explorer.exe` in `twinui.pcshell.dll+0x1BB010` with `0xC0000409`
 (fail-fast). A `Dismiss` on that thread happened to work, but the executor does
 not rely on the asymmetry: every command runs on the launcher thread.
 
-Shape: a hidden message-only window owned by the mod, created by the manager's
-`Show` on the thread it runs on. That `Show` is the one bootstrap: it records the
-launcher thread and creates the window with no peer and no worker. A Win or
-Start-button entry cannot bootstrap: both run only after a live peer and a
-started worker, and nothing on this build calls `OnStartButtonPressed`.
-`Dismiss`/`ShowStartView` never adopt: a
-non-pumping COM or taskbar caller passes natively, and if its internal manager
-`Show` then runs on that thread, that `Show` is the adopter. A targeted
-`WH_GETMESSAGE` hook on an already recorded launcher thread can create the window
-there; it does not adopt. The worker never creates it. A worker waits on the channel event
+Shape: a hidden message-only window owned by the mod, created on the launcher
+thread. The manager's `Show` proposes the thread it runs on; a targeted
+`WH_GETMESSAGE` hook fires there, commits it and creates the window on its first
+message. A non-pumping COM or taskbar caller never fires the hook and leaves
+capability 0. A Win or Start-button entry adopts the thread directly and creates
+the window, but only after a live peer and a started worker, so it never
+bootstraps a thread for a service that is not already answering.
+`Dismiss`/`ShowStartView` never adopt. The worker never creates the window. A
+worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
 an empty stack. The window class is one fixed name
 (`WindhawkSwipeFor10Start.Executor`) registered under `&__ImageBase`;
@@ -134,9 +133,13 @@ class from an earlier image points at an unmapped procedure.
 Shutdown is an order, not a set of flags. BeforeUninit clears readiness and
 signals the worker's stop; Uninit joins the worker **INFINITE**, then destroys the
 one published window on its owner thread — directly when it already runs there,
-otherwise with a synchronous `SendMessage(kExecTeardownMessage)` whose handler
-calls `DestroyWindow`; the call returns after `WM_NCDESTROY`. No window-gone event
-is used. The class is unregistered under the same `&__ImageBase`
+otherwise with a synchronous `SendMessage(kExecTeardownMessage)`. A top-level
+handler kills the dismiss/probe/latch timers and calls `DestroyWindow`; a
+handler that lands while a WndProc or `RunPressOriginal` frame is on the stack
+marks the teardown pending and the outermost frame completes it. The unload
+waits on the acknowledgement event, so a nested send cannot return into a frame
+that can still call the shell. No window-gone event is used. The class is
+unregistered under the same `&__ImageBase`
 instance only after the window is gone, and the worker/stop handles
 and the channel close last. A destroyed window says this activation's window is
 gone, not that the launcher thread is gone. The old creator reservation,

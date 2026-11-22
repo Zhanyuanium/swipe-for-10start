@@ -87,13 +87,14 @@ path), a window this activation created on that thread, a started worker, the
 verified layout, and for
 the directional close intent the callable `Dismiss` the command will need. A Hide never adopts an unproven thread
 (`reason=wrong-thread|no-window|no-capability|no-primitive`). The manager's
-`Show` is the bootstrap that records a thread and creates the window with no
-peer; a Win/Start-button entry runs only after a live peer and a started worker
-and never creates a window for a service that is not already answering, and
-`ShowStartView`/`Dismiss` never adopt.
+`Show` proposes the thread it runs on: a targeted `WH_GETMESSAGE` hook fires
+there, commits the thread and creates the window on its first message, so a COM
+or taskbar caller that never pumps leaves capability 0. A Win/Start-button entry
+adopts the thread directly and creates the window only after a live peer and a
+started worker; `ShowStartView`/`Dismiss` never adopt.
 A wrong-thread launcher call is not a clean error: never call from a hook frame,
-and the executor window is created only by the manager's `Show` (or a
-`WH_GETMESSAGE` hook on an already recorded launcher thread).
+and the executor window is created only by that hook after a `Show` proposal, or
+by a Win/Start-button entry on the recorded launcher thread.
 
 Launcher symbols are resolved once per module per install, on the executor
 worker, never in a hook. `HookSymbols` blocks on Windhawk's PDB fetch (measured
@@ -516,7 +517,13 @@ checked by hand, and the table lists the sessions with captured numbers.
   trigger; no per-trigger branch in either mod.
 - A wrong-thread launcher call is not a clean error. Never call from a hook
   frame; post to the executor window, and never create that window off the
-  recorded launcher thread.
+  recorded launcher thread. A `Show` on an unproven thread only proposes it; the
+  targeted `WH_GETMESSAGE` hook commits it after the loop pumps.
+- No cross-process call from a XAML handler. The taskbar's appbar record is
+  cached on the input thread at startup and refreshed on
+  `WM_SETTINGCHANGE`/`WM_DISPLAYCHANGE`; `ProbeTaskbar` reads the cache.
+  `SHAppBarMessage` from `SizeChanged` could block the UI thread inside a
+  sent-message loop and let the unload's teardown run nested.
 - The shell owns every visual transition. The mods read and request, never
   write the launcher's state.
 - The trace is a setting. Every decision line calls `Wh_Log`; the file is
@@ -527,7 +534,10 @@ checked by hand, and the table lists the sessions with captured numbers.
   teardown to the module's own hidden window on the XAML UI thread (off the
   owner, it takes the root admission lock exclusive before choosing the
   teardown), then requires the UI-turn count and registration count and one
-  acknowledged empty turn. A missing
+  acknowledged empty turn. A XAML handler or an executor window frame on the
+  stack defers the teardown to its outermost unwind; the unload waits for the
+  acknowledgement event, so it never frees under a frame that can still call the
+  shell. A missing
   drain acknowledgement (`ui drain not acknowledged`), a windowless root after a
   UI-turn lease was ever used (dispatcher turn or settle batch), or an inline
   unload with a pending entry
