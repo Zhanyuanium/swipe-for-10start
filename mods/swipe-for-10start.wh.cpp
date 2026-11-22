@@ -13030,6 +13030,17 @@ PrepareRootElement_t PrepareRootElement_Original = nullptr;
 bool EnsureUiRendezvousWindow();
 
 void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
+    // The first touch of this image is the counted entry itself. The unload
+    // either sees this lease and waits, or this hook sees its flag and adds no
+    // state; there is no third ordering in which a registration outlives the
+    // proofs.
+    ModuleEntryLease entryLease;
+    if (g_unloading.load(std::memory_order_relaxed)) {
+        // No module state is touched. The shell still gets its own root.
+        return PrepareRootElement_Original
+                   ? PrepareRootElement_Original(frame, perFrameData, flag)
+                   : nullptr;
+    }
     void* result = PrepareRootElement_Original
                        ? PrepareRootElement_Original(frame, perFrameData, flag)
                        : nullptr;
@@ -13043,7 +13054,16 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     // unload in that window can then run the teardown on the owner thread.
     g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     CaptureCoreWindowHandle();
-    EnsureUiRendezvousWindow();
+    if (!EnsureUiRendezvousWindow()) {
+        static bool rendezvousFailureLogged = false;
+        if (!rendezvousFailureLogged) {
+            rendezvousFailureLogged = true;
+            Wh_Log(L"UI rendezvous window could not be created; the root gets "
+                   L"no renderer and the unload has no window to drain");
+            TraceLog(L"root registration skipped reason=no-rendezvous-window");
+        }
+        return result;
+    }
 
     try {
         wux::UIElement element{nullptr};
@@ -13082,6 +13102,14 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
             alreadyLoaded = root.IsLoaded();
         } catch (winrt::hresult_error const& e) {
             Wh_Log(L"IsLoaded check failed: %08X", e.code());
+        }
+
+        // The first registration is below. Re-read the stop immediately before
+        // it: the lease already keeps the unload waiting, and this check keeps a
+        // hook that saw the flag late from adding a delegate at all.
+        if (g_unloading.load(std::memory_order_relaxed)) {
+            TraceLog(L"root registration skipped reason=unloading");
+            return result;
         }
 
         if (alreadyLoaded) {
