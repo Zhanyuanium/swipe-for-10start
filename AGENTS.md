@@ -153,8 +153,9 @@ admission (`kPressQueueWaitMs + kPressAckTimeoutMs`) is dropped
 hard kill cannot produce a ghost toggle minutes later. The 100 ms reserve poll
 stops when no slot is outstanding.
 The Start side claims the
-sequence **before** it copies the record and re-checks the claim after the copy;
-a record the bridge aborted in between is dropped **and answered as superseded**
+sequence **before** it copies the record and re-reads the record after the claim;
+an abort in between makes the counter odd, so the read fails, and the record is
+dropped **and answered as superseded**
 (`intent drop ... reason=record-gone`, `intent revoked seq=...`), so the
 publisher's slot is never left waiting for an ack that cannot come. The ack
 timeout then decides by proof, not by the
@@ -414,7 +415,8 @@ generation, the intent and its ack and the taken sequence (the ack is the
 bridge's next-press barrier; the take is the timeout's proof), the executor
 command and its ack, one
 controller direction word plus the touch flag, and the liveness triple
-`peerTick` (204) / `peerState` (208) / `peerEpoch` (212) / `intentTaken` (216). The debug command
+`peerTick` (204) / `peerState` (208) / `peerEpoch` (212). The consumer claim
+`intentTaken` (216) is a separate word, not liveness. The debug command
 channel — its record, mutex, event and parser — is **gone**.
 `tools/ipc.ps1` is read-only: `-State` reads 224 bytes and prints the records and
 the peer epoch.
@@ -456,7 +458,11 @@ are implemented and **unverified on this machine**: the code path is the same
   transition is outstanding. The only idle wake is the 100 ms `peerTick`
   heartbeat, and only while the peer is advertised. The Explorer worker blocks
   on its events once the launcher symbols resolved or were refused. A change that
-  reintroduces a periodic tick or a state poll is a regression.
+  reintroduces a periodic tick or a state poll is a regression. Two bounded
+  exceptions are state-owned, not periodic: the open-generation gate reads its
+  generation every 20 ms for at most 900 ms, and a standing press slot or
+  external barrier keeps a 100 ms reserve poll for its queue bound. Each stops
+  when its state clears, and neither wakes an idle thread.
 - A mapped channel is not a live peer. Interception needs the Start side's
   `peerState=alive` and a `peerTick` younger than 600 ms; otherwise the shell's
   own path runs. Availability is published only by the ready consumer and

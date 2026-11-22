@@ -54,6 +54,10 @@ can fight.
 - **A tracker for the evidence.** `tools/panel_edge_track.ps1` samples the
   panel's trailing edge for any of the four docks, which is how every claim above
   was judged in pixels rather than in logs.
+- **The channel is 224 bytes.** `intentTaken` at 216 is new in this release; the
+  layout grows from the 216 bytes of the previous tag to 224. No separate ABI
+  bump is needed because `v0.8.0` itself is the boundary: the tag names one
+  mod built from one layout.
 
 Still owed, and named in `docs/limits.md`: the top and right docks are
 implemented but unmeasured on this machine, a pen by hand, and a consumed finger

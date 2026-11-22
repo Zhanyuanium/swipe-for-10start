@@ -184,8 +184,9 @@ not a lock. The Start side's turn is:
    a write in progress or an aborted record);
 2. write `intentTaken = seq`;
 3. copy the record;
-4. re-read the record's sequence and `intentTaken`; act only when both are still
-   this sequence. A claimed record that can no longer be applied is answered
+4. re-read the record's sequence; act only when it is still this sequence. An
+   abort between the claim and this read makes the counter odd, so the read
+   fails. A claimed record that can no longer be applied is answered
    `intent revoked seq=...` (`kSwipeAckSuperseded`), never dropped silently: the
    publisher's timeout is holding the queue slot for exactly this answer.
 

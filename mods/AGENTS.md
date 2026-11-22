@@ -668,8 +668,9 @@ probe or timer failure is answered `unknown`.
   (`kPressQueueWaitMs + kPressAckTimeoutMs`) is dropped
   (`own press dropped ... reason=stale`) and never run natively. The 100 ms
   reserve poll is killed when no slot is outstanding. The Start side claims the
-  sequence before it copies the record and re-checks the claim after the copy
-  (`intent drop ... reason=record-gone`); a claimed record it cannot apply is
+  sequence before it copies the record and re-reads the record after the claim
+  (`intent drop ... reason=record-gone`); an abort between the claim and the read
+  makes the counter odd, so the copy fails; a claimed record it cannot apply is
   answered `intent revoked seq=...` with `kSwipeAckSuperseded`, so the publisher
   is never left waiting for an ack that cannot come. An ack timeout is then
   resolved by proof: any claim for the sequence is

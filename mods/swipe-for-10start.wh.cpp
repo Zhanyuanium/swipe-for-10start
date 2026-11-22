@@ -8146,11 +8146,12 @@ void PostUiOpenWatchRelease(uint32_t closedGeneration,
 // close runs the one mirrored close and asks for Dismiss, external drops the
 // pull and resyncs. The bridge's executor acks through execAck.
 //
-// The record is claimed before it is copied, and the caller proves the claim
-// after the copy: `intentTaken == intent.seq` and the same sequence. The
-// publisher aborts an untaken record before it replays, so a record whose claim
-// or copy no longer holds is dropped, never applied. The ack is written only
-// after the branch published the resulting controller direction.
+// The record is claimed before it is copied, and the copy is proved by the
+// record's sequence after the claim: an abort makes the counter odd, so that read
+// fails. The claim word is written by this same input thread, so it is not a
+// second proof. The publisher aborts an untaken record before it replays, so a
+// record whose copy no longer holds is dropped, never applied. The ack is written
+// only after the branch published the resulting controller direction.
 void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
     if (intent.seq == 0 || intent.seq == g_lastIntentSeq) {
         return;
@@ -8322,12 +8323,12 @@ void AnswerRevokedIntent(LONG64 sequence) {
 }
 
 // The input thread's one intent turn. The claim is written before the record is
-// copied: a publisher whose ack times out aborts the record, and an abort after
-// this claim is caught by the re-read below, so the controller never acts on a
-// record the bridge has already revoked. A claim that a newer sequence replaced
-// is equally dropped. Only a claimed sequence applied under this activation is
-// acknowledged; a claimed one this activation cannot apply is answered as
-// superseded, never silently.
+// copied, so a publisher whose ack times out can see that the controller may
+// already hold a copy. The record read after the claim is the proof: an abort
+// after the claim makes the counter odd and that read fails, so the controller
+// never acts on a record the bridge has already revoked. Only a claimed sequence
+// applied under this activation is acknowledged; a claimed one this activation
+// cannot apply is answered as superseded, never silently.
 void ApplyBridgeIntent() {
     const LONG64 sequence = SwipeIpcIntentSequence(&g_ipc);
     if (sequence == 0 || sequence == g_lastIntentSeq) {
@@ -8337,12 +8338,6 @@ void ApplyBridgeIntent() {
     SwipeIpcIntent intent{};
     if (!SwipeIpcReadIntent(&g_ipc, &intent) || intent.seq != sequence) {
         TraceLog(L"intent drop seq=%lld reason=record-moved",
-                static_cast<long long>(sequence));
-        AnswerRevokedIntent(sequence);
-        return;
-    }
-    if (SwipeIpcTakenIntent(&g_ipc) != sequence) {
-        TraceLog(L"intent drop seq=%lld reason=claim-revoked",
                 static_cast<long long>(sequence));
         AnswerRevokedIntent(sequence);
         return;
@@ -8658,8 +8653,8 @@ void CheckExecAckTimeout(uint64_t now) {
 // is reconciled here — an open or close intent is the user
 // talking to a menu, and the cancel/recovery rules already own that case.
 // The snapshot above only identifies the external; the claim is taken before it
-// is applied and the record and the claim are re-read after the claim, so an
-// external the bridge aborted in between is not applied.
+// is applied and the record is re-read after the claim, so an external the bridge
+// aborted in between is not applied.
 void ReconcileSupersedingIntentBeforeLanding() {
     SwipeIpcIntent intent{};
     if (!SwipeIpcReadIntent(&g_ipc, &intent) || intent.seq == 0 ||
@@ -8673,12 +8668,6 @@ void ReconcileSupersedingIntentBeforeLanding() {
     SwipeIpcIntent current{};
     if (!SwipeIpcReadIntent(&g_ipc, &current) || current.seq != intent.seq) {
         TraceLog(L"intent reconcile drop seq=%lld reason=record-moved",
-                static_cast<long long>(intent.seq));
-        AnswerRevokedIntent(intent.seq);
-        return;
-    }
-    if (SwipeIpcTakenIntent(&g_ipc) != intent.seq) {
-        TraceLog(L"intent reconcile drop seq=%lld reason=claim-revoked",
                 static_cast<long long>(intent.seq));
         AnswerRevokedIntent(intent.seq);
         return;
