@@ -2,7 +2,7 @@
 // @id              swipe-for-10start
 // @name            Legacy Start Swipe
 // @description     Swipe in from the taskbar edge to pull the Start menu out with your finger, and swipe back to close it
-// @version         0.7.0
+// @version         0.8.0
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe

@@ -5,7 +5,7 @@ The project's memory: what was measured, what was falsified, and why each
 decision was taken. The user-facing quick start is `../README.md` /
 `../README.zh-CN.md`.
 
-architecture.md: M3.3, the shipping design. The launcher read (`s_pLauncher`
+architecture.md: M3.4, the shipping design. The launcher read (`s_pLauncher`
 outer object, `+0x18` IXamlLauncher, `[+0x160]` state, readiness `> 0x10000`
 checked again at the post-call resync),
 the executor thread (the `OnHotkeyInvoke` thread, not the taskbar thread), the

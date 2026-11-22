@@ -7,6 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
+| `v0.8.0` | 0.8.0 | — | 216 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
 | `v0.7.0` | 0.7.0 | — | 216 B | one mod, two processes: the collection's review answered (symbol hooks, no pin, deadline-driven wakeups, tap rejection, lean channel) |
 | `v0.6.2` | 0.44.0 | 0.25.0 | v7 | M3.3: one controller, one executor |
 | `v0.6.1` | 0.40.0 | 0.21.0 | v4 | intent direction from the controller state; no press lost after a gesture close |
@@ -20,6 +21,44 @@ pair that shipped before the merge.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.8.0 — a close you can interrupt
+
+Windhawk `@version` 0.8.0. The Win key, the Start button and the touch gesture
+now interrupt the same transition the same way, and a close owns the panel from
+its first frame to its hard landing instead of being one more animation a finger
+can fight.
+
+- **One ownership record.** A close is a serial, the menu it was accepted
+  against, a phase (`settling`, `awaiting-hide`, `done`) and a 600 ms repair
+  bound. Fifteen readers ask it instead of a clock. The bound's ending is a
+  repair: it releases the published direction and leaves the dismiss command and
+  the recovery ticket naming the hide that may still land, which is what the
+  anti-heal rule waits on, so a slow hide (measured 562–593 ms) cannot land on a
+  panel that was just restored under it.
+- **A grab, once.** A down during a retract is admitted only when it lands in the
+  band or on the surface the retract still shows — both halves of the panel
+  rectangle, from the run's own geometry. It spends one transfer at 24 DIP: a
+  take that reverses the retract from its live position in one take, with the
+  finger's offset kept; a band pull whose surface is gone is the same open
+  request a press makes, and follows the finger from the entry; anything else
+  consumes the contact with no open right until it lifts.
+- **A landing adopts no finger.** The landing serves only an explicit open
+  request that lost its race to an entered `Dismiss`. A hand resting through a
+  retract no longer resurrects the menu afterwards, and a consumed contact ends
+  only on its lift or a report that proves another contact — never on the
+  digitizer's quiet through a hide.
+- **Two diagnostic lines.** `exec dismiss enter ... at=` dates the launcher call
+  from before it was entered, and `motion sample` records the position and slope
+  a takeover read. Both are written only with `DiagnosticTrace`.
+- **A tracker for the evidence.** `tools/panel_edge_track.ps1` samples the
+  panel's trailing edge for any of the four docks, which is how every claim above
+  was judged in pixels rather than in logs.
+
+Still owed, and named in `docs/limits.md`: the top and right docks are
+implemented but unmeasured on this machine, a pen by hand, and a consumed finger
+that is silent through a landing and then moves (the virtual digitizer cannot
+deliver that report).
 
 ## v0.7.0 — one mod, two processes
 
