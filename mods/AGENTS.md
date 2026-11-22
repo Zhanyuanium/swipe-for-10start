@@ -529,7 +529,9 @@ probe or timer failure is answered `unknown`.
   a close by definition: it reaches the one dispatcher, so `closing` makes it the
   reopen only while a real left button is down (`ClickAwayPointerNow`); a z-band
   change from Alt+Tab, a foreground switch or a taskbar activation carries no
-  button and is a close, as is a click whose cursor is over the taskbar window.
+  button and is a close, as is a click whose cursor is over the tray's top-level
+  window (`Shell_TrayWnd` or `Shell_SecondaryTrayWnd`, including its clock and
+  tray children).
   A panel the controller owns makes it the close (method 7 stays the
   click-away evidence, mapped to 6 on the Start side). A click with no panel to
   close and no close to reverse passes to the shell through the dispatcher's one
@@ -590,9 +592,11 @@ probe or timer failure is answered `unknown`.
   gate the trigger passes to the
   shell (`own pass trigger=... reason=no-peer` and the other reasons); nothing is
   swallowed for a command nobody would execute. With an older press outstanding or
-  queued, a stale peer is not a pass: the gate logs `reason=peer-stale-queued` and
-  lets the press reach admission, which reconciles or queues it, so it cannot
-  overtake the earlier press. The channel alone is not the
+  queued, a stale peer is not a pass: on the recorded launcher thread the gate
+  logs `reason=peer-stale-queued` and lets the press reach admission, which
+  reconciles or queues it, so it cannot overtake the earlier press. The queue is
+  launcher-local, so the gate reads it only after the thread is proven. The
+  channel alone is not the
   condition: this mod creates it, so it stays valid with the Start mod disabled.
   A failed worker startup is the same case for the life of the attachment. 600 ms
   is a detection budget, not a delivery guarantee.

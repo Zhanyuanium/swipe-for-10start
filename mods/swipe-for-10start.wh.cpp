@@ -14481,9 +14481,9 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
         // A stale tick normally goes native: the controller cannot answer this
         // press. With an older press outstanding or queued, a native pass would
         // run this press ahead of that older one; let the hook reach admission,
-        // which reconciles the old record or queues this press. Nothing is
-        // published before its turn.
-        if (PressQueueHeld()) {
+        // which reconciles the old record or queues this press. The queue is
+        // launcher-local, so it is read only on the recorded thread.
+        if (OnRecordedLauncherThread() && PressQueueHeld()) {
             TraceLog(L"own pass trigger=%s reason=peer-stale-queued", trigger);
         } else {
             // No controller and nothing held: the caller forwards to the shell.
@@ -14524,8 +14524,9 @@ bool HideCanServeClose(const wchar_t** reason) {
     if (!PeerAliveNow()) {
         // Same rule as the decision gate: a native close would pass over an
         // older press. With one outstanding or queued, let the close reach the
-        // dispatcher, which reconciles or queues it.
-        if (PressQueueHeld()) {
+        // dispatcher, which reconciles or queues it. The queue is launcher-local;
+        // read it only on the recorded thread.
+        if (OnRecordedLauncherThread() && PressQueueHeld()) {
             TraceLog(L"exec hide peer-stale-queued");
         } else {
             *reason = L"no-peer";
@@ -14579,12 +14580,19 @@ bool ClickAwayPointerNow() {
     if (!under) {
         return false;
     }
+    // The clock, a tray icon and the taskbar background are children of the
+    // tray's top-level window; take the root so every one of them is excluded,
+    // including a secondary bar's Shell_SecondaryTrayWnd.
+    const HWND root = GetAncestor(under, GA_ROOT);
+    if (!root) {
+        return false;
+    }
     wchar_t className[64]{};
-    if (GetClassNameW(under, className, ARRAYSIZE(className)) == 0) {
+    if (GetClassNameW(root, className, ARRAYSIZE(className)) == 0) {
         return false;
     }
     return wcscmp(className, L"Shell_TrayWnd") != 0 &&
-           wcscmp(className, L"MSTaskListWClass") != 0;
+           wcscmp(className, L"Shell_SecondaryTrayWnd") != 0;
 }
 
 // XamlLauncherState::HideStartAndCortana(void* self, uint32_t method)

@@ -125,8 +125,10 @@
   Round-11 probe). The taskbar app-button case is **not measured**: the
   auto-hidden bar did not reveal a pointer target in the 2026-11-22 session and
   its focused buttons do not expose `InvokePattern`. `ClickAwayPointerNow`
-  excludes a click whose cursor window is `Shell_TrayWnd`/`MSTaskListWClass`; a
-  taskbar implementation with another class would be read as a pointer click and
+  excludes a click whose cursor is over the tray's top-level window
+  (`Shell_TrayWnd` or `Shell_SecondaryTrayWnd`, via `GetAncestor(GA_ROOT)`), so
+  the clock, a tray icon and the bar background are all excluded; a taskbar
+  implementation with another root class would be read as a pointer click and
   reopen, which is the residual of that rule.
 - **Two bounded wakes are state-owned.** The open-generation gate reads its
   generation every 20 ms for at most 900 ms, and a standing press slot or
