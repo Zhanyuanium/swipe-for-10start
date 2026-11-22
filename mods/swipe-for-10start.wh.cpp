@@ -72,37 +72,37 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
 /*
 - AnimationStyle: Windows 11
   $name: Menu animation style
+  $name:zh-CN: 菜单动画样式
   $description: >-
-    How the menu moves whenever it slides: touch swipes, and Windows-key
-    opens and closes too. Both choices are the same spring, only the damping
-    differs. Windows 11 (1.72) is fitted to the native Quick Settings panel
-    (Win+A) and glides into place; Windows 10 (0.9) is slower off the mark
-    and lands firmer, the feel this mod shipped with. A bigger menu takes
-    longer rather than moving faster: the duration follows the travel and is
-    not a setting.
+    The shape of the slide. Windows 11 is fitted to the system's Quick Settings
+    flyout; Windows 10 is the looser spring the mod shipped with. Both run the
+    same spring; the choice changes the feel, never the mechanism, and it also
+    decides how opening and closing with the Windows key look.
+  $description:zh-CN: 滑动动画的曲线形状。Windows 11 拟合自系统自带面板（快速设置弹出面板）的动作；Windows 10 是本模组最初发布时的手感，弹簧更松，可能略微过冲。两者跑的是同一条弹簧——这个选择只改手感，不改机制——同一个选择也决定按 Windows 键开合菜单时的动画。
   $options:
-  - Windows 11: glides like the Win+A Quick Settings panel
-  - Windows 10: slower off the mark, lands firmer (as shipped)
+  - Windows 11: glides like the Quick Settings flyout
+  - Windows 10: looser spring, can overshoot slightly
 - GestureStartSpeedPercent: 100
   $name: Animation start speed (% of swipe speed)
+  $name:zh-CN: 动画起步速度（占滑动速度的百分比）
   $description: >-
-    How fast the menu keeps moving at the instant you lift your finger. The
-    speed is measured from an 8-30 ms window of reports that ends at the newest
-    point, which must itself be no more than 30 ms before you lift, and it is
-    projected onto the direction the menu is about to move: 100 continues at
-    that component, a higher value snaps it away faster (up to 300), 0 starts
-    from a standstill. A finger held still has no speed to carry, and sideways
-    motion does not count, because only the part toward the target enters the
-    motion. Neither do Windows-key opens and closes: they start from rest
-    whatever you set.
+    How fast the menu keeps moving the moment you lift your finger, as a
+    percentage of the finger's speed in the direction the menu is going. 100
+    continues at finger speed, higher values snap away faster, 0 always starts
+    from a standstill. A finger held still starts from rest whatever this says,
+    and Windows-key opens always start from rest; this setting does not affect
+    them.
+  $description:zh-CN: 松手瞬间菜单继续滑动的速度，取手指朝菜单目标方向的速度分量的百分比。100 表示按手指速度继续；更大的值甩得更快；0 总是从静止起步。手指停住再抬起时无论设多少都从静止起步；用 Windows 键打开也总是从静止起步——这两种情况都不受这个设置影响。
+- CommitDistancePercent: 10
+  $name: Drag intent distance (% of travel)
+  $name:zh-CN: 拖动意图距离（占行程的百分比）
+  $description: How far a drag must travel toward the target before releasing commits it. A shorter pull springs back closed; a shorter close drag reverses back open. The same value applies on every taskbar side; a quick flick commits even when it is shorter.
+  $description:zh-CN: 拖动朝目标方向走多远，松手才算数。拉开不足这个距离会弹回关闭状态；收回不足这个距离会回弹重新打开。四个任务栏方向共用同一个值；快速一甩即使距离更短也会生效。
 - DiagnosticTrace: false
   $name: Write a diagnostic trace file
-  $description: >-
-    Writes the mod's decision lines to a log file in its storage folder, one
-    file per process (renderer.log in the Start menu host, bridge.log in
-    Explorer). Turn it on only when a maintainer or a bug report asks for it:
-    the trace is capped, but it is meant for diagnosis, not for everyday use.
-    Off, nothing is written to disk.
+  $name:zh-CN: 写入诊断跟踪文件
+  $description: Turns on the decision log described below. Leave it off for everyday use; a bug report or a maintainer will ask for it.
+  $description:zh-CN: 打开下文所述的决策日志。日常使用请保持关闭；只有在维护者或缺陷报告要求时才打开。
 */
 // ==/WindhawkModSettings==
 
@@ -614,6 +614,14 @@ constexpr int kGestureStartSpeedDefault = 100;
 constexpr int kGestureStartSpeedMin = 0;
 constexpr int kGestureStartSpeedMax = 300;
 
+// The percentage of the panel's travel a release must cover toward the target
+// to commit. One value for every axis keeps the release rule the same on all
+// four taskbar sides; the clamp keeps a malformed setting from turning a tap
+// into a commit or demanding a full-panel drag.
+constexpr int kCommitDistancePercentDefault = 10;
+constexpr int kCommitDistancePercentMin = 1;
+constexpr int kCommitDistancePercentMax = 50;
+
 // Every gesture close ends in one executor dismiss at the end of its settle. The
 // dismiss is the bridge's Dismiss on the launcher thread: no key handler, no
 // explorer-side request and no re-arm exist. The settle runs first, so the panel
@@ -633,11 +641,6 @@ static_assert(static_cast<uint64_t>(kSettleMaxDuration.count()) <=
               "the close dismiss must run inside the restore suppression");
 
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
-constexpr float kCommitDistanceFraction = 0.20f;
-// A vertical dismiss starts counting only once the list underneath has reached
-// its end, so the remaining drag is short by nature; 20% of the panel would ask
-// for a drag most people never make.
-constexpr float kCommitDistanceFractionVertical = 0.10f;
 constexpr float kCommitVelocity = 0.45f;
 constexpr float kScrollAbortPerp = 120.0f;
 constexpr float kScrollAbortRatio = 1.5f;
@@ -1265,6 +1268,19 @@ void LoadGestureStartSpeed() {
                    kGestureStartSpeedMin, kGestureStartSpeedMax);
     g_gestureStartSpeedPercent.store(percent, std::memory_order_relaxed);
     TraceLog(L"settle start speed=%d%%", percent);
+}
+
+// The release threshold as a percentage of the panel's travel. One value for
+// every axis; Wh_ModInit and Wh_ModSettingsChanged write it, and the release
+// decision reads it once.
+std::atomic<int> g_commitDistancePercent{kCommitDistancePercentDefault};
+
+void LoadCommitDistance() {
+    const int percent = std::clamp(Wh_GetIntSetting(L"CommitDistancePercent"),
+                                   kCommitDistancePercentMin,
+                                   kCommitDistancePercentMax);
+    g_commitDistancePercent.store(percent, std::memory_order_relaxed);
+    TraceLog(L"gesture commit distance=%d%%", percent);
 }
 
 // ---------------------------------------------------------------------------
@@ -3116,20 +3132,22 @@ void ArmGestureClose(CloseKind kind, std::chrono::milliseconds duration) {
 // The commit decision both gesture families make at release. The travel at
 // release and the session average are the whole-gesture tests this mod was
 // measured against; only the settle's seam reads the end speed. One function so
-// the dismiss and the reveal cannot drift apart on the thresholds.
+// the dismiss and the reveal cannot drift apart on the thresholds. The travel
+// threshold is the `CommitDistancePercent` setting, the same value on every
+// axis; a fast flick still commits through the average-velocity rule.
 //
 // `travelDip` is the release travel away from the start, `elapsedMs` the session
 // length, and `distance` the panel travel the threshold is a fraction of.
 bool ReleaseCommits(bool allowCommit, float travelDip, uint64_t elapsedMs,
-                    float distance, int32_t axis) {
+                    float distance) {
     if (!allowCommit || !(distance > 0.0f)) {
         return false;
     }
     const float averageVelocity =
         travelDip / static_cast<float>(elapsedMs > 0 ? elapsedMs : 1);
-    const float threshold = IsHorizontalAxis(axis)
-                                ? kCommitDistanceFraction
-                                : kCommitDistanceFractionVertical;
+    const float threshold =
+        static_cast<float>(g_commitDistancePercent.load(
+            std::memory_order_relaxed)) / 100.0f;
     return travelDip > threshold * distance ||
            averageVelocity > kCommitVelocity;
 }
@@ -7119,7 +7137,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     const bool liveHeld =
         reveal.liveTakeover && progress >= reveal.liveStart;
     const bool commit =
-        ReleaseCommits(true, travel, elapsed, distance, geometry.axis()) ||
+        ReleaseCommits(true, travel, elapsed, distance) ||
         liveHeld;
 
     // The release line is written after the animation starts: the file write
@@ -7331,8 +7349,7 @@ void ReleaseHidSession(const GestureGeometry& geometry, bool allowCommit,
     const float finalDelta = std::max(0.0f, session.curDelta);
     const float distance = geometry.distance();
     const bool commit =
-        ReleaseCommits(allowCommit, finalDelta, elapsed, distance,
-                       geometry.axis());
+        ReleaseCommits(allowCommit, finalDelta, elapsed, distance);
 
     const uint64_t releaseQpc = QpcMsNow();
     EndContactTiming();
@@ -13938,10 +13955,11 @@ BOOL RoleInit() {
     SetTraceFileName(L"renderer.log");
     RefreshTraceSetting();
     TraceLog(L"mod init");
-    Wh_Log(L"Legacy Start Swipe %s initializing (start role)", kModVersion);
+    Wh_Log(L"Swipe for 10Start %s initializing (start role)", kModVersion);
 
     LoadAnimationStyle();
     LoadGestureStartSpeed();
+    LoadCommitDistance();
     // The stop event the input thread's wait watches. Created before the thread
     // exists, so the unload has a signal that does not depend on the window.
     g_hidStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -14260,6 +14278,7 @@ void RoleSettingsChanged() {
     }
     LoadAnimationStyle();
     LoadGestureStartSpeed();
+    LoadCommitDistance();
     RefreshTraceSetting();
 }
 
