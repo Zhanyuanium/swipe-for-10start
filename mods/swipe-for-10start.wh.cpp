@@ -13850,6 +13850,12 @@ constexpr UINT_PTR kExecProbeTimer = 0x5359;
 constexpr UINT_PTR kPressLatchTimer = 0x535A;
 constexpr UINT_PTR kExecDismissProbeTimer = 0x535B;
 constexpr UINT_PTR kPressAckTimer = 0x535C;
+// The landing watch for a latched open's remainder: a bounded one-shot that
+// checks whether the open has reached the screen before the next owed press is
+// published.
+constexpr UINT_PTR kPressLandingTimer = 0x535D;
+constexpr uint64_t kPressLandingPollMs = 20;
+constexpr uint64_t kPressLandingMaxWaitMs = 900;
 constexpr uint64_t kPressLatchTimeoutMs = 400;
 constexpr uint64_t kPressLatchRetryMs = 100;
 // One outstanding press. The ack normally arrives in the consumer's own turn
@@ -14768,6 +14774,12 @@ struct PressLatch {
 };
 
 PressLatch g_pressLatch;  // launcher thread only
+// After a latch serves its first open, the remainder waits here until that show
+// has actually put the window on screen. A close published into the uncloak is
+// ended by the Start side's fresh-open rule, so the second owed press would be
+// lost. Launcher thread only.
+bool g_pressOpenLandingPending = false;
+uint64_t g_pressOpenLandingDeadline = 0;
 // Why the timer that will serve g_pressLatch was armed: the hidden event's
 // deferral ("hidden") or the 400 ms fallback ("timeout"). The serve line names
 // it. Launcher thread only, like the latch.
@@ -14978,6 +14990,14 @@ bool ServeLatchedPress(const wchar_t* reason) {
     const LONG64 sequence = PublishPressIntent(kSwipeIntentOpen, first, L"latch");
     if (sequence <= 0) {
         RunPressOriginal(first, L"latch-publish");
+    } else if (latch.count > 1) {
+        // The first open's show is still in flight when its ack arrives. The
+        // remainder must wait for the window to be on screen, or its close is
+        // ended by the fresh-open rule and the second press is lost. The bound
+        // starts when the ack (or the timeout) first releases the queue, not at
+        // this publication: a late ack must not shorten the show's budget.
+        g_pressOpenLandingPending = true;
+        g_pressOpenLandingDeadline = 0;
     }
     for (int i = 1; i < latch.count; ++i) {
         QueuePress(latch.presses[i], L"latch");
@@ -15020,6 +15040,11 @@ OutstandingPress g_pressOutstanding;  // launcher thread only
 // thread only.
 void DropPressQueue(const wchar_t* reason) {
     int dropped = 0;
+    g_pressOpenLandingPending = false;
+    HWND landingWindow = g_execWindow.load(std::memory_order_relaxed);
+    if (landingWindow) {
+        KillTimer(landingWindow, kPressLandingTimer);
+    }
     while (g_pressQueueCount > 0) {
         const QueuedPress& press = g_pressQueue[g_pressQueueHead];
         TraceLog(L"own press dropped trigger=%s entry=%s reason=%s wait=%llu",
@@ -15255,6 +15280,40 @@ void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
 // leave no ack to wait for, so the next press is served on this same turn; a
 // published press stops the loop at its ack.
 void ServeNextPress(const wchar_t* reason) {
+    if (g_pressOpenLandingPending) {
+        // The ack of a latched open can arrive before its show reaches the
+        // screen. Publishing the owed close into the uncloak would be ended by
+        // the Start side's fresh-open rule, so the remainder waits for the
+        // window's cloak to read open, bounded by one show's budget.
+        const uint64_t now = GetTickCount64();
+        if (g_pressOpenLandingDeadline == 0) {
+            g_pressOpenLandingDeadline = now + kPressLandingMaxWaitMs;
+        }
+        uint64_t state = 0;
+        void* launcher = LauncherNow(&state);
+        bool open = false;
+        if (launcher) {
+            const OwnSnapshot own = OwnSync(launcher);
+            open = own.ready && own.open;
+        }
+        if (!open && now < g_pressOpenLandingDeadline) {
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                SetTimer(window, kPressLandingTimer,
+                         static_cast<UINT>(kPressLandingPollMs), nullptr);
+            } else {
+                g_pressOpenLandingPending = false;
+            }
+            return;
+        }
+        if (!open) {
+            TraceLog(L"own press open landing expired wait=%llu",
+                    static_cast<unsigned long long>(
+                        now - (g_pressOpenLandingDeadline -
+                               kPressLandingMaxWaitMs)));
+        }
+        g_pressOpenLandingPending = false;
+    }
     while (!g_pressOutstanding.pending && g_pressQueueCount > 0) {
         const QueuedPress press = g_pressQueue[g_pressQueueHead];
         g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
@@ -16605,6 +16664,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         KillTimer(window, kPressLatchTimer);
         KillTimer(window, kExecDismissProbeTimer);
         KillTimer(window, kPressAckTimer);
+        KillTimer(window, kPressLandingTimer);
         DestroyWindow(window);
         // The acknowledgement is set after DestroyWindow returns, not from
         // WM_NCDESTROY inside it: the class's window count is decremented when
@@ -16744,6 +16804,11 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
     if (message == WM_TIMER && wParam == kPressAckTimer) {
         KillTimer(window, kPressAckTimer);
         HandlePressAckTimeout();
+        return 0;
+    }
+    if (message == WM_TIMER && wParam == kPressLandingTimer) {
+        KillTimer(window, kPressLandingTimer);
+        ServeNextPress(L"open-landing");
         return 0;
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -17206,6 +17271,7 @@ BOOL RoleInit() {
     g_pressQueueCount = 0;
     g_pressOutstanding = OutstandingPress{};
     g_pressLatch = PressLatch{};
+    g_pressOpenLandingPending = false;
 
     // The channel to the Start side. Opening it here means the section and its
     // events exist before the first Hide, and a Start mod that attaches later

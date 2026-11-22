@@ -292,7 +292,10 @@ posted to the executor window when the event runs on another thread, so the slot
 and its timer stay owned by the launcher thread. A second
 press is appended (`own press latch owed count=2`), not replacing the first; the
 serve logs `own press served ... owed=2`, publishes the first open, then queues
-the remainder so the ack barrier makes the next press the opposite direction
+the remainder so the ack barrier makes the next press the opposite direction.
+The remainder waits for the open's cloak to read open (`reason=open-landing`, a
+bounded 20 ms one-shot) before it is published; a close sent into the uncloak is
+ended by the Start side's fresh-open rule and would lose the second press
 (bottom auto-hidden medians: 219 ms Win close, 210 ms
 Start-button, 234 ms click-away; the gesture latch is rare and measured 94 ms).
 The 400 ms timer is only the fallback for a landing the event missed. A latch
