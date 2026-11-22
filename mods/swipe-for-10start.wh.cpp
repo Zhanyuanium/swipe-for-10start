@@ -13338,14 +13338,14 @@ bool InstallStartUIHooks(HMODULE module) {
     }
     TraceLog(L"root install begin module=%p", module);
 
-    // The Windows 11 image is StartUI_.dll. The collection's file-name index
-    // knows the component as startui.dll, so the array carries that name and no
-    // module comment of its own.
+    // StartUI_.dll. The collection's file-name index knows the component as
+    // startui.dll; this array is named for the image actually hooked, and the
+    // index may raise a review item that the maintainer decides.
     //
     // The entry's name is the exact undecorated spelling, read from the
     // reference StartUI.pdb (10.0.22621.3733) with the same DIA undecorator the
     // Windhawk symbol API matches against.
-    WindhawkUtils::SYMBOL_HOOK startuiDllHooks[] = {
+    WindhawkUtils::SYMBOL_HOOK startUIHooks[] = {
         {
             {L"private: static class Windows::UI::Xaml::UIElement ^ __cdecl "
              L"StartUI::App::PrepareRootElement(class Windows::UI::Xaml::"
@@ -13356,7 +13356,7 @@ bool InstallStartUIHooks(HMODULE module) {
     };
     const uintptr_t base = reinterpret_cast<uintptr_t>(module);
     const bool hooked = WindhawkUtils::HookSymbols(
-        module, startuiDllHooks, ARRAYSIZE(startuiDllHooks));
+        module, startUIHooks, ARRAYSIZE(startUIHooks));
     const uintptr_t resolved =
         reinterpret_cast<uintptr_t>(PrepareRootElement_Original);
     if (!hooked || !resolved) {
