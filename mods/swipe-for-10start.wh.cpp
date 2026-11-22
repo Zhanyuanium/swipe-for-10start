@@ -1137,10 +1137,15 @@ std::atomic<DWORD> g_hidThreadId{0};
 // the compositor or the dispatcher is counted from before it can run.
 // ---------------------------------------------------------------------------
 std::atomic<int> g_moduleEntryCount{0};
+// Set by the first lease ever constructed. The unload uses it to distinguish
+// "nothing was ever registered, so no drain is needed" from "the UI side was
+// used, and without a window the final destructor cannot be proved returned".
+std::atomic<bool> g_moduleEntryEverUsed{false};
 
 class ModuleEntryLease {
   public:
     ModuleEntryLease() {
+        g_moduleEntryEverUsed.store(true, std::memory_order_release);
         g_moduleEntryCount.fetch_add(1, std::memory_order_seq_cst);
     }
     ~ModuleEntryLease() {
@@ -14059,7 +14064,21 @@ void RoleUninit() {
     //    batch, restore resting progress and neutral translation, drop the
     //    UI-owned objects. SendMessage returns only after TeardownUi has
     //    returned, so no dispatcher lambda or its delegate thunk outlives it.
+    //    The owner id is read before TeardownUi clears it, so the inline path is
+    //    known even when no window was involved.
+    const DWORD uiOwner = g_uiThreadId.load(std::memory_order_relaxed);
     HWND uiWindow = TeardownUiOnUiThread();
+    const bool inlineUnload =
+        uiOwner != 0 && uiOwner == GetCurrentThreadId();
+
+    // 4a. Without a window there is no empty-turn barrier. If any entry was ever
+    //     used, two zero reads cannot prove the last destructor returned, so the
+    //     unload blocks instead of freeing under a destructor still running. The
+    //     never-attached case (no hook, no entries) still completes.
+    if (!inlineUnload && !uiWindow &&
+        g_moduleEntryEverUsed.load(std::memory_order_acquire)) {
+        BlockUnload(L"no window to drain module entries");
+    }
 
     // 4. The same proof on every path: no counted entry and no registered XAML
     //    handler. A teardown window that could not run does not excuse either
