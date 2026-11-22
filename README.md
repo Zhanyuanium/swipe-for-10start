@@ -77,12 +77,12 @@ folder must be on `PATH`; `-Compiler` names `windhawk-cli` explicitly, `-All`
 also installs the diagnostic probes, and `-SkipRestart` leaves the menu host
 alone.
 
-The script restarts `StartMenuExperienceHost.exe` when it finishes; do it by hand
-(Task Manager → details → `StartMenuExperienceHost.exe` → end task; it restarts
-itself) or sign out and back in — the mod can only attach when the menu process
-creates its window. `mod install` leaves a previously disabled mod disabled, so
-the script enables it; the Explorer half hooks Explorer when the mod is enabled,
-without an Explorer restart on this build.
+The script restarts `StartMenuExperienceHost.exe` when it finishes. A restart is
+not required for the mod to work: an enable or update attaches to the root the
+running menu host already has, and the next open uses it. `mod install` leaves a
+previously disabled mod disabled, so the script enables it; the Explorer half
+hooks Explorer when the mod is enabled, without an Explorer restart on this
+build.
 
 ## Settings
 
@@ -153,9 +153,6 @@ without an Explorer restart on this build.
   shell with
   `windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true`
   or from the mod's settings, then reproduce the problem.
-- After disabling and re-enabling the mod, restart
-  `StartMenuExperienceHost.exe` — gestures cannot attach to the already-open
-  menu window.
 - The root hook is found by public symbol, not by address. If `StartUI_.dll`
   does not carry `StartUI::App::PrepareRootElement` (or its symbols cannot be
   read), no gesture starts and the log shows `startui root symbol unresolved

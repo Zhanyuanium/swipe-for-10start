@@ -760,6 +760,15 @@ false result is terminal: `startui root symbol unresolved ... attempts=1`, no
 retry, no root hook and no controller service. The shell keeps pumping for the
 whole fetch.
 
+`PrepareRootElement` is not the only attach path. A host that is already running
+when this image loads has created its root, so the hook may never run again.
+`Wh_ModAfterInit` finds the host's `CoreWindow`, posts a registered message, and
+a targeted `WH_GETMESSAGE` hook runs on that UI thread: it records the thread,
+creates the rendezvous window, takes `Window::Current().Content()` and calls the
+same `AttachRootElement`. A suspended host keeps the message until it next pumps,
+so enabling does not block; the unload removes the hook first. The root hook
+remains the path for a root the shell creates later.
+
 The explorer half moved the same way. The launcher entry points, the
 `s_pLauncher` slot and `IsVisible` are resolved by one `HookSymbols` call on
 `twinui.pcshell.dll`; the fixed VAs, the `twinui` file-version/timestamp gate,

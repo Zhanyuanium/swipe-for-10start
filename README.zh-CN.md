@@ -32,8 +32,7 @@ pwsh -File .\tools\install_mods.ps1
 
 脚本先运行 `tools/make_store_mods.ps1 -Profile local`，把共享头文件内联后的单文件构建写到 `dist\local\`（`@compilerOptions` 中不再有 `-I`，因为安装后的模组由 Windhawk 从标准输入编译，旁边没有仓库）；随后安装并启用该模组。Windhawk 的安装目录必须在 `PATH` 上；`-Compiler` 可直接指定 `windhawk-cli`，`-All` 会一并安装诊断探针，`-SkipRestart` 则不重启菜单宿主。
 
-脚本结束时重启 `StartMenuExperienceHost.exe`；手动操作时在任务管理器 → 详细信息 →
-`StartMenuExperienceHost.exe` → 结束任务，它会自动重启，或者注销并重新登录——模组只能在菜单进程创建窗口时挂载。`mod install` 不会启用先前被禁用的模组，所以脚本会显式启用它；Explorer 的半边在模组启用时挂钩 Explorer，在当前系统版本上不必重启它。
+脚本结束时重启 `StartMenuExperienceHost.exe`。但启用或更新模组并不需要重启：它会挂到正在运行的菜单宿主已有的根上，下一次打开菜单就使用新的渲染器。`mod install` 不会启用先前被禁用的模组，所以脚本会显式启用它；Explorer 的半边在模组启用时挂钩 Explorer，在当前系统版本上不必重启它。
 
 ## 设置项
 
@@ -62,7 +61,6 @@ pwsh -File .\tools\install_mods.ps1
 - 模组可以把决策日志写进它的 Windhawk 存储目录（Windhawk 在模组页面上显示该路径）下的两个文件：Start 半边的 `renderer.log` 和 Explorer 半边的 `bridge.log`，都在 `local@swipe-for-10start` 下。只有打开 **写入诊断跟踪文件**（`DiagnosticTrace`）时才会写；打开一次即可：
   `windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true`，
   也可以在模组设置里打开（命令行需要管理员权限），然后复现问题。
-- 禁用再启用模组后要重启 `StartMenuExperienceHost.exe`——手势无法挂到已经存在的菜单窗口上。
 - 根钩子按公开符号查找，不依赖固定地址。若 `StartUI_.dll` 不含 `StartUI::App::PrepareRootElement`（或读不到符号），手势不会启动，日志里会看到 `startui root symbol unresolved ...`；此时所有按键都交给系统自行处理。
 - 拖动菜单期间，菜单内容仍在原位置接收触摸——这是已知限制；另一条已知限制：本模组假设触摸面板覆盖主显示器。
 - 完整的技术文档在 [docs/](docs/README.md)（英文），其中有测量数据、被证伪的方案和每项设计决定的理由，也包括完整的[已知限制列表](docs/limits.md)。

@@ -27,6 +27,12 @@ executor owns the launcher call and the non-touch triggers. Wh_ModInit picks one
 role table from the host executable name before either half runs, and the other
 half's hooks, threads and handles are never created there.
 
+An enable or update attaches the Start half to a host that is already running:
+`Wh_ModAfterInit` posts a registered message, a targeted `WH_GETMESSAGE` hook
+runs on the host's UI thread, and `Window::Current().Content()` goes through the
+same root attach path. The `PrepareRootElement` hook remains the path for a root
+the shell creates later, and the posted hook is removed before the image unloads.
+
 The controller decides; the executor performs. The Win key
 (`XamlLauncher::OnHotkeyInvoke`), the Start button (`ShowStartView` method 11,
 `Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) reach one

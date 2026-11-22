@@ -20,8 +20,19 @@ reachable.
 
 ## Start (StartMenuExperienceHost.exe)
 
+A host that was already running when the image loaded has created its root long
+ago, so `PrepareRootElement` may never run for this image. `Wh_ModAfterInit`
+finds the host's `CoreWindow`, posts a registered message, and a targeted
+`WH_GETMESSAGE` hook runs the attach on that UI thread: it records the thread,
+creates the rendezvous window, takes `Window::Current().Content()` and passes it
+through the same `AttachRootElement` path the hook uses. The root hook remains
+the path for a later root. A suspended host keeps the posted message until it
+next pumps, so the enable does not block; the unload removes the hook before the
+image goes.
+
 1. **`Wh_ModBeforeUninit`** takes the symbol-install lock and sets `g_disabled`,
-   sets `g_unloading`, stops the async dismiss callback, and withdraws peer
+   sets `g_unloading`, removes the enable-time attach hook, stops the async
+   dismiss callback, and withdraws peer
    availability (`PublishPeerGone`: `peerState=0` plus `controllerDirection=0`
    plus `controllerTouch=0`) before the consumer is stopped. The root install
    applies its queued hook under that same lock, so a stop here either waits for

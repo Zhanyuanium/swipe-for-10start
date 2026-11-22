@@ -148,7 +148,10 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   Wh_ModInit
  *   selects exactly one role table from the host executable name
  *   (start::Role or bridge::Role), and the four Windhawk entry points forward
- *   to that table. The bridge reads the loaded twinui fixed file version before
+ *   to that table. Wh_ModAfterInit attaches the Start half to a host that is
+ *   already running by taking Window::Current().Content() on that host's own
+ *   thread; the PrepareRootElement hook remains the path for a later root. The
+ *   bridge reads the loaded twinui fixed file version before
  *   its one symbol attempt: any other image is refused with
  *   `exec launcher layout unverified ... skipped=version` and no PDB fetch.
  * [POS]: the single shipping source. The two halves were two mods before 0.7.0
@@ -4605,7 +4608,108 @@ HWND FindStartCoreWindow() {
     return nullptr;
 }
 
+// Runs a small procedure on the thread that owns `hwnd`, without blocking the
+// caller. A thread-targeted WH_GETMESSAGE hook sees the posted registered
+// message before the loop dispatches it, so the procedure runs on the UI thread
+// with its message loop active; the hook removes itself and frees the call.
+// This is the enable path's way onto an already-running Start host, whose root
+// hook is not guaranteed to run again. A host that is suspended keeps the hook
+// and the posted message until it next pumps; the unload removes the hook.
+using RunFromWindowThreadProc = void(WINAPI*)(PVOID);
+
+struct RunFromWindowThreadParam {
+    RunFromWindowThreadProc proc;
+    PVOID param;
+    HHOOK hook;
+    bool ran;
+};
+
+std::atomic<HHOOK> g_startAttachHook{nullptr};
+
+UINT RunFromWindowThreadMessage() {
+    static const UINT message = RegisterWindowMessageW(
+        L"WindhawkSwipeFor10Start_RunFromWindowThread");
+    return message;
+}
+
+LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam,
+                                         LPARAM lParam) {
+    if (code == HC_ACTION && wParam == PM_REMOVE) {
+        auto* message = reinterpret_cast<MSG*>(lParam);
+        if (message && message->message == RunFromWindowThreadMessage()) {
+            auto* call =
+                reinterpret_cast<RunFromWindowThreadParam*>(message->lParam);
+            if (call && call->proc) {
+                call->ran = true;
+                call->proc(call->param);
+                const HHOOK hook = call->hook;
+                call->hook = nullptr;
+                g_startAttachHook.store(nullptr, std::memory_order_release);
+                message->lParam = 0;
+                UnhookWindowsHookEx(hook);
+                delete call;
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc proc,
+                         PVOID param) {
+    if (!hwnd || !proc) {
+        return false;
+    }
+    const UINT message = RunFromWindowThreadMessage();
+    if (!message) {
+        TraceLog(L"run on window thread: registered message unavailable");
+        return false;
+    }
+    const DWORD threadId = GetWindowThreadProcessId(hwnd, nullptr);
+    if (threadId == 0) {
+        return false;
+    }
+    if (threadId == GetCurrentThreadId()) {
+        proc(param);
+        return true;
+    }
+    HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, RunFromWindowThreadHook,
+                                   nullptr, threadId);
+    if (!hook) {
+        TraceLog(L"run on window thread: hook failed tid=%u err=%u", threadId,
+                GetLastError());
+        return false;
+    }
+    auto* call = new (std::nothrow)
+        RunFromWindowThreadParam{proc, param, hook, false};
+    if (!call) {
+        UnhookWindowsHookEx(hook);
+        return false;
+    }
+    g_startAttachHook.store(hook, std::memory_order_release);
+    if (!PostMessageW(hwnd, message, 0, reinterpret_cast<LPARAM>(call))) {
+        g_startAttachHook.store(nullptr, std::memory_order_release);
+        UnhookWindowsHookEx(hook);
+        delete call;
+        return false;
+    }
+    TraceLog(L"run on window thread posted hwnd=%p tid=%u", hwnd, threadId);
+    return true;
+}
+
+// Removes a posted attach that the host has not served. The posted message
+// stays in the queue with its now-unused parameter; no hook runs for it, and
+// the shell ignores an unknown registered message. This is called after
+// g_unloading is set, so an in-flight callback returns without touching state.
+void RemoveStartAttachHook() {
+    HHOOK hook = g_startAttachHook.exchange(nullptr, std::memory_order_acq_rel);
+    if (hook) {
+        TraceLog(L"start attach hook removed before service");
+        UnhookWindowsHookEx(hook);
+    }
+}
+
 // Cached answer of StartWindowIsOpen() for the report handler. The cloaked
+
 // query is a syscall, so one answer serves every report inside 20 ms; the
 // cache is dropped on each lift so a down always starts from a fresh query.
 bool g_openCheckValid = false;     // input thread only
@@ -13204,6 +13308,8 @@ PrepareRootElement_t PrepareRootElement_Original = nullptr;
 // thread, from this hook and before Loaded is registered.
 bool EnsureUiRendezvousWindow();
 
+void AttachRootElement(wux::FrameworkElement const& root, bool replaceExisting);
+
 void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     // The first touch of this image is the admission lock itself. The unload
     // either holds the exclusive writer and this hook registers nothing, or the
@@ -13262,94 +13368,7 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
             return result;
         }
 
-        Wh_Log(L"PrepareRootElement root class=%s name=%s",
-               winrt::get_class_name(root).c_str(), root.Name().c_str());
-
-        // A new open: drop the previous root's property set, animation and
-        // gesture state before installing the fresh renderer.
-        ResetRenderer();
-
-        // The dispatcher is UI-thread state the renderer uses for counted turns.
-        // The unload now revokes through the rendezvous window, not through this
-        // dispatcher; capture it here, under the same mutex every reader takes,
-        // before the first registration.
-        try {
-            wucore::CoreDispatcher dispatcher = root.Dispatcher();
-            if (dispatcher) {
-                std::lock_guard lock(g_compositionMutex);
-                g_dispatcher = dispatcher;
-            }
-        } catch (winrt::hresult_error const& e) {
-            Wh_Log(L"Dispatcher capture failed: %08X", e.code());
-        } catch (...) {
-            Wh_Log(L"Dispatcher capture failed with an unknown exception");
-        }
-
-        bool alreadyLoaded = false;
-        try {
-            alreadyLoaded = root.IsLoaded();
-        } catch (winrt::hresult_error const& e) {
-            Wh_Log(L"IsLoaded check failed: %08X", e.code());
-        }
-
-        // The first registration is below. Re-read the stop immediately before
-        // it: the shared admission lock already keeps the unload waiting, and
-        // this check keeps a hook that saw the flag late from adding a delegate
-        // at all.
-        if (g_unloading.load(std::memory_order_relaxed)) {
-            TraceLog(L"root registration skipped reason=unloading");
-            return result;
-        }
-
-        if (alreadyLoaded) {
-            Setup(root);
-        } else if (g_loadedToken.value) {
-            // The previous Loaded registration survived its revoke. Its token is
-            // the only handle on a handler that can still fire, so it is kept:
-            // overwriting it would lose that handle for the rest of the process,
-            // and the unload would wait on a handler it cannot clear. This
-            // root then installs no renderer, and the log says why.
-            Wh_Log(L"Loaded registration from the previous root is still "
-                   L"attached; this root gets no renderer");
-            TraceLog(L"xaml loaded handler left attached; new registration "
-                    L"refused");
-        } else {
-            const winrt::hstring rootClassName = winrt::get_class_name(root);
-            TraceLog(L"root pending load class=%s", rootClassName.c_str());
-
-            const uint32_t generation =
-                g_setupGeneration.load(std::memory_order_relaxed);
-            auto weak = winrt::make_weak(root);
-            g_loadedRoot = root;
-            g_loadedToken = root.Loaded(
-                [weak, generation](
-                    winrt::Windows::Foundation::IInspectable const& sender,
-                    wux::RoutedEventArgs const&) {
-                    UiDepthGuard depth;
-                    try {
-                        if (generation != g_setupGeneration.load(
-                                              std::memory_order_relaxed)) {
-                            return;
-                        }
-                        wux::FrameworkElement current =
-                            sender.try_as<wux::FrameworkElement>();
-                        if (!current) {
-                            current = weak.get();
-                        }
-                        if (current) {
-                            Setup(current);
-                        }
-                    } catch (winrt::hresult_error const& e) {
-                        Wh_Log(L"Loaded setup failed: %08X %s", e.code(),
-                               e.message().c_str());
-                    } catch (...) {
-                        Wh_Log(L"Loaded setup failed with an unknown exception");
-                    }
-                });
-            if (g_loadedToken.value) {
-                g_uiRegistrationCount.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
+        AttachRootElement(root, true);
     } catch (winrt::hresult_error const& e) {
         Wh_Log(L"PrepareRootElement hook failed: %08X %s", e.code(),
                e.message().c_str());
@@ -13358,6 +13377,116 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     }
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// The one root attach path
+//
+// The PrepareRootElement hook calls this for a root the shell just produced;
+// the enable-time path calls it for the root already in the running host.
+// `replaceExisting` is true only for the hook: a new root must drop the previous
+// renderer, while an enable must not tear down one that is already live.
+// ---------------------------------------------------------------------------
+void AttachRootElement(wux::FrameworkElement const& root, bool replaceExisting) {
+    if (!root) {
+        return;
+    }
+    if (!replaceExisting) {
+        std::lock_guard lock(g_compositionMutex);
+        if (g_root || g_state) {
+            TraceLog(L"root attach skipped reason=already-attached");
+            return;
+        }
+    }
+
+    Wh_Log(L"Attaching root class=%s name=%s",
+           winrt::get_class_name(root).c_str(), root.Name().c_str());
+
+    // A new open: drop the previous root's property set, animation and gesture
+    // state before installing the fresh renderer.
+    ResetRenderer();
+
+    // The dispatcher is UI-thread state the renderer uses for counted turns.
+    // The unload revokes through the rendezvous window, not through this
+    // dispatcher; capture it here, under the same mutex every reader takes,
+    // before the first registration.
+    try {
+        wucore::CoreDispatcher dispatcher = root.Dispatcher();
+        if (dispatcher) {
+            std::lock_guard lock(g_compositionMutex);
+            g_dispatcher = dispatcher;
+        }
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"Dispatcher capture failed: %08X", e.code());
+    } catch (...) {
+        Wh_Log(L"Dispatcher capture failed with an unknown exception");
+    }
+
+    bool alreadyLoaded = false;
+    try {
+        alreadyLoaded = root.IsLoaded();
+    } catch (winrt::hresult_error const& e) {
+        Wh_Log(L"IsLoaded check failed: %08X", e.code());
+    }
+
+    // The first registration is below. Re-read the stop immediately before it:
+    // the shared admission lock already keeps the unload waiting, and this check
+    // keeps a caller that saw the flag late from adding a delegate at all.
+    if (g_unloading.load(std::memory_order_relaxed)) {
+        TraceLog(L"root registration skipped reason=unloading");
+        return;
+    }
+
+    if (alreadyLoaded) {
+        Setup(root);
+        return;
+    }
+    if (g_loadedToken.value) {
+        // The previous Loaded registration survived its revoke. Its token is the
+        // only handle on a handler that can still fire, so it is kept:
+        // overwriting it would lose that handle for the rest of the process, and
+        // the unload would wait on a handler it cannot clear. This root then
+        // installs no renderer, and the log says why.
+        Wh_Log(L"Loaded registration from the previous root is still attached; "
+               L"this root gets no renderer");
+        TraceLog(L"xaml loaded handler left attached; new registration refused");
+        return;
+    }
+
+    const winrt::hstring rootClassName = winrt::get_class_name(root);
+    TraceLog(L"root pending load class=%s", rootClassName.c_str());
+
+    const uint32_t generation =
+        g_setupGeneration.load(std::memory_order_relaxed);
+    auto weak = winrt::make_weak(root);
+    g_loadedRoot = root;
+    g_loadedToken = root.Loaded(
+        [weak, generation](winrt::Windows::Foundation::IInspectable const& sender,
+                           wux::RoutedEventArgs const&) {
+            UiDepthGuard depth;
+            try {
+                if (generation !=
+                    g_setupGeneration.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                wux::FrameworkElement current =
+                    sender.try_as<wux::FrameworkElement>();
+                if (!current) {
+                    current = weak.get();
+                }
+                if (current) {
+                    Setup(current);
+                }
+            } catch (winrt::hresult_error const& e) {
+                Wh_Log(L"Loaded setup failed: %08X %s", e.code(),
+                       e.message().c_str());
+            } catch (...) {
+                Wh_Log(L"Loaded setup failed with an unknown exception");
+            }
+        });
+    if (g_loadedToken.value) {
+        g_uiRegistrationCount.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -13925,6 +14054,62 @@ bool EnsureUiRendezvousWindow() {
     return true;
 }
 
+// Attaches this activation to a Start host that is already running. The
+// PrepareRootElement hook is not guaranteed to run again once the host has
+// created its root, so Wh_ModAfterInit takes the root from the live XAML window
+// on its own thread and uses the same attach path. A host with no window yet is
+// left to the hook.
+void AttachToRunningStartHost() {
+    HWND coreWindow = FindStartCoreWindow();
+    if (!coreWindow) {
+        TraceLog(L"attach existing host: no core window");
+        return;
+    }
+    const bool posted = RunFromWindowThread(coreWindow, [](PVOID) {
+        UiDepthGuard depth;
+        RootAdmissionShared admission;
+        if (g_unloading.load(std::memory_order_relaxed)) {
+            TraceLog(L"attach existing host: unloading");
+            return;
+        }
+        g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        CaptureCoreWindowHandle();
+        if (!EnsureUiRendezvousWindow()) {
+            TraceLog(L"attach existing host: no rendezvous window");
+            return;
+        }
+        try {
+            wux::Window window = wux::Window::Current();
+            if (!window) {
+                TraceLog(L"attach existing host: no xaml window");
+                return;
+            }
+            wux::UIElement content = window.Content();
+            if (!content) {
+                TraceLog(L"attach existing host: no xaml content");
+                return;
+            }
+            wux::FrameworkElement root =
+                content.try_as<wux::FrameworkElement>();
+            if (!root) {
+                TraceLog(L"attach existing host: content is not a "
+                         L"FrameworkElement");
+                return;
+            }
+            TraceLog(L"attach existing host root class=%s",
+                    winrt::get_class_name(root).c_str());
+            AttachRootElement(root, false);
+        } catch (winrt::hresult_error const& e) {
+            Wh_Log(L"Attach to running Start host failed: %08X %s", e.code(),
+                   e.message().c_str());
+        } catch (...) {
+            Wh_Log(L"Attach to running Start host failed with an unknown "
+                   L"exception");
+        }
+    }, nullptr);
+    TraceLog(L"attach existing host posted=%d", posted ? 1 : 0);
+}
+
 void UnregisterUiRendezvousClass() {
     if (!g_uiRendezvousClassRegistered) {
         return;
@@ -14217,6 +14402,11 @@ void RoleAfterInit() {
     Wh_ApplyHookOperations();
     RecordLoadedStartUIModule();
 
+    // A host that was already running when this image loaded has created its
+    // root long ago, so the PrepareRootElement hook will not run again. Attach
+    // to that live root now; the hook remains the path for a later root.
+    AttachToRunningStartHost();
+
     TraceLog(L"hid init");
     if (!g_hidStopEvent) {
         // A gesture source that cannot be stopped is worse than no gesture:
@@ -14249,6 +14439,11 @@ void RoleBeforeUninit() {
     g_disabled = true;
     ReleaseSRWLockExclusive(&g_startUIHookLock);
     g_unloading = true;
+
+    // A posted enable-time attach may still be queued in the host's message
+    // loop; its hook points into this image. Remove it after g_unloading so an
+    // in-flight callback returns without touching the root.
+    RemoveStartAttachHook();
 
     // Stop the asynchronous dismiss-settle callback from touching state once
     // the module starts to unload. The handler reads this before it takes any
@@ -14309,6 +14504,10 @@ void RoleUninit() {
     // otherwise read the flag as clear, block on the lock and deadlock against
     // the teardown send. The normal path already set it there.
     g_unloading = true;
+
+    // Symmetric with BeforeUninit: an uninit that skipped it still removes the
+    // posted attach hook before the root teardown.
+    RemoveStartAttachHook();
 
     // The bridge's interception precondition fails here, before anything below
     // is freed: from this point no intent is consumed, so no trigger may be
