@@ -17,9 +17,13 @@ touch-first open can reach the launcher before any Win or Start-button hook ran.
 The version follows the project tag; the former Start 0.44.0 and bridge 0.25.0
 versions are gone.
 
-**Settings and logging.** Three settings: `AnimationStyle` (`Windows 11` /
+**Settings and logging.** Four settings: `AnimationStyle` (`Windows 11` /
 `Windows 10`, the settle's damping), `GestureStartSpeedPercent` (0-300, the
-release-speed carry), and `DiagnosticTrace` (boolean, default false). Every
+release-speed carry), `CommitDistancePercent` (1-50, default 10, the share of
+the panel's travel a release must cover; one value on every axis), and
+`DiagnosticTrace` (boolean, default false). The two motion settings and the
+commit distance are read at init and on every settings change into atomics, so
+the release and settle paths never look a setting up. Every
 decision line goes through one `TraceLog` wrapper, which always calls `Wh_Log`
 (Windhawk's own debug logging decides whether it is stored) and writes the same
 line to `<mod storage>\renderer.log` or `\bridge.log` only while
@@ -53,8 +57,8 @@ The controller and the touch gesture. It reads the digitizer through Raw Input
 contact identity and its evidence clock, the coordinate-only fallback); the
 dismiss and reveal sessions; the band admission and the grab's down hit-test; the
 reveal entry and the
-2.2 DIP/ms chase; the commit thresholds; the settle spring and the coast; the
-scroll survey and its gate; the unhealed-window rule; the geometry snapshot and
+2.2 DIP/ms chase; the commit threshold (`CommitDistancePercent`, one value on
+every axis); the settle spring and the coast; the scroll survey and its gate; the unhealed-window rule; the geometry snapshot and
 its lock; the close record; and the peer liveness the bridge's interception
 gate reads. `peerEpoch` is claimed once per attach; `peerState=alive` is
 published only by the input thread once its window, its message loop and its

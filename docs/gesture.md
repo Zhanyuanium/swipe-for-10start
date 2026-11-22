@@ -6,8 +6,10 @@
 ## Session types
 
 - **dismiss** — the contact started on the open panel. A vertical drag toward
-  the taskbar follows the finger; a release past the commit threshold settles to
-  0 and closes. A press on a scrolling region that can still scroll is refused
+  the taskbar follows the finger; a release past the drag-intent distance
+  settles to 0 and closes. The distance is `CommitDistancePercent` of the
+  panel's travel, default 10%, the same value on every taskbar side. A press on
+  a scrolling region that can still scroll is refused
   (`dismiss deferred to scroll ...`); a press on a region at its end closes.
 - **reveal** — the contact started in the taskbar band (or the band-tail strip)
   while the menu is closed. Admission records it; the bridge show is requested on
@@ -119,8 +121,9 @@ contact lifts.
 5. **Follow** — once caught up, `behind=0.000`: the panel is glued (bottom
    auto-hidden `progress=0.96` at a held 300 DIP finger, the panel edge 1.8 px
    from it; `progress=0.90` at 350 DIP, 0.4 px; the bottom docked 300 DIP hold
-   measured 2 px). A release commits on travel (half the travel) or on the
-   session average, and the release speed is measured over the last 8–30 ms
+   measured 2 px). A release commits on travel (`CommitDistancePercent` of the
+   panel's `distance`, default 10%, one value on every axis) or on the session
+   average, and the release speed is measured over the last 8–30 ms
    window (freshness 30 ms). The one exception is a live takeover: a pull that
    came in to interrupt a close commits when the panel is at or above the
    position it took over, whatever its own travel (the release line prints
