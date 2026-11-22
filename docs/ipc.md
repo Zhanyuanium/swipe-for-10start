@@ -90,10 +90,10 @@ the first at once and publishes the next only when the ack for the outstanding
 sequence arrives (the worker waits on `IntentAck` and posts a private message to
 the executor window) or its 1000 ms bound expires. The next press therefore
 decides from the direction the controller published while applying the press
-before it. A press the queue cannot serve — full queue, an ack that never
-arrives, a press that waited past 1500 ms — runs the shell's own original
-primitive for that press under the executor guard (`own press fallback ...`); it
-is never silently lost. An `external` intent clears the queue and the latch.
+before it. An arriving press on a full queue is dropped with the depth in its
+line and is never executed ahead of the queue; a press still unpublished past
+1500 ms runs the shell's own original primitive under the executor guard
+(`own press fallback ...`). An `external` intent clears the queue and the latch.
 
 `method` is **evidence about the shell path that produced the trigger**, not an
 execution method. A click-away carries the Hide method `7`. The Start side maps

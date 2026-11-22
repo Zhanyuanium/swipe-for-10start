@@ -124,8 +124,9 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   the intent ack for the press before it (or its 1000 ms bound) and then decides
  *   from the direction the controller published by then; an ack timeout is
  *   replayed only for a gone or stale peer, while a live silent peer is consumed.
- *   A press the queue cannot serve runs the shell's own primitive under the
- *   executor guard. Every
+ *   A queue overflow drops the arriving press with the depth and keeps the
+ *   queue's order; a press still unpublished past its wait runs the shell's own
+ *   primitive under the executor guard. Every
  *   line goes through `TraceLog`: `Wh_Log` always, and the role's file only
  *   while the `DiagnosticTrace` setting is on. The two interruption dates are
  *   `motion sample` — the position and slope `TakeProgressNow` reads, once per
@@ -15182,11 +15183,13 @@ bool AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
         return ServePress(press, &own);
     }
     if (g_pressQueueCount >= kPressQueueCapacity) {
+        // The arriving press is the one that cannot be held. Running its original
+        // here would execute it ahead of the four presses already queued, so it
+        // is dropped with the depth in the line and the queue keeps its order.
         TraceLog(L"own press dropped trigger=%s entry=%s reason=queue-full q=%d "
                 L"outstanding=%d",
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
                 g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0);
-        RunPressOriginal(press, L"queue-full");
         return true;
     }
     const int tail = (g_pressQueueHead + g_pressQueueCount) % kPressQueueCapacity;
