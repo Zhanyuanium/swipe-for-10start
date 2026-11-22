@@ -92,6 +92,48 @@
   it. A press already swallowed and then lost (peer or epoch changed before the
   serve) has no shell path left; it is dropped, not passed on.
 
+## Presses and claims
+
+- **A hard kill while a press is claimed holds the slot.** `peerState` stays
+  `alive` without the unload's withdrawal, so the bridge cannot prove the
+  controller gone. The claimed slot and its queue are held until the next attach
+  changes `peerEpoch` (`reason=epoch-changed`). Presses queued behind it are
+  dropped at the 2500 ms absolute bound (`own press dropped ... reason=stale`)
+  rather than toggling minutes later; the 2026-11-22 test froze the host after
+  its claim, queued press 2, and logged the drop at `wait=2594`.
+- **A taken press with no answer is lost, not duplicated.** If the controller
+  dies after `intentTaken` and before the ack, the bridge has seen a claim and
+  cannot replay: the press is lost. This is the exactly-once trade. An abort that
+  lands before the copy is the exception: Start's superseded answer (`state=7`)
+  proves no intent ran, and the bridge replays the original once
+  (`reason=revoked-before-copy`), verified on the same build.
+- **A queued press older than 2500 ms is dropped.** The queue-age bound pauses
+  behind a claimed press, so the absolute cap is measured from `admittedTick`:
+  `kPressQueueWaitMs + kPressAckTimeoutMs`. A press the user made during a freeze
+  is not run natively when the slot is finally released; only the claimed press's
+  own action remains and the queued toggles are gone.
+- **A stale-period press with nothing held passes natively.** When the gate fails
+  on a stale heartbeat and no press is outstanding or queued, the press runs the
+  shell's own path; the mod cannot order it against a later press. With a press
+  outstanding or queued, the gate logs `reason=peer-stale-queued` and routes the
+  press to admission so it cannot overtake the earlier one. This is the chosen
+  trade, not a missed call.
+- **The click-away reopen needs a real left button.** A method-7 z-band change
+  without a left button down (Alt+Tab, a foreground switch, a taskbar activation)
+  is a close, not the reopen that interrupts a close; main (`8b55ddf`) publishes
+  the same close. A desktop click with the button down still reopens (5/5 in the
+  Round-11 probe). The taskbar app-button case is **not measured**: the
+  auto-hidden bar did not reveal a pointer target in the 2026-11-22 session and
+  its focused buttons do not expose `InvokePattern`. `ClickAwayPointerNow`
+  excludes a click whose cursor window is `Shell_TrayWnd`/`MSTaskListWClass`; a
+  taskbar implementation with another class would be read as a pointer click and
+  reopen, which is the residual of that rule.
+- **Two bounded wakes are state-owned.** The open-generation gate reads its
+  generation every 20 ms for at most 900 ms, and a standing press slot or
+  external barrier keeps a 100 ms reserve poll for its queue bound. Each stops
+  when its state clears; a poll that outlives its slot is killed in
+  `HandlePressAckTimeout`. Neither is an idle period.
+
 ## The idle cost
 
 The mod is loaded all day on the tablets and touch laptops it targets, so what
@@ -244,17 +286,17 @@ Win press opens exactly once; the transition itself is never synthesized.
 
 ## The taskbar
 
-- **Current layout: left, docked** (`axis=0`): work `48,0,1440,900`, the bar at
-  `0,0..48,900` (96 physical wide), band `0..96`, panel `60,151..1053,726`, trail
-  1053, Distance 1392; measured 2026-11-21. The bottom docked layout (work
-  `0,0,1440,852`, tray `0,852..1440,900`, Distance 852) and the bottom auto-hidden
-  layouts are historical and their numbers are not the current ones. The smoke
-  reads the axis, band, rectangle and scale from the mod's own log lines, so it
-  runs on whichever edge is live.
-- The bottom auto-hidden bar once stopped revealing after an injected-touch
-  session (`Shell_TrayWnd` stayed at `0,899,1440,947`, `ABM_GETSTATE=1`, Win+`T`
-  did not draw it); that state is historical. The Win/touch/click-away paths do
-  not depend on the bar either way.
+- **Current layout: bottom, auto-hidden** (`axis=3`): work `0,0,1440,900`, band
+  `804..900`, panel `236,279..1229,840`, trail 279, Distance 900; measured
+  2026-11-22. The left docked layout (`axis=0`, panel `60,151..1053,726`, trail
+  1053, Distance 1392) was the 2026-11-21 measurement and is historical. The
+  smoke reads the axis, band, rectangle and scale from the mod's own log lines,
+  so it runs on whichever edge is live.
+- The bottom auto-hidden bar did not reveal in the 2026-11-22 click-away session:
+  `Shell_TrayWnd` stayed at `0,1798,2880,1894`, a cursor at the last row and
+  `Win+T` focus did not draw it. The taskbar app-button case in the click-away
+  measurement is therefore unmeasured; the Win/touch/click-away paths do not
+  depend on the bar.
 - The bar's 48 DIP thickness (96 physical at 200 %) and the 200 % scaling are
   measured, not assumed.
 

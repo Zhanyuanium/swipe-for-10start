@@ -77,6 +77,33 @@
   beside `peerTick`/`peerState`, which is how a re-enable is told from a
   still-running activation. There is no command publisher any more.
 
+## Release evidence: the full smoke, 2026-11-22
+
+Run on the release code (HEAD `ad20815`; the docs commit after it changes no
+code) with `DiagnosticTrace` on, bottom auto-hidden layout (`axis=3`, work
+`0,0,1440,900`, band `804..900`). The final gate re-ran the same rows after the
+docs commit; the table is that run. Every row passed:
+
+| Step | Ok | Detail |
+| --- | --- | --- |
+| starts closed | True | `state=False` |
+| win open | True | |
+| win close | True | |
+| touch open | True | |
+| touch close (injected) | True | `producer=hid` |
+| click-away | True | |
+| win close + click reopen | True | `interrupt=click from=0.938 deadline=382980610 final=True` |
+| start close + win reopen | True | `interrupt=win from=0.917 deadline=382987251 final=True` |
+| gesture close + click reopen | True | `interrupt=click close=hid from=0.009 deadline=382994192 final=True` |
+| no error lines | True | |
+
+The three reversal `from=` values are **0.938, 0.917 and 0.009**: each interruption
+landed while the panel was still off its rest. The earlier run at `ad20815`
+measured 0.937, 0.926 and 0.02 with the same rows and verdicts. The smoke's click
+helpers hold the left button for 60 ms, so the click-away rows are real pointer
+decisions (`ptr=1`). This is the release's in-tree automated evidence; the doc
+commit after `ad20815` changes no code.
+
 ## Touch producers: real digitizer vs injected contact
 
 `tools/inject_swipe.ps1` calls `InjectTouchInput`, but the contact reaches the
@@ -103,7 +130,10 @@ not only the close's outcome.
 ## Round-2 runtime checks
 
 Each line is what a run must show for one review item; the code half is in
-`mods/` and the static limits are named in the item's notes.
+`mods/` and the static limits are named in the item's notes. **Round-5 through
+Round-11, and the Round-3 readiness-floor item, require a temporary test hook or
+an external harness that is not in the tree.** The smoke above is the only
+release check that runs from the tree itself.
 
 The outcome words are distinct and are not interchangeable: **passed native**
 (the shell's own path served the press), **published** (an intent or executor
@@ -180,7 +210,8 @@ could act, or before its confirmation could land).
 
 ## Round-3 runtime checks
 
-- **Readiness floor at the resync boundary.** A post-call resync of a null or
+- **Readiness floor at the resync boundary.** Requires a temporary harness, not
+  in the tree: a post-call resync of a null or
   `0x100` state logs `own state resync skipped reason=state-not-ready raw=...`
   and leaves the cached direction as it was; the valid state logs the usual
   `own state resync cached=... shell=...`. On the shipping build the sentinel is
@@ -220,6 +251,9 @@ could act, or before its confirmation could land).
 
 ## Round-5 runtime checks
 
+**Requires a temporary harness, not in the tree:** each item below pauses the
+consumer after its claim or suspend/restarts the host by hand.
+
 - **Before-take pause (A).** Suspend the Start host, send one Win press while its
   heartbeat is still fresh, let the 1000 ms bound run, then resume it. The bridge
   logs `own press ack timeout ... decision=replay reason=revoked`, runs the native
@@ -246,6 +280,9 @@ could act, or before its confirmation could land).
 
 ## Round-6 runtime checks
 
+**Requires a temporary harness, not in the tree:** the claim pauses and the
+forced timer failures are test hooks.
+
 - **Claim window (A).** Hold the consumer's claim until the bridge's timeout has
   read `intentTaken` (a test harness delays the claim and pauses after the copy).
   The timeout aborts at the widened read/abort window, sees the claim, logs
@@ -267,6 +304,9 @@ could act, or before its confirmation could land).
 
 ## Round-7 runtime checks
 
+**Requires a temporary harness, not in the tree:** the post-copy pause, the
+external marker and the forced timer failure are test hooks.
+
 - **Stale tick, claimed (A).** Claim press 1 and pause after the validated copy
   for 2 s without a heartbeat refresh (the peer state stays `alive`). At 1000 ms
   the timeout logs `decision=consumed awaiting=ack` with `peer=stale`; press 2
@@ -283,6 +323,9 @@ could act, or before its confirmation could land).
   of the replay. Without the re-read it chooses open again.
 
 ## Round-8 runtime checks
+
+**Requires a temporary harness, not in the tree:** the admission pauses, the
+forced stale classification and the external drop/publish hooks are test-only.
 
 - **Claim at admission (A).** Suspend the host, press once, let the heartbeat go
   stale while the state stays `alive`, then press again before the 1000 ms bound;
@@ -305,6 +348,9 @@ could act, or before its confirmation could land).
 
 ## Round-9 runtime check
 
+**Requires a temporary harness, not in the tree:** the Start-side claim hold and
+the admission gap are test hooks.
+
 - **External claim after the first read.** Publish an unarmed external barrier
   with a press queued behind it. A Start-side test hook holds the external claim
   until the admission has read `intentTaken`; a test hook then pauses the
@@ -317,6 +363,9 @@ could act, or before its confirmation could land).
   admission: the abort succeeded and the claim re-read found none.
 
 ## Round-10 runtime check
+
+**Requires a temporary harness, not in the tree:** the Start-side claim hold, the
+watchdog gap and the forced stale classification are test hooks.
 
 - **External claim at the watchdog.** Publish an unarmed external barrier with a
   press queued behind it, keep Start from claiming it, and let the 1000 ms
@@ -331,6 +380,10 @@ could act, or before its confirmation could land).
   press is served in order.
 
 ## Round-11 runtime check
+
+**Requires an external probe, not in the tree:** the five-try loop and the
+Alt+Tab/foreground/desktop-click actions were driven from a temporary
+PowerShell probe.
 
 - **Click-away reopen evidence.** Five tries each on the release build
   (2026-11-22), during a Win close: Alt+Tab produced 5 click-away decisions and
@@ -547,9 +600,11 @@ Frames were captured at 200 % DPI with the tool's own DIB; `t` is the capture
 start, so a frame can lag its stamp by one compositor interval, and the CSV's
 `edge_dip` is the measured edge divided by the derived scale.
 
-### The ownership change, measured (P1)
+### The ownership change, measured (P1, historical)
 
-A close now owns the panel to its landing: a down during the retract is a grab
+The P1 rows are the 0.8.0 design capture, not the current build's release
+evidence; the release smoke at the top of this file is. A close now owns the
+panel to its landing: a down during the retract is a grab
 only when it lands in the band or on the surface the retract still shows, the
 grab's one transfer attempt is spent either way, and a landing adopts no finger.
 Four probes on the bottom auto-hidden bar, 2026-11-22, with the installed build
