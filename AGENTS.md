@@ -138,17 +138,26 @@ never waits. A press the queue cannot serve is handled by its state, not by a
 replay: the arriving press on a full queue is dropped with the depth in its line
 (`reason=queue-full`), never executed ahead of the four already queued; a press
 still unpublished past its 1500 ms wait runs the shell's own original primitive
-under the executor guard (`reason=queue-wait`). The ack timeout is stricter: the
-Start side writes `intentTaken = seq` before it acts, and the timeout reads that
-claim. `taken == seq` is `decision=consumed` with no replay; `taken != seq` with
-the record still this sequence and a live peer is `decision=reserved` and is
-re-checked, so no newer publication can overwrite a press the controller may
-take; only a gone/stale peer or a record that has moved past the sequence is
-replayed (`decision=replay reason=peer-gone|superseded`, `reason=no-ack`). A take
-is never replayed: one execution at most, one native execution when the
-controller is gone before taking, and that press lost rather than duplicated if
-the controller dies after the take. The timeout line carries the sequence, the
-wait, the take, the peer age and the epoch. An
+under the executor guard (`reason=queue-wait`). The Start side claims the
+sequence **before** it copies the record and re-checks the claim after the copy;
+a record the bridge aborted in between is dropped (`intent drop ...
+reason=record-gone`). The ack timeout then decides by proof, not by the
+heartbeat:
+
+- `taken == seq` is `decision=consumed`: the controller has the record and no
+  replay follows;
+- `taken != seq` aborts the record (the counter goes to its odd state, so no
+  consumer can copy or claim it), then re-reads the claim. Not this sequence:
+  `decision=replay reason=revoked` runs the original once. This sequence:
+  `decision=none reason=claim-after-abort`, because the claimer's copy can no
+  longer succeed and a replay is refused;
+- a record that has already moved cannot be aborted (`decision=superseded
+  reason=record-moved`), so nothing is replayed.
+
+The peer words are evidence in the line; the abort and the claim are the proof.
+A take is never replayed: one execution at most, one native execution when the
+record is aborted before any claim, and a press lost rather than duplicated if
+the controller dies after the take. An
 external takeover is published at once and clears the queue and latch; it then
 sets the same barrier for the presses that follow, because its record is the one
 Start must reconcile before another intent may overwrite it. That barrier is a

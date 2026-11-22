@@ -651,15 +651,16 @@ probe or timer failure is answered `unknown`.
   reads `2` and reopens. A queue overflow drops the arriving press with the depth
   in its line (`reason=queue-full`) and never executes it ahead of the queue; a
   press still unpublished past its 1500 ms wait runs the shell's original
-  primitive under `t_execCall` (`reason=queue-wait`). An ack timeout is
-  resolved by the Start side's take, not by a guess: the consumer writes
-  `intentTaken = seq` before it acts. `taken == seq` is
-  `decision=consumed` with no replay; `taken != seq` with the record still the
-  same sequence and a live peer is `decision=reserved` and is polled
-  (`kPressReservePollMs`, bounded by `kSwipePeerStaleMs`), so the outstanding
-  sequence is never overwritten; a gone/stale peer or a moved record is
-  `decision=replay`, `reason=no-ack`. A taken sequence is never replayed. The
-  queue's own lines are
+  primitive under `t_execCall` (`reason=queue-wait`). The Start side claims the
+  sequence before it copies the record and re-checks the claim after the copy
+  (`intent drop ... reason=record-gone` on a revocation). An ack timeout is then
+  resolved by proof: `taken == seq` is `decision=consumed` with no replay;
+  `taken != seq` aborts the record (`SwipeIpcAbortIntent`, the counter's odd
+  state), re-reads the claim, and only replays when the abort succeeded and the
+  claim is not this sequence (`decision=replay reason=revoked`). A claim that
+  landed after the abort is `decision=none reason=claim-after-abort` and a record
+  that already moved is `decision=superseded reason=record-moved`. The queue's own
+  lines are
   `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch, is published at once,
   and sets the same barrier as a state, not a timer: it stands even when

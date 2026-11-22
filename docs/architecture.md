@@ -360,8 +360,9 @@ the shell's own toggle is always correct, so a lost interception costs one press
 never a wedged menu.
 
 The Start side publishes the executor command and then answers the intent
-(`intent ack`); the ack reports the decision and is the bridge's serialisation
-point for the next admitted press, not a barrier the command waits for:
+(`intent ack`); every branch publishes the resulting controller direction before
+that answer, so the ack means "direction visible" and is the bridge's
+serialisation point for the next admitted press:
 
 - open: `exec show` immediately; the shell's own show is swallowed while the
   controller owns the panel and the same opening touch is protected by
@@ -383,6 +384,12 @@ point for the next admitted press, not a barrier the command waits for:
   is cleared only by that record's ack or by a peer that is gone/stale; a live but
   silent peer keeps it (`decision=reserved`), and the takeover has no original to
   replay.
+
+An unanswered intent is resolved by the record, not by the heartbeat. The Start
+side claims the sequence before copying and re-checks the claim after the copy.
+The bridge's timeout either accepts a taken sequence as consumed or aborts the
+record (its counter goes odd, so no consumer can copy or claim it) and re-reads
+the claim before any replay. The peer words stay in the line as evidence.
 
 Fallbacks, each logged once:
 

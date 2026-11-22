@@ -707,8 +707,11 @@ inline bool SwipeIpcReadIntent(SwipeIpcChannel* channel, SwipeIpcIntent* out) {
 }
 
 // The consumer's claim: "I have this intent sequence and am about to act on it".
-// Written before the action, so a publisher whose answer is late can prove that
-// a replay would be a second execution. 0 means no claim has been made.
+// Written before the record is copied, so a publisher whose answer is late can
+// prove that a replay would be a second execution. 0 means no claim has been
+// made. A claim is not a lock: the publisher's abort below is what makes an
+// untaken record unreachable, and the consumer re-checks this word after its
+// copy before it acts.
 inline void SwipeIpcTakeIntent(SwipeIpcChannel* channel, LONG64 seq) {
     if (channel->state && seq > 0) {
         InterlockedExchange64(&channel->state->intentTaken, seq);
@@ -717,6 +720,30 @@ inline void SwipeIpcTakeIntent(SwipeIpcChannel* channel, LONG64 seq) {
 
 inline LONG64 SwipeIpcTakenIntent(SwipeIpcChannel* channel) {
     return channel->state ? SwipeIpcLoad64(&channel->state->intentTaken) : 0;
+}
+
+// The raw sequence of the current intent record, or 0 when there is none. An odd
+// value is a record being written, or one the publisher aborted: it names no
+// intent and must not be claimed.
+inline LONG64 SwipeIpcIntentSequence(SwipeIpcChannel* channel) {
+    if (!channel->state) {
+        return 0;
+    }
+    const LONG64 sequence = SwipeIpcLoad64(&channel->state->intentSeq);
+    return (sequence & 1) != 0 ? 0 : sequence;
+}
+
+// Abandons the published intent `seq` so no consumer can take or copy it
+// afterwards. The counter is stepped to its odd state, which every reader
+// rejects; the next writer steps past it, so an aborted sequence is never
+// reused. True means the record was still `seq` and is now unreachable. False
+// means it had already moved: the caller must not replay.
+inline bool SwipeIpcAbortIntent(SwipeIpcChannel* channel, LONG64 seq) {
+    if (!channel->state || seq <= 0 || (seq & 1) != 0) {
+        return false;
+    }
+    return InterlockedCompareExchange64(&channel->state->intentSeq, seq + 1,
+                                        seq) == seq;
 }
 
 inline bool SwipeIpcAnswerIntent(SwipeIpcChannel* channel, LONG64 intentSeq,

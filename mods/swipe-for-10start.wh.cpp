@@ -8144,19 +8144,16 @@ void PostUiOpenWatchRelease(uint32_t closedGeneration,
 // close runs the one mirrored close and asks for Dismiss, external drops the
 // pull and resyncs. The bridge's executor acks through execAck.
 //
-// The record is passed in, not re-read. The landing reconciliation examined a
-// snapshot before it applied anything; re-reading there could consume a newer
-// record (an open published while the external was being examined) and then
-// claim the external that was seen had been applied.
+// The record is claimed before it is copied, and the caller proves the claim
+// after the copy: `intentTaken == intent.seq` and the same sequence. The
+// publisher aborts an untaken record before it replays, so a record whose claim
+// or copy no longer holds is dropped, never applied. The ack is written only
+// after the branch published the resulting controller direction.
 void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
     if (intent.seq == 0 || intent.seq == g_lastIntentSeq) {
         return;
     }
     g_lastIntentSeq = intent.seq;
-    // The claim the bridge's timeout reads: this sequence is now being acted on.
-    // It is written before the first action (the log is not an action), so a
-    // replay after the take would be a second execution.
-    SwipeIpcTakeIntent(&g_ipc, intent.seq);
     const wchar_t* kind = intent.kind == kSwipeIntentOpen
                               ? L"open"
                               : (intent.kind == kSwipeIntentClose ? L"close"
@@ -8305,13 +8302,34 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
             }
         }
     }
+    // The answer is the bridge's "direction visible" signal: every branch above
+    // publishes the resulting direction (open, closing, unowned) before this
+    // call. Do not move it above a direction publication.
     SwipeIpcAnswerIntent(&g_ipc, intent.seq, ackState, ackDuration, ackEntry,
                          static_cast<int32_t>(ackHr));
 }
 
+// The input thread's one intent turn. The claim is written before the record is
+// copied: a publisher whose ack times out aborts the record, and an abort after
+// this claim is caught by the re-read below, so the controller never acts on a
+// record the bridge has already revoked. A claim that a newer sequence replaced
+// is equally dropped. Only a claimed sequence applied under this activation is
+// acknowledged.
 void ApplyBridgeIntent() {
+    const LONG64 sequence = SwipeIpcIntentSequence(&g_ipc);
+    if (sequence == 0 || sequence == g_lastIntentSeq) {
+        return;
+    }
+    SwipeIpcTakeIntent(&g_ipc, sequence);
     SwipeIpcIntent intent{};
-    if (!SwipeIpcReadIntent(&g_ipc, &intent)) {
+    if (!SwipeIpcReadIntent(&g_ipc, &intent) || intent.seq != sequence) {
+        TraceLog(L"intent drop seq=%lld reason=record-moved",
+                static_cast<long long>(sequence));
+        return;
+    }
+    if (SwipeIpcTakenIntent(&g_ipc) != sequence) {
+        TraceLog(L"intent drop seq=%lld reason=claim-revoked",
+                static_cast<long long>(sequence));
         return;
     }
     ApplyBridgeIntentRecord(intent);
@@ -8624,8 +8642,9 @@ void CheckExecAckTimeout(uint64_t now) {
 // arrived with the landing is read here before the landing acts. Only `external`
 // is reconciled here — an open or close intent is the user
 // talking to a menu, and the cancel/recovery rules already own that case.
-// ApplyBridgeIntent consumes the record, so the event's later wake finds
-// nothing new.
+// The snapshot above only identifies the external; the claim is taken before it
+// is applied and the record and the claim are re-read after the claim, so an
+// external the bridge aborted in between is not applied.
 void ReconcileSupersedingIntentBeforeLanding() {
     SwipeIpcIntent intent{};
     if (!SwipeIpcReadIntent(&g_ipc, &intent) || intent.seq == 0 ||
@@ -8633,6 +8652,18 @@ void ReconcileSupersedingIntentBeforeLanding() {
         return;
     }
     if (intent.kind != kSwipeIntentExternal) {
+        return;
+    }
+    SwipeIpcTakeIntent(&g_ipc, intent.seq);
+    SwipeIpcIntent current{};
+    if (!SwipeIpcReadIntent(&g_ipc, &current) || current.seq != intent.seq) {
+        TraceLog(L"intent reconcile drop seq=%lld reason=record-moved",
+                static_cast<long long>(intent.seq));
+        return;
+    }
+    if (SwipeIpcTakenIntent(&g_ipc) != intent.seq) {
+        TraceLog(L"intent reconcile drop seq=%lld reason=claim-revoked",
+                static_cast<long long>(intent.seq));
         return;
     }
     TraceLog(L"intent reconcile seq=%lld kind=external (before landing recovery)",
@@ -15519,23 +15550,21 @@ void HandlePressAck() {
 
 // The ack did not arrive inside its bound. A missing ack is not proof that the
 // controller did nothing: the close may have landed and only its notification
-// been late, and replaying the original then reopens the menu. The timeout
-// therefore reads the ack once more, the consumer's `intentTaken` claim, the
-// shared intent record and the peer's liveness words:
+// been late, and replaying the original then reopens the menu. The timeout reads
+// the ack once more, the consumer's `intentTaken` claim and the shared record:
 //
-// - a late ack for this sequence is the answer, and only advances the queue;
-// - `taken == seq` means the controller has the record and may already have
-//   acted: the press is consumed, no replay, whichever the peer is doing;
-// - `taken != seq` with the record still this sequence and a live peer means the
-//   controller may take it at any moment: the slot is reserved and the check
-//   repeats, so no newer publication can overwrite it;
-// - a gone/stale peer or a record that has moved past this sequence means the
-//   controller cannot take it any more: the original is the only actor left.
+// - a late ack is the answer and only advances the queue;
+// - `taken == seq` means the controller has the record: the press is consumed,
+//   no replay, whichever the peer is doing;
+// - `taken != seq` is resolved by aborting the record: the counter is stepped to
+//   its odd state, so no consumer can copy or claim it afterwards. The claim is
+//   then re-read. Not this sequence: the original is the one execution. This
+//   sequence: a claim landed after the abort, its copy can no longer succeed,
+//   and nothing is replayed;
+// - a record that has already moved cannot be aborted, so nothing is replayed.
 //
-// The take is written before the controller acts, so a replay can never follow
-// a taken sequence: one execution at most, and one native execution when the
-// controller is gone before taking. The reserve is bounded by the peer window;
-// a crash after the take loses that press rather than duplicating it.
+// The peer words are evidence in the line; the abort and the claim are the proof.
+// A crash after the take loses that press rather than duplicating it.
 void HandlePressAckTimeout() {
     if (!g_pressOutstanding.pending) {
         return;
@@ -15580,9 +15609,7 @@ void HandlePressAckTimeout() {
         // The takeover itself is native and has no original to replay. Its
         // barrier is cleared by its ack above, or by a peer that can no longer
         // answer — never by this timer, and never by a guess: a live peer that is
-        // silent may still reconcile the record, and a newer intent published over
-        // it would be lost. The reserve re-checks at the poll cadence, bounded by
-        // the peer's own staleness window.
+        // silent may still reconcile the record.
         if (peerAlive) {
             TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
                     L"epoch=%u decision=reserved",
@@ -15593,10 +15620,6 @@ void HandlePressAckTimeout() {
             if (!window ||
                 SetTimer(window, kPressAckTimer,
                          static_cast<UINT>(kPressReservePollMs), nullptr) == 0) {
-                // Keep the barrier. Its ack still clears it through the worker's
-                // event, and the next admission releases it once the peer is
-                // stale; dropping it here would let a press overwrite a record
-                // the controller may still reconcile.
                 TraceLog(L"own external reserve timer failed err=%u seq=%lld",
                         GetLastError(), static_cast<long long>(press.seq));
             }
@@ -15625,70 +15648,62 @@ void HandlePressAckTimeout() {
             KillTimer(window, kPressAckTimer);
         }
         TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-                L"taken=%lld record=%lld peer=%s age=%u epoch=%u "
-                L"decision=consumed",
+                L"taken=%lld peer=%s age=%u epoch=%u decision=consumed",
                 static_cast<long long>(press.seq),
                 PressTriggerName(press.press.trigger),
                 PressEntryName(press.press.entry),
                 static_cast<unsigned long long>(wait),
-                static_cast<long long>(taken),
-                static_cast<long long>(press.seq), peer, peerAge,
-                PeerEpochNow());
+                static_cast<long long>(taken), peer, peerAge, PeerEpochNow());
         ServeNextPress(L"taken");
         return;
     }
-    // Not taken. The only safe replay is when the record can no longer be taken:
-    // the peer is gone/stale, or the shared record has moved past this sequence.
-    // Keep the slot reserved while the record is still current and the peer is
-    // alive; a newer publication would overwrite a press the controller may take
-    // at any moment.
-    SwipeIpcIntent current{};
-    const bool haveRecord = SwipeIpcReadIntent(&g_ipc, &current);
-    const bool recordMoved = haveRecord && current.seq != press.seq;
-    if (!peerAlive || recordMoved) {
-        g_pressOutstanding = OutstandingPress{};
-        HWND window = g_execWindow.load(std::memory_order_relaxed);
-        if (window) {
-            KillTimer(window, kPressAckTimer);
-        }
+    // Not taken. The replay is proved by the abort, not by the peer: the abort
+    // makes the record unreachable, so a claim that lands afterwards cannot copy
+    // it. A record that already moved cannot be aborted and is never replayed.
+    const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+    const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
+    g_pressOutstanding = OutstandingPress{};
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (window) {
+        KillTimer(window, kPressAckTimer);
+    }
+    if (!revoked) {
         TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-                L"taken=%lld record=%lld peer=%s age=%u epoch=%u "
-                L"decision=replay reason=%s",
+                L"taken=%lld peer=%s age=%u epoch=%u "
+                L"decision=superseded reason=record-moved",
                 static_cast<long long>(press.seq),
                 PressTriggerName(press.press.trigger),
                 PressEntryName(press.press.entry),
                 static_cast<unsigned long long>(wait),
-                static_cast<long long>(taken),
-                static_cast<long long>(haveRecord ? current.seq : 0), peer,
-                peerAge, PeerEpochNow(),
-                recordMoved ? L"superseded" : L"peer-gone");
-        RunPressOriginal(press.press, L"no-ack");
+                static_cast<long long>(taken), peer, peerAge, PeerEpochNow());
         ServeNextPress(L"timeout");
         return;
     }
-    // Reserved: the record is still current and the controller is alive. The
-    // outstanding sequence stays, so no newer publication can overwrite it. A
-    // later poll sees the take, a superseded record, or a stale peer.
+    if (takenAfter == press.seq) {
+        // The claim landed after the abort. The controller's copy can no longer
+        // succeed (the record is odd), so neither actor runs and nothing is
+        // replayed: the rule refuses a replay once the sequence was claimed.
+        TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
+                L"taken=%lld peer=%s age=%u epoch=%u "
+                L"decision=none reason=claim-after-abort",
+                static_cast<long long>(press.seq),
+                PressTriggerName(press.press.trigger),
+                PressEntryName(press.press.entry),
+                static_cast<unsigned long long>(wait),
+                static_cast<long long>(takenAfter), peer, peerAge,
+                PeerEpochNow());
+        ServeNextPress(L"timeout");
+        return;
+    }
     TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-            L"taken=%lld record=%lld peer=%s age=%u epoch=%u "
-            L"decision=reserved",
+            L"taken=%lld peer=%s age=%u epoch=%u decision=replay reason=revoked",
             static_cast<long long>(press.seq),
             PressTriggerName(press.press.trigger),
             PressEntryName(press.press.entry),
             static_cast<unsigned long long>(wait),
-            static_cast<long long>(taken),
-            static_cast<long long>(haveRecord ? current.seq : 0), peer, peerAge,
-            PeerEpochNow());
-    HWND window = g_execWindow.load(std::memory_order_relaxed);
-    if (!window ||
-        SetTimer(window, kPressAckTimer, static_cast<UINT>(kPressReservePollMs),
-                 nullptr) == 0) {
-        // Keep the reservation: an ack still clears it through the worker's
-        // event, and a later admission checks the peer. Dropping it here would
-        // allow a second publication over a record the controller may take.
-        TraceLog(L"own press reserve timer failed err=%u seq=%lld",
-                GetLastError(), static_cast<long long>(press.seq));
-    }
+            static_cast<long long>(taken), peer, peerAge, PeerEpochNow());
+    RunPressOriginal(press.press, L"no-ack");
+    ServeNextPress(L"timeout");
 }
 
 // The one toggle dispatcher for the three physical entries: the bare Windows
