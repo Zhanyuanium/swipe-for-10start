@@ -347,8 +347,8 @@ the shell's own toggle is always correct, so a lost interception costs one press
 never a wedged menu.
 
 The Start side publishes the executor command and then answers the intent
-(`intent ack`); the ack reports the decision and is not a barrier the bridge
-waits for before the command:
+(`intent ack`); the ack reports the decision and is the bridge's serialisation
+point for the next admitted press, not a barrier the command waits for:
 
 - open: `exec show` immediately; the shell's own show is swallowed while the
   controller owns the panel and the same opening touch is protected by

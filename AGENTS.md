@@ -31,8 +31,8 @@ The controller decides; the executor performs. The Win key
 (`XamlLauncher::OnHotkeyInvoke`), the Start button (`ShowStartView` method 11,
 `Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) reach one
 toggle decision and publish one `intent(seq, kind, trigger, method, flags, open)`;
-the Start side answers (`intent ack`) and publishes `exec show`, or runs the one
-mirrored close settle and then `exec dismiss`. A click on the desktop therefore
+the Start side applies it — `exec show`, or the one mirrored close settle and then
+`exec dismiss` — and answers `intent ack`. A click on the desktop therefore
 closes a settled panel and reverses a close that is still in flight, exactly like
 the other two presses; method 7 stays the click-away evidence in the intent and
 the Start side maps it to the executor's 6. External takeovers (Win+Tab, lock,
@@ -298,7 +298,8 @@ seqlock with its own counter and an `offsetof` assert. The names carry the merge
 mod's own prefix (`SwipeFor10Start_SingleMod_`) and there is **no product version
 word**: the namespace is the ABI identity, so an older development image cannot
 join, and a future layout changes the prefix. The records are the open
-generation, the intent and its ack, the executor command and its ack, one
+generation, the intent and its ack (the ack is the bridge's next-press barrier),
+the executor command and its ack, one
 controller direction word plus the touch flag, and the liveness triple
 `peerTick` (204) / `peerState` (208) / `peerEpoch` (212). The debug command
 channel — its record, mutex, event and parser — is **gone**.
