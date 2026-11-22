@@ -13648,13 +13648,11 @@ void RunTeardownThunk(void*) {
 void RunNoopThunk(void*) {}
 
 // Runs the teardown on the UI thread that owns the XAML root. Returns the window
-// used for the later drain, or null when the teardown ran inline or the thread is
-// gone. `threadGone` lets the caller skip a lease/count proof that no thread can
-// satisfy. No dispatcher and no completion event are involved.
-HWND TeardownUiOnUiThread(bool* threadGone) {
-    if (threadGone) {
-        *threadGone = false;
-    }
+// used for the later drain, or null when the teardown ran inline or no window
+// could run it. A missing window is not a proof that the UI thread is gone: the
+// caller still requires the entry and registration counts to say that nothing
+// can call back. No dispatcher and no completion event are involved.
+HWND TeardownUiOnUiThread() {
     const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
     if (uiThread != 0 && uiThread == GetCurrentThreadId()) {
         TeardownUi();
@@ -13675,11 +13673,9 @@ HWND TeardownUiOnUiThread(bool* threadGone) {
     }
     if (!hwnd) {
         if (g_uiRegistrationCount.load(std::memory_order_acquire) == 0) {
-            // The thread is gone or had no window; nothing can still call back.
-            if (threadGone) {
-                *threadGone = true;
-            }
-            TraceLog(L"unload teardown window gone");
+            // No window can run the teardown, but no handler is registered
+            // either. The counts below still decide whether the image is free.
+            TraceLog(L"unload teardown without a UI window");
             return nullptr;
         }
         BlockUnload(L"teardown has no UI window");
@@ -13691,45 +13687,52 @@ HWND TeardownUiOnUiThread(bool* threadGone) {
         return hwnd;
     }
     if (result == WindowThreadResult::WindowGone) {
-        if (threadGone) {
-            *threadGone = true;
-        }
+        // The handle died before the teardown could run. This says nothing
+        // about the UI thread or its registrations; the caller proves those.
         TraceLog(L"unload teardown window gone");
         return nullptr;
     }
     BlockUnload(L"teardown send failed");
 }
 
-// Waits for the last counted entry. The event is auto-reset and a signal can
-// still be pending from an earlier transition to zero, so the count is the
+// Waits for the last counted entry and requires every XAML registration to be
+// gone. This is the same proof on every path: inline teardown, a message that
+// ran, or a window that could not run it. The event is auto-reset and a signal
+// can still be pending from an earlier transition to zero, so the count is the
 // predicate: consume a signal, re-check, and wait again until the count is
-// actually zero. No timeout and no polling. The caller follows with a UI round
-// trip because the lease is released inside its destructor, before the rest of
-// the delegate chain has unwound.
-void WaitForModuleEntries() {
+// actually zero. No timeout and no polling.
+void RequireNoModuleCallbacks() {
     const bool haveEvent = g_moduleEntriesGone != nullptr;
     for (;;) {
         if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
-            return;
+            break;
         }
         if (!haveEvent) {
             BlockUnload(L"module entry event missing");
         }
         WaitForSingleObject(g_moduleEntriesGone, INFINITE);
     }
+    if (g_uiRegistrationCount.load(std::memory_order_acquire) != 0) {
+        BlockUnload(L"xaml revokes remain");
+    }
 }
 
-// One more synchronous empty turn: the UI thread cannot take this message until
-// it has left the teardown lambda, every earlier callback and every delegate
-// destructor it was inside.
+// Sends one more synchronous empty turn when a window exists, so the UI thread
+// cannot still be inside an earlier callback or delegate destructor. A window
+// that is gone cannot provide that barrier; the counts are then the only proof,
+// and RequireNoModuleCallbacks runs even after WindowGone.
 void DrainUiThread(HWND hwnd) {
-    if (!hwnd) {
-        return;
+    if (hwnd) {
+        const WindowThreadResult result =
+            RunFromWindowThread(hwnd, RunNoopThunk, nullptr);
+        if (result == WindowThreadResult::Failed) {
+            BlockUnload(L"ui drain send failed");
+        }
+        if (result == WindowThreadResult::WindowGone) {
+            TraceLog(L"unload drain window gone; counts decide");
+        }
     }
-    if (RunFromWindowThread(hwnd, RunNoopThunk, nullptr) ==
-        WindowThreadResult::Failed) {
-        BlockUnload(L"ui drain send failed");
-    }
+    RequireNoModuleCallbacks();
 }
 
 BOOL RoleInit() {
@@ -13960,26 +13963,21 @@ void RoleUninit() {
     //    batch, restore resting progress and neutral translation, drop the
     //    UI-owned objects. SendMessage returns only after TeardownUi has
     //    returned, so no dispatcher lambda or its delegate thunk outlives it.
-    bool threadGone = false;
-    HWND uiWindow = TeardownUiOnUiThread(&threadGone);
+    HWND uiWindow = TeardownUiOnUiThread();
 
-    if (!threadGone) {
-        // 4. Wait once for a batch completion the compositor had already
-        //    dispatched. The lease is released inside its destructor, so one
-        //    more UI round trip proves the UI thread left that destructor and
-        //    every earlier callback before the image can be freed.
-        WaitForModuleEntries();
-        DrainUiThread(uiWindow);
+    // 4. The same proof on every path: no counted entry and no registered XAML
+    //    handler. A teardown window that could not run does not excuse either
+    //    proof, because the UI thread and its dispatcher may still be alive.
+    RequireNoModuleCallbacks();
 
-        // 5. A XAML revoke that failed leaves a delegate attached to the root
-        //    it closes over. The UI-thread teardown above removes the
-        //    wrong-thread cause; a genuine failure still has no safe free, so
-        //    it blocks once instead of polling.
-        if (g_uiRegistrationCount.load(std::memory_order_acquire) != 0) {
-            BlockUnload(L"xaml revokes remain");
-        }
+    // 5. One more synchronous empty turn when a window exists, so the UI thread
+    //    has left every callback and delegate destructor it was inside. The
+    //    counts are re-checked after it; a window that is gone cannot skip them.
+    DrainUiThread(uiWindow);
+    if (uiWindow) {
+        TraceLog(L"unload ui drained");
     } else {
-        TraceLog(L"unload ui thread gone; no callback can run");
+        TraceLog(L"unload teardown without a window; counts clear");
     }
 
     ClearScrollerRetry();
