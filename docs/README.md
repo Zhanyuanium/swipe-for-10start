@@ -35,7 +35,8 @@ names it.
 | [geometry.md](geometry.md) | The `GestureGeometry` snapshot and its lock discipline, the panel-trail measurement and band, the taskbar axis probe (including auto-hide), the deferred-measurement request, the scroll survey and gate, and the measured layouts. |
 | [ipc.md](ipc.md) | The merged mod's shared-memory channel: names, 232-byte layout with `intentTaken` at 216 and `execCapable` at 224, seqlocks, the open generation, intents and acks with the claim/abort rule, executor commands and acks with their admission vocabulary and expiry rules, the controller direction, peer liveness and activation identity (600 ms is a detection budget), the bridge's executor capability and its terminal symbol attempt, and the init handshake. |
 | [lifecycle.md](lifecycle.md) | Quiescing both roles before the image is unmapped: the Start join/UI-teardown/entry-drain order, the bridge worker join/window destruction/class unregistration order, the no-safe-success rule, and the host's unload boundary. |
-| [testing.md](testing.md) | The PowerShell/Python probes and injectors, and the captured measurements in `artifacts/`. |
+| [testing.md](testing.md) | The PowerShell/Python probes and injectors, the captured measurements in `artifacts/`, and the smoke's assertions. |
+| [development.md](development.md) | The generated local build, the elevated install, the store build with `source meta --strict`, and the repository-side compile check. |
 | [limits.md](limits.md) | Known limits and risks, what the real-machine pass covered, and what is still owed (a pen by hand, and the HID dismiss log excerpt). |
 | [store.md](store.md) | How the mod is submitted to `ramensoftware/windhawk-mods`: the generated single-file form, the one-file rule, and the checks to run before opening the PR. |
 
@@ -79,7 +80,7 @@ per usage per process and the probe takes the stream for itself.
 
 ## Build and test
 
-The install commands are in [../README.md](../README.md). The mods compile
-through Windhawk itself; the test tools are PowerShell 7 / Python — see
-[testing.md](testing.md) — and their member list is
+The local build and install commands are in [development.md](development.md).
+The mods compile through Windhawk itself; the test tools are PowerShell 7 /
+Python — see [testing.md](testing.md) — and their member list is
 [../tools/AGENTS.md](../tools/AGENTS.md).

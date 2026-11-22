@@ -78,6 +78,9 @@ join/UI-teardown/entry-drain order, the bridge worker join/window destruction/
 class unregistration order, the no-safe-success rule, and the host's unload
 boundary.
 
+development.md: the generated local build, the elevated install, the store
+build with `source meta --strict`, and the repository-side compile check.
+
 testing.md: the build gate (`make_store_mods.ps1` and its README block), the
 probes/injectors and the captured measurements in `artifacts/`;
 the smoke's `DiagnosticTrace` precondition and the tap tests.

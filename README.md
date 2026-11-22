@@ -1,4 +1,4 @@
-**English** | [简体中文](README.zh-CN.md)
+**English** | [简体中文](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/README.zh-CN.md)
 
 # Swipe for 10Start
 
@@ -17,72 +17,33 @@ By Zhanyuanium, distributed as a Windhawk mod.
 - **Windows 11** with **ExplorerPatcher** set to the Windows 10 (legacy) Start
   menu (`Start_ShowClassicMode=1`). Verified on Windows 11 build 26300.10075
   (`twinui.pcshell.dll` fixed 10.0.26100.10068) and ExplorerPatcher 26100.9711.
-- **Windhawk** 2.0 or later.
+- **Windhawk**.
 - A touchscreen or pen. (The mouse is deliberately not used for these
   gestures.)
 
 ## The mod
 
-One Windhawk mod ships, and it runs in both processes it needs: the controller
-in StartMenuExperienceHost and the executor in Explorer.
+One Windhawk mod ships, and it runs in both processes it needs: the gesture and
+the animation live in StartMenuExperienceHost, the shell calls in Explorer.
 
-- **The controller** owns the gesture itself: edge-pull to open, follow the
-  finger, drag to dismiss, and the animation. It also consumes the executor's
-  intents and schedules the close's dismiss.
-- **The executor** runs in Explorer and executes the shell's own
-  `ShowStartView`/`Dismiss` on the launcher's thread. The Windows key, the Start
-  button and a click away publish one intent; the controller decides open or
-  close from its own published state, runs the one shell-close settle, and then
-  asks the executor to dismiss. A close applies the open spring in the closing
-  direction: it moves at once and decelerates into the taskbar.
-  A press during a close is read as a reopen: while the window is still on
-  screen the close is cancelled and the panel settles back from where the
-  retract left it; a press inside the shell's hide is latched and served when
-  the hide lands. A pull during the close does the same at 24 DIP of inward
-  travel. When it grabbed the panel while some of it was still on screen, the
-  armed dismiss is cancelled and the panel reverses from where the retract
-  reached instead of finishing and then popping open. A pull that began in the
-  band and reaches 24 DIP only after the close has finished is still an open:
-  `ShowStartView` is requested and the panel follows the finger from the entry.
-  A pull that lands where the panel has already left, or one on the retract's
-  surface that the close outruns, gets no second chance: it must lift, and the
-  menu stays closed until a new pull. Recovery is best effort, not a guarantee:
-  a press the bridge already swallowed has no native replay left, so a peer that
-  dies between the gate and the serve loses that press.
-  Win+Tab, the lock screen and a display change pass through untouched, so a
-  lock never waits. If the executor half is refused — the Explorer build does
-  not match, or the launcher's public symbols cannot be resolved — the menu
-  still opens and closes, but the close is instant. The launcher hooks are found
-  by public symbol, and their private layout is enabled only on the verified
-  reference image (the fixed file version and all 13 reference RVAs); any other
-  build keeps the shell's own path. The Start half withdraws its interception
-  whenever it has no usable renderer: while the menu's root is being replaced or
-  a failed geometry write has invalidated it, a press runs the shell's own path
-  exactly once, and the mod resumes when a usable root is attached.
+Swipe in from the taskbar edge and the menu opens following your finger; drag
+the open menu back toward the edge and it slides away. The Windows key, the
+Start button and a click on the desktop use the same animation.
+
+A press or a pull during a close takes the menu back while it is still on
+screen: the close stops where it is and the panel reverses. A close that has
+already landed is final for that finger; the next open needs a new touch.
+Win+Tab, the lock screen and a display change pass through untouched.
+
+If Explorer's half cannot run on this build, the menu still opens and closes,
+but the close is instant; touch and pen gestures keep following your finger in
+the Start host.
 
 ## Install
 
-Install the mod from the Windhawk UI, or from an elevated PowerShell in this
-repository:
-
-```powershell
-pwsh -File .\tools\install_mods.ps1
-```
-
-The script runs `tools/make_store_mods.ps1 -Profile local` first: that writes the
-single-file build to `dist\local\`, with the shared headers inlined and no `-I`
-in `@compilerOptions`, because an installed mod is compiled from stdin with no
-repository beside it. It then installs and enables the mod. Windhawk's install
-folder must be on `PATH`; `-Compiler` names `windhawk-cli` explicitly, `-All`
-also installs the diagnostic probes, and `-SkipRestart` leaves the menu host
-alone.
-
-The script restarts `StartMenuExperienceHost.exe` when it finishes. A restart is
-not required for the mod to work: an enable or update attaches to the root the
-running menu host already has, and the next open uses it. `mod install` leaves a
-previously disabled mod disabled, so the script enables it; the Explorer half
-hooks Explorer when the mod is enabled, without an Explorer restart on this
-build.
+Install **Swipe for 10Start** from Windhawk and enable it. Enabling or updating
+attaches to the menu host that is already running; no Explorer or Start menu
+restart is needed.
 
 ## Settings
 
@@ -147,11 +108,10 @@ build.
 
 - The mod can write a decision log into two files in its Windhawk storage
   folder, which Windhawk shows on the mod's page: `renderer.log` from the Start
-  half and `bridge.log` from the Explorer half, both under
-  `local@swipe-for-10start`. They are written only while **Write a diagnostic
-  trace file** (`DiagnosticTrace`) is on; turn it on once from an elevated
-  shell with
-  `windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true`
+  half and `bridge.log` from the Explorer half, both under `swipe-for-10start`.
+  They are written only while **Write a diagnostic trace file**
+  (`DiagnosticTrace`) is on; turn it on once from an elevated shell with
+  `windhawk-cli mod settings set swipe-for-10start DiagnosticTrace=true`
   or from the mod's settings, then reproduce the problem.
 - The root hook is found by public symbol, not by address. If `StartUI_.dll`
   does not carry `StartUI::App::PrepareRootElement` (or its symbols cannot be
@@ -161,7 +121,11 @@ build.
   original positions — a known limit, along with the assumption that the touch
   panel covers the primary monitor.
 - The full technical documentation — what was measured, what was falsified,
-  and every design decision — lives in [docs/](docs/README.md), including the
-  complete [known-limits list](docs/limits.md).
-- [CHANGELOG.md](CHANGELOG.md) lists each release tag with the version it
-  shipped.
+  and every design decision — lives in
+  [docs/](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/README.md),
+  including the complete
+  [known-limits list](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/limits.md).
+- [CHANGELOG.md](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/CHANGELOG.md)
+  lists each release tag with the version it shipped.
+- Building and installing from source is covered in
+  [docs/development.md](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/development.md).

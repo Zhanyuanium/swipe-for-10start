@@ -1,4 +1,4 @@
-[English](README.md) | **简体中文**
+[English](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/README.md) | **简体中文**
 
 # Swipe for 10Start
 
@@ -12,27 +12,22 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 
 - **Windows 11**，且 **ExplorerPatcher** 已设置为 Windows 10（经典）开始菜单（`Start_ShowClassicMode=1`）。已在 Windows 11 build 26300.10075（`twinui.pcshell.dll` 固定版本 10.0.26100.10068）和
   ExplorerPatcher 26100.9711 上验证。
-- **Windhawk** 2.0 或更高版本。
+- **Windhawk**。
 - 触摸屏或手写笔。（本模组刻意不响应鼠标拖动。）
 
 ## 模组由两部分组成
 
-只发布一个 Windhawk 模组，但它同时运行在需要的两个进程中：StartMenuExperienceHost 里是控制器，Explorer 里是执行器。
+只发布一个 Windhawk 模组，同时运行在需要的两个进程中：手势和动画在 StartMenuExperienceHost 里，系统调用在 Explorer 里。
 
-- **控制器**负责手势本身：边缘划入打开、跟随手指、拖动关闭，以及滑动动画。它还接收执行器的意图，并在关闭时安排 dismiss。
-- **执行器**运行在 Explorer 中，在启动器自己的线程上执行系统自己的 `ShowStartView`/`Dismiss`。Win 键、开始按钮和点击空白各发布一个意图；控制器根据自己的已发布状态决定打开或关闭，跑完唯一的镜像回弹，再请执行器 dismiss。关闭使用与手势关闭相同的动画。关闭过程中的按键按“重新打开”处理：窗口还在屏幕上时取消这次关闭，面板从收回到的位置回弹；按键落在系统 hide 里时被锁存，等 hide 落地再补发。关闭过程中的手指只有在落在仍在屏幕上的那部分面板（或任务栏边缘带）上时才算抓住这次收回：向内划过 24 DIP 时中止这次关闭，已武装的 dismiss 被撤销，面板从回收到的位置直接反向，而不是先收完再弹出。从边缘带起手、但直到关闭结束之后才划满 24 DIP 的手指同样是一次打开：模组请求 `ShowStartView`，面板从入场位置跟随手指。恢复是尽力而为，不是保证：桥已经吞掉的按键没有原生回放，若控制器在门禁与补发之间消失，这一次按键就丢了。落在面板已经离开的区域、或者在收回表面上被关闭抢先落地的手指没有第二次机会——它必须先抬起，菜单也要等下一次新的拉动。Win+Tab、锁屏和显示变化直接透传，锁屏绝不会被拖住。如果 Explorer 的半边被拒绝——系统版本不符，或启动器的公开符号解析不到——菜单照常开关，但关闭是瞬间的。启动器的钩子按公开符号查找，私有布局只在已验证的参考映像上启用（固定的文件版本和全部 13 个参考 RVA）；其他版本仍走系统自己的路径。Start 半边在没有可用渲染器时也会撤回拦截：菜单根正在替换，或一次几何写入失败使其失效时，按键恰好在系统自己的路径上执行一次；可用根挂上后恢复。
+从任务栏边缘划入，菜单跟随手指打开；把已打开的菜单往该边缘拖回，菜单滑出关闭。Win 键、开始按钮和点击桌面播放同一套动画。
+
+关闭过程中再按一次或再拉一次，只要窗口还在屏幕上，就会取消这次关闭，并从当前位置反向回弹；已经落地的关闭不会被同一根手指重新打开，下一次打开需要新的触摸。Win+Tab、锁屏和显示变化直接透传。
+
+如果 Explorer 的半边在当前系统版本上无法运行，菜单仍能开合，但关闭是瞬间的；Start 半边里的触摸和手写笔手势仍会跟随手指。
 
 ## 安装
 
-在 Windhawk 界面中安装该模组，或者在仓库目录下以管理员身份运行 PowerShell：
-
-```powershell
-pwsh -File .\tools\install_mods.ps1
-```
-
-脚本先运行 `tools/make_store_mods.ps1 -Profile local`，把共享头文件内联后的单文件构建写到 `dist\local\`（`@compilerOptions` 中不再有 `-I`，因为安装后的模组由 Windhawk 从标准输入编译，旁边没有仓库）；随后安装并启用该模组。Windhawk 的安装目录必须在 `PATH` 上；`-Compiler` 可直接指定 `windhawk-cli`，`-All` 会一并安装诊断探针，`-SkipRestart` 则不重启菜单宿主。
-
-脚本结束时重启 `StartMenuExperienceHost.exe`。但启用或更新模组并不需要重启：它会挂到正在运行的菜单宿主已有的根上，下一次打开菜单就使用新的渲染器。`mod install` 不会启用先前被禁用的模组，所以脚本会显式启用它；Explorer 的半边在模组启用时挂钩 Explorer，在当前系统版本上不必重启它。
+在 Windhawk 中安装 **Swipe for 10Start** 并启用。启用或更新会挂到正在运行的菜单宿主上，不需要重启 Explorer 或开始菜单宿主。
 
 ## 设置项
 
@@ -58,10 +53,11 @@ pwsh -File .\tools\install_mods.ps1
 
 ## 如果看起来不对
 
-- 模组可以把决策日志写进它的 Windhawk 存储目录（Windhawk 在模组页面上显示该路径）下的两个文件：Start 半边的 `renderer.log` 和 Explorer 半边的 `bridge.log`，都在 `local@swipe-for-10start` 下。只有打开 **写入诊断跟踪文件**（`DiagnosticTrace`）时才会写；打开一次即可：
-  `windhawk-cli mod settings set local@swipe-for-10start DiagnosticTrace=true`，
+- 模组可以把决策日志写进它的 Windhawk 存储目录（Windhawk 在模组页面上显示该路径）下的两个文件：Start 半边的 `renderer.log` 和 Explorer 半边的 `bridge.log`，都在 `swipe-for-10start` 下。只有打开 **写入诊断跟踪文件**（`DiagnosticTrace`）时才会写；打开一次即可：
+  `windhawk-cli mod settings set swipe-for-10start DiagnosticTrace=true`，
   也可以在模组设置里打开（命令行需要管理员权限），然后复现问题。
 - 根钩子按公开符号查找，不依赖固定地址。若 `StartUI_.dll` 不含 `StartUI::App::PrepareRootElement`（或读不到符号），手势不会启动，日志里会看到 `startui root symbol unresolved ...`；此时所有按键都交给系统自行处理。
 - 拖动菜单期间，菜单内容仍在原位置接收触摸——这是已知限制；另一条已知限制：本模组假设触摸面板覆盖主显示器。
-- 完整的技术文档在 [docs/](docs/README.md)（英文），其中有测量数据、被证伪的方案和每项设计决定的理由，也包括完整的[已知限制列表](docs/limits.md)。
-- 每次发布的 tag 与对应的版本号见 [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)（英文版 [CHANGELOG.md](CHANGELOG.md)）。
+- 完整的技术文档在 [docs/](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/README.md)（英文），其中有测量数据、被证伪的方案和每项设计决定的理由，也包括完整的[已知限制列表](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/limits.md)。
+- 每次发布的 tag 与对应的版本号见 [CHANGELOG.zh-CN.md](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/CHANGELOG.zh-CN.md)（英文版 [CHANGELOG.md](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/CHANGELOG.md)）。
+- 从源码构建与安装的步骤见 [docs/development.md](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/development.md)。
