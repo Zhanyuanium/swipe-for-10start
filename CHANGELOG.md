@@ -57,7 +57,8 @@ this release is the lifecycle half of the same design.
 - **The version check precedes the symbol work.** The launcher's fixed version is
   read from the mapped image's `RT_VERSION`, not from the file path; a build
   other than the reference is refused in one line and never starts the 33 MB PDB
-  fetch.
+  fetch. The Start side's `StartUI_.dll` root symbol gets the same one-attempt
+  rule, after a bounded wait for the module.
 
 Still owed, and named in `docs/limits.md`: the top and right docks are
 implemented but unmeasured on this machine, a pen by hand, a second display and

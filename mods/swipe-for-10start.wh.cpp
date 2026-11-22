@@ -10346,7 +10346,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     bool visibilitySeeded = false;
     // The root hook is resolved here and not by the LoadLibraryExW notification:
     // the first symbol load blocks for Windhawk's PDB fetch, and this thread is
-    // the mod's own. A pending result leaves the peer unpublished.
+    // the mod's own. Until the symbol is ready and refused is clear, the peer
+    // stays unpublished.
     ProbeRootSymbolFromInputThread();
     if (g_rootHookReady.load(std::memory_order_acquire) && RendererReady() &&
         capabilitySeen) {
@@ -10355,8 +10356,8 @@ DWORD WINAPI HidInputThread(LPVOID) {
     while (running) {
         // The module appears after this thread starts in the measured host, so
         // the bootstrap deadline (NextInputDeadlineMs) is what brings this thread
-        // back to look. The call is throttled while the result is pending and
-        // stops as soon as ready or refused is set.
+        // back to look. The probe stops as soon as ready or refused is set, and
+        // the one symbol attempt happens on the first pass that finds the module.
         ProbeRootSymbolFromInputThread();
         // The bridge's capability is a continuing promise. A gain is what lets
         // this side advertise; a loss withdraws the peer before any press can be
@@ -13249,25 +13250,20 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
 // The image the notification saw, and the image an install currently owns.
 // `Seen` is written by the `LoadLibraryExW` notification and read by the input
 // thread; `HookModule` is the one-attempt claim that keeps two install paths
-// from loading symbols at once. A failed attempt clears the claim so the input
-// thread can retry the same image.
+// from resolving the same image at once. A refused result is terminal for the
+// session; it never clears the claim for a retry.
 std::atomic<HMODULE> g_startUIModuleSeen{nullptr};
 std::atomic<HMODULE> g_startUIHookModule{nullptr};
 std::atomic<bool> g_loadHookMatchLogged{false};
 
-// The input thread's module-wait schedule for the root symbol. The wait is
-// bounded at 120 s: StartUI_.dll can load late on the shell's own schedule, and
-// the bound is long enough to cover a normal logon before a user concludes the
-// feature is broken. Once the module is present the one HookSymbols call is
-// made; a false result is terminal, never a pending retry. Input thread only; a
-// fresh image starts them at zero.
+// The input thread's module wait for the root symbol. The module may load late;
+// the wait is bounded by kRootPendingDeadlineMs, and once the module is present
+// the one HookSymbols call is made. A false result is terminal, never a pending
+// retry. Input thread only; a fresh image starts these at zero.
 //
 // `kRootProbeMs` is the module-poll interval and, through NextInputDeadlineMs,
-// the wait planner's bootstrap deadline: while the answer is neither ready nor
-// refused, the thread has to come back to see whether the module has loaded.
-// The input thread's module wait for the root symbol. The module may load late;
-// once it is present the symbol call is made exactly once, and the wait itself is
-// bounded by kRootPendingDeadlineMs.
+// the wait planner's bootstrap deadline: while the module has not appeared, the
+// thread has to come back to see whether it has loaded.
 constexpr uint64_t kRootPendingDeadlineMs = 120000;
 uint64_t g_rootProbeNextTick = 0;
 uint64_t g_rootProbeFirstTick = 0;
@@ -13296,8 +13292,7 @@ bool InstallStartUIHooks(HMODULE module) {
     AcquireSRWLockExclusive(&g_startUIHookLock);
     // The lock is the stop barrier BeforeUninit takes, so a stop and this
     // install cannot interleave. The claim also marks the image this call is
-    // resolving, so a refused result is retried later rather than resolved twice
-    // at once.
+    // resolving; a refused result is terminal, never a second attempt.
     HMODULE expected = nullptr;
     if (!g_startUIHookModule.compare_exchange_strong(expected, module)) {
         ReleaseSRWLockExclusive(&g_startUIHookLock);
@@ -15109,9 +15104,8 @@ bool OnRecordedLauncherThread() {
 // first: without a live controller an intent has no consumer, so deciding would
 // only delay the shell's own toggle. Then a started worker, then this thread: a
 // hook on another thread must not read the latch or the armed dismiss. The window
-// is created here, on a known launcher entry, and never from the library-load
-// hook or the worker's wait loop. Creating it takes no wait, so this is safe
-// inside the hook.
+// is created here, on a known launcher entry. Creating it takes no wait, so this
+// is safe inside the hook.
 //
 // `epochOut` is the activation the admission was decided under. The latch stores
 // this value, not a fresh read: a restart between this decision and the latch
@@ -18916,6 +18910,11 @@ void RoleUninit() {
     if (!g_initialised) {
         return;
     }
+
+    // Symmetric with the Start side: an uninit that skipped BeforeUninit still
+    // closes interception before the window and class go. The normal path set
+    // this there already.
+    g_disabled = true;
 
     // The posting worker first. It never calls the launcher synchronously, so
     // the join does not depend on the launcher thread; it sees the stop event
