@@ -78,7 +78,8 @@ join/UI-teardown/entry-drain order, the bridge worker join/window destruction/
 class unregistration order, the no-safe-success rule, and the host's unload
 boundary.
 
-testing.md: the probes/injectors and the captured measurements in `artifacts/`;
+testing.md: the build gate (`make_store_mods.ps1` and its README block), the
+probes/injectors and the captured measurements in `artifacts/`;
 the smoke's `DiagnosticTrace` precondition and the tap tests.
 
 limits.md: the measured limits — the shell cap, the launcher readiness, the
@@ -92,7 +93,8 @@ still owed.
 README.md: the map and the one shipping mod.
 
 store.md: how the mod reaches `ramensoftware/windhawk-mods` — the one-file-per-PR
-rule that forces `tools/make_store_mods.ps1` to inline the shared headers, what
+rule that forces `tools/make_store_mods.ps1` to inline the shared headers and
+replace the readme body with the two user guides, what
 the `store` and `local` profiles each change (no `-I` in either; the store also
 drops `-Wall`/`-Wextra` and adds `@github`/`@license`/`@homepage`), the two
 constraints the collection's scripts impose on the source (a hook name must be a

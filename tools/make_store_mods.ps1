@@ -25,8 +25,10 @@ changes nothing else. Two profiles:
   stay so a local build is warning-clean, and no store metadata is added.
 
 The output is generated, never hand-edited: `dist/` is ignored, and a diff
-against the repo source is only the inlined headers and the metadata the store
-profile requires.
+against the repo source is only the inlined headers, the shipped README block
+and the metadata the store profile requires. In both profiles the
+`==WindhawkModReadme==` body is replaced with `README.md`, a `---` separator
+and `README.zh-CN.md`; the condensed block in the source is not shipped.
 
 .PARAMETER Profile
 `store` or `local`. Default `store`.
@@ -87,6 +89,19 @@ function Resolve-WindhawkCli {
 $modsToBuild = New-Object System.Collections.Generic.List[hashtable]
 $modsToBuild.Add(@{ File = 'swipe-for-10start.wh.cpp' })
 
+# The user guides are the shipped readme. Both profiles use the same block, so
+# the installed mod and the store submission cannot show different guides.
+$readmeEnPath = Join-Path $repo 'README.md'
+$readmeZhPath = Join-Path $repo 'README.zh-CN.md'
+foreach ($path in @($readmeEnPath, $readmeZhPath)) {
+    if (-not (Test-Path -LiteralPath $path)) {
+        throw "missing README for the WindhawkModReadme block: $path"
+    }
+}
+$readmeBlock = [IO.File]::ReadAllText($readmeEnPath) +
+    "`n`n---`n`n" +
+    [IO.File]::ReadAllText($readmeZhPath)
+
 $cli = $null
 if ($isStore) { $cli = Resolve-WindhawkCli }
 
@@ -130,6 +145,28 @@ $($body.TrimEnd())
             if (-not $opts) { return '' }
             $m.Groups[1].Value + $opts + "`r"
         }.GetNewClosure())
+
+    # -- the shipped readme is README.md + separator + README.zh-CN.md. Replace
+    #    the whole body between the markers, including the comment wrapper; the
+    #    authored condensed block never reaches an installed or submitted file.
+    $readmeStart = '// ==WindhawkModReadme=='
+    $readmeEnd = '// ==/WindhawkModReadme=='
+    $startCount = ([regex]::Matches($text, [regex]::Escape($readmeStart))).Count
+    $endCount = ([regex]::Matches($text, [regex]::Escape($readmeEnd))).Count
+    if ($startCount -ne 1 -or $endCount -ne 1) {
+        throw ("$($mod.File): expected one '$readmeStart' and one '$readmeEnd' marker, " +
+            "found $startCount and $endCount")
+    }
+    $startIndex = $text.IndexOf($readmeStart)
+    $endIndex = $text.IndexOf($readmeEnd, $startIndex + $readmeStart.Length)
+    if ($endIndex -lt 0) {
+        throw "$($mod.File): the readme end marker precedes the start marker"
+    }
+    $newline = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $prefix = $text.Substring(0, $startIndex + $readmeStart.Length)
+    $suffix = $text.Substring($endIndex)
+    $readmeBody = $newline + '/*' + "`n" + $readmeBlock + "`n" + '*/' + $newline
+    $text = $prefix + $readmeBody + $suffix
 
     if ($isStore) {
         # -- metadata the collection requires and this repo does not need locally

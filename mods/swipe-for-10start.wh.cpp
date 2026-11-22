@@ -1,7 +1,9 @@
 // ==WindhawkMod==
 // @id              swipe-for-10start
-// @name            Legacy Start Swipe
-// @description     Swipe in from the taskbar edge to pull the Start menu out with your finger, and swipe back to close it
+// @name            Swipe for 10Start
+// @name:zh-CN      Swipe for 10Start
+// @description     Touch and pen swipe gestures for ExplorerPatcher's legacy Windows 10 Start menu: pull it out with your finger, drag it back to close, with the same animation on the Windows key.
+// @description:zh-CN 为 ExplorerPatcher 恢复的 Windows 10 经典开始菜单加上触摸与手写笔滑动：手指拉出、拖回关闭，Win 键开合播放同一套动画。
 // @version         0.8.2
 // @author          Zhanyuanium
 // @include         explorer.exe
@@ -12,7 +14,7 @@
 
 // ==WindhawkModReadme==
 /*
-# Legacy Start Swipe
+# Swipe for 10Start
 
 Touch and pen gestures for the Windows 10 Start menu that ExplorerPatcher
 restores on Windows 11. Swipe in from the taskbar edge and the menu follows
@@ -37,7 +39,7 @@ What you need:
   (`twinui.pcshell.dll` fixed 10.0.26100.10068) with ExplorerPatcher 26100.9711.
 - Windhawk 2.0 or later and a touchscreen or pen.
 
-Install **Legacy Start Swipe** from Windhawk and enable it. One mod covers both
+Install **Swipe for 10Start** from Windhawk and enable it. One mod covers both
 processes: the gesture runs in StartMenuExperienceHost, the shell calls in Explorer.
 
 Settings:
@@ -14267,7 +14269,7 @@ void RoleUninit() {
                     ? GetTickCount64() - g_unloadStartTick
                     : 0));
     g_initialised = false;
-    Wh_Log(L"Legacy Start Swipe uninitialized (start role)");
+    Wh_Log(L"Swipe for 10Start uninitialized (start role)");
 }
 
 // A settings change only refreshes the atomics: the next settle reads them, no
@@ -18852,7 +18854,7 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 BOOL RoleInit() {
     SetTraceFileName(L"bridge.log");
     RefreshTraceSetting();
-    Wh_Log(L"Legacy Start Swipe %s initializing (explorer role)", kModVersion);
+    Wh_Log(L"Swipe for 10Start %s initializing (explorer role)", kModVersion);
 
     // A re-enable starts with no press of the previous activation. The queue,
     // its outstanding record and the latch belong to that activation's window and
@@ -18992,7 +18994,7 @@ void RoleUninit() {
                     ? GetTickCount64() - g_unloadStartTick
                     : 0));
     g_initialised = false;
-    Wh_Log(L"Legacy Start Swipe uninitialized (explorer role)");
+    Wh_Log(L"Swipe for 10Start uninitialized (explorer role)");
 }
 
 // The explorer role reads no setting: the one settings block belongs to the

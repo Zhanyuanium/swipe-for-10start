@@ -15,10 +15,11 @@ hand-edited (`dist/` is ignored), and changes only what the collection requires:
 |---|---|
 | Each `#include "<local>.h"` replaced by the header body, inside `#pragma clang diagnostic push/ignored "-Wunused-const-variable"/pop` | One file per PR; the contract's constants are used by one side, so the unused half would warn, and the 2.0 compatibility check fails on any warning |
 | `-I` (if a source ever carries one), `-Wall`, `-Wextra` removed from `@compilerOptions` in the store profile | A machine path must not survive and a quoted option breaks the compile job outright; `-Wall`/`-Wextra` are not among the options the collection accepts, and its CI compiles without them |
+| `==WindhawkModReadme==` body replaced by `README.md` + `---` + `README.zh-CN.md` | The installed mod and the store page show the same full bilingual guides; the condensed block in `mods/` is a placeholder and is never shipped |
 | `@github https://github.com/Zhanyuanium`, `@license MIT`, `@homepage <repo>` added | `@github` is required and must equal the PR author's profile exactly; the collection treats a missing licence as MIT |
 
-Everything else — code, README body, version, `@include`, `@architecture` — is the
-repo source verbatim, so the submitted file and `mods/` cannot drift apart.
+Everything else — code, version, `@include`, `@architecture` — is the repo source
+verbatim, so the submitted file and `mods/` cannot drift apart.
 
 Two source constraints come from the collection's scripts, not from Windhawk:
 

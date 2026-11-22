@@ -3,6 +3,17 @@
 > 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
 > Part of [docs/README.md](README.md). Member lists with more detail: [../tools/AGENTS.md](../tools/AGENTS.md) and [../artifacts/AGENTS.md](../artifacts/AGENTS.md).
 
+## Build gate
+
+`tools/make_store_mods.ps1` produces the single-file source that
+`tools/install_mods.ps1` installs (`-Profile local`) and the store submission
+(`-Profile store`). After inlining `swipe_ipc_shared.h`, both profiles replace
+the `==WindhawkModReadme==` body with `README.md`, a `---` separator and
+`README.zh-CN.md`, so the installed mod and the store page show the full
+bilingual guides; the authored condensed block is not shipped. The build fails
+if either README or either marker is missing. The store profile also runs
+`windhawk-cli source meta --strict` and fails on any rejection.
+
 ## Tools
 
 - `tools/screenshot.ps1` — full-screen PNG in physical pixels. The process is
