@@ -458,6 +458,12 @@ bool SwipeCloseIntentAllowed(uint32_t method) {
            method == kSwipeDismissMethodClickAwayEvidence;
 }
 
+// The release the two role-start lines name. Windhawk exposes no runtime read of
+// the mod's @version metadata, so this is the one authored copy; the metadata
+// block above and this constant change in the same commit. A role-start line that
+// says a different release is a bug, not history.
+constexpr wchar_t kModVersion[] = L"0.8.0";
+
 namespace start {
 
 
@@ -13345,7 +13351,7 @@ BOOL RoleInit() {
     SetTraceFileName(L"renderer.log");
     RefreshTraceSetting();
     TraceLog(L"mod init");
-    Wh_Log(L"Legacy Start Swipe 0.7.0 initializing (start role)");
+    Wh_Log(L"Legacy Start Swipe %s initializing (start role)", kModVersion);
 
     LoadAnimationStyle();
     LoadGestureStartSpeed();
@@ -16500,7 +16506,7 @@ void PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 BOOL RoleInit() {
     SetTraceFileName(L"bridge.log");
     RefreshTraceSetting();
-    Wh_Log(L"Legacy Start Swipe 0.7.0 initializing (explorer role)");
+    Wh_Log(L"Legacy Start Swipe %s initializing (explorer role)", kModVersion);
 
     // The channel to the Start side. Opening it here means the section and its
     // events exist before the first Hide, and a Start mod that attaches later
