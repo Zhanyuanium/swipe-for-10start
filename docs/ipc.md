@@ -127,23 +127,23 @@ the line names it (`intent open refused entry=... reason=no-executor`,
 `intent close refused from=... reason=no-executor`); the bridge does not retry the
 original on an answered refusal. An **unanswered** decision is not replayed on a
 guess. At the 1000 ms bound the bridge re-reads the ack, `intentTaken` and the
-shared intent record. A taken sequence is `decision=consumed awaiting=ack`: the
-take proves the controller has the record, not that the resulting direction is
-published, so the next press waits for the ack while the queued presses keep
-their own queue-age bound (and are served natively if that ack never comes).
+shared intent record. Any claim is `decision=consumed awaiting=ack`: the take
+proves the controller has the record, not that the resulting direction is
+published, so the next press waits for the ack, its queue-age bound stays paused,
+and only the ack, a changed epoch, or a gone/stale peer releases it. A claim that
+lands after the bridge's first read but before its abort is the same case
+(`reason=claim-after-abort`): the controller may already hold a validated copy.
 Every Start branch publishes the resulting direction before it answers, so the
 press after an ack reads the new direction. Otherwise the bridge **aborts** the
 record (`SwipeIpcAbortIntent` steps
 the counter to its odd state, which every reader rejects) and re-reads the claim.
-If the abort succeeded and the claim is not this sequence, the original runs once
-(`decision=replay reason=revoked`); if the claim landed after the abort the record
-can no longer be copied, so nothing runs (`decision=none
-reason=claim-after-abort`); a record that already moved cannot be aborted
+If the abort succeeded and no claim exists, the original runs once
+(`decision=replay reason=revoked`); a record that already moved cannot be aborted
 (`decision=superseded reason=record-moved`). A different `peerEpoch` means the
 activation that was asked is gone: a taken press is consumed without its ack
 (`reason=epoch-changed`), an untaken one is aborted and replayed, and the queue
-advances. The peer words are evidence; the
-abort and the claim are the proof. A take is never replayed: at most one
+advances. The peer words are evidence;
+the abort and the claim are the proof. A take is never replayed: at most one
 execution, one native execution when the record is aborted before any claim, and
 a press lost rather than duplicated if the controller dies after the take.
 
@@ -163,12 +163,15 @@ not a lock. The Start side's turn is:
 2. write `intentTaken = seq`;
 3. copy the record;
 4. re-read the record's sequence and `intentTaken`; act only when both are still
-   this sequence (`intent drop ... reason=record-gone` otherwise).
+   this sequence. A claimed record that can no longer be applied is answered
+   `intent revoked seq=...` (`kSwipeAckSuperseded`), never dropped silently: the
+   publisher's timeout is holding the queue slot for exactly this answer.
 
-The publisher's timeout then has one proof: `taken == seq` means the controller
-has the record and no replay follows; `taken != seq` aborts the record and
-re-reads the claim, and the original runs only when the abort succeeded and the
-claim is not this sequence.
+The publisher's timeout then has one proof: a claim for the sequence means the
+controller may still apply it, so no replay follows and the next press waits for
+the ack; only a changed epoch or a gone/stale peer releases it without the ack.
+An untaken record is aborted and re-read; the original runs only when the abort
+succeeded and no claim landed.
 
 `0` means no claim has been made. The word is not a seqlock: it is a claim, and no
 two fields must agree. An aborted record stays odd until the next publisher steps

@@ -386,13 +386,16 @@ serialisation point for the next admitted press — the take alone is not:
   replay.
 
 An unanswered intent is resolved by the record, not by the heartbeat. The Start
-side claims the sequence before copying and re-checks the claim after the copy.
-The bridge's timeout either waits for the ack of a taken sequence (the take proves
-execution, not that the direction is visible; every branch publishes the direction
-before the ack) or aborts the
-record (its counter goes odd, so no consumer can copy or claim it) and re-reads
-the claim before any replay. A changed `peerEpoch` at the watchdog is a restart:
-the replacement seeded `g_lastIntentSeq` past the record and will never answer, so
+side claims the sequence before copying and re-checks the claim after the copy; a
+claimed record it cannot apply is answered as superseded, so the publisher is
+never left waiting. Any claim keeps the bridge's slot open: the press waits for
+the ack (the take proves execution, not that the direction is visible; every
+branch publishes the direction before the ack), and the next press's queue-age
+bound is paused, so no later press can be reordered ahead of it. Only a changed
+`peerEpoch` or a gone/stale peer releases the slot without the ack. An untaken
+record is aborted (its counter goes odd, so no consumer can copy or claim it) and
+re-read before any replay. A changed epoch at the watchdog is a restart: the
+replacement seeded `g_lastIntentSeq` past the record and will never answer, so
 the record is aborted, replayed if no claim exists, and the queue advances. The
 peer words stay in the line as evidence.
 

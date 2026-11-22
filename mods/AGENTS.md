@@ -662,21 +662,23 @@ probe or timer failure is answered `unknown`.
   predecessor is never aged out ahead of it. An external barrier is not an
   executing press, so its held presses keep the bound. The Start side claims the
   sequence before it copies the record and re-checks the claim after the copy
-  (`intent drop ... reason=record-gone` on a revocation). An ack timeout is then
-  resolved by proof: `taken == seq` is `decision=consumed awaiting=ack` — the
-  take proves execution, not that the direction is published, so the next press
-  waits for the ack and only the queued presses' own bound can serve them
-  (`own press poll timer failed` drains them if that wake cannot be armed). Every
-  Start branch publishes the resulting direction before its ack, so the press
-  after an ack reads the new direction (close then reopen, not two closes).
+  (`intent drop ... reason=record-gone`); a claimed record it cannot apply is
+  answered `intent revoked seq=...` with `kSwipeAckSuperseded`, so the publisher
+  is never left waiting for an ack that cannot come. An ack timeout is then
+  resolved by proof: any claim for the sequence is
+  `decision=consumed awaiting=ack` — including one that lands between the first
+  read and the abort (`reason=claim-after-abort`) — and the next press is not
+  served and its bound stays paused until the ack, a changed epoch, or a
+  gone/stale peer (`decision=consumed reason=peer-gone`) releases it. Every Start
+  branch publishes the resulting direction before its ack, so the press after an
+  ack reads the new direction (close then reopen, not two closes).
   `taken != seq` aborts the record (`SwipeIpcAbortIntent`, the counter's odd
-  state), re-reads the claim, and only replays when the abort succeeded and the
-  claim is not this sequence (`decision=replay reason=revoked|epoch-changed`). A
-  claim that landed after the abort is `decision=none reason=claim-after-abort`
-  and a record that already moved is `decision=superseded reason=record-moved`.
-  A changed `peerEpoch` at the watchdog is a restart: a taken press is consumed
-  without its ack (`reason=epoch-changed`), an untaken one is aborted and
-  replayed, and the queue advances. The queue's own lines are
+  state), re-reads the claim, and only replays when the abort succeeded and no
+  claim exists (`decision=replay reason=revoked|epoch-changed`); a record that
+  already moved is `decision=superseded reason=record-moved`. A changed
+  `peerEpoch` at the watchdog is a restart: a taken press is consumed without its
+  ack (`reason=epoch-changed`), an untaken one is aborted and replayed, and the
+  queue advances. The queue's own lines are
   `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch, is published at once,
   and sets the same barrier as a state, not a timer: it stands even when

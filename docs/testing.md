@@ -246,6 +246,12 @@ could act, or before its confirmation could land).
 
 ## Round-6 runtime checks
 
+- **Claim window (A).** Hold the consumer's claim until the bridge's timeout has
+  read `intentTaken` (a test harness delays the claim and pauses after the copy).
+  The timeout aborts at the widened read/abort window, sees the claim, logs
+  `decision=consumed awaiting=ack reason=claim-after-abort`, and press 2 stays
+  queued: no `own press dequeued` until `own press ack`. The directions then
+  alternate.
 - **Claimed 1500 ms (B).** Claim press 1 and pause after the copy for longer than
   the queue bound, with its heartbeat kept fresh. The timeout logs
   `decision=consumed awaiting=ack`; at 1500 ms there is no `own press fallback

@@ -146,30 +146,35 @@ waited behind a claimed predecessor is never aged out ahead of it. An external
 barrier is not an executing press, so the presses held behind it keep the bound.
 The Start side claims the
 sequence **before** it copies the record and re-checks the claim after the copy;
-a record the bridge aborted in between is dropped (`intent drop ...
-reason=record-gone`). The ack timeout then decides by proof, not by the
+a record the bridge aborted in between is dropped **and answered as superseded**
+(`intent drop ... reason=record-gone`, `intent revoked seq=...`), so the
+publisher's slot is never left waiting for an ack that cannot come. The ack
+timeout then decides by proof, not by the
 heartbeat:
 
-- `taken == seq` is `decision=consumed awaiting=ack`: the take proves execution,
-  not that the resulting direction is published, so the next press waits for the
-  ack while the queued presses keep their own 1500 ms bound. An ack is the
-  bridge's one release: every Start branch publishes the resulting direction
-  before it answers, so the press after an ack reads the new direction (a close
-  then a reopen, not two same-direction intents);
+- any claim for this sequence is `decision=consumed awaiting=ack`: the take
+  proves execution, not that the resulting direction is published, so the next
+  press waits for the ack and its queue-age bound stays paused. This includes a
+  claim that lands between the timeout's first read and its abort
+  (`reason=claim-after-abort`): the controller may already hold a validated copy
+  and will apply and ack it. An ack is the bridge's one release: every Start
+  branch publishes the resulting direction before it answers, so the press after
+  an ack reads the new direction (a close then a reopen, not two same-direction
+  intents);
 - `taken != seq` aborts the record (the counter goes to its odd state, so no
-  consumer can copy or claim it), then re-reads the claim. Not this sequence:
-  `decision=replay reason=revoked` runs the original once. This sequence:
-  `decision=none reason=claim-after-abort`, because the claimer's copy can no
-  longer succeed and a replay is refused;
+  consumer can copy or claim it), then re-reads the claim. No claim:
+  `decision=replay reason=revoked` runs the original once;
 - a record that has already moved cannot be aborted (`decision=superseded
   reason=record-moved`), so nothing is replayed.
 
-A different `peerEpoch` at the watchdog means the activation that was asked is
-gone: the replacement seeds `g_lastIntentSeq` past the record and will never
-answer, so a taken press is consumed without its ack (`reason=epoch-changed`), an
-untaken record is aborted and replayed under the same rule, and the external
-barrier is released. The peer words are evidence in the line; the abort and the
-claim are the proof.
+A claim is released only by its ack, a changed peer epoch, or a peer that is
+gone/stale (`decision=consumed reason=peer-gone`): those are the proofs that no
+direction is still coming. A different `peerEpoch` at the watchdog means the
+activation that was asked is gone: the replacement seeds `g_lastIntentSeq` past
+the record and will never answer, so a taken press is consumed without its ack
+(`reason=epoch-changed`), an untaken record is aborted and replayed under the
+same rule, and the external barrier is released. The peer words are evidence in
+the line; the abort and the claim are the proof.
 A take is never replayed: one execution at most, one native execution when the
 record is aborted before any claim, and a press lost rather than duplicated if
 the controller dies after the take. An

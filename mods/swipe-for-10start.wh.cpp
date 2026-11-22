@@ -8309,12 +8309,22 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                          static_cast<int32_t>(ackHr));
 }
 
+// Answers a sequence this activation claimed but cannot apply. The publisher's
+// timeout keeps its slot until this answer, so a revoked record must not be
+// dropped silently: state=superseded says no action ran, and the ack releases the
+// queue without a replay.
+void AnswerRevokedIntent(LONG64 sequence) {
+    TraceLog(L"intent revoked seq=%lld", static_cast<long long>(sequence));
+    SwipeIpcAnswerIntent(&g_ipc, sequence, kSwipeAckSuperseded, 0, 0, S_OK);
+}
+
 // The input thread's one intent turn. The claim is written before the record is
 // copied: a publisher whose ack times out aborts the record, and an abort after
 // this claim is caught by the re-read below, so the controller never acts on a
 // record the bridge has already revoked. A claim that a newer sequence replaced
 // is equally dropped. Only a claimed sequence applied under this activation is
-// acknowledged.
+// acknowledged; a claimed one this activation cannot apply is answered as
+// superseded, never silently.
 void ApplyBridgeIntent() {
     const LONG64 sequence = SwipeIpcIntentSequence(&g_ipc);
     if (sequence == 0 || sequence == g_lastIntentSeq) {
@@ -8325,11 +8335,13 @@ void ApplyBridgeIntent() {
     if (!SwipeIpcReadIntent(&g_ipc, &intent) || intent.seq != sequence) {
         TraceLog(L"intent drop seq=%lld reason=record-moved",
                 static_cast<long long>(sequence));
+        AnswerRevokedIntent(sequence);
         return;
     }
     if (SwipeIpcTakenIntent(&g_ipc) != sequence) {
         TraceLog(L"intent drop seq=%lld reason=claim-revoked",
                 static_cast<long long>(sequence));
+        AnswerRevokedIntent(sequence);
         return;
     }
     ApplyBridgeIntentRecord(intent);
@@ -8659,11 +8671,13 @@ void ReconcileSupersedingIntentBeforeLanding() {
     if (!SwipeIpcReadIntent(&g_ipc, &current) || current.seq != intent.seq) {
         TraceLog(L"intent reconcile drop seq=%lld reason=record-moved",
                 static_cast<long long>(intent.seq));
+        AnswerRevokedIntent(intent.seq);
         return;
     }
     if (SwipeIpcTakenIntent(&g_ipc) != intent.seq) {
         TraceLog(L"intent reconcile drop seq=%lld reason=claim-revoked",
                 static_cast<long long>(intent.seq));
+        AnswerRevokedIntent(intent.seq);
         return;
     }
     TraceLog(L"intent reconcile seq=%lld kind=external (before landing recovery)",
@@ -15708,14 +15722,16 @@ void HandlePressAck() {
 // the ack once more, the consumer's `intentTaken` claim and the shared record:
 //
 // - a late ack is the answer and only advances the queue;
-// - `taken == seq` proves consumption, not that the resulting direction is
-//   visible. The press waits for its ack; the queued presses keep their own
-//   queue-age bound and are served natively if that ack never comes;
+// - any claim for this sequence proves the controller may still apply it. The
+//   press waits for its ack; the queue is not served and the next press's
+//   queue-age bound is paused, so no later press can choose a direction before
+//   this one publishes its own. Only the ack, a changed epoch, or a gone/stale
+//   peer releases it;
 // - `taken != seq` is resolved by aborting the record: the counter is stepped to
 //   its odd state, so no consumer can copy or claim it afterwards. The claim is
-//   then re-read. Not this sequence: the original is the one execution. This
-//   sequence: a claim landed after the abort, its copy can no longer succeed,
-//   and nothing is replayed;
+//   then re-read. No claim: the original is the one execution. A claim in that
+//   window: the controller may already hold a validated copy, so the slot is kept
+//   awaiting its ack and nothing is replayed;
 // - a record that has already moved cannot be aborted, so nothing is replayed.
 //
 // A different peer epoch means the activation that was asked is gone. The
@@ -15865,6 +15881,26 @@ void HandlePressAckTimeout() {
                     static_cast<unsigned long long>(wait),
                     static_cast<long long>(taken), peer, peerAge, epochNow);
         }
+        if (!peerAlive) {
+            // The activation that claimed it can no longer answer. The press may
+            // already have run, so there is no replay; the queue is released.
+            g_pressOutstanding = OutstandingPress{};
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                KillTimer(window, kPressAckTimer);
+            }
+            TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s "
+                    L"wait=%llu taken=%lld peer=%s age=%u epoch=%u "
+                    L"decision=consumed reason=peer-gone",
+                    static_cast<long long>(press.seq),
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(wait),
+                    static_cast<long long>(taken), peer, peerAge, epochNow);
+            ResumePressQueueAge();
+            ServeNextPress(L"timeout");
+            return;
+        }
         AgeOutQueuedPress();
         if (g_pressQueueCount > 0 && !ArmConsumedPressPoll()) {
             // The ack is still the release. Without this poll the peer and epoch
@@ -15881,12 +15917,12 @@ void HandlePressAckTimeout() {
     // it. A record that already moved cannot be aborted and is never replayed.
     const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
     const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
-    g_pressOutstanding = OutstandingPress{};
-    HWND window = g_execWindow.load(std::memory_order_relaxed);
-    if (window) {
-        KillTimer(window, kPressAckTimer);
-    }
     if (!revoked) {
+        g_pressOutstanding = OutstandingPress{};
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
         TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
                 L"taken=%lld peer=%s age=%u epoch=%u->%u "
                 L"decision=superseded reason=record-moved",
@@ -15901,21 +15937,32 @@ void HandlePressAckTimeout() {
         return;
     }
     if (takenAfter == press.seq) {
-        // The claim landed after the abort. The controller's copy can no longer
-        // succeed (the record is odd), so neither actor runs and nothing is
-        // replayed: the rule refuses a replay once the sequence was claimed.
-        TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-                L"taken=%lld peer=%s age=%u epoch=%u->%u "
-                L"decision=none reason=claim-after-abort",
-                static_cast<long long>(press.seq),
-                PressTriggerName(press.press.trigger),
-                PressEntryName(press.press.entry),
-                static_cast<unsigned long long>(wait),
-                static_cast<long long>(takenAfter), peer, peerAge,
-                press.publishedEpoch, epochNow);
-        ResumePressQueueAge();
-        ServeNextPress(L"timeout");
+        // The claim landed between this turn's first read and the abort. The
+        // controller may already hold a validated copy: it will apply and ack.
+        // Keeping the slot is the whole point — serving the next press now would
+        // let it choose a direction before this one published its own.
+        if (!g_pressOutstanding.consumedAwaitingAck) {
+            g_pressOutstanding.consumedAwaitingAck = true;
+            TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s "
+                    L"wait=%llu taken=%lld peer=%s age=%u epoch=%u "
+                    L"decision=consumed awaiting=ack reason=claim-after-abort",
+                    static_cast<long long>(press.seq),
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(wait),
+                    static_cast<long long>(takenAfter), peer, peerAge, epochNow);
+        }
+        if (g_pressQueueCount > 0 && !ArmConsumedPressPoll()) {
+            TraceLog(L"own press poll timer failed err=%u seq=%lld q=%d",
+                    GetLastError(), static_cast<long long>(press.seq),
+                    g_pressQueueCount);
+        }
         return;
+    }
+    g_pressOutstanding = OutstandingPress{};
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (window) {
+        KillTimer(window, kPressAckTimer);
     }
     TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
             L"taken=%lld peer=%s age=%u epoch=%u->%u decision=replay reason=%s",
