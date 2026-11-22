@@ -1599,6 +1599,11 @@ void ScheduleCloseTap(CloseKind kind, uint64_t delayMs) {
 }
 
 std::atomic<HWND> g_coreHwnd{nullptr};
+// The mod's own message-only window on the XAML UI thread. It is the unload's
+// one rendezvous: the teardown and the destroy messages are sent to it, and the
+// CoreWindow is only read for the cloak and bounds. Created from
+// PrepareRootElement before Loaded; never subclassing a shell window.
+std::atomic<HWND> g_uiRendezvousHwnd{nullptr};
 // Resolved in Wh_ModInit. A runtime resolve keeps the mod loadable without
 // dwmapi.dll in the import table.
 std::atomic<DwmGetWindowAttribute_t> g_dwmGetWindowAttribute{nullptr};
@@ -12542,9 +12547,8 @@ void ReleaseScrollableElementIfGeneration(uint32_t maxGeneration) {
 }
 
 // The HWND is needed for the DWM cloaked query that decides whether the menu
-// is open, for the window bounds the input thread tests against, and for the
-// unload's synchronous UI round trip. A failed re-capture keeps the previous
-// live window: the teardown still needs a window on that UI thread.
+// is open and for the window bounds the input thread tests against. A failed
+// re-capture keeps the previous live window: the cloak read still needs one.
 void CaptureCoreWindowHandle() {
     HWND previous = g_coreHwnd.load(std::memory_order_relaxed);
 
@@ -13010,6 +13014,10 @@ bool Setup(wux::FrameworkElement const& root) {
 using PrepareRootElement_t = void* (*)(void*, void*, bool);
 PrepareRootElement_t PrepareRootElement_Original = nullptr;
 
+// Defined with the unload helpers. The window is created only on the recorded UI
+// thread, from this hook and before Loaded is registered.
+bool EnsureUiRendezvousWindow();
+
 void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     void* result = PrepareRootElement_Original
                        ? PrepareRootElement_Original(frame, perFrameData, flag)
@@ -13019,11 +13027,12 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     }
 
     // This hook is the first code that can register a XAML handler (Loaded) on
-    // the new root, before Setup runs. Record the UI thread and a window on it
-    // here, so an unload in that window can still run the teardown on its owner
-    // thread instead of revoking a delegate from the Windhawk thread.
+    // the new root, before Setup runs. Record the UI thread and create this
+    // module's own rendezvous window on it here, before any registration: an
+    // unload in that window can then run the teardown on the owner thread.
     g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
     CaptureCoreWindowHandle();
+    EnsureUiRendezvousWindow();
 
     try {
         wux::UIElement element{nullptr};
@@ -13547,105 +13556,158 @@ void TeardownUi() {
     __builtin_unreachable();
 }
 
-// One synchronous turn on the owner of `hwnd`. The task is stack storage and the
-// message returns only after the task ran, so no C++/WinRT delegate or dispatcher
-// operation outlives this call. `WindowGone` is the reviewer's thread-gone case:
-// SendMessage to a destroyed window cannot reach module code, so freeing is safe.
-constexpr UINT kRunFromWindowThreadMessage = WM_APP + 0x62;
-using WindowThreadFn = void (*)(void*);
+// The unload's rendezvous is this module's own message-only window, created on
+// the XAML UI thread by PrepareRootElement before Loaded. No shell window is
+// subclassed and no shell procedure is replaced. The private messages run only
+// on this window: teardown returns after TeardownUi and its delegate thunks,
+// drain is an empty turn, and destroy tears the window down on its owner.
+constexpr wchar_t kUiRendezvousClassName[] =
+    L"WindhawkLegacyStartSwipeUiRendezvous";
+constexpr UINT kUiTeardownMessage = WM_APP + 0x62;
+constexpr UINT kUiDestroyMessage = WM_APP + 0x63;
+constexpr UINT kUiDrainMessage = WM_APP + 0x64;
+constexpr WPARAM kUiTeardownMagic = 0x53575455;  // "SWTU"
+constexpr WPARAM kUiDestroyMagic = 0x53575458;   // "SWTX"
+constexpr WPARAM kUiDrainMagic = 0x53575452;     // "SWTR"
 
-struct WindowThreadCall {
-    WindowThreadFn run;
-    void* arg;
+bool g_uiRendezvousClassRegistered = false;
+HINSTANCE g_uiRendezvousClassInstance = nullptr;
+
+struct UiTeardownCall {
     bool ran;
 };
 
-std::atomic<WNDPROC> g_windowThreadPrev{nullptr};
-
-LRESULT CALLBACK RunFromWindowThreadProc(HWND hwnd, UINT message, WPARAM wParam,
-                                         LPARAM lParam) {
-    if (message == kRunFromWindowThreadMessage) {
-        auto* call = reinterpret_cast<WindowThreadCall*>(lParam);
-        if (call && call->run) {
-            try {
-                call->run(call->arg);
-            } catch (...) {
-                // The teardown records its own failures; a callback must not
-                // unwind into the shell's message loop.
-            }
+LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
+                                  LPARAM lParam) {
+    if (message == kUiTeardownMessage) {
+        auto* call = reinterpret_cast<UiTeardownCall*>(lParam);
+        if (wParam != kUiTeardownMagic ||
+            hwnd != g_uiRendezvousHwnd.load(std::memory_order_acquire)) {
+            TraceLog(L"ui rendezvous teardown ignored hwnd=%p", hwnd);
+            return 0;
+        }
+        try {
+            TeardownUi();
+        } catch (...) {
+            // A callback must not unwind into the shell's message loop.
+        }
+        if (call) {
             call->ran = true;
         }
         return 0;
     }
-    WNDPROC previous = g_windowThreadPrev.load(std::memory_order_relaxed);
-    return previous ? CallWindowProcW(previous, hwnd, message, wParam, lParam)
-                    : DefWindowProcW(hwnd, message, wParam, lParam);
+    if (message == kUiDrainMessage) {
+        if (wParam != kUiDrainMagic ||
+            hwnd != g_uiRendezvousHwnd.load(std::memory_order_acquire)) {
+            TraceLog(L"ui rendezvous drain ignored hwnd=%p", hwnd);
+        }
+        return 0;
+    }
+    if (message == kUiDestroyMessage) {
+        if (wParam != kUiDestroyMagic ||
+            hwnd != g_uiRendezvousHwnd.load(std::memory_order_acquire)) {
+            TraceLog(L"ui rendezvous destroy ignored hwnd=%p", hwnd);
+            return 0;
+        }
+        if (!DestroyWindow(hwnd)) {
+            TraceLog(L"ui rendezvous destroy failed err=%u", GetLastError());
+        }
+        return 0;
+    }
+    if (message == WM_NCDESTROY) {
+        if (g_uiRendezvousHwnd.load(std::memory_order_acquire) == hwnd) {
+            g_uiRendezvousHwnd.store(nullptr, std::memory_order_release);
+        }
+    }
+    return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
-enum class WindowThreadResult {
-    Ran,
-    WindowGone,
-    Failed,
-};
-
-WindowThreadResult RunFromWindowThread(HWND hwnd, WindowThreadFn run,
-                                       void* arg) {
-    if (!hwnd || !IsWindow(hwnd)) {
-        return WindowThreadResult::WindowGone;
+// Creates the one window on the recorded XAML UI thread. Called from
+// PrepareRootElement before Loaded, never from the unload thread and never from
+// a shell hook frame. A class left by an earlier image is a failure, not
+// something to adopt: its procedure would point into unmapped code.
+bool EnsureUiRendezvousWindow() {
+    const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
+    if (uiThread == 0 || uiThread != GetCurrentThreadId()) {
+        TraceLog(L"ui rendezvous refused off-thread tid=%u ui=%u",
+                static_cast<unsigned>(GetCurrentThreadId()),
+                static_cast<unsigned>(uiThread));
+        return false;
     }
-    WNDPROC previous = reinterpret_cast<WNDPROC>(
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
-                          reinterpret_cast<LONG_PTR>(RunFromWindowThreadProc)));
-    if (!previous) {
-        return IsWindow(hwnd) ? WindowThreadResult::Failed
-                              : WindowThreadResult::WindowGone;
+    HWND existing = g_uiRendezvousHwnd.load(std::memory_order_acquire);
+    if (existing) {
+        if (IsWindow(existing)) {
+            return true;
+        }
+        g_uiRendezvousHwnd.store(nullptr, std::memory_order_release);
     }
-    g_windowThreadPrev.store(previous, std::memory_order_relaxed);
-    WindowThreadCall call{run, arg, false};
-    SendMessageW(hwnd, kRunFromWindowThreadMessage, 0,
-                 reinterpret_cast<LPARAM>(&call));
-    // Restore before clearing the previous procedure: a message that arrives
-    // between the two must reach the shell's own proc, never DefWindowProc.
-    const LONG_PTR restored = SetWindowLongPtrW(
-        hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(previous));
-    g_windowThreadPrev.store(nullptr, std::memory_order_relaxed);
-    if (!restored && IsWindow(hwnd)) {
-        // The shell's window still points at this image's procedure. Freeing
-        // the image would leave that pointer unmapped.
-        BlockUnload(L"ui window procedure restore failed");
+    if (!g_uiRendezvousClassRegistered) {
+        WNDCLASSEXW windowClass{};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = UiRendezvousProc;
+        windowClass.hInstance = reinterpret_cast<HINSTANCE>(&__ImageBase);
+        windowClass.lpszClassName = kUiRendezvousClassName;
+        if (!RegisterClassExW(&windowClass)) {
+            TraceLog(L"ui rendezvous class failed err=%u", GetLastError());
+            return false;
+        }
+        g_uiRendezvousClassRegistered = true;
+        g_uiRendezvousClassInstance = windowClass.hInstance;
     }
-    if (call.ran) {
-        return WindowThreadResult::Ran;
+    HWND window = CreateWindowExW(0, kUiRendezvousClassName, L"", 0, 0, 0, 0,
+                                  0, HWND_MESSAGE, nullptr,
+                                  g_uiRendezvousClassInstance, nullptr);
+    if (!window) {
+        TraceLog(L"ui rendezvous create failed err=%u", GetLastError());
+        return false;
     }
-    return IsWindow(hwnd) ? WindowThreadResult::Failed
-                          : WindowThreadResult::WindowGone;
+    g_uiRendezvousHwnd.store(window, std::memory_order_release);
+    TraceLog(L"ui rendezvous hwnd=%p tid=%u", window,
+            static_cast<unsigned>(uiThread));
+    return true;
 }
 
-struct ThreadWindowSearch {
-    HWND hwnd;
-};
-
-BOOL CALLBACK FindThreadWindowProc(HWND hwnd, LPARAM lParam) {
-    auto* search = reinterpret_cast<ThreadWindowSearch*>(lParam);
-    if (IsWindow(hwnd)) {
-        search->hwnd = hwnd;
-        return FALSE;
+void UnregisterUiRendezvousClass() {
+    if (!g_uiRendezvousClassRegistered) {
+        return;
     }
-    return TRUE;
+    if (UnregisterClassW(kUiRendezvousClassName, g_uiRendezvousClassInstance)) {
+        TraceLog(L"ui rendezvous class unregistered");
+    } else {
+        const DWORD error = GetLastError();
+        if (error == ERROR_CLASS_DOES_NOT_EXIST) {
+            TraceLog(L"ui rendezvous class already gone");
+        } else {
+            // The class still points at this image's window procedure. There is
+            // no safe free; one block instead of a retry loop.
+            BlockUnload(L"ui rendezvous class unregister failed");
+        }
+    }
+    g_uiRendezvousClassRegistered = false;
+    g_uiRendezvousClassInstance = nullptr;
 }
 
-HWND FindThreadWindow(DWORD threadId) {
-    ThreadWindowSearch search{nullptr};
-    EnumThreadWindows(threadId, FindThreadWindowProc,
-                     reinterpret_cast<LPARAM>(&search));
-    return search.hwnd;
+// Destroys the one window synchronously on its owner thread, then unregisters
+// the class under the same instance. A destroyed window means this activation's
+// window is gone, not that the UI thread is gone; the caller has already proved
+// the counts.
+void DestroyUiRendezvousWindow() {
+    HWND hwnd = g_uiRendezvousHwnd.load(std::memory_order_acquire);
+    if (hwnd) {
+        if (IsWindow(hwnd)) {
+            SendMessageW(hwnd, kUiDestroyMessage, kUiDestroyMagic, 0);
+        }
+        if (g_uiRendezvousHwnd.load(std::memory_order_acquire) == hwnd) {
+            if (!IsWindow(hwnd)) {
+                g_uiRendezvousHwnd.store(nullptr, std::memory_order_release);
+                TraceLog(L"ui rendezvous gone without destroy hwnd=%p", hwnd);
+            } else {
+                BlockUnload(L"ui rendezvous window still alive");
+            }
+        }
+    }
+    UnregisterUiRendezvousClass();
 }
-
-void RunTeardownThunk(void*) {
-    TeardownUi();
-}
-
-void RunNoopThunk(void*) {}
 
 // Runs the teardown on the UI thread that owns the XAML root. Returns the window
 // used for the later drain, or null when the teardown ran inline or no window
@@ -13667,11 +13729,8 @@ HWND TeardownUiOnUiThread() {
         return nullptr;
     }
 
-    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    HWND hwnd = g_uiRendezvousHwnd.load(std::memory_order_acquire);
     if (!hwnd || !IsWindow(hwnd)) {
-        hwnd = uiThread != 0 ? FindThreadWindow(uiThread) : nullptr;
-    }
-    if (!hwnd) {
         if (g_uiRegistrationCount.load(std::memory_order_acquire) == 0) {
             // No window can run the teardown, but no handler is registered
             // either. The counts below still decide whether the image is free.
@@ -13681,18 +13740,19 @@ HWND TeardownUiOnUiThread() {
         BlockUnload(L"teardown has no UI window");
     }
 
-    const WindowThreadResult result =
-        RunFromWindowThread(hwnd, RunTeardownThunk, nullptr);
-    if (result == WindowThreadResult::Ran) {
+    UiTeardownCall call{false};
+    SendMessageW(hwnd, kUiTeardownMessage, kUiTeardownMagic,
+                 reinterpret_cast<LPARAM>(&call));
+    if (call.ran) {
         return hwnd;
     }
-    if (result == WindowThreadResult::WindowGone) {
-        // The handle died before the teardown could run. This says nothing
-        // about the UI thread or its registrations; the caller proves those.
-        TraceLog(L"unload teardown window gone");
-        return nullptr;
+    if (IsWindow(hwnd)) {
+        BlockUnload(L"teardown message refused");
     }
-    BlockUnload(L"teardown send failed");
+    // The window died before the teardown could run. This says nothing about
+    // the UI thread or its registrations; the caller proves those.
+    TraceLog(L"unload teardown window gone");
+    return nullptr;
 }
 
 // Waits for the last counted entry and requires every XAML registration to be
@@ -13723,13 +13783,10 @@ void RequireNoModuleCallbacks() {
 // and RequireNoModuleCallbacks runs even after WindowGone.
 void DrainUiThread(HWND hwnd) {
     if (hwnd) {
-        const WindowThreadResult result =
-            RunFromWindowThread(hwnd, RunNoopThunk, nullptr);
-        if (result == WindowThreadResult::Failed) {
-            BlockUnload(L"ui drain send failed");
-        }
-        if (result == WindowThreadResult::WindowGone) {
+        if (!IsWindow(hwnd)) {
             TraceLog(L"unload drain window gone; counts decide");
+        } else {
+            SendMessageW(hwnd, kUiDrainMessage, kUiDrainMagic, 0);
         }
     }
     RequireNoModuleCallbacks();
@@ -13979,6 +14036,10 @@ void RoleUninit() {
     } else {
         TraceLog(L"unload teardown without a window; counts clear");
     }
+
+    // 6. The window and then its class: the class must not outlive the image,
+    //    and the window must be gone before the class is unregistered.
+    DestroyUiRendezvousWindow();
 
     ClearScrollerRetry();
     SwipeIpcClose(&g_ipc);
