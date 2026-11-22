@@ -293,6 +293,15 @@ could act, or before its confirmation could land).
   (`own press queued ... outstanding=1`), and no `own press dequeued` or
   `published` runs before `own press ack`; after the ack the second press is
   dequeued and publishes the opposite direction.
+- **Queued before the refresh (B).** Publish an unarmed external barrier and
+  queue an older press behind it, then press while a test hook forces the stale
+  classification (so the drain can publish behind a fresh peer) and the admission
+  refresh to fail. The drain releases the barrier, publishes the older press
+  (`own press published ... kind=open`), and the arriving press queues
+  (`own press queued ... outstanding=1`) with no `state-after-replay` original.
+  After the older press's ack the arriving press is served and publishes
+  `kind=close`; the order is older `published`, older `ack`, then the arriving
+  `published`, never the arriving press first.
 
 ## The one-pass smoke
 

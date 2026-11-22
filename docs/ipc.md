@@ -151,9 +151,11 @@ caller's pre-check, not the last read: reconciliation reads the claim again, and
 a claim found there on the same epoch with the state alive keeps the slot
 (`reason=claimed-at-admission`) until its ack; a claim between that read and the
 abort holds as `reason=claim-after-abort`. When admission
-reconciles, it re-reads the launcher state after the replay or drain before
-deciding the arriving press, so an old native open is followed by a close, not a
-second open. The peer words are
+reconciles, it decides FIFO placement before any snapshot: if the drain published
+an older press, the arriving press queues and reads the launcher at its turn. Only
+an immediately servable press re-reads the launcher state after the replay or
+drain, so an old native open is followed by a close, not a second open. The peer
+words are
 evidence;
 the abort and the claim are the proof. A take is never replayed: at most one
 execution, one native execution when the record is aborted before any claim, and

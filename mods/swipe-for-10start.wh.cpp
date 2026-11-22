@@ -15758,11 +15758,14 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     return true;
 }
 
-// One admitted press. The immediate press decides on this hook's own snapshot;
-// a press behind it is queued and decides later. A press that cannot be queued
-// is dropped, never executed out of order; nothing waits on the launcher hook.
+// One admitted press. FIFO placement comes first: only a press that can be served
+// now needs a launcher snapshot (the hook's own, or one re-read after a
+// reconciliation). A press behind an outstanding one or a queued head is queued
+// without a read and takes its snapshot in ServePress when it becomes the head. A
+// press that cannot be queued is dropped, never executed out of order; nothing
+// waits on the launcher hook.
 void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
-    OwnSnapshot current = own;
+    bool reconciled = false;
     if (g_pressOutstanding.pending) {
         // A replacement or a withdrawn peer proves the record's activation is
         // gone. A stale tick alone does not release a claimed record: the
@@ -15778,48 +15781,50 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
             SwipeIpcTakenIntent(&g_ipc) == g_pressOutstanding.seq;
         const bool staleUnclaimed = !claimed && !PeerAliveNow();
         if (epochChanged || peerGone || staleUnclaimed) {
-            const bool reconciled = ReconcileOutstandingAtAdmission(
+            reconciled = ReconcileOutstandingAtAdmission(
                 epochChanged ? L"epoch-changed"
                              : (peerGone ? L"peer-gone" : L"stale-unclaimed"),
                 epochNow);
-            // A claim found during the reconciliation keeps the slot: the
-            // controller has a validated copy and its direction is still coming,
-            // so this press queues behind it and nothing re-reads the launcher.
-            if (reconciled) {
-                // The replay or the drain may have run a native toggle after
-                // this hook's snapshot. Re-read the launcher before deciding
-                // this press, or the arriving toggle can repeat the replay's
-                // direction.
-                uint64_t state = 0;
-                void* launcher = LauncherNow(&state);
-                if (!launcher) {
-                    TraceLog(L"own press pass trigger=%s entry=%s "
-                            L"reason=state-after-replay state=0x%llX",
-                            PressTriggerName(press.trigger),
-                            PressEntryName(press.entry),
-                            static_cast<unsigned long long>(state));
-                    RunPressOriginal(press, L"state-after-replay");
-                    return;
-                }
-                current = OwnSync(launcher);
-                if (!current.ready) {
-                    TraceLog(L"own press pass trigger=%s entry=%s "
-                            L"reason=state-after-replay state=%u",
-                            PressTriggerName(press.trigger),
-                            PressEntryName(press.entry), current.state);
-                    RunPressOriginal(press, L"state-after-replay");
-                    return;
-                }
-            }
         }
     }
-    if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
-        // A held close is requeued by ServePress and served by the gate's timer;
-        // its false return needs no action here.
-        ServePress(press, &current);
+    // A claim found during the reconciliation keeps the slot, and the replay or
+    // drain may have published an older queued press. Either way this press is
+    // not the head: queue it without a snapshot and let its serve read the
+    // launcher at its turn.
+    if (g_pressOutstanding.pending || g_pressQueueCount > 0) {
+        QueuePress(press, L"press");
         return;
     }
-    QueuePress(press, L"press");
+    OwnSnapshot current = own;
+    if (reconciled) {
+        // The replay or the drain may have run a native toggle after this hook's
+        // snapshot. Re-read the launcher before deciding this press, or the
+        // arriving toggle can repeat the replay's direction. No older press is
+        // left, so a failed read may run this press's original now.
+        uint64_t state = 0;
+        void* launcher = LauncherNow(&state);
+        if (!launcher) {
+            TraceLog(L"own press pass trigger=%s entry=%s "
+                    L"reason=state-after-replay state=0x%llX",
+                    PressTriggerName(press.trigger),
+                    PressEntryName(press.entry),
+                    static_cast<unsigned long long>(state));
+            RunPressOriginal(press, L"state-after-replay");
+            return;
+        }
+        current = OwnSync(launcher);
+        if (!current.ready) {
+            TraceLog(L"own press pass trigger=%s entry=%s "
+                    L"reason=state-after-replay state=%u",
+                    PressTriggerName(press.trigger),
+                    PressEntryName(press.entry), current.state);
+            RunPressOriginal(press, L"state-after-replay");
+            return;
+        }
+    }
+    // A held close is requeued by ServePress and served by the gate's timer; its
+    // false return needs no action here.
+    ServePress(press, &current);
 }
 
 // The intent ack for the outstanding press. The worker posts this to the

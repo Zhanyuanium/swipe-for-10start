@@ -402,10 +402,12 @@ record is aborted (its counter goes odd, so no consumer can copy or claim it) an
 re-read before any replay. A changed epoch at the watchdog **or at the next
 admission** is a restart: the replacement seeded `g_lastIntentSeq` past the record
 and will never answer, so the record is aborted, replayed if no claim exists, the
-external barrier is released, and the queue advances without a timer. When the
-admission reconciles, it re-reads the launcher after the replay or drain before
-deciding the arriving press, so the arriving toggle follows the state the replay
-left (an old open is closed, not opened again). The peer
+external barrier is released, and the queue advances without a timer. Admission
+places the arriving press before any snapshot: a press behind the drain's older
+one queues and reads the launcher when it becomes the head. Only an immediately
+servable press re-reads the launcher after the replay or drain, so the arriving
+toggle follows the state the replay left (an old open is closed, not opened
+again). The peer
 words stay in the line as evidence.
 
 Fallbacks, each logged once:

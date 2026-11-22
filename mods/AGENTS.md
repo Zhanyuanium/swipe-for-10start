@@ -687,11 +687,14 @@ probe or timer failure is answered `unknown`.
   `peerEpoch` at the watchdog **or at the next admission** is a restart: a taken
   press is consumed without its ack (`reason=epoch-changed`), an untaken one is
   aborted and replayed, the external barrier is released, and the queue advances
-  without needing a timer (`own press abandoned ...`). When the admission
-  reconciles, it re-reads the launcher (readiness and open/visible) after the
-  replay or drain and before deciding the arriving press, so an old native open
+  without needing a timer (`own press abandoned ...`). Admission decides FIFO
+  placement before any snapshot: when the drain published an older press or the
+  claim kept the slot, the arriving press queues and reads the launcher when it
+  becomes the head. Only an immediately servable press re-reads the launcher
+  (readiness and open/visible) after the reconciliation, so an old native open
   leaves the arriving press closing, not opening again
-  (`own press pass ... reason=state-after-replay` if the read fails). The queue's
+  (`own press pass ... reason=state-after-replay` if that read fails); no older
+  press is left then, so the original may run at once. The queue's
   own lines are
   `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch, is published at once,

@@ -184,11 +184,15 @@ is consumed without its ack (`reason=epoch-changed`), an untaken record is
 aborted and replayed under the same rule, and the external barrier is released
 (`own press abandoned ...` / `own external barrier ... released reason=...`). The
 admission check needs no timer, so a watchdog that failed to arm cannot park the
-queue behind a dead activation. When admission reconciles, it **re-reads the
-launcher state** before deciding the arriving press: the replay or drain may have
-run a native toggle after the hook's snapshot, and the arriving press must read
-that result (an old replay that opened the shell leaves the arriving press
-closing it, not opening a second time). The peer words are evidence in the line;
+queue behind a dead activation. When admission reconciles, it decides FIFO
+placement **before** any snapshot: if the drain published an older press or the
+claim kept the slot, the arriving press queues without a read and takes its
+launcher snapshot when it becomes the head. Only an immediately servable press
+**re-reads the launcher state** after the reconciliation, because the replay or
+drain may have run a native toggle after the hook's snapshot (an old replay that
+opened the shell leaves the arriving press closing it, not opening a second
+time). A failed re-read runs the original only when no older press is left. The
+peer words are evidence in the line;
 the abort and the claim are the proof.
 A take is never replayed: one execution at most, one native execution when the
 record is aborted before any claim, and a press lost rather than duplicated if
