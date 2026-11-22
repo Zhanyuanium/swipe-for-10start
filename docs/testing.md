@@ -79,10 +79,9 @@
 
 ## Release evidence: the full smoke, 2026-11-22
 
-Run on the release code (HEAD `ad20815`; the docs commit after it changes no
-code) with `DiagnosticTrace` on, bottom auto-hidden layout (`axis=3`, work
-`0,0,1440,900`, band `804..900`). The final gate re-ran the same rows after the
-docs commit; the table is that run. Every row passed:
+Run on the final release tree (HEAD `75c6067`, 2026-11-22) with `DiagnosticTrace`
+on, bottom auto-hidden layout (`axis=3`, work `0,0,1440,900`, band `804..900`).
+Every row passed:
 
 | Step | Ok | Detail |
 | --- | --- | --- |
@@ -92,17 +91,16 @@ docs commit; the table is that run. Every row passed:
 | touch open | True | |
 | touch close (injected) | True | `producer=hid` |
 | click-away | True | |
-| win close + click reopen | True | `interrupt=click from=0.938 deadline=382980610 final=True` |
-| start close + win reopen | True | `interrupt=win from=0.917 deadline=382987251 final=True` |
-| gesture close + click reopen | True | `interrupt=click close=hid from=0.009 deadline=382994192 final=True` |
+| win close + click reopen | True | `interrupt=click from=0.937 deadline=384268042 final=True` |
+| start close + win reopen | True | `interrupt=win from=0.927 deadline=384274729 final=True` |
+| gesture close + click reopen | True | `interrupt=click close=hid from=0.026 deadline=384280935 final=True` |
 | no error lines | True | |
 
-The three reversal `from=` values are **0.938, 0.917 and 0.009**: each interruption
-landed while the panel was still off its rest. The earlier run at `ad20815`
-measured 0.937, 0.926 and 0.02 with the same rows and verdicts. The smoke's click
-helpers hold the left button for 60 ms, so the click-away rows are real pointer
-decisions (`ptr=1`). This is the release's in-tree automated evidence; the doc
-commit after `ad20815` changes no code.
+The three reversal `from=` values are **0.937, 0.927 and 0.026**: each interruption
+landed while the panel was still off its rest. Earlier runs at `ad20815` and
+`e3bc048` measured 0.937/0.926/0.02 and 0.938/0.917/0.009 with the same rows and
+verdicts. The smoke's click helpers hold the left button for 60 ms, so the
+click-away rows are real pointer decisions (`ptr=1`).
 
 ## Touch producers: real digitizer vs injected contact
 
@@ -396,6 +394,28 @@ PowerShell probe.
   sampled with Alt+Tab once: it published `intent close trigger=clickaway` and
   ended closed, so the pre-fix review reopen was a regression; the release build
   now matches it without a button and keeps the desktop-click reopen.
+
+## Round-12 release check
+
+**Requires a temporary harness or external probe, not in the tree.**
+
+- **Tray ancestry.** Five tray-point clicks (2350,1799 physical, the auto-hidden
+  bar's 2 px strip) during a Win close: the hit was `TrayNotifyWnd` with root
+  `Shell_TrayWnd`, and every decision was `own toggle decide
+  trigger=clickaway ... kind=close ... ptr=0`; Start stayed closed 5/5. Five
+  clock-point clicks (2800,1799) produced zero click-away decisions and Start
+  stayed closed 5/5. Before `GetAncestor(GA_ROOT)`, the tray child itself would
+  have read `ptr=1` and reopened.
+- **Replay bound.** Start was held between its sequence read and its claim for
+  4.3 s (past the 1000 ms watchdog and the 2500 ms bound), while the watchdog
+  aborted and paused before its re-read. The trace: `decision=consumed
+  awaiting=ack reason=claim-after-abort`; Start `intent drop seq=2
+  reason=record-moved`, `intent revoked seq=2`; bridge `own press ack seq=2
+  state=7 ... wait=4297` and `own press dropped trigger=win entry=hotkey reason=stale
+  wait=4297`, with no `revoked-before-copy` fallback; the menu stayed closed.
+- **Touch tap.** A virtual-digitizer tap on the desktop during a Win close
+  produced `own toggle decide trigger=clickaway ... kind=close ... ptr=0`, not a
+  reopen. A real finger/pen tap remains unmeasured; see limits.md.
 
 ## The one-pass smoke
 

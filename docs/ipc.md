@@ -167,7 +167,9 @@ the abort and the claim are the proof. An execution is never duplicated: an
 applied press is not replayed, and a press is lost rather than duplicated if the
 controller dies after the take. When the bridge's abort lands before Start's
 copy, Start answers superseded, which proves no intent ran; the bridge then runs
-the original once (`reason=revoked-before-copy`).
+the original once (`reason=revoked-before-copy`), unless the press is past the
+2500 ms absolute bound, in which case it is dropped (`reason=stale`) rather than
+toggled late.
 
 A landing reconciles an already-published `external` intent before it may issue a
 recovery: the idle timer and the intent event are two wait objects of the same

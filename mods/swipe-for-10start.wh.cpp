@@ -14569,7 +14569,11 @@ bool HideCanServeClose(const wchar_t** reason) {
 // reopen a close. A click on the taskbar itself is excluded by the window under
 // the cursor: activating another app is not a click on the menu's owner surface.
 bool ClickAwayPointerNow() {
-    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+    // The logical primary button: a left-handed mouse swaps the physical buttons,
+    // and the desktop-click reopen must follow the primary one.
+    const int primary =
+        GetSystemMetrics(SM_SWAPBUTTON) != 0 ? VK_RBUTTON : VK_LBUTTON;
+    if ((GetAsyncKeyState(primary) & 0x8000) == 0) {
         return false;
     }
     POINT point{};
@@ -15409,6 +15413,26 @@ void RequeuePressFront(const QueuedPress& press) {
     ++g_pressQueueCount;
 }
 
+// A replay is this press's one native execution. Past the same absolute bound
+// the queue uses, the direction is stale: the press is dropped instead of
+// toggling the menu long after the user asked. Launcher thread only.
+bool ReplayPastBound(const QueuedPress& press) {
+    if (press.admittedTick == 0) {
+        return false;
+    }
+    const uint64_t now = GetTickCount64();
+    return now > press.admittedTick &&
+           now - press.admittedTick > kPressQueueStaleMs;
+}
+
+void DropPastBoundReplay(const QueuedPress& press) {
+    const uint64_t now = GetTickCount64();
+    TraceLog(L"own press dropped trigger=%s entry=%s reason=stale wait=%llu",
+            PressTriggerName(press.trigger), PressEntryName(press.entry),
+            static_cast<unsigned long long>(
+                now > press.admittedTick ? now - press.admittedTick : 0));
+}
+
 // Drops a queued press that has outlived the absolute bound. The queue-age
 // bound is paused behind a claimed press and is not an absolute cap; after a
 // freeze or a hard kill the old press must not toggle the menu minutes later.
@@ -15873,6 +15897,7 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     if (window) {
         KillTimer(window, kPressAckTimer);
     }
+    const bool lateReplay = replay && ReplayPastBound(press.press);
     if (press.external) {
         TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
                 L"decision=released reason=%s",
@@ -15886,9 +15911,11 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
                 PressTriggerName(press.press.trigger),
                 PressEntryName(press.press.entry),
                 static_cast<unsigned long long>(wait), press.publishedEpoch,
-                epochNow, replay ? L"replay" : L"consumed", reason);
+                epochNow,
+                replay ? (lateReplay ? L"dropped" : L"replay") : L"consumed",
+                lateReplay ? L"stale" : reason);
     }
-    if (replay) {
+    if (replay && !lateReplay) {
         RunPressOriginal(press.press, L"abandoned");
     }
     ResumePressQueueAge();
@@ -16007,8 +16034,13 @@ void HandlePressAck() {
     if (replayed) {
         // The abort landed before Start's copy, and its superseded answer is the
         // proof: no intent ran and the shell never saw this press. Run the one
-        // native execution before the queue advances.
-        RunPressOriginal(press.press, L"revoked-before-copy");
+        // native execution before the queue advances, unless it is past the
+        // absolute bound: that direction is stale and is dropped.
+        if (ReplayPastBound(press.press)) {
+            DropPastBoundReplay(press.press);
+        } else {
+            RunPressOriginal(press.press, L"revoked-before-copy");
+        }
     }
     ResumePressQueueAge();
     ServeNextPress(L"ack");
@@ -16107,7 +16139,11 @@ void HandlePressAckTimeout() {
                                                     press.publishedTick));
         }
         if (replayed) {
-            RunPressOriginal(press.press, L"revoked-before-copy");
+            if (ReplayPastBound(press.press)) {
+                DropPastBoundReplay(press.press);
+            } else {
+                RunPressOriginal(press.press, L"revoked-before-copy");
+            }
         }
         ResumePressQueueAge();
         ServeNextPress(L"late-ack");
@@ -16318,15 +16354,20 @@ void HandlePressAckTimeout() {
     if (window) {
         KillTimer(window, kPressAckTimer);
     }
+    const bool lateReplay = ReplayPastBound(press.press);
     TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
-            L"taken=%lld peer=%s age=%u epoch=%u->%u decision=replay reason=%s",
+            L"taken=%lld peer=%s age=%u epoch=%u->%u decision=%s reason=%s",
             static_cast<long long>(press.seq),
             PressTriggerName(press.press.trigger),
             PressEntryName(press.press.entry),
             static_cast<unsigned long long>(wait),
             static_cast<long long>(taken), peer, peerAge, press.publishedEpoch,
-            epochNow, epochChanged ? L"epoch-changed" : L"revoked");
-    RunPressOriginal(press.press, L"no-ack");
+            epochNow, lateReplay ? L"dropped" : L"replay",
+            lateReplay ? L"stale"
+                       : (epochChanged ? L"epoch-changed" : L"revoked"));
+    if (!lateReplay) {
+        RunPressOriginal(press.press, L"no-ack");
+    }
     ResumePressQueueAge();
     ServeNextPress(L"timeout");
 }

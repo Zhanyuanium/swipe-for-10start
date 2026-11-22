@@ -217,7 +217,9 @@ An execution is never duplicated: an applied press is not replayed, and a press
 is lost rather than duplicated if the controller dies after the take. When the
 bridge's abort lands before Start's copy, Start answers superseded and no intent
 ran; the bridge then runs the original once (`reason=revoked-before-copy`), so
-the press is neither lost nor duplicated. An
+the press is neither lost nor duplicated — unless the press is older than the
+2500 ms absolute bound: then it is dropped (`reason=stale`), never a late
+toggle. An
 external takeover is published at once and clears the queue and latch; it then
 sets the same barrier for the presses that follow, because its record is the one
 Start must reconcile before another intent may overwrite it. That barrier is a

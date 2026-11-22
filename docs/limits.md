@@ -130,6 +130,23 @@
   the clock, a tray icon and the bar background are all excluded; a taskbar
   implementation with another root class would be read as a pointer click and
   reopen, which is the residual of that rule.
+- **A replay is bounded too.** A press that is aborted before Start's copy, or
+  released by the aborted-no-claim / epoch-changed path, is replayed only while
+  `now - admittedTick <= kPressQueueStaleMs` (2500 ms). Past it the replay is
+  dropped (`reason=stale`), not toggled late: a Start freeze between the sequence
+  read and the claim cannot turn into a toggle seconds after the user's press.
+  The 2026-11-22 test held Start for 4.3 s before its claim; the bridge logged
+  `own press ack seq=2 state=7 ... wait=4297` and `own press dropped ...
+  reason=stale wait=4297`, with no `revoked-before-copy` fallback and the menu
+  stayed closed.
+- **A finger or pen tap on the desktop is a pointer, not a mouse button.** The
+  click-away reopen reads the logical mouse primary (`VK_RBUTTON` under
+  `SM_SWAPBUTTON`, `VK_LBUTTON` otherwise). A virtual-digitizer tap during a Win
+  close logged `ptr=0 kind=close`, so on this instrument a touch tap closes
+  rather than reopening. The "desktop click is equivalent to the Win key"
+  contract therefore covers a **mouse** click; a real finger or pen tap is still
+  owed, and until measured it is expected to behave like the virtual tap (a
+  close, not a reopen).
 - **Two bounded wakes are state-owned.** The open-generation gate reads its
   generation every 20 ms for at most 900 ms, and a standing press slot or
   external barrier keeps a 100 ms reserve poll for its queue bound. Each stops
