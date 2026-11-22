@@ -1103,6 +1103,9 @@ std::atomic<bool> g_stopDismissCallback{false};
 // returns at once until the role actually initialised.
 bool g_initialised = false;
 
+// First tick of RoleBeforeUninit, for the one unload-duration line at the end.
+uint64_t g_unloadStartTick = 0;
+
 // Signalled when the counted entry count reaches zero. Created before the first
 // lease, waited on at unload. See ModuleEntryLease.
 HANDLE g_moduleEntriesGone = nullptr;
@@ -10105,21 +10108,24 @@ void ProbeRootSymbolFromInputThread();
 // discipline as the executor's fixed class: `ERROR_CLASS_ALREADY_EXISTS` is a
 // failure, never adopted, and a failed unregister keeps the unload trying
 // instead of returning success into an image the class still points at.
+// A proof that cannot be obtained blocks the unload. Defined with the Start
+// unload helpers; forward-declared for the input thread's class teardown.
+[[noreturn]] void BlockUnload(const wchar_t* reason);
+
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 void UnregisterHidWindowClass(HINSTANCE instance) {
-    for (;;) {
-        if (UnregisterClassW(kHidWindowClass, instance)) {
-            TraceLog(L"hid window class unregistered");
-            return;
-        }
-        const DWORD error = GetLastError();
-        if (error == ERROR_CLASS_DOES_NOT_EXIST) {
-            TraceLog(L"hid window class already gone");
-            return;
-        }
-        TraceLog(L"hid window class unregister failed err=%u", error);
-        Sleep(1000);
+    if (UnregisterClassW(kHidWindowClass, instance)) {
+        TraceLog(L"hid window class unregistered");
+        return;
     }
+    const DWORD error = GetLastError();
+    if (error == ERROR_CLASS_DOES_NOT_EXIST) {
+        TraceLog(L"hid window class already gone");
+        return;
+    }
+    // The class still points at this image's window procedure. No safe return;
+    // one block, not a retry loop.
+    BlockUnload(L"hid window class unregister failed");
 }
 
 DWORD WINAPI HidInputThread(LPVOID) {
@@ -12529,19 +12535,27 @@ void ReleaseScrollableElementIfGeneration(uint32_t maxGeneration) {
 }
 
 // The HWND is needed for the DWM cloaked query that decides whether the menu
-// is open, and for the window bounds the input thread tests against.
+// is open, for the window bounds the input thread tests against, and for the
+// unload's synchronous UI round trip. A failed re-capture keeps the previous
+// live window: the teardown still needs a window on that UI thread.
 void CaptureCoreWindowHandle() {
-    g_coreHwnd.store(nullptr, std::memory_order_relaxed);
+    HWND previous = g_coreHwnd.load(std::memory_order_relaxed);
 
     try {
         wucore::CoreWindow coreWindow =
             wucore::CoreWindow::GetForCurrentThread();
         if (!coreWindow) {
+            if (!previous || !IsWindow(previous)) {
+                g_coreHwnd.store(nullptr, std::memory_order_relaxed);
+            }
             return;
         }
 
         void* windowAbi = winrt::get_abi(coreWindow);
         if (!windowAbi) {
+            if (!previous || !IsWindow(previous)) {
+                g_coreHwnd.store(nullptr, std::memory_order_relaxed);
+            }
             return;
         }
 
@@ -12549,6 +12563,9 @@ void CaptureCoreWindowHandle() {
         if (FAILED(static_cast<IUnknown*>(windowAbi)->QueryInterface(
                 kCoreWindowInteropIid, &interop)) ||
             !interop) {
+            if (!previous || !IsWindow(previous)) {
+                g_coreHwnd.store(nullptr, std::memory_order_relaxed);
+            }
             return;
         }
 
@@ -12559,9 +12576,16 @@ void CaptureCoreWindowHandle() {
             getWindowHandle(interop, &hwnd);
         }
         static_cast<IUnknown*>(interop)->Release();
-        g_coreHwnd.store(hwnd, std::memory_order_relaxed);
+        if (hwnd) {
+            g_coreHwnd.store(hwnd, std::memory_order_relaxed);
+        } else if (!previous || !IsWindow(previous)) {
+            g_coreHwnd.store(nullptr, std::memory_order_relaxed);
+        }
     } catch (...) {
         // No HWND means no cloaked query, so no gesture starts.
+        if (!previous || !IsWindow(previous)) {
+            g_coreHwnd.store(nullptr, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -12986,6 +13010,13 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     if (!result || g_unloading.load(std::memory_order_relaxed)) {
         return result;
     }
+
+    // This hook is the first code that can register a XAML handler (Loaded) on
+    // the new root, before Setup runs. Record the UI thread and a window on it
+    // here, so an unload in that window can still run the teardown on its owner
+    // thread instead of revoking a delegate from the Windhawk thread.
+    g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    CaptureCoreWindowHandle();
 
     try {
         wux::UIElement element{nullptr};
@@ -13497,103 +13528,197 @@ void TeardownUi() {
     g_settleLease.reset();
 }
 
-// Posts the one teardown turn and waits for its completion, or runs it inline
-// when the unload already runs on the captured UI thread. The dispatcher is
-// kept through this turn. A missing dispatcher with registrations still live
-// has no safe answer: the loop reports and keeps waiting rather than freeing a
-// delegate that can still run.
-void TeardownUiOnUiThread() {
-    const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
-    if (uiThread == 0 || uiThread == GetCurrentThreadId()) {
-        TeardownUi();
-        return;
-    }
-
-    wucore::CoreDispatcher dispatcher = CopyDispatcher();
-    if (!dispatcher) {
-        const bool anythingRegistered =
-            g_uiRegistrationCount.load(std::memory_order_acquire) != 0 ||
-            g_dismissBatchToken.value != 0;
-        if (!anythingRegistered) {
-            return;
-        }
-        ULONGLONG nextReport = 0;
-        for (;;) {
-            const ULONGLONG now = GetTickCount64();
-            if (now >= nextReport) {
-                nextReport = now + 5000;
-                TraceLog(L"unload teardown waiting: no dispatcher, entries=%d",
-                        g_moduleEntryCount.load(std::memory_order_relaxed));
-            }
-            Sleep(1000);
-        }
-    }
-
-    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!done) {
-        ULONGLONG nextReport = 0;
-        for (;;) {
-            const ULONGLONG now = GetTickCount64();
-            if (now >= nextReport) {
-                nextReport = now + 5000;
-                TraceLog(L"unload teardown waiting: no completion event");
-            }
-            Sleep(1000);
-        }
-    }
-
-    try {
-        dispatcher.RunAsync(wucore::CoreDispatcherPriority::Normal, [done]() {
-            try {
-                TeardownUi();
-            } catch (...) {
-                // Never let an exception escape the dispatcher callback. The
-                // event still releases the unload, which then waits for the
-                // counted entries.
-            }
-            SetEvent(done);
-        });
-    } catch (winrt::hresult_error const& e) {
-        TraceLog(L"unload teardown queue failed: %08X %s", e.code(),
-                e.message().c_str());
-        CloseHandle(done);
-        for (;;) {
-            TraceLog(L"unload teardown waiting: dispatch refused");
-            Sleep(5000);
-        }
-    } catch (...) {
-        CloseHandle(done);
-        for (;;) {
-            TraceLog(L"unload teardown waiting: dispatch failed");
-            Sleep(5000);
-        }
-    }
-
-    WaitForSingleObject(done, INFINITE);
-    CloseHandle(done);
+// A proof that cannot be obtained blocks the unload. This is the last resort,
+// not a retry: the wrong-thread and non-pumping conditions that used to reach
+// it are removed below, and one log line is the whole diagnostic. There is no
+// successful return with a mod-owned callback still reachable.
+[[noreturn]] void BlockUnload(const wchar_t* reason) {
+    TraceLog(L"unload blocked reason=%s", reason);
+    Wh_Log(L"Unload blocked: %s; the module image cannot be freed safely",
+           reason);
+    Sleep(INFINITE);
+    __builtin_unreachable();
 }
 
-// Waits until no counted module entry can still run. The event is set by the
-// last lease release, so this is completion signalling, not a poll for zero.
-// The wait has no deadline: returning under a live delegate would free the
-// image its code still runs in.
+// One synchronous turn on the owner of `hwnd`. The task is stack storage and the
+// message returns only after the task ran, so no C++/WinRT delegate or dispatcher
+// operation outlives this call. `WindowGone` is the reviewer's thread-gone case:
+// SendMessage to a destroyed window cannot reach module code, so freeing is safe.
+constexpr UINT kRunFromWindowThreadMessage = WM_APP + 0x62;
+using WindowThreadFn = void (*)(void*);
+
+struct WindowThreadCall {
+    WindowThreadFn run;
+    void* arg;
+    bool ran;
+};
+
+std::atomic<WNDPROC> g_windowThreadPrev{nullptr};
+
+LRESULT CALLBACK RunFromWindowThreadProc(HWND hwnd, UINT message, WPARAM wParam,
+                                         LPARAM lParam) {
+    if (message == kRunFromWindowThreadMessage) {
+        auto* call = reinterpret_cast<WindowThreadCall*>(lParam);
+        if (call && call->run) {
+            try {
+                call->run(call->arg);
+            } catch (...) {
+                // The teardown records its own failures; a callback must not
+                // unwind into the shell's message loop.
+            }
+            call->ran = true;
+        }
+        return 0;
+    }
+    WNDPROC previous = g_windowThreadPrev.load(std::memory_order_relaxed);
+    return previous ? CallWindowProcW(previous, hwnd, message, wParam, lParam)
+                    : DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+enum class WindowThreadResult {
+    Ran,
+    WindowGone,
+    Failed,
+};
+
+WindowThreadResult RunFromWindowThread(HWND hwnd, WindowThreadFn run,
+                                       void* arg) {
+    if (!hwnd || !IsWindow(hwnd)) {
+        return WindowThreadResult::WindowGone;
+    }
+    WNDPROC previous = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                          reinterpret_cast<LONG_PTR>(RunFromWindowThreadProc)));
+    if (!previous) {
+        return IsWindow(hwnd) ? WindowThreadResult::Failed
+                              : WindowThreadResult::WindowGone;
+    }
+    g_windowThreadPrev.store(previous, std::memory_order_relaxed);
+    WindowThreadCall call{run, arg, false};
+    SendMessageW(hwnd, kRunFromWindowThreadMessage, 0,
+                 reinterpret_cast<LPARAM>(&call));
+    // Restore before clearing the previous procedure: a message that arrives
+    // between the two must reach the shell's own proc, never DefWindowProc.
+    const LONG_PTR restored = SetWindowLongPtrW(
+        hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(previous));
+    g_windowThreadPrev.store(nullptr, std::memory_order_relaxed);
+    if (!restored && IsWindow(hwnd)) {
+        // The shell's window still points at this image's procedure. Freeing
+        // the image would leave that pointer unmapped.
+        BlockUnload(L"ui window procedure restore failed");
+    }
+    if (call.ran) {
+        return WindowThreadResult::Ran;
+    }
+    return IsWindow(hwnd) ? WindowThreadResult::Failed
+                          : WindowThreadResult::WindowGone;
+}
+
+struct ThreadWindowSearch {
+    HWND hwnd;
+};
+
+BOOL CALLBACK FindThreadWindowProc(HWND hwnd, LPARAM lParam) {
+    auto* search = reinterpret_cast<ThreadWindowSearch*>(lParam);
+    if (IsWindow(hwnd)) {
+        search->hwnd = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND FindThreadWindow(DWORD threadId) {
+    ThreadWindowSearch search{nullptr};
+    EnumThreadWindows(threadId, FindThreadWindowProc,
+                     reinterpret_cast<LPARAM>(&search));
+    return search.hwnd;
+}
+
+void RunTeardownThunk(void*) {
+    TeardownUi();
+}
+
+void RunNoopThunk(void*) {}
+
+// Runs the teardown on the UI thread that owns the XAML root. Returns the window
+// used for the later drain, or null when the teardown ran inline or the thread is
+// gone. `threadGone` lets the caller skip a lease/count proof that no thread can
+// satisfy. No dispatcher and no completion event are involved.
+HWND TeardownUiOnUiThread(bool* threadGone) {
+    if (threadGone) {
+        *threadGone = false;
+    }
+    const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
+    if (uiThread != 0 && uiThread == GetCurrentThreadId()) {
+        TeardownUi();
+        return nullptr;
+    }
+
+    // No UI thread was ever recorded: no XAML registration can exist, because
+    // PrepareRootElement records the thread before it registers Loaded.
+    if (uiThread == 0 &&
+        g_uiRegistrationCount.load(std::memory_order_acquire) == 0) {
+        TeardownUi();
+        return nullptr;
+    }
+
+    HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
+    if (!hwnd || !IsWindow(hwnd)) {
+        hwnd = uiThread != 0 ? FindThreadWindow(uiThread) : nullptr;
+    }
+    if (!hwnd) {
+        if (g_uiRegistrationCount.load(std::memory_order_acquire) == 0) {
+            // The thread is gone or had no window; nothing can still call back.
+            if (threadGone) {
+                *threadGone = true;
+            }
+            TraceLog(L"unload teardown window gone");
+            return nullptr;
+        }
+        BlockUnload(L"teardown has no UI window");
+    }
+
+    const WindowThreadResult result =
+        RunFromWindowThread(hwnd, RunTeardownThunk, nullptr);
+    if (result == WindowThreadResult::Ran) {
+        return hwnd;
+    }
+    if (result == WindowThreadResult::WindowGone) {
+        if (threadGone) {
+            *threadGone = true;
+        }
+        TraceLog(L"unload teardown window gone");
+        return nullptr;
+    }
+    BlockUnload(L"teardown send failed");
+}
+
+// Waits once for the last counted entry. The last lease sets the event; the
+// caller follows with a UI round trip because the lease is released inside its
+// destructor, before the rest of the delegate chain has unwound.
 void WaitForModuleEntries() {
-    ULONGLONG nextReport = 0;
-    for (;;) {
-        if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
-            return;
-        }
-        const ULONGLONG now = GetTickCount64();
-        if (now >= nextReport) {
-            nextReport = now + 5000;
-            TraceLog(L"unload waiting for module entries=%d",
-                    g_moduleEntryCount.load(std::memory_order_relaxed));
-        }
-        if (g_moduleEntriesGone) {
-            WaitForSingleObject(g_moduleEntriesGone, 1000);
-        } else {
-            Sleep(1000);
-        }
+    if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    if (!g_moduleEntriesGone) {
+        BlockUnload(L"module entry event missing");
+    }
+    WaitForSingleObject(g_moduleEntriesGone, INFINITE);
+    if (g_moduleEntryCount.load(std::memory_order_acquire) != 0) {
+        BlockUnload(L"module entries remain after the last lease");
+    }
+}
+
+// One more synchronous empty turn: the UI thread cannot take this message until
+// it has left the teardown lambda, every earlier callback and every delegate
+// destructor it was inside.
+void DrainUiThread(HWND hwnd) {
+    if (!hwnd) {
+        return;
+    }
+    if (RunFromWindowThread(hwnd, RunNoopThunk, nullptr) ==
+        WindowThreadResult::Failed) {
+        BlockUnload(L"ui drain send failed");
     }
 }
 
@@ -13733,6 +13858,8 @@ void RoleBeforeUninit() {
     if (!g_initialised) {
         return;
     }
+    g_unloadStartTick = GetTickCount64();
+    TraceLog(L"unload begin tid=%u", GetCurrentThreadId());
 
     // Stop hook registration and code that can run on its own thread before
     // Windhawk removes the hooks (Wh_SetFunctionHook/Wh_ApplyHookOperations
@@ -13784,17 +13911,9 @@ void RoleBeforeUninit() {
             TraceLog(L"unload hid thread joined");
         } else {
             // A wait that fails on a valid handle is not expected; there is
-            // still no safe return while the thread can run module code.
-            ULONGLONG nextReport = 0;
-            for (;;) {
-                const ULONGLONG now = GetTickCount64();
-                if (now >= nextReport) {
-                    nextReport = now + 5000;
-                    TraceLog(L"unload hid thread join failed err=%u",
-                            static_cast<unsigned>(GetLastError()));
-                }
-                Sleep(1000);
-            }
+            // still no safe return while the thread can run module code. One
+            // block, not a retry loop.
+            BlockUnload(L"hid thread join failed");
         }
     } else {
         TraceLog(L"unload hid thread joined");
@@ -13822,34 +13941,35 @@ void RoleUninit() {
             CloseHandle(g_hidThread);
             g_hidThread = nullptr;
             TraceLog(L"unload hid thread joined (uninit)");
+        } else {
+            BlockUnload(L"hid thread join failed (uninit)");
         }
     }
 
-    // 3. One UI teardown turn: revoke the XAML handlers and the settle batch,
-    //    restore resting progress and neutral translation, drop the UI-owned
-    //    objects. Waiting for the turn is the proof the revokes ran.
-    TeardownUiOnUiThread();
+    // 3. One synchronous UI turn: revoke the XAML handlers and the settle
+    //    batch, restore resting progress and neutral translation, drop the
+    //    UI-owned objects. SendMessage returns only after TeardownUi has
+    //    returned, so no dispatcher lambda or its delegate thunk outlives it.
+    bool threadGone = false;
+    HWND uiWindow = TeardownUiOnUiThread(&threadGone);
 
-    // 4. Wait for a batch completion the compositor had already dispatched.
-    //    The count is the proof its code is gone; the IPC view and handles stay
-    //    until it returns.
-    WaitForModuleEntries();
+    if (!threadGone) {
+        // 4. Wait once for a batch completion the compositor had already
+        //    dispatched. The lease is released inside its destructor, so one
+        //    more UI round trip proves the UI thread left that destructor and
+        //    every earlier callback before the image can be freed.
+        WaitForModuleEntries();
+        DrainUiThread(uiWindow);
 
-    // 5. A XAML revoke that failed leaves a delegate attached to the root it
-    //    closes over. There is no safe free of that root or of this image, so
-    //    the unload reports and keeps waiting; it never returns success with a
-    //    mod-owned callback still reachable.
-    {
-        ULONGLONG nextReport = 0;
-        while (g_uiRegistrationCount.load(std::memory_order_acquire) != 0) {
-            const ULONGLONG now = GetTickCount64();
-            if (now >= nextReport) {
-                nextReport = now + 5000;
-                TraceLog(L"unload waiting for xaml revokes=%d",
-                        g_uiRegistrationCount.load(std::memory_order_relaxed));
-            }
-            Sleep(1000);
+        // 5. A XAML revoke that failed leaves a delegate attached to the root
+        //    it closes over. The UI-thread teardown above removes the
+        //    wrong-thread cause; a genuine failure still has no safe free, so
+        //    it blocks once instead of polling.
+        if (g_uiRegistrationCount.load(std::memory_order_acquire) != 0) {
+            BlockUnload(L"xaml revokes remain");
         }
+    } else {
+        TraceLog(L"unload ui thread gone; no callback can run");
     }
 
     ClearScrollerRetry();
@@ -13867,6 +13987,11 @@ void RoleUninit() {
         CloseHandle(g_moduleEntriesGone);
         g_moduleEntriesGone = nullptr;
     }
+    TraceLog(L"unload done elapsed=%llums",
+            static_cast<unsigned long long>(
+                g_unloadStartTick != 0 && GetTickCount64() >= g_unloadStartTick
+                    ? GetTickCount64() - g_unloadStartTick
+                    : 0));
     g_initialised = false;
     Wh_Log(L"Legacy Start Swipe uninitialized (start role)");
 }
@@ -13892,7 +14017,7 @@ const SwipeModRole Role = {RoleInit, RoleAfterInit, RoleBeforeUninit,
 namespace bridge {
 
 void EnsureExecutorWindow();
-DWORD NoteLauncherThread(const wchar_t* source);
+DWORD NoteLauncherThread(const wchar_t* source, bool adopt);
 void EnsureExecutorOnLauncherThread(const wchar_t* source);
 void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr);
 LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
@@ -14121,9 +14246,6 @@ std::atomic<bool> g_execReady{false};
 std::atomic<bool> g_execCapable{false};
 // Set by WM_NCDESTROY on the launcher thread when the published window is
 // destroyed. The unload resets it before posting the teardown and waits on it
-// without a deadline, so the window and its timers are gone before the class is
-// unregistered and the channel closed.
-HANDLE g_execWindowGone = nullptr;
 // The hidden event does not publish the latched open from its own stack. A show
 // that ran at the hidden event's own tick was swallowed by the completing hide
 // (measured on the auto-hidden layout: `own state event=hidden`, show and
@@ -14205,6 +14327,9 @@ std::atomic<bool> g_closeHookEnabled{false};
 // Set at the end of RoleInit; a fresh image starts false. The later callbacks
 // return at once until the role actually initialised.
 bool g_initialised = false;
+
+// First tick of RoleBeforeUninit, for the one unload-duration line at the end.
+uint64_t g_unloadStartTick = 0;
 
 // ---------------------------------------------------------------------------
 // Logging (state transitions only, never per frame)
@@ -14672,9 +14797,20 @@ bool ExecutorWindowOnThisThread() {
     return g_execThreadId == GetCurrentThreadId();
 }
 
+// Only entries that are known to run on the launcher thread's own message loop
+// may adopt it. Dismiss/ShowStartView can be called by a COM/taskbar caller that
+// does not pump messages; adopting that thread made the executor window
+// unreachable at unload. A dismissed first entry passes natively; the manager's
+// Show (EnsureExecutorOnLauncherThread, source `show`) or the Win key records
+// the real launcher thread on the next entry.
+bool LauncherTriggerMayAdopt(const wchar_t* trigger) {
+    return wcscmp(trigger, L"win") == 0 ||
+           wcscmp(trigger, L"startbutton") == 0;
+}
+
 // The recorded launcher thread, without adopting one. A Hide that reaches a
 // thread this mod has not proven is never made the executor's thread by being
-// the first entry it ran on: only the four decision entries adopt.
+// the first entry it ran on: only the proven entries adopt.
 bool OnRecordedLauncherThread() {
     const DWORD known = g_launcherThread.load(std::memory_order_relaxed);
     return known != 0 && known == GetCurrentThreadId();
@@ -14718,7 +14854,7 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
         TraceLog(L"own pass trigger=%s reason=no-executor", trigger);
         return false;
     }
-    if (NoteLauncherThread(trigger) == 0) {
+    if (NoteLauncherThread(trigger, LauncherTriggerMayAdopt(trigger)) == 0) {
         // The thread test comes before the window test, so a hook on another
         // thread cannot reach the launcher-local fields through an existing
         // window.
@@ -17815,20 +17951,15 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         KillTimer(window, kPressAckTimer);
         KillTimer(window, kPressOpenGenTimer);
         DestroyWindow(window);
-        // The acknowledgement is set after DestroyWindow returns, not from
-        // WM_NCDESTROY inside it: the class's window count is decremented when
-        // the call completes, and the unload must not unregister the class
-        // between the two.
-        if (g_execWindowGone) {
-            SetEvent(g_execWindowGone);
-        }
+        // DestroyWindow returns after WM_NCDESTROY and the class's window count
+        // are complete. SendMessage from the unload thread returns after this
+        // handler, so no completion event is needed.
         return 0;
     }
     if (message == WM_NCDESTROY) {
         // The destructor of the one published window. Any other window of this
         // class (there is none: the class is owned and unregistered) must not
-        // answer for it. The class acknowledgement is set by the teardown above
-        // after DestroyWindow returns.
+        // answer for it.
         const bool identified =
             g_execWindow.load(std::memory_order_acquire) == window;
         if (identified) {
@@ -17972,10 +18103,14 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
 // messages. The library-load hook is deliberately not an entry: it runs on
 // whichever thread loaded twinui, and the taskbar thread is the one measured as
 // an explorer fail-fast for a show.
-DWORD NoteLauncherThread(const wchar_t* source) {
+DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     const DWORD tid = GetCurrentThreadId();
     DWORD known = g_launcherThread.load(std::memory_order_relaxed);
     if (known == 0) {
+        if (!adopt) {
+            TraceLog(L"exec launcher thread not adopted source=%s", source);
+            return 0;
+        }
         if (g_launcherThread.compare_exchange_strong(known, tid)) {
             TraceLog(L"exec launcher thread tid=%u source=%s", tid, source);
             known = tid;
@@ -17997,7 +18132,7 @@ void EnsureExecutorOnLauncherThread(const wchar_t* source) {
     if (ExecutorWindowOnThisThread()) {
         return;  // already created on this thread
     }
-    if (NoteLauncherThread(source) == 0) {
+    if (NoteLauncherThread(source, true) == 0) {
         return;  // not the launcher thread: never create a window here
     }
     EnsureExecutorWindow();
@@ -18245,6 +18380,8 @@ void StartExecutorWorker() {
 // callback, so this join cannot be held up by the launcher thread's own work.
 // A worker that does not exit is a bug that blocks the unload; there is no safe
 // return while it can still post into module code.
+[[noreturn]] void BlockBridgeUnload(const wchar_t* reason);
+
 void JoinExecutorWorker() {
     if (!g_execWorker) {
         return;
@@ -18256,23 +18393,25 @@ void JoinExecutorWorker() {
         g_execWorkerId = 0;
         return;
     }
-    ULONGLONG nextReport = 0;
-    for (;;) {
-        const ULONGLONG now = GetTickCount64();
-        if (now >= nextReport) {
-            nextReport = now + 5000;
-            TraceLog(L"exec worker join failed err=%u tid=%u", GetLastError(),
-                    g_execWorkerId);
-        }
-        Sleep(1000);
-    }
+    BlockBridgeUnload(L"executor worker join failed");
 }
 
-// Destroys the one published window on its owner thread and waits for
-// WM_NCDESTROY. Called after the worker is joined, so no new post can arrive.
-// DestroyWindow is asynchronous only across threads: the teardown message makes
-// the owner run it, and WM_NCDESTROY signals the event. On the owner thread it
-// runs inline. A window that does not go away has no safe successful unload.
+// A proof that cannot be obtained blocks the unload. The window is created only
+// on a recorded launcher entry, and Dismiss/ShowStartView no longer adopt an
+// unknown thread, so the non-pumping owner that used to make this wait forever is
+// removed. A genuine failure still has no safe return.
+[[noreturn]] void BlockBridgeUnload(const wchar_t* reason) {
+    TraceLog(L"unload blocked reason=%s", reason);
+    Wh_Log(L"Unload blocked: %s; the module image cannot be freed safely",
+           reason);
+    Sleep(INFINITE);
+    __builtin_unreachable();
+}
+
+// Destroys the one published window synchronously on its owner thread.
+// SendMessage returns only after the private teardown handler has run
+// DestroyWindow and WM_NCDESTROY; no completion event is needed. A destroyed
+// window means the owner thread is gone, not a hang.
 void DestroyExecutorWindow() {
     HWND window = g_execWindow.load(std::memory_order_acquire);
     if (!window) {
@@ -18281,58 +18420,22 @@ void DestroyExecutorWindow() {
     if (g_execThreadId == GetCurrentThreadId()) {
         DestroyWindow(window);
     } else {
-        if (!g_execWindowGone) {
-            TraceLog(L"exec window gone event missing hwnd=%p", window);
-            for (;;) {
-                Sleep(5000);
-            }
-        }
-        ResetEvent(g_execWindowGone);
-        if (!PostMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0)) {
-            if (!g_execWindow.load(std::memory_order_acquire)) {
-                return;  // it died before the message
-            }
-            ULONGLONG nextReport = 0;
-            for (;;) {
-                const ULONGLONG now = GetTickCount64();
-                if (now >= nextReport) {
-                    nextReport = now + 5000;
-                    TraceLog(L"exec window teardown post failed err=%u hwnd=%p",
-                            GetLastError(), window);
-                }
-                Sleep(1000);
-            }
-        }
-        if (WaitForSingleObject(g_execWindowGone, INFINITE) != WAIT_OBJECT_0) {
-            ULONGLONG nextReport = 0;
-            for (;;) {
-                const ULONGLONG now = GetTickCount64();
-                if (now >= nextReport) {
-                    nextReport = now + 5000;
-                    TraceLog(L"exec window teardown wait failed err=%u hwnd=%p",
-                            GetLastError(), window);
-                }
-                Sleep(1000);
-            }
-        }
-        TraceLog(L"exec window destroyed tid=%u",
+        TraceLog(L"exec window teardown send hwnd=%p tid=%u", window,
                 static_cast<unsigned>(g_execThreadId));
+        SendMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0);
     }
-    if (g_execWindow.load(std::memory_order_acquire)) {
-        // DestroyWindow refused or the owner never published the destruction.
-        // Freeing the class or the image under it is not an option.
-        HWND remaining = g_execWindow.load(std::memory_order_acquire);
-        ULONGLONG nextReport = 0;
-        for (;;) {
-            const ULONGLONG now = GetTickCount64();
-            if (now >= nextReport) {
-                nextReport = now + 5000;
-                TraceLog(L"exec window still published hwnd=%p tid=%u",
-                        remaining, static_cast<unsigned>(g_execThreadId));
-            }
-            Sleep(1000);
+    if (g_execWindow.load(std::memory_order_acquire) == window) {
+        if (!IsWindow(window)) {
+            // The owner went away between the lookup and the send. No procedure
+            // in this image can run there now.
+            g_execWindow.store(nullptr, std::memory_order_release);
+            TraceLog(L"exec window gone without teardown hwnd=%p", window);
+        } else {
+            BlockBridgeUnload(L"executor window still published");
         }
     }
+    TraceLog(L"exec window destroyed tid=%u",
+            static_cast<unsigned>(g_execThreadId));
 }
 
 // Unregisters the fixed class under the instance that registered it. The window
@@ -18343,18 +18446,17 @@ void UnregisterExecutorClass() {
     if (!g_execClassRegistered) {
         return;
     }
-    for (;;) {
-        if (UnregisterClassW(kExecClassName, g_execClassInstance)) {
-            TraceLog(L"exec window class unregistered");
-            break;
-        }
+    if (UnregisterClassW(kExecClassName, g_execClassInstance)) {
+        TraceLog(L"exec window class unregistered");
+    } else {
         const DWORD error = GetLastError();
         if (error == ERROR_CLASS_DOES_NOT_EXIST) {
             TraceLog(L"exec window class already gone");
-            break;
+        } else {
+            // The class still points at this image's WndProc. There is no safe
+            // free; one block instead of a retry loop.
+            BlockBridgeUnload(L"executor class unregister failed");
         }
-        TraceLog(L"exec window class unregister failed err=%u", error);
-        Sleep(1000);
     }
     g_execClassRegistered = false;
     g_execClassInstance = nullptr;
@@ -18460,11 +18562,6 @@ BOOL RoleInit() {
     // The acknowledgement event for the window's destruction. Created before
     // any window can exist; the unload resets it before it posts the teardown
     // and waits on it without a deadline.
-    g_execWindowGone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_execWindowGone) {
-        TraceLog(L"exec window gone event failed err=%u", GetLastError());
-    }
-
     if (g_ipc.state) {
         StartExecutorWorker();
     }
@@ -18509,6 +18606,8 @@ void RoleBeforeUninit() {
     if (!g_initialised) {
         return;
     }
+    g_unloadStartTick = GetTickCount64();
+    TraceLog(L"unload begin tid=%u", GetCurrentThreadId());
     // This must be set before Windhawk removes the hooks. Every hook and the
     // executor's WndProc reads it: a close or a dispatch that enters after this
     // point skips the channel. The lock is what makes the flag authoritative
@@ -18556,10 +18655,6 @@ void RoleUninit() {
     // activation's 1 into the next one.
     PublishExecutorCapability(L"uninit");
 
-    if (g_execWindowGone) {
-        CloseHandle(g_execWindowGone);
-        g_execWindowGone = nullptr;
-    }
     if (g_execStopEvent) {
         CloseHandle(g_execStopEvent);
         g_execStopEvent = nullptr;
@@ -18571,6 +18666,11 @@ void RoleUninit() {
         TraceLog(L"ipc close");
     }
 
+    TraceLog(L"unload done elapsed=%llums",
+            static_cast<unsigned long long>(
+                g_unloadStartTick != 0 && GetTickCount64() >= g_unloadStartTick
+                    ? GetTickCount64() - g_unloadStartTick
+                    : 0));
     g_initialised = false;
     Wh_Log(L"Legacy Start Swipe uninitialized (explorer role)");
 }

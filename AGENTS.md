@@ -516,11 +516,15 @@ are implemented and **unverified on this machine**: the code path is the same
   written only while `DiagnosticTrace` is on, one file per role, capped at
   20,000 lines. The smoke requires it and otherwise prints the one command that
   enables it.
-- The image is not pinned. Unloading joins every owned thread, runs the UI
-  teardown turn, drains the counted entries, destroys the launcher window and
-  the raw-input window, and unregisters both fixed classes under `&__ImageBase`
-  before the channel closes. A proof that cannot be
+- The image is not pinned. Unloading joins the two owned threads, runs the UI
+  teardown as one synchronous `SendMessage` round trip on the CoreWindow thread,
+  waits once on the counted entries and follows with one empty round trip,
+  destroys the launcher window with a synchronous `SendMessage` (no window-gone
+  event), destroys the raw-input window, and unregisters both fixed classes with
+  one checked call under `&__ImageBase` before the channel closes. Every
+  reachable wait is single-shot; a proof that cannot be
   obtained blocks the unload; there is no residual success.
+  `Dismiss`/`ShowStartView` on an unknown thread never adopts the executor.
 - Docs and code move together. Update this header, the L2 map and the L3 header
   of the file you changed.
 

@@ -41,24 +41,26 @@ reachable.
    (`EndContactTiming`), runs the per-activation reset, cancels the pending
    measurement, destroys its window, unregisters its fixed class under
    `&__ImageBase`, and exits. Its own exit withdraws availability again
-   (`reason=consumer-exit`). The unregister is checked and retried: only success
-   or `ERROR_CLASS_DOES_NOT_EXIST` lets the thread end, because the class still
+   (`reason=consumer-exit`). The unregister is one checked call: failure other
+   than `ERROR_CLASS_DOES_NOT_EXIST` blocks the unload, because the class still
    holds this image's procedure. The hook goes before the event handle it
    signals: a callback that ran after the close would set a recycled handle, and
    both belong to this thread.
-3. **`Wh_ModUninit`** posts one UI teardown turn to the captured dispatcher (or
-   runs it inline when the unload already is that thread). The turn revokes the
-   `Loaded`, `SizeChanged`, `LayoutUpdated` and scroller `ViewChanged` handlers,
-   detaches the settle batch's `Completed`, stops the animations, restores
-   resting `Progress` and the neutral translation, resets the scroller watches and
-   drops the UI-owned composition/root/dispatcher references. The turn signals
-   completion; the unload waits on that signal, not on a registration count.
-   Turns posted before it run first, and the input thread is already joined, so no
-   new turn can be posted.
-4. The counted **module entries** are drained through their event: a batch
+3. **`Wh_ModUninit`** runs one synchronous UI turn with a `SendMessage` round
+   trip to the CoreWindow (the window recorded when `PrepareRootElement` first
+   registers `Loaded`), or inline when the unload already is that thread. The
+   turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated` and scroller
+   `ViewChanged` handlers, detaches the settle batch's `Completed`, stops the
+   animations, restores resting `Progress` and the neutral translation, resets
+   the scroller watches and drops the UI-owned composition/root/dispatcher
+   references. The message returns only after the turn and its delegate thunks
+   have returned. A destroyed window is the thread-gone case, not a wait.
+4. The counted **module entries** are drained with one event wait: a batch
    completion the compositor already dispatched keeps the count up until it
-   returns. A XAML revoke that failed leaves a reachable delegate and therefore
-   keeps the unload waiting (`unload waiting for xaml revokes=...`).
+   returns. Because the lease is released inside its destructor, one more
+   synchronous empty UI turn follows, so the UI thread has left every earlier
+   callback before the image is freed. A genuine XAML revoke failure blocks once
+   (`unload blocked reason=xaml revokes remain`); it is not polled.
 5. Only then are the IPC view and the thread/stop/entry handles closed.
 
 `[[clang::no_destroy]]` is on `g_root`, `g_loadedRoot`, `g_sizeRoot`,
@@ -83,16 +85,23 @@ them explicitly on the UI thread.
    publishes the terminal clear again (`exec capable=0 reason=window-gone`), and
    the class teardown writes the last `exec capable=0 reason=uninit` before the
    section is closed.
-3. The one published HWND is destroyed on its owner thread: directly when the
-   unload already runs there, otherwise through the private
-   `kExecTeardownMessage`, which kills the dismiss/probe/latch timers and calls
-   `DestroyWindow`; `WM_NCDESTROY` signals `g_execWindowGone`. The unload waits on
-   that event **INFINITE**.
+3. The one published HWND is destroyed synchronously on its owner thread:
+   directly when the unload already runs there, otherwise with
+   `SendMessage(kExecTeardownMessage)`, which kills the dismiss/probe/latch
+   timers and calls `DestroyWindow`; the call returns after `WM_NCDESTROY` and
+   the window publication is cleared. No completion event or wait is used. A
+   destroyed window means the owner thread is gone, not a hang.
 4. The fixed window class is unregistered under the same instance that registered
    it (`&__ImageBase`) only after the window is gone. Registration treats
    `ERROR_CLASS_ALREADY_EXISTS` as failure: a surviving class from an earlier
-   image is never adopted.
-5. Worker/stop/window-gone handles are closed, then the IPC view and its events.
+   image is never adopted. A failure other than `ERROR_CLASS_DOES_NOT_EXIST`
+   blocks once; it is not retried.
+5. Worker/stop handles are closed, then the IPC view and its events.
+
+Only `OnHotkeyInvoke`, `OnStartButtonPressed` and the manager's `Show` may adopt
+an unknown launcher thread. `Dismiss`/`ShowStartView` called from a COM/taskbar
+thread that does not pump pass natively instead of creating an executor window
+there; the next `Show`/Win entry records the real launcher thread.
 
 The old creator reservation, admission flag, stop target, reaper, creator drain
 and `CloseCallLease` count are **gone**. Two effects replace them: the worker is

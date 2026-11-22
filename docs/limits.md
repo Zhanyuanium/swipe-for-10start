@@ -59,28 +59,35 @@
   every trigger.
 - **A teardown that cannot be proved gone blocks the unload.** The image is not
   pinned, so returning while a mod-owned thread, delegate or owner window is
-  still reachable would hand it unmapped code. The unload joins threads
-  `INFINITE`, waits for the UI teardown turn and the counted entries, and waits
-  for `WM_NCDESTROY`; a permanently hung launcher or UI thread therefore blocks
-  the disable instead of corrupting the process. There is no bounded-wait
-  success path and no residual return.
+  still reachable would hand it unmapped code. The unload joins the two owned
+  threads `INFINITE`, runs the UI teardown as one synchronous `SendMessage`
+  round trip on the CoreWindow thread (the call returns after the turn), waits
+  once on the module-entry event, then runs one more empty round trip so the
+  releasing destructor has returned. The executor window is destroyed by a
+  synchronous `SendMessage` whose handler calls `DestroyWindow`, and the class
+  unregister is one checked call. A permanently hung UI thread, a worker that
+  does not exit or a class that cannot be unregistered therefore blocks the
+  disable instead of corrupting the process. There is no bounded-wait success
+  path and no residual return.
 - **The launcher must be attached.** `[outer+0x18+0x160] > 0x10000`; zero means
   no `IXamlLauncherState`. The constructor's sentinel is `0x100`. A first open
   after a fresh logon can therefore be refused; the shell's own gesture then
   opens the menu and creates the executor window for the next one.
 - **The launcher thread is not the taskbar thread.** A `ShowStartView` on the
   taskbar thread fail-fasts explorer (`0xC0000409` at `twinui+0x1BB010`);
-  measured. The executor creates its window on the thread that runs
-  `OnHotkeyInvoke` / the shell's own `ShowStartView`, and refuses a window on any
-  other.
+  measured. The executor creates its window only on a thread that entered
+  through `OnHotkeyInvoke`, `OnStartButtonPressed` or the manager's `Show`, and
+  refuses a window on any other. A `Dismiss`/`ShowStartView` on an unknown
+  thread (a COM/taskbar caller that does not pump) passes natively; it never
+  adopts.
 - **A reinstalled Windhawk image does not inherit its window classes.** Both
   fixed classes (`WindhawkLegacyStartSwipeRawInputWindow`,
   `WindhawkSwipeFor10Start.Executor`) are registered under `&__ImageBase` and
   unregistered under it. `ERROR_CLASS_ALREADY_EXISTS` is a failure, never
   adopted: a surviving class from an earlier image points at an unmapped
   procedure, so the Start input thread refuses to run and the executor refuses
-  to create its window. A failed unregister is retried instead of returning
-  success into an image the class still points at.
+  to create its window. A failed unregister other than
+  `ERROR_CLASS_DOES_NOT_EXIST` blocks the unload once; it is not retried.
 - **A press that lands inside the shell's hide is a no-op show.** Once the shell
   is hiding (`InternalState` 9/11), or our own executor has entered its `Dismiss`
   call, the bridge latches the press (one slot, tick, the epoch the admission was

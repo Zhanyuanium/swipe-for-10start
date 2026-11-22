@@ -110,9 +110,10 @@ crashed `explorer.exe` in `twinui.pcshell.dll+0x1BB010` with `0xC0000409`
 not rely on the asymmetry: every command runs on the launcher thread.
 
 Shape: a hidden message-only window owned by the mod, created only from a known
-launcher entry — the first of `OnHotkeyInvoke`, `Dismiss`, `ShowStartView`, the
-manager's `Show` or the worker's targeted `WM_GETMESSAGE` adopts the thread (`exec
-launcher thread`), and a window is never created from the `LoadLibraryExW` hook,
+launcher entry — `OnHotkeyInvoke`, `OnStartButtonPressed`, the manager's `Show`
+or the worker's targeted `WM_GETMESSAGE` adopts the thread (`exec launcher
+thread`); a `Dismiss`/`ShowStartView` on an unknown thread never does, and a
+window is never created from the `LoadLibraryExW` hook,
 which runs on whichever thread loaded twinui. A worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
 an empty stack. The window class is one fixed name
@@ -123,9 +124,10 @@ class from an earlier image points at an unmapped procedure.
 Shutdown is an order, not a set of flags. BeforeUninit clears readiness and
 signals the worker's stop; Uninit joins the worker **INFINITE**, then destroys the
 one published window on its owner thread — directly when it already runs there,
-otherwise with the private `kExecTeardownMessage`, whose `WM_NCDESTROY` signals
-`g_execWindowGone`. The class is unregistered under the same `&__ImageBase`
-instance only after the window is gone, and the worker/stop/window-gone handles
+otherwise with a synchronous `SendMessage(kExecTeardownMessage)` whose handler
+calls `DestroyWindow`; the call returns after `WM_NCDESTROY`. No window-gone event
+is used. The class is unregistered under the same `&__ImageBase`
+instance only after the window is gone, and the worker/stop handles
 and the channel close last. The old creator reservation, admission flag, creator
 drain, reaper and `CloseCallLease` count are gone; the join and the class
 ownership are the barriers. A window or worker that does not go away blocks the

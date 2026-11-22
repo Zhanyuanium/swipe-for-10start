@@ -490,20 +490,23 @@ capability word.
 
 **Executor.** A hidden message-only window, class
 `WindhawkSwipeFor10Start.Executor` (fixed, registered under `&__ImageBase`),
-created only from a known launcher entry: the first of `OnHotkeyInvoke`,
-`Dismiss`, `ShowStartView`, the manager's `Show` or the worker's targeted
-`WH_GETMESSAGE` adopts that thread (`exec launcher thread`), and a hook on any
-other thread logs `exec launcher thread mismatch` and creates nothing. The
-library-load hook never creates the window. `ERROR_CLASS_ALREADY_EXISTS` is a
-failure, never adopted. Shutdown is an order: BeforeUninit clears readiness and
-signals the stop; Uninit joins the worker **INFINITE**, destroys the one
-published window on its owner thread (directly there, otherwise through the
-private `kExecTeardownMessage`; `WM_NCDESTROY` signals `g_execWindowGone`), then
-unregisters the class under the same instance, closes the handles and the
-channel last. The old creator reservation, admission flag, creator drain,
-reaper and `CloseCallLease` count are gone; a window or worker that does not go
-away blocks the unload. The procedure refuses every dispatch (`kExecMessage`,
-timers) for an HWND other than the currently published one. Readiness is
+created only from a known launcher entry: `OnHotkeyInvoke`,
+`OnStartButtonPressed`, the manager's `Show` or the worker's targeted
+`WH_GETMESSAGE` adopts that thread (`exec launcher thread`); a
+`Dismiss`/`ShowStartView` on an unknown thread never adopts and passes natively,
+and a hook on any other thread logs `exec launcher thread mismatch` and creates
+nothing. The library-load hook never creates the window.
+`ERROR_CLASS_ALREADY_EXISTS` is a failure, never adopted. Shutdown is an order:
+BeforeUninit clears readiness and signals the stop; Uninit joins the worker
+**INFINITE**, destroys the one published window synchronously on its owner
+thread (directly there, otherwise with `SendMessage(kExecTeardownMessage)`, whose
+handler kills the timers, calls `DestroyWindow` and returns after
+`WM_NCDESTROY`; no completion event exists), then unregisters the class under
+the same instance with one checked call, closes the handles and the channel
+last. The old creator reservation, admission flag, creator drain, reaper,
+`CloseCallLease` count and `g_execWindowGone` event are gone; a window or worker
+that does not go away blocks the unload. The procedure refuses every dispatch
+(`kExecMessage`, timers) for an HWND other than the currently published one. Readiness is
 published by the worker itself after its exit guard is installed, and the gate
 also reads `g_disabled`, so a late positive write from a stopping worker is
 unreadable. The full capability is `PublishExecutorCapability`: it writes the
@@ -791,14 +794,17 @@ creator drain and reaper, and every residual/deferred-success return. `kExecTear
 and the destructive first-frame work remain.
 
 **Lifecycle.** No pin, no instance guard, no re-enable state. The Start side joins
-its input thread `INFINITE` in BeforeUninit, runs one UI teardown turn, drains the
-counted batch entries, then closes the channel. The bridge joins its posting
-worker `INFINITE`, destroys the one published window on the launcher thread and
-waits for `WM_NCDESTROY`, unregisters the fixed class under `&__ImageBase`, then
-closes the handles and the channel. A proof that cannot be obtained (a thread
-that does not exit, a delegate that does not revoke, a window that does not go
-away) keeps the unload waiting; there is no residual success and no deferred
-close. `docs/lifecycle.md` has the order and the blocking cases.
+its input thread `INFINITE` in BeforeUninit, runs the UI teardown as one
+synchronous `SendMessage` turn on the recorded UI thread, waits once for the
+counted batch entries and follows with one empty turn, then closes the channel.
+The bridge joins its posting worker `INFINITE`, destroys the one published window
+on the launcher thread with a synchronous `SendMessage(kExecTeardownMessage)`
+(its handler calls `DestroyWindow`; no window-gone event exists), unregisters the
+fixed class with one checked call under `&__ImageBase`, then closes the handles
+and the channel. A proof that cannot be obtained (a thread that does not exit, a
+delegate that does not revoke, a window that does not go away) blocks the unload
+once; there is no residual success, no deferred close and no retry loop.
+`docs/lifecycle.md` has the order and the blocking cases.
 
 ### swipe_ipc_shared.h (merged mod, 232 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**,
