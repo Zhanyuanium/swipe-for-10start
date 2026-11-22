@@ -123,7 +123,12 @@ is waited on by the executor worker and posted to the executor window; the hook
 never waits. A press the queue cannot serve (full, ack timeout, past its 1500 ms
 wait) runs the shell's own original primitive for that press under the executor
 guard (`own press fallback ... reason=queue-full|no-ack|queue-wait`) instead of
-being lost; an `external` intent clears the queue and the latch.
+being lost; an `external` intent clears the queue and the latch. The ack timeout
+is stricter than the other two: a live peer that is silent is treated as having
+consumed the record (`decision=consumed`), because replaying a close that landed
+would reopen the menu; only a gone or stale peer is replayed
+(`decision=replay`, `reason=no-ack`). The line carries the sequence, the wait, the
+peer age and the epoch.
 
 The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user

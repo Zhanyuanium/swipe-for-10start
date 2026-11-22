@@ -621,10 +621,14 @@ probe or timer failure is answered `unknown`.
   The ack is read on this thread; the executor worker (which can wait on the
   `IntentAck` event) posts `kExecIntentAckMessage` and never reads the queue. The
   direction is sampled when a press is published, so the press after a close
-  reads `2` and reopens. A queue overflow, an ack that never arrives and a press
-  past its 1500 ms wait run the shell's original primitive for that press under
-  `t_execCall` (`own press fallback ...`), so the shell keeps its toggle; the
-  queue's own lines are `own press queued|published|ack|ack timeout|dropped`. An
+  reads `2` and reopens. A queue overflow and a press past its 1500 ms wait run
+  the shell's original primitive for that press under `t_execCall`
+  (`own press fallback ...`), so the shell keeps its toggle. An ack timeout is
+  resolved by proof, not by replay: a late ack is consumed, a live-but-silent peer
+  is treated as consumed (`own press ack timeout ... peer=alive ... decision=consumed`),
+  and only a gone/stale peer is replayed (`peer=stale ... decision=replay`,
+  `reason=no-ack`). The queue's own lines are
+  `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch.
 
 **Deleted here.** The retract request/plan wait, the arbitration hold, the

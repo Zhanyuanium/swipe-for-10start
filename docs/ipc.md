@@ -107,11 +107,15 @@ it publishes, so the shell never saw that press; when the Start side answers
 press is lost. The refusal is reserved for the case where nothing could run, and
 the line names it (`intent open refused entry=... reason=no-executor`,
 `intent close refused from=... reason=no-executor`); the bridge does not retry the
-original on an answered refusal. Only an **unanswered** decision is replayed: the
-outstanding press whose ack does not arrive inside its 1000 ms bound runs its
-original primitive (`own press fallback ... reason=no-ack`), because the press
-cannot be left with no toggle. The record may still be applied by a slow
-controller afterwards; no scheme can recall it, and the line names the trade.
+original on an answered refusal. An **unanswered** decision is not simply
+replayed. At the 1000 ms bound the bridge re-reads the ack and the peer's state,
+tick and epoch. A live peer that is silent is treated as having consumed the
+record (`own press ack timeout ... peer=alive ... decision=consumed`): the close
+may have landed and only the answer been late, and replaying its original would
+reopen the menu. Only a gone or stale peer, which cannot consume the record,
+replays it (`peer=stale ... decision=replay`, `own press fallback ... reason=no-ack`).
+A record applied after a peer-gone replay is the residual double action; no scheme
+can recall a record, and the line names which case it chose.
 
 A landing reconciles an already-published `external` intent before it may issue a
 recovery: the idle timer and the intent event are two wait objects of the same

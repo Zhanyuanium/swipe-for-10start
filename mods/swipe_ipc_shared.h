@@ -914,6 +914,22 @@ inline uint32_t SwipeIpcPeerEpoch(SwipeIpcChannel* channel) {
                : 0;
 }
 
+// The published liveness words, for a diagnostic that has to say why a timeout
+// was replayed or treated as consumed. The reader that decides liveness is
+// SwipeIpcPeerAlive above; these are reads, not a second gate.
+inline int32_t SwipeIpcPeerState(SwipeIpcChannel* channel) {
+    return channel->state
+               ? InterlockedCompareExchange(&channel->state->peerState, 0, 0)
+               : kSwipePeerGone;
+}
+
+inline uint32_t SwipeIpcPeerTick(SwipeIpcChannel* channel) {
+    return channel->state
+               ? static_cast<uint32_t>(InterlockedCompareExchange(
+                     &channel->state->peerTick, 0, 0))
+               : 0;
+}
+
 // True while the Start side is attached and its tick is younger than `staleMs`.
 // The comparison clock is read here, after the tick, never passed in by the
 // caller: a tick published between the caller's own clock read and this call

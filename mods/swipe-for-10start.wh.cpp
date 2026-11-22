@@ -122,8 +122,10 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   per command; one decision line and one executor line per trigger. One intent
  *   is outstanding at a time: an admitted press waits in a four-entry FIFO until
  *   the intent ack for the press before it (or its 1000 ms bound) and then decides
- *   from the direction the controller published by then; a press the queue cannot
- *   serve runs the shell's own primitive under the executor guard. Every
+ *   from the direction the controller published by then; an ack timeout is
+ *   replayed only for a gone or stale peer, while a live silent peer is consumed.
+ *   A press the queue cannot serve runs the shell's own primitive under the
+ *   executor guard. Every
  *   line goes through `TraceLog`: `Wh_Log` always, and the role's file only
  *   while the `DiagnosticTrace` setting is on. The two interruption dates are
  *   `motion sample` — the position and slope `TakeProgressNow` reads, once per
@@ -14347,6 +14349,18 @@ uint32_t PeerEpochNow() {
     return g_ipc.state ? SwipeIpcPeerEpoch(&g_ipc) : 0;
 }
 
+// How old the last heartbeat is, in milliseconds. Only the ack timeout's
+// diagnostic reads it: the liveness decision is PeerAliveNow's, which pairs the
+// state with the tick so a just-started activation is not read through the
+// previous one's words.
+uint32_t PeerTickAgeMs() {
+    if (!g_ipc.state) {
+        return 0xFFFFFFFFu;
+    }
+    return static_cast<uint32_t>(GetTickCount64()) -
+           SwipeIpcPeerTick(&g_ipc);
+}
+
 // The executor half of the gate: the worker that turns a command into a
 // launcher call. Without it, a command the controller publishes would have no
 // thread to run it.
@@ -15214,23 +15228,70 @@ void HandlePressAck() {
     ServeNextPress(L"ack");
 }
 
-// The ack did not arrive inside its bound. The record may still be applied by a
-// controller that was slow, but the user's press can no longer wait for it: run
-// the shell's own primitive for that press and serve the next one. This is the
-// one place the promise is traded explicitly, and the line says so.
+// The ack did not arrive inside its bound. A missing ack is not proof that the
+// controller did nothing: the close may have landed and only its notification
+// been late, and replaying the original then reopens the menu. The timeout
+// therefore reads the ack once more and the peer's liveness words:
+//
+// - a late ack for this sequence is the answer, and only advances the queue;
+// - a live peer that is silent is treated as having consumed the record: no
+//   original runs, because the alternative is a second toggle for a press that
+//   already happened. The line names the trade;
+// - a gone or stale peer cannot consume the record, so running the original is
+//   the only way the press still reaches the shell.
+//
+// There is no consumer-set "taken" word: the ack record plus the peer triple is
+// the cheap proof that exists, and a new field would still race the consumer's
+// turn. The cost is one press in the alive-but-hung case; the timeout line says
+// which case it chose.
 void HandlePressAckTimeout() {
     if (!g_pressOutstanding.pending) {
         return;
     }
     const OutstandingPress press = g_pressOutstanding;
+    SwipeIpcIntentAck ack{};
+    if (SwipeIpcReadIntentAck(&g_ipc, &ack) && ack.intent == press.seq) {
+        // The answer won the race with the timer. It is the same path as an
+        // ordinary ack, not a replay.
+        g_pressOutstanding = OutstandingPress{};
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
+        TraceLog(L"own press ack late seq=%lld state=%d trigger=%s entry=%s "
+                L"wait=%llu",
+                static_cast<long long>(ack.intent), ack.state,
+                PressTriggerName(press.press.trigger),
+                PressEntryName(press.press.entry),
+                static_cast<unsigned long long>(GetTickCount64() -
+                                                press.publishedTick));
+        ServeNextPress(L"late-ack");
+        return;
+    }
+
+    const bool haveChannel = g_ipc.state != nullptr;
+    const bool peerAlive = PeerAliveNow();
+    const uint32_t peerAge = PeerTickAgeMs();
+    const wchar_t* peer =
+        !haveChannel ? L"absent" : (peerAlive ? L"alive" : L"stale");
     g_pressOutstanding = OutstandingPress{};
-    TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu",
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (window) {
+        KillTimer(window, kPressAckTimer);
+    }
+    const uint64_t wait = GetTickCount64() - press.publishedTick;
+    TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s wait=%llu "
+            L"peer=%s age=%u epoch=%u decision=%s",
             static_cast<long long>(press.seq),
             PressTriggerName(press.press.trigger),
             PressEntryName(press.press.entry),
-            static_cast<unsigned long long>(GetTickCount64() -
-                                            press.publishedTick));
-    RunPressOriginal(press.press, L"no-ack");
+            static_cast<unsigned long long>(wait), peer, peerAge, PeerEpochNow(),
+            peerAlive ? L"consumed" : L"replay");
+    if (!peerAlive) {
+        // No live consumer can take this record, so the shell's own primitive is
+        // the only actor left for the press.
+        RunPressOriginal(press.press, L"no-ack");
+    }
     ServeNextPress(L"timeout");
 }
 
