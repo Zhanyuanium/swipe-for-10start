@@ -13805,16 +13805,24 @@ HWND TeardownUiOnUiThread() {
 // can still be pending from an earlier transition to zero, so the count is the
 // predicate: consume a signal, re-check, and wait again until the count is
 // actually zero. No timeout and no polling.
-void RequireNoModuleCallbacks() {
-    const bool haveEvent = g_moduleEntriesGone != nullptr;
-    for (;;) {
-        if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
-            break;
+//
+// `waitForEntries` is false only for an unload that already runs on the UI
+// owner: a lease can then be held by a dispatcher turn that can only run on the
+// thread doing the waiting. A non-zero count is a self-deadlock, not a wait.
+void RequireNoModuleCallbacks(bool waitForEntries) {
+    if (waitForEntries) {
+        const bool haveEvent = g_moduleEntriesGone != nullptr;
+        for (;;) {
+            if (g_moduleEntryCount.load(std::memory_order_acquire) == 0) {
+                break;
+            }
+            if (!haveEvent) {
+                BlockUnload(L"module entry event missing");
+            }
+            WaitForSingleObject(g_moduleEntriesGone, INFINITE);
         }
-        if (!haveEvent) {
-            BlockUnload(L"module entry event missing");
-        }
-        WaitForSingleObject(g_moduleEntriesGone, INFINITE);
+    } else if (g_moduleEntryCount.load(std::memory_order_acquire) != 0) {
+        BlockUnload(L"unload on ui thread with pending entries");
     }
     if (g_uiRegistrationCount.load(std::memory_order_acquire) != 0) {
         BlockUnload(L"xaml revokes remain");
@@ -13833,7 +13841,7 @@ void DrainUiThread(HWND hwnd) {
             SendMessageW(hwnd, kUiDrainMessage, kUiDrainMagic, 0);
         }
     }
-    RequireNoModuleCallbacks();
+    RequireNoModuleCallbacks(true);
 }
 
 BOOL RoleInit() {
@@ -14070,6 +14078,10 @@ void RoleUninit() {
     HWND uiWindow = TeardownUiOnUiThread();
     const bool inlineUnload =
         uiOwner != 0 && uiOwner == GetCurrentThreadId();
+    if (inlineUnload) {
+        TraceLog(L"unload inline on ui thread entries=%d",
+                g_moduleEntryCount.load(std::memory_order_acquire));
+    }
 
     // 4a. Without a window there is no empty-turn barrier. If any entry was ever
     //     used, two zero reads cannot prove the last destructor returned, so the
@@ -14080,18 +14092,23 @@ void RoleUninit() {
         BlockUnload(L"no window to drain module entries");
     }
 
-    // 4. The same proof on every path: no counted entry and no registered XAML
-    //    handler. A teardown window that could not run does not excuse either
-    //    proof, because the UI thread and its dispatcher may still be alive.
-    RequireNoModuleCallbacks();
+    // 4b. The same proof on every path: no counted entry and no registered XAML
+    //     handler. On the owner thread a non-zero count is a self-deadlock (the
+    //     turn holding it can only run here), so it blocks; off the owner the
+    //     count is the predicate.
+    RequireNoModuleCallbacks(!inlineUnload);
 
     // 5. One more synchronous empty turn when a window exists, so the UI thread
     //    has left every callback and delegate destructor it was inside. The
     //    counts are re-checked after it; a window that is gone cannot skip them.
-    DrainUiThread(uiWindow);
-    if (uiWindow) {
+    if (inlineUnload) {
+        // TeardownUi ran on this thread and the counts above are zero; no turn
+        // is needed and none can be sent anywhere.
+    } else if (uiWindow) {
+        DrainUiThread(uiWindow);
         TraceLog(L"unload ui drained");
     } else {
+        DrainUiThread(nullptr);
         TraceLog(L"unload teardown without a window; counts clear");
     }
 
