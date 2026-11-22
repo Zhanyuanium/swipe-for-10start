@@ -46,7 +46,8 @@ reachable.
    holds this image's procedure. The hook goes before the event handle it
    signals: a callback that ran after the close would set a recycled handle, and
    both belong to this thread.
-3. **`Wh_ModUninit`** sends one synchronous teardown message to this module's own
+3. **The unload waits for an admitted root before choosing its teardown.**
+   `Wh_ModUninit` sends one synchronous teardown message to this module's own
    hidden message-only window on the XAML UI thread (created by
    `PrepareRootElement` before `Loaded`; the CoreWindow is only read for the cloak
    and bounds), or runs the turn inline when the unload already is that thread.
@@ -54,25 +55,26 @@ reachable.
    first instruction: it takes a lease, re-reads the unload flag before touching
    module state and again immediately before its first registration, and
    registers nothing if either check sees a stop or the rendezvous window could
-   not be created. The turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated`
-   and scroller
+   not be created. Off the owner, `RoleUninit` first waits on the module-entry
+   count alone, because that hook may have published its owner and lease before
+   its window; it re-reads the owner and window after the wait, then runs the
+   teardown. The turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated` and
+   scroller
    `ViewChanged` handlers, detaches the settle batch's `Completed`, stops the
    animations, restores resting `Progress` and the neutral translation, resets
    the scroller watches and drops the UI-owned composition/root/dispatcher
    references. The message returns only after the turn and its delegate thunks
-   have returned. A window that is gone cannot run the turn; the counts below are
-   then the whole proof, never the window's absence.
-4. **The counts are the proof on every path.** The module-entry count is the
-   predicate: wait on the event, re-check, and repeat until it is actually zero
-   (the event is auto-reset, so a pending signal is not a zero). Every XAML
-   registration must also be zero. One empty synchronous turn on the same window
-   follows when it exists, so the UI thread has left the releasing destructor and
-   every earlier callback; a window that is gone skips only that turn, never the
-   counts. If no window exists and any entry was ever used, the off-owner unload
-   blocks (`no window to drain module entries`) instead of treating zero as the
-   destructor's return. An unload already on the owner thread never waits: a
-   non-zero count blocks (`unload on ui thread with pending entries`). A genuine
-   XAML revoke failure blocks once
+   have returned.
+4. **After the teardown the proof is both counts and an acknowledged drain.**
+   No counted entry and no registered XAML handler may remain. Off the owner, one
+   empty drain message follows; its handler sets a caller-owned acknowledgement
+   only for an accepted message from this activation's published window. A drain
+   that did not run blocks (`ui drain not acknowledged`), because zero alone does
+   not prove the last lease destructor returned. A window that is gone with any
+   entry ever used blocks (`no window to drain module entries`); a never-entered
+   process has neither and completes. An unload already on the owner thread never
+   waits: a non-zero count blocks (`unload on ui thread with pending entries`).
+   A genuine XAML revoke failure blocks once
    (`unload blocked reason=xaml revokes remain`); it is not polled.
 5. The rendezvous window is destroyed with its own message, its class is
    unregistered under `&__ImageBase`, and only then are the IPC view and the
@@ -113,7 +115,11 @@ them explicitly on the UI thread.
    `ERROR_CLASS_ALREADY_EXISTS` as failure: a surviving class from an earlier
    image is never adopted. A failure other than `ERROR_CLASS_DOES_NOT_EXIST`
    blocks once; it is not retried.
-5. Worker/stop handles are closed, then the IPC view and its events.
+5. The twinui loader reference taken for the symbol attempt is released here,
+   after Windhawk has disabled the hooks and `Wh_ModUninit` has stopped using
+   the mapping. Windhawk removes the hooks after `Wh_ModUninit`, so this is a
+   release after disabling, not after removal. Worker/stop handles are closed,
+   then the IPC view and its events.
 
 Only `OnHotkeyInvoke`, `OnStartButtonPressed` and the manager's `Show` may adopt
 an unknown launcher thread. `Dismiss`/`ShowStartView` called from a COM/taskbar

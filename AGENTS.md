@@ -520,16 +520,18 @@ are implemented and **unverified on this machine**: the code path is the same
   20,000 lines. The smoke requires it and otherwise prints the one command that
   enables it.
 - The image is not pinned. Unloading joins the two owned threads, sends the UI
-  teardown to the module's own hidden window on the XAML UI thread, waits on the
-  entry count as a predicate and follows with one empty turn (this predicate is
-  the only wait that repeats; every other wait is a single call),
+  teardown to the module's own hidden window on the XAML UI thread (off the
+  owner, it first waits on the entry count so an admitted root publishes its
+  window), then requires both counts and one acknowledged empty turn. A missing
+  drain acknowledgement (`ui drain not acknowledged`), a windowless root with
+  entries ever used, or an inline unload with a pending entry blocks rather than
+  waiting past it. The predicate count wait is the only wait that repeats; every
+  other wait is a single call. It
   destroys the launcher window with a synchronous `SendMessage` (no window-gone
   event), destroys the raw-input window, destroys the UI rendezvous window, and
   unregisters the three fixed classes (raw input, executor, UI rendezvous) with
-  one checked call each under `&__ImageBase` before the channel closes. Without
-  a rendezvous window an off-owner unload with entries ever used blocks, and an
-  inline unload with a pending entry blocks rather than waiting. A proof that
-  cannot be
+  one checked call each under `&__ImageBase` before the channel closes. A proof
+  that cannot be
   obtained blocks the unload; there is no residual success.
   `Dismiss`/`ShowStartView` on an unknown thread never adopts the executor.
 - Docs and code move together. Update this header, the L2 map and the L3 header

@@ -13100,9 +13100,10 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
         // gesture state before installing the fresh renderer.
         ResetRenderer();
 
-        // The dispatcher is UI-thread state and the only way to revoke a
-        // delegate registered below if Setup never runs. Capture it here, under
-        // the same mutex every reader takes, before the first registration.
+        // The dispatcher is UI-thread state the renderer uses for counted turns.
+        // The unload now revokes through the rendezvous window, not through this
+        // dispatcher; capture it here, under the same mutex every reader takes,
+        // before the first registration.
         try {
             wucore::CoreDispatcher dispatcher = root.Dispatcher();
             if (dispatcher) {

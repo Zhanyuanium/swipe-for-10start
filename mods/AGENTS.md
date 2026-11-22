@@ -805,11 +805,12 @@ creator drain and reaper, and every residual/deferred-success return. `kExecTear
 and the destructive first-frame work remain.
 
 **Lifecycle.** No pin, no instance guard, no re-enable state. The Start side joins
-its input thread `INFINITE` in BeforeUninit, sends the UI teardown to its own
-window on the recorded UI thread, waits on the counted batch entries as a
-predicate and follows with one empty turn. If the window is unavailable and any
-entry was ever used, the off-owner unload blocks; an unload already on the owner
-blocks on a non-zero count instead of waiting. It then closes the channel.
+its input thread `INFINITE` in BeforeUninit. Off the owner it waits on the
+module-entry count alone so an admitted root publishes its window, then sends the
+UI teardown to that window and requires both counts. It follows with one
+acknowledged empty turn; a missing acknowledgement blocks
+(`ui drain not acknowledged`), as do a windowless root with entries ever used and
+an inline owner unload with a pending entry. It then closes the channel.
 The bridge joins its posting worker `INFINITE`, destroys the one published window
 on the launcher thread with a synchronous `SendMessage(kExecTeardownMessage)`
 (its handler calls `DestroyWindow`; no window-gone event exists), unregisters the
