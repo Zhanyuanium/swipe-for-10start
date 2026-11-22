@@ -9,7 +9,7 @@
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -lshell32 -Wall -Wextra
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -luser32 -lhid -lshell32 -ladvapi32 -Wall -Wextra
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -19164,11 +19164,29 @@ const SwipeModRole* g_modRole = nullptr;
 
 }  // namespace
 
+// ExplorerPatcher is the host this mod is written for. Its legacy Start mode is
+// a hard gate: without it the Start host would keep a raw-input registration and
+// the Explorer half would fetch the twinui PDB for a UI this mod does not hook.
+// The value is read, never written.
+bool LegacyStartMenuEnabled() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    const LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER, L"Software\\ExplorerPatcher",
+        L"Start_ShowClassicMode", RRF_RT_REG_DWORD, nullptr, &value, &size);
+    return status == ERROR_SUCCESS && value == 1;
+}
+
 BOOL Wh_ModInit() {
     // The first operation, before either half touches anything: this process
     // picks its half, and the other half's init never runs here.
     g_modRole = ResolveModRole();
     if (!g_modRole) {
+        return FALSE;
+    }
+    if (!LegacyStartMenuEnabled()) {
+        Wh_Log(L"ExplorerPatcher Start_ShowClassicMode is not 1; Swipe for "
+               L"10Start stays disabled");
         return FALSE;
     }
     return g_modRole->modInit();
