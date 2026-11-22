@@ -209,11 +209,14 @@ Start must reconcile before another intent may overwrite it. That barrier is a
 state, not a timer: it is set whether or not the watchdog could be armed
 (`own external barrier ... armed|unarmed`), and it is cleared only by its ack, by
 a changed epoch (`released reason=epoch-changed`), or by its peer's state going
-away (`released reason=peer-gone|stale-unclaimed`), never by a timeout and never
-by an arm failure. A claimed barrier is held through a stale heartbeat. At the
-watchdog an unclaimed barrier is released when the tick goes stale; at admission
-it is released only after a successful abort and a claim re-read that finds no
-claim. A live but
+away (`released reason=peer-gone`), never by a timeout and never by an arm
+failure. A claimed barrier is held through a stale heartbeat. A stale heartbeat
+with no claim is not enough by itself: at the watchdog and at admission the
+claim is read, the record is aborted, and the claim is read again. A claim in
+between, or a record that cannot be aborted, keeps the barrier reserved
+(`decision=reserved reason=claim-after-abort|record-moved`); only an aborted
+record with no claim after the re-read is released (`released
+reason=stale-unclaimed`). A live but
 silent peer keeps it, and a following press waits; a reserve poll re-checks it
 and runs any held press that has outlived its queue bound.
 

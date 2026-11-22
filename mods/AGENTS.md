@@ -708,15 +708,15 @@ probe or timer failure is answered `unknown`.
   `SetTimer` fails (`own external barrier seq=... armed|unarmed`) and is cleared
   only by its ack (`own external ack ... reconciled`), by a changed epoch
   (`released reason=epoch-changed`), or by its peer's state going away
-  (`released reason=peer-gone`), with an unclaimed barrier also released by a
-  stale tick on the reserve poll (`released reason=stale-unclaimed`). At
-  admission that release needs the abort proof: the claim is read, the record is
-  aborted, and the claim is read again; a claim before or after the abort keeps
-  the barrier reserved (`decision=reserved`), as does a record that cannot be
-  aborted (`reason=record-moved`). A claimed barrier is held through a stale heartbeat; a
+  (`released reason=peer-gone`). A stale heartbeat is not a release on its own:
+  at the watchdog and at admission the claim is read, the record is aborted, and
+  the claim is read again. A claim in between, or a record that cannot be
+  aborted, keeps the barrier reserved (`decision=reserved`,
+  `reason=claim-after-abort|record-moved`); only an aborted record with no claim
+  after the re-read is released (`reason=stale-unclaimed`). A claimed barrier is held through a stale heartbeat; a
   live but silent peer keeps it; the timeout line is
-  `decision=reserved`, never a reconciliation guess, and the poll runs any held
-  press past its bound.
+  `decision=reserved reason=peer-alive|claimed`, never a reconciliation guess,
+  and the poll runs any held press past its bound.
 
 **Deleted here.** The retract request/plan wait, the arbitration hold, the
 close-record read/seed, `OwnDecideFrom` and its open/close/reopen helpers, the

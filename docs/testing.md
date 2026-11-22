@@ -316,6 +316,20 @@ could act, or before its confirmation could land).
   the external record before its claim logs `released reason=stale-unclaimed` at
   admission: the abort succeeded and the claim re-read found none.
 
+## Round-10 runtime check
+
+- **External claim at the watchdog.** Publish an unarmed external barrier with a
+  press queued behind it, keep Start from claiming it, and let the 1000 ms
+  watchdog fire with a stale heartbeat. A test hook pauses the watchdog after its
+  first read; claim the record in that window by delaying Start's claim and
+  releasing it during the hook, then let the handler continue. The abort re-read
+  finds the claim and logs `own external ack timeout ... claimed=1
+  decision=reserved reason=claim-after-abort`; the queued press is not served
+  until `own external ack`, then publishes in order. A second run with Start
+  dropping the record before its claim lets the watchdog's abort succeed and
+  re-read find none: `decision=released reason=stale-unclaimed`, then the queued
+  press is served in order.
+
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges

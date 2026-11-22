@@ -15887,6 +15887,35 @@ void HandlePressAck() {
     ServeNextPress(L"ack");
 }
 
+// Keeps an external barrier and gives the queue-age bound its wake. The ack
+// event is the primary release; this poll re-checks the peer, the epoch and the
+// bound for a barrier that must stand past the watchdog's 1000 ms turn. False
+// means no wake could be armed; the caller then gives the held presses their
+// natively served turns.
+bool ReserveExternalBarrier(const OutstandingPress& press, const wchar_t* peer,
+                            uint32_t peerAge, uint32_t epochNow, uint64_t wait,
+                            bool claimed, const wchar_t* reason) {
+    g_pressOutstanding.consumedAwaitingAck = true;
+    TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
+            L"epoch=%u claimed=%d decision=reserved reason=%s",
+            static_cast<long long>(press.seq),
+            static_cast<unsigned long long>(wait), peer, peerAge, epochNow,
+            claimed ? 1 : 0, reason);
+    AgeOutQueuedPress();
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (!window ||
+        SetTimer(window, kPressAckTimer,
+                 static_cast<UINT>(kPressReservePollMs), nullptr) == 0) {
+        TraceLog(L"own external reserve timer failed err=%u seq=%lld",
+                GetLastError(), static_cast<long long>(press.seq));
+        while (g_pressQueueCount > 0) {
+            ServeQueuedOriginal(L"timer-failed");
+        }
+        return false;
+    }
+    return true;
+}
+
 // The ack did not arrive inside its bound. A missing ack is not proof that the
 // controller did nothing: the close may have landed and only its notification
 // been late, and replaying the original then reopens the menu. The timeout reads
@@ -15960,9 +15989,12 @@ void HandlePressAckTimeout() {
         // The takeover itself is native and has no original to replay. Its
         // barrier is cleared by its ack, by a changed activation that can no
         // longer answer it, or by its peer. A claimed barrier is held through a
-        // stale heartbeat; only the withdrawn state (or a change of the
-        // activation) is the proof it cannot be reconciled. An unclaimed one is
-        // released when the tick goes stale: it cannot be applied any more.
+        // stale heartbeat. A stale heartbeat with no claim at the first read is
+        // not proof either: Start may claim before the abort, so the release
+        // uses the admission path's evidence — abort the record, re-read the
+        // claim, and release only when the abort succeeded and no claim landed.
+        // A claim in between, or a record that cannot be aborted, reserves the
+        // barrier; the withdrawn state releases it on its own.
         if (epochChanged) {
             g_pressOutstanding = OutstandingPress{};
             HWND window = g_execWindow.load(std::memory_order_relaxed);
@@ -15980,28 +16012,31 @@ void HandlePressAckTimeout() {
         }
         const bool claimed = taken == press.seq;
         if (peerAlive || (claimed && PeerStateAliveNow())) {
-            TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
-                    L"epoch=%u claimed=%d decision=reserved",
-                    static_cast<long long>(press.seq),
-                    static_cast<unsigned long long>(wait), peer, peerAge,
-                    epochNow, claimed ? 1 : 0);
-            // The presses held behind the barrier still reach their own bound
-            // while it stands; the poll that re-checks the barrier is also the
-            // wake that bound uses.
-            AgeOutQueuedPress();
-            HWND window = g_execWindow.load(std::memory_order_relaxed);
-            if (!window ||
-                SetTimer(window, kPressAckTimer,
-                         static_cast<UINT>(kPressReservePollMs), nullptr) == 0) {
-                // No wake for the queue-age bound: give the held presses their
-                // natively served turns on this one.
-                TraceLog(L"own external reserve timer failed err=%u seq=%lld",
-                        GetLastError(), static_cast<long long>(press.seq));
-                while (g_pressQueueCount > 0) {
-                    ServeQueuedOriginal(L"timer-failed");
-                }
-            }
+            ReserveExternalBarrier(press, peer, peerAge, epochNow, wait, claimed,
+                                   peerAlive ? L"peer-alive" : L"claimed");
             return;
+        }
+        const wchar_t* releaseReason = nullptr;
+        bool claimedNow = claimed;
+        if (!PeerStateAliveNow()) {
+            releaseReason = L"peer-gone";
+        } else {
+            const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+            const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
+            claimedNow = takenAfter == press.seq;
+            if (!PeerStateAliveNow()) {
+                releaseReason = L"peer-gone";
+            } else if (claimedNow) {
+                ReserveExternalBarrier(press, peer, peerAge, epochNow, wait,
+                                       true, L"claim-after-abort");
+                return;
+            } else if (!revoked) {
+                ReserveExternalBarrier(press, peer, peerAge, epochNow, wait,
+                                       false, L"record-moved");
+                return;
+            } else {
+                releaseReason = L"stale-unclaimed";
+            }
         }
         g_pressOutstanding = OutstandingPress{};
         HWND window = g_execWindow.load(std::memory_order_relaxed);
@@ -16012,8 +16047,7 @@ void HandlePressAckTimeout() {
                 L"epoch=%u claimed=%d decision=released reason=%s",
                 static_cast<long long>(press.seq),
                 static_cast<unsigned long long>(wait), peer, peerAge,
-                epochNow, claimed ? 1 : 0,
-                PeerStateAliveNow() ? L"stale-unclaimed" : L"peer-gone");
+                epochNow, claimedNow ? 1 : 0, releaseReason);
         ResumePressQueueAge();
         ServeNextPress(L"timeout");
         return;

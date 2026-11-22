@@ -192,7 +192,13 @@ controller may still apply it, so no replay follows and the next press waits for
 the ack; only a changed epoch or the peer's state going away releases it without
 the ack. A stale heartbeat is not that proof.
 An untaken record is aborted and re-read; the original runs only when the abort
-succeeded and no claim landed.
+succeeded and no claim landed. An `external` record has no original: at the
+watchdog's stale-heartbeat turn its claim is read, the record is aborted, and the
+claim is read again. A claim in between, or a record that cannot be aborted,
+keeps the barrier reserved (`decision=reserved
+reason=claim-after-abort|record-moved`); only an aborted record with no claim
+after the re-read is released (`reason=stale-unclaimed`), and an explicit state
+withdrawal still releases (`reason=peer-gone`).
 
 `0` means no claim has been made. The word is not a seqlock: it is a claim, and no
 two fields must agree. An aborted record stays odd until the next publisher steps

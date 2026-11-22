@@ -381,9 +381,11 @@ serialisation point for the next admitted press — the take alone is not:
   every later publication — a state, not a timer, so it stands even when the
   watchdog cannot be armed (`own external barrier seq=... armed|unarmed`) — so a
   following press cannot overwrite the takeover before Start reads it. The barrier
-  is cleared only by that record's ack or by a peer that is gone/stale; a live but
-  silent peer keeps it (`decision=reserved`), and the takeover has no original to
-  replay.
+  is cleared only by that record's ack, a changed epoch, a peer whose state is
+  gone, or a stale heartbeat after the record is aborted with no claim found by
+  the re-read; a claim in between or an unabortable record keeps it reserved. A
+  live but silent peer keeps it (`decision=reserved`), and the takeover has no
+  original to replay.
 
 An unanswered intent is resolved by the record, not by the heartbeat. The Start
 side claims the sequence before copying and re-checks the claim after the copy; a
