@@ -142,6 +142,30 @@ landed while the panel was still off its rest. Earlier runs at `ad20815` and
 verdicts. The smoke's click helpers hold the left button for 60 ms, so the
 click-away rows are real pointer decisions (`ptr=1`).
 
+### `be0f195`: the front-loaded close and the adopted cold open
+
+`be0f195` replaced the reversed open samples with `start * (1 - openY(i))` for
+the three shell close triggers and made an unowned shown event adopt the resting
+value. Re-measured on the same layout with a screen diff against a closed-desktop
+baseline: the top edge of the panel content in physical px (566 = fully open,
+1706 = at the bar), timer from the trigger.
+
+| run | frames | verdict |
+| --- | --- | --- |
+| Win close | 566 @103, 688 @152, 1344 @205, 1706 @256 | moves in the first frame, monotonic |
+| click-away close | 688 @171, 1496 @231, 1706 @283 | same shape |
+| cold first open | no panel until 553, 1710 @553, 566 @786 | the shell's own slide; `win open adopted reason=unowned`, no settle |
+
+The cold open is the one the bridge answered `own pass trigger=win
+reason=no-peer`; capability arrived with the shell's own `Show`, and the shown
+event now adopts it instead of replaying from 0, so no flash. The full smoke on
+the same tree passed 10/10 with `from=` **0.146, 0.075, 0.004**: the close now
+crosses most of its travel in the first half, so the fixed 120 ms interruption
+lands later in the retract than it did on `75c6067`. Each row still proves the
+cancel (`close ended ... reason=open-cancel`) and ends open; the gesture row's
+0.004 is a reopen that races an almost landed close, not a missed interrupt.
+
+
 ## Touch producers: real digitizer vs injected contact
 
 `tools/inject_swipe.ps1` calls `InjectTouchInput`, but the contact reaches the
