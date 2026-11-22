@@ -115,7 +115,10 @@ closes (`from≈0.94`, `0.92`, `0.02`; each `final=True`). The Win close line is
 executor's ack for the same show sequence. The only first-open exception is the
 cold executor: after an explorer/reload with no recorded launcher thread, the
 first native open creates the window, publishes `exec capable=1`, and the Start
-side advertises; every later trigger is intercepted.
+side advertises; every later trigger is intercepted. `tools/smoke.ps1` warms
+that one press itself (one native open, then its close) before the first row, so
+a run started right after an install measures interception instead of the
+documented pass.
 
 ## Release evidence: the full smoke, 2026-11-22
 

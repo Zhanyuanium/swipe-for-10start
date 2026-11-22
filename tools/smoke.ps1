@@ -38,6 +38,12 @@ switch). The script checks that one of the two files was written during the run
 and otherwise prints the one command that enables the trace and exits non-zero.
 With the trace on it needs no other switch.
 
+A run started on a cold executor — right after an install, or a reload with no
+recorded launcher thread — first performs one native open and its close, because
+the executor window does not exist until the shell's own Show creates it. That
+step is not a row: it only clears the documented first-press exception, so the
+rows below measure interception rather than the cold pass.
+
 The injection geometry is read from the mod's own lines after the warm-up open:
 one `reveal panelTrail` record of that run supplies the axis, band and panel
 rectangle, and a `dismiss` record on the same axis supplies the bar's thickness
@@ -461,9 +467,31 @@ $runMark = Mark
 
 # 0. clean start
 if (State) { [Smoke.Native]::WinTap(); Start-Sleep -Milliseconds 900 }
+
+# The executor capability appears only when the shell's first Show creates the
+# executor window on the recorded launcher thread, so a fresh Start host (an
+# install, or a bridge reload) passes the first press natively. Warm that one
+# press before a row asserts interception: one native open, then the close the
+# now-capable controller performs. The warm-up is not a row and changes no claim.
+function Test-ExecutorCapable {
+    $state = & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'ipc.ps1') -State 2>&1 | Out-String
+    $state = $state -replace "`e\[[0-9;]*m", ''
+    return $state -match 'execCapable\s*:\s*1'
+}
+if (-not (Test-ExecutorCapable)) {
+    Write-Host 'cold executor: one native open, then the close it enables'
+    [Smoke.Native]::WinTap()
+    [void](Wait-For $true 4000)
+    [Smoke.Native]::WinTap()
+    [void](Wait-For $false 4000)
+    Start-Sleep -Milliseconds 400
+    if (-not (Test-ExecutorCapable)) {
+        Write-Host 'warm-up did not produce execCapable=1; the rows below will report the cold path'
+    }
+}
 Add-Row 'starts closed' (Wait-For $false 3000) "state=$(State)"
 
-# 1. the keyboard path opens. This warm-up open is also what refreshes the mod's
+# 1. the keyboard path opens. This row's open is also what refreshes the mod's
 # geometry, so the layout is read *after* it: the geometry snapshot a run starts
 # with can belong to a rotated trace or a bar that moved since.
 $m = Mark
