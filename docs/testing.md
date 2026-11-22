@@ -244,6 +244,16 @@ could act, or before its confirmation could land).
   `own press latched` (or a served press), never `exec pass hide ...
   reason=executor` on the native Hide.
 
+## Round-6 runtime checks
+
+- **Claimed 1500 ms (B).** Claim press 1 and pause after the copy for longer than
+  the queue bound, with its heartbeat kept fresh. The timeout logs
+  `decision=consumed awaiting=ack`; at 1500 ms there is no `own press fallback
+  ... reason=queue-wait` and no press 2 publication. When the pause ends, press 1
+  applies and acks, then press 2 is dequeued `reason=ack` and publishes the
+  opposite direction. Order preserved; the bound restarts when press 1's slot is
+  released.
+
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges

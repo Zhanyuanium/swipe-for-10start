@@ -657,7 +657,10 @@ probe or timer failure is answered `unknown`.
   press still unpublished past its 1500 ms wait runs the shell's original
   primitive under `t_execCall` (`reason=queue-wait`), and the reserve poll
   re-evaluates that bound so a press behind a held slot does not wait for a serve.
-  The Start side claims the
+  The bound is paused while a normal press is executing (`servableTick=0`): the
+  head's clock restarts when that slot is released, so a press behind a claimed
+  predecessor is never aged out ahead of it. An external barrier is not an
+  executing press, so its held presses keep the bound. The Start side claims the
   sequence before it copies the record and re-checks the claim after the copy
   (`intent drop ... reason=record-gone` on a revocation). An ack timeout is then
   resolved by proof: `taken == seq` is `decision=consumed awaiting=ack` — the

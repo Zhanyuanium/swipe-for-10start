@@ -99,7 +99,10 @@ decides from the direction the controller published while applying the press
 before it. An arriving press on a full queue is dropped with the depth in its
 line and is never executed ahead of the queue; a press still unpublished past
 1500 ms runs the shell's own original primitive under the executor guard
-(`own press fallback ...`). An `external` intent clears the queue and the latch,
+(`own press fallback ...`), and the reserve poll re-evaluates that bound. The
+bound is paused while a normal press is executing: its clock restarts when that
+slot is released, so the next press is never aged out ahead of the claimed one.
+An `external` intent clears the queue and the latch,
 is published at once, and sets the same barrier as a state, not a timer: it
 stands even when the watchdog cannot be armed (`own external barrier ... armed`
 or `unarmed`) and is cleared only by its ack (`own external ack ... reconciled`),

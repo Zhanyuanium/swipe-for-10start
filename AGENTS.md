@@ -140,7 +140,11 @@ replay: the arriving press on a full queue is dropped with the depth in its line
 still unpublished past its 1500 ms wait runs the shell's own original primitive
 under the executor guard (`reason=queue-wait`), and that bound is evaluated by
 the reserve poll as well, so a press behind a held slot does not wait for a
-serve. The Start side claims the
+serve. The bound is **paused while a normal press is executing** (`servableTick`
+0 until the slot is released): the head's 1500 ms restarts then, so a press that
+waited behind a claimed predecessor is never aged out ahead of it. An external
+barrier is not an executing press, so the presses held behind it keep the bound.
+The Start side claims the
 sequence **before** it copies the record and re-checks the claim after the copy;
 a record the bridge aborted in between is dropped (`intent drop ...
 reason=record-gone`). The ack timeout then decides by proof, not by the

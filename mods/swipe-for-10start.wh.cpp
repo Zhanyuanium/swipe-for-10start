@@ -14797,6 +14797,10 @@ struct QueuedPress {
     uint32_t flags = 0;
     uint32_t admittingEpoch = 0;
     uint64_t admittedTick = 0;
+    // When this press became the head with no normal press executing. The 1500 ms
+    // queue bound counts from here, not from admission behind an older press; 0
+    // means the head's bound is paused. Launcher thread only.
+    uint64_t servableTick = 0;
 };
 
 const wchar_t* PressEntryName(int32_t entry) {
@@ -15284,6 +15288,16 @@ bool QueuePress(const QueuedPress& press, const wchar_t* source) {
     const int tail = (g_pressQueueHead + g_pressQueueCount) % kPressQueueCapacity;
     g_pressQueue[tail] = press;
     ++g_pressQueueCount;
+    // A press that arrives as the head starts its own bound now, unless a normal
+    // press is executing: that press's direction is still in flight, and aging
+    // the next one out natively would run it ahead of that direction. An external
+    // barrier is not an executing press, so the held presses keep their bound
+    // behind it.
+    const bool executing =
+        g_pressOutstanding.pending && !g_pressOutstanding.external;
+    if (g_pressQueueCount == 1 && !executing) {
+        g_pressQueue[tail].servableTick = GetTickCount64();
+    }
     TraceLog(L"own press queued trigger=%s entry=%s q=%d outstanding=%d "
             L"seq=%lld source=%s",
             PressTriggerName(press.trigger), PressEntryName(press.entry),
@@ -15291,8 +15305,8 @@ bool QueuePress(const QueuedPress& press, const wchar_t* source) {
             static_cast<long long>(g_pressOutstanding.seq), source);
     if (g_pressOutstanding.pending && g_pressOutstanding.consumedAwaitingAck &&
         !ArmConsumedPressPoll()) {
-        // Without a wake the age bound would never run. Serving the head on this
-        // turn is the same fallback the bound would perform.
+        // The ack event is still the primary release; without this poll the peer
+        // and epoch would only be re-checked on the next admission.
         TraceLog(L"own press poll timer failed err=%u q=%d", GetLastError(),
                 g_pressQueueCount);
     }
@@ -15306,6 +15320,7 @@ void RequeuePressFront(const QueuedPress& press) {
     g_pressQueueHead =
         (g_pressQueueHead + kPressQueueCapacity - 1) % kPressQueueCapacity;
     g_pressQueue[g_pressQueueHead] = press;
+    g_pressQueue[g_pressQueueHead].servableTick = GetTickCount64();
     ++g_pressQueueCount;
 }
 
@@ -15319,28 +15334,46 @@ void ServeQueuedOriginal(const wchar_t* reason) {
     const QueuedPress press = g_pressQueue[g_pressQueueHead];
     g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
     --g_pressQueueCount;
+    if (g_pressQueueCount > 0) {
+        g_pressQueue[g_pressQueueHead].servableTick = GetTickCount64();
+    }
+    const uint64_t ageStart =
+        press.servableTick != 0 ? press.servableTick : press.admittedTick;
     TraceLog(L"own press fallback trigger=%s entry=%s reason=%s wait=%llu q=%d",
             PressTriggerName(press.trigger), PressEntryName(press.entry), reason,
-            static_cast<unsigned long long>(GetTickCount64() -
-                                            press.admittedTick),
+            static_cast<unsigned long long>(GetTickCount64() - ageStart),
             g_pressQueueCount);
     RunPressOriginal(press, reason);
 }
 
 // Runs the oldest queued press natively once it has outlived the queue bound.
-// True means one press was dequeued and served.
+// True means one press was dequeued and served. A head whose bound is paused
+// (0) is behind an executing press and is never aged out: ordering outranks the
+// bound.
 bool AgeOutQueuedPress() {
     if (g_pressQueueCount == 0) {
         return false;
     }
     const QueuedPress& head = g_pressQueue[g_pressQueueHead];
+    if (head.servableTick == 0) {
+        return false;
+    }
     const uint64_t now = GetTickCount64();
-    if (now <= head.admittedTick ||
-        now - head.admittedTick <= kPressQueueWaitMs) {
+    if (now <= head.servableTick ||
+        now - head.servableTick <= kPressQueueWaitMs) {
         return false;
     }
     ServeQueuedOriginal(L"queue-wait");
     return true;
+}
+
+// Releases the head's queue-age bound after the outstanding slot is free: the
+// next press's 1500 ms counts from here, not from the time it spent behind the
+// press that was executing. Launcher thread only.
+void ResumePressQueueAge() {
+    if (g_pressQueueCount > 0) {
+        g_pressQueue[g_pressQueueHead].servableTick = GetTickCount64();
+    }
 }
 
 // Publishes one decision and makes it the outstanding press. The ack timer is
@@ -15381,6 +15414,11 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
     g_pressOutstanding.publishedTick = GetTickCount64();
     g_pressOutstanding.press = press;
     g_pressOutstanding.publishedEpoch = publishedEpoch;
+    // The next press's queue-age bound is paused while this one executes: its
+    // 1500 ms restarts when this press's slot is released.
+    if (g_pressQueueCount > 0) {
+        g_pressQueue[g_pressQueueHead].servableTick = 0;
+    }
     TraceLog(L"own press published trigger=%s entry=%s seq=%lld kind=%s q=%d "
             L"source=%s",
             PressTriggerName(press.trigger), PressEntryName(press.entry),
@@ -15398,11 +15436,15 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
 // close parked on the open-generation gate, and the gate's timer owns its turn.
 bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
     const uint64_t now = GetTickCount64();
-    if (now > press.admittedTick && now - press.admittedTick > kPressQueueWaitMs) {
+    // The bound counts from when this press became the servable head, not from
+    // its admission behind a press that was still executing.
+    const uint64_t ageStart =
+        press.servableTick != 0 ? press.servableTick : press.admittedTick;
+    if (now > ageStart && now - ageStart > kPressQueueWaitMs) {
         TraceLog(L"own press fallback trigger=%s entry=%s reason=queue-wait "
                 L"wait=%llu",
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
-                static_cast<unsigned long long>(now - press.admittedTick));
+                static_cast<unsigned long long>(now - ageStart));
         RunPressOriginal(press, L"queue-wait");
         return true;
     }
@@ -15572,6 +15614,10 @@ void ServeNextPress(const wchar_t* reason) {
         const QueuedPress press = g_pressQueue[g_pressQueueHead];
         g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
         --g_pressQueueCount;
+        if (g_pressQueueCount > 0) {
+            // The next press is the head now; its own bound starts here.
+            g_pressQueue[g_pressQueueHead].servableTick = GetTickCount64();
+        }
         TraceLog(L"own press dequeued trigger=%s entry=%s q=%d reason=%s "
                 L"wait=%llu",
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
@@ -15606,6 +15652,7 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
         }
         // The presses that queued behind the barrier have no other wake: serve
         // them now, each falling back to its own primitive under the guard.
+        ResumePressQueueAge();
         ServeNextPress(L"external-peer-gone");
     }
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
@@ -15651,6 +15698,7 @@ void HandlePressAck() {
                 static_cast<unsigned long long>(GetTickCount64() -
                                                 press.publishedTick));
     }
+    ResumePressQueueAge();
     ServeNextPress(L"ack");
 }
 
@@ -15706,6 +15754,7 @@ void HandlePressAckTimeout() {
                     static_cast<unsigned long long>(GetTickCount64() -
                                                     press.publishedTick));
         }
+        ResumePressQueueAge();
         ServeNextPress(L"late-ack");
         return;
     }
@@ -15737,6 +15786,7 @@ void HandlePressAckTimeout() {
                     static_cast<long long>(press.seq),
                     static_cast<unsigned long long>(wait), peer, peerAge,
                     press.publishedEpoch, epochNow);
+            ResumePressQueueAge();
             ServeNextPress(L"epoch");
             return;
         }
@@ -15774,6 +15824,7 @@ void HandlePressAckTimeout() {
                 static_cast<long long>(press.seq),
                 static_cast<unsigned long long>(wait), peer, peerAge,
                 epochNow);
+        ResumePressQueueAge();
         ServeNextPress(L"timeout");
         return;
     }
@@ -15796,6 +15847,7 @@ void HandlePressAckTimeout() {
                     static_cast<unsigned long long>(wait),
                     static_cast<long long>(taken), peer, peerAge,
                     press.publishedEpoch, epochNow);
+            ResumePressQueueAge();
             ServeNextPress(L"epoch");
             return;
         }
@@ -15815,12 +15867,12 @@ void HandlePressAckTimeout() {
         }
         AgeOutQueuedPress();
         if (g_pressQueueCount > 0 && !ArmConsumedPressPoll()) {
-            // Without a wake the queued presses would park past their bound.
-            TraceLog(L"own press poll timer failed err=%u seq=%lld",
-                    GetLastError(), static_cast<long long>(press.seq));
-            while (g_pressQueueCount > 0) {
-                ServeQueuedOriginal(L"timer-failed");
-            }
+            // The ack is still the release. Without this poll the peer and epoch
+            // are only re-checked on the next admission; never drain here, because
+            // the claimed press may still publish the direction.
+            TraceLog(L"own press poll timer failed err=%u seq=%lld q=%d",
+                    GetLastError(), static_cast<long long>(press.seq),
+                    g_pressQueueCount);
         }
         return;
     }
@@ -15844,6 +15896,7 @@ void HandlePressAckTimeout() {
                 static_cast<unsigned long long>(wait),
                 static_cast<long long>(taken), peer, peerAge,
                 press.publishedEpoch, epochNow);
+        ResumePressQueueAge();
         ServeNextPress(L"timeout");
         return;
     }
@@ -15860,6 +15913,7 @@ void HandlePressAckTimeout() {
                 static_cast<unsigned long long>(wait),
                 static_cast<long long>(takenAfter), peer, peerAge,
                 press.publishedEpoch, epochNow);
+        ResumePressQueueAge();
         ServeNextPress(L"timeout");
         return;
     }
@@ -15872,6 +15926,7 @@ void HandlePressAckTimeout() {
             static_cast<long long>(taken), peer, peerAge, press.publishedEpoch,
             epochNow, epochChanged ? L"epoch-changed" : L"revoked");
     RunPressOriginal(press.press, L"no-ack");
+    ResumePressQueueAge();
     ServeNextPress(L"timeout");
 }
 
