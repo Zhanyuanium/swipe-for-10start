@@ -333,6 +333,13 @@ Win press opens exactly once; the transition itself is never synthesized.
   depend on the bar.
 - The bar's 48 DIP thickness (96 physical at 200 %) and the 200 % scaling are
   measured, not assumed.
+- **One upright primary display.** Every measurement above is one 2880x1800
+  primary panel at 200 %, with the bar on the measured edge. A taskbar on a
+  secondary monitor and any non-zero rotation have no run. The mod derives the
+  axis, band, panel rectangle and scale from the live bar and panel, so the
+  mapping is not hard-coded to this monitor; nothing proves the digitizer's
+  virtual-desktop coordinates, the secondary monitor's scale or the shell's
+  reveal in those layouts. Treated as unsupported until measured.
 
 ## Hardware
 

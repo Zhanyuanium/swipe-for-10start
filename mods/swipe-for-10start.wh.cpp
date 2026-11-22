@@ -33,8 +33,8 @@ What it does:
 What you need:
 
 - Windows 11, x86-64, with ExplorerPatcher's legacy Start
-  (`Start_ShowClassicMode=1`). Verified on build 26300.9974 with
-  ExplorerPatcher 26100.9711.
+  (`Start_ShowClassicMode=1`). Verified on build 26300.10075
+  (`twinui.pcshell.dll` fixed 10.0.26100.10068) with ExplorerPatcher 26100.9711.
 - Windhawk 2.0 or later and a touchscreen or pen.
 
 Install **Legacy Start Swipe** from Windhawk and enable it. One mod covers both
@@ -48,6 +48,7 @@ Settings:
   finger, as a percentage of the finger's speed: 0 starts from a standstill,
   100 continues at that speed, up to 300 snaps it away. Windows-key opens and
   closes start from rest.
+
 Known limits:
 
 - The shell owns the reveal, so the first frame can arrive about a quarter of a
@@ -55,9 +56,12 @@ Known limits:
 - If the launcher's private symbols or the menu layout are unavailable, the mod
   steps aside and the shell handles every press natively; the Start side also
   withdraws while the menu's root is replaced or a failed write invalidates it.
-- Tested on one 2880x1800 display at 200 %: the live left docked taskbar and,
-  earlier, the bottom layouts. The gesture reads the taskbar's edge rather than
-  assuming a side.
+- Tested on one upright 2880x1800 primary display at 200 %: the live left docked
+  taskbar and, earlier, the bottom layouts. The gesture reads the taskbar's edge
+  rather than assuming a side.
+- A taskbar on a secondary monitor and display rotation are unverified and
+  unsupported: no measurement covers them, so the mod may map the finger wrong
+  there.
 
 The repository has the [user guide](https://github.com/Zhanyuanium/swipe-for-10start#readme)
 and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-for-10start/blob/main/docs/limits.md).

@@ -112,6 +112,8 @@ without an Explorer restart on this build.
   side runs the same code path and was exercised earlier but is not verified on
   the current setup. **Auto-hide** is supported (it is the daily
   configuration).
+- **One upright display.** A taskbar on a secondary monitor or a rotated display
+  is unverified and unsupported; every measurement is the primary panel.
 - **Touch** works. **Pen** input is decoded (hover is ignored) but has not yet
   been exercised by hand.
 - On a top or bottom taskbar, a vertical swipe inside the open menu scrolls
