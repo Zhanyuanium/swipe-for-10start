@@ -8,7 +8,9 @@ menu opens following your finger; drag the open menu back toward that edge and
 it slides away and closes. Keyboard opens and closes get the same animation.
 By Zhanyuanium, distributed as a Windhawk mod.
 
-![Following the finger and reversing a close](docs/images/demo.gif)
+![Bottom taskbar: the menu follows the finger and a close is reversed](docs/images/demo-bottom.gif)
+
+![Left taskbar: the same gesture](docs/images/demo-left.gif)
 
 ## What you need
 

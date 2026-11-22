@@ -101,6 +101,13 @@ foreach ($path in @($readmeEnPath, $readmeZhPath)) {
 $readmeBlock = [IO.File]::ReadAllText($readmeEnPath) +
     "`n`n---`n`n" +
     [IO.File]::ReadAllText($readmeZhPath)
+# The mod page carries both languages in one block, so the repository's
+# language-switch line would be a dead link there. Drop that first line (and the
+# blank line after it) from each guide; the repo pages keep their own.
+$readmeBlock = [regex]::Replace(
+    $readmeBlock,
+    '(?m)^(\*\*English\*\* \| \[简体中文\]\([^)]*\)|\[English\]\([^)]*\) \| \*\*简体中文\*\*)\r?\n\r?\n',
+    '')
 
 $cli = $null
 if ($isStore) { $cli = Resolve-WindhawkCli }

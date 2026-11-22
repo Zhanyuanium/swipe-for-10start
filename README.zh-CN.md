@@ -4,7 +4,9 @@
 
 ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；本模组为它加上触摸和手写笔滑动手势。从任务栏所在的屏幕边缘划入，菜单会跟随手指打开；把已打开的菜单往该边缘拖回，菜单会滑出并关闭。用键盘打开或关闭菜单时播放同一套动画。由 Zhanyuanium 开发，以 Windhawk 模组形式发布。
 
-![跟随手指与反转关闭](docs/images/demo.gif)
+![任务栏在底部：菜单跟随手指，关闭被反转](docs/images/demo-bottom.gif)
+
+![任务栏在左侧：同样的手势](docs/images/demo-left.gif)
 
 ## 你需要什么
 
