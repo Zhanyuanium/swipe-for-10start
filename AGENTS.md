@@ -519,9 +519,9 @@ are implemented and **unverified on this machine**: the code path is the same
   written only while `DiagnosticTrace` is on, one file per role, capped at
   20,000 lines. The smoke requires it and otherwise prints the one command that
   enables it.
-- The image is not pinned. Unloading joins the two owned threads, runs the UI
-  teardown as one synchronous `SendMessage` round trip on the CoreWindow thread,
-  waits once on the counted entries and follows with one empty round trip,
+- The image is not pinned. Unloading joins the two owned threads, sends the UI
+  teardown to the module's own hidden window on the XAML UI thread, waits on the
+  entry count as a predicate and follows with one empty turn,
   destroys the launcher window with a synchronous `SendMessage` (no window-gone
   event), destroys the raw-input window, and unregisters both fixed classes with
   one checked call under `&__ImageBase` before the channel closes. Every

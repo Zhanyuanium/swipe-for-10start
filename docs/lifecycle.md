@@ -46,22 +46,28 @@ reachable.
    holds this image's procedure. The hook goes before the event handle it
    signals: a callback that ran after the close would set a recycled handle, and
    both belong to this thread.
-3. **`Wh_ModUninit`** runs one synchronous UI turn with a `SendMessage` round
-   trip to the CoreWindow (the window recorded when `PrepareRootElement` first
-   registers `Loaded`), or inline when the unload already is that thread. The
-   turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated` and scroller
+3. **`Wh_ModUninit`** sends one synchronous teardown message to this module's own
+   hidden message-only window on the XAML UI thread (created by
+   `PrepareRootElement` before `Loaded`; the CoreWindow is only read for the cloak
+   and bounds), or runs the turn inline when the unload already is that thread.
+   The turn revokes the `Loaded`, `SizeChanged`, `LayoutUpdated` and scroller
    `ViewChanged` handlers, detaches the settle batch's `Completed`, stops the
    animations, restores resting `Progress` and the neutral translation, resets
    the scroller watches and drops the UI-owned composition/root/dispatcher
    references. The message returns only after the turn and its delegate thunks
-   have returned. A destroyed window is the thread-gone case, not a wait.
-4. The counted **module entries** are drained with one event wait: a batch
-   completion the compositor already dispatched keeps the count up until it
-   returns. Because the lease is released inside its destructor, one more
-   synchronous empty UI turn follows, so the UI thread has left every earlier
-   callback before the image is freed. A genuine XAML revoke failure blocks once
+   have returned. A window that is gone cannot run the turn; the counts below are
+   then the whole proof, never the window's absence.
+4. **The counts are the proof on every path.** The module-entry count is the
+   predicate: wait on the event, re-check, and repeat until it is actually zero
+   (the event is auto-reset, so a pending signal is not a zero). Every XAML
+   registration must also be zero. One empty synchronous turn on the same window
+   follows when it exists, so the UI thread has left the releasing destructor and
+   every earlier callback; a window that is gone skips only that turn, never the
+   counts. A genuine XAML revoke failure blocks once
    (`unload blocked reason=xaml revokes remain`); it is not polled.
-5. Only then are the IPC view and the thread/stop/entry handles closed.
+5. The rendezvous window is destroyed with its own message, its class is
+   unregistered under `&__ImageBase`, and only then are the IPC view and the
+   thread/stop/entry handles closed.
 
 `[[clang::no_destroy]]` is on `g_root`, `g_loadedRoot`, `g_sizeRoot`,
 `g_layoutRoot`, `g_dispatcher`, `g_compositor`, `g_state`, `g_visual`,
@@ -73,24 +79,26 @@ them explicitly on the UI thread.
 ## Explorer (explorer.exe)
 
 1. **`Wh_ModBeforeUninit`** takes the symbol-install lock, sets `g_disabled`,
-   clears `g_execReady`, clears the published `execCapable` word and signals
-   `g_execStopEvent`. Every hook and the
+   clears `g_execReady`, recomputes the published `execCapable` word and signals
+   `g_execStopEvent`. The `exec capable=0` line appears only when the word
+   actually changes. Every hook and the
    executor's WndProc reads `g_disabled` and passes; the worker's wait sees the
    stop before the `Exec` event. The launcher hooks are applied inside the same
    lock as their resolution, so a stop either waits for the complete install or
    makes the install refuse; the worker never applies hooks after this point.
-2. **`Wh_ModUninit`** joins the posting worker **INFINITE**. The worker never
-   calls the launcher synchronously and never waits for an owner callback, so
-   this join cannot be held up by the launcher thread. The window destruction
-   publishes the terminal clear again (`exec capable=0 reason=window-gone`), and
-   the class teardown writes the last `exec capable=0 reason=uninit` before the
-   section is closed.
+2. **`Wh_ModUninit`** joins the posting worker **INFINITE**. The worker only
+   posts commands; it does not create the executor window. The join stops new
+   posts but says nothing about creation, which happens on the launcher thread
+   from a launcher entry. The window destruction recomputes the capability (the
+   line appears only on a change), and the class teardown writes the last
+   recomputation before the section is closed.
 3. The one published HWND is destroyed synchronously on its owner thread:
    directly when the unload already runs there, otherwise with
    `SendMessage(kExecTeardownMessage)`, which kills the dismiss/probe/latch
    timers and calls `DestroyWindow`; the call returns after `WM_NCDESTROY` and
    the window publication is cleared. No completion event or wait is used. A
-   destroyed window means the owner thread is gone, not a hang.
+   destroyed window means this activation's window is gone, not that the
+   launcher thread is gone; a window that does not answer blocks.
 4. The fixed window class is unregistered under the same instance that registered
    it (`&__ImageBase`) only after the window is gone. Registration treats
    `ERROR_CLASS_ALREADY_EXISTS` as failure: a surviving class from an earlier
@@ -101,14 +109,18 @@ them explicitly on the UI thread.
 Only `OnHotkeyInvoke`, `OnStartButtonPressed` and the manager's `Show` may adopt
 an unknown launcher thread. `Dismiss`/`ShowStartView` called from a COM/taskbar
 thread that does not pump pass natively instead of creating an executor window
-there; the next `Show`/Win entry records the real launcher thread.
+there. While capability is 0 the Win hook passes its press natively too, so a
+Win entry alone cannot bootstrap adoption: the shell's own `ShowStartView` call
+reaches `CStartExperienceManager::Show`, whose hook records the launcher thread
+and creates the window; the next press is then the controller's.
 
 The old creator reservation, admission flag, stop target, reaper, creator drain
-and `CloseCallLease` count are **gone**. Two effects replace them: the worker is
-joined before the window is destroyed, and the window is destroyed before the
-class is unregistered. A creation in flight is covered by the join (the worker is
-the only creator) and by the fixed class ownership (a second activation cannot
-start while the first still owns the class).
+and `CloseCallLease` count are **gone**. The worker is joined before the window is
+destroyed, and the window is destroyed before the class is unregistered. The join
+stops posting, not creation; a creation that races the teardown leaves its window
+owned by the class, and the class unregister then blocks instead of freeing under
+it. The fixed class ownership also keeps a second activation from starting while
+the first still owns the class.
 
 ## The host's boundary
 

@@ -117,10 +117,14 @@ not rely on the asymmetry: every command runs on the launcher thread.
 
 Shape: a hidden message-only window owned by the mod, created only from a known
 launcher entry — `OnHotkeyInvoke`, `OnStartButtonPressed`, the manager's `Show`
-or the worker's targeted `WM_GETMESSAGE` adopts the thread (`exec launcher
-thread`); a `Dismiss`/`ShowStartView` on an unknown thread never does, and a
+or a targeted `WH_GETMESSAGE` hook already installed for the recorded launcher
+thread (`exec launcher thread`); a `Dismiss`/`ShowStartView` on an unknown thread
+never does, and a
 window is never created from the `LoadLibraryExW` hook,
-which runs on whichever thread loaded twinui. A worker waits on the channel event
+which runs on whichever thread loaded twinui. While capability is 0 the Win hook
+passes its press natively, so a Win entry alone cannot bootstrap adoption; the
+shell's forwarded `Show` reaches the manager's `Show` hook, which records the
+thread and creates the window. A worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
 an empty stack. The window class is one fixed name
 (`WindhawkSwipeFor10Start.Executor`) registered under `&__ImageBase`;
@@ -134,9 +138,13 @@ otherwise with a synchronous `SendMessage(kExecTeardownMessage)` whose handler
 calls `DestroyWindow`; the call returns after `WM_NCDESTROY`. No window-gone event
 is used. The class is unregistered under the same `&__ImageBase`
 instance only after the window is gone, and the worker/stop handles
-and the channel close last. The old creator reservation, admission flag, creator
-drain, reaper and `CloseCallLease` count are gone; the join and the class
-ownership are the barriers. A window or worker that does not go away blocks the
+and the channel close last. A destroyed window says this activation's window is
+gone, not that the launcher thread is gone. The old creator reservation,
+admission flag, creator
+drain, reaper and `CloseCallLease` count are gone. The join stops posting, not
+creation: a creation that races the teardown leaves its window owned by the
+class, so the unregister blocks instead of freeing under it. A window or worker
+that does not go away blocks the
 unload rather than returning success into an image it still points at. The
 procedure also refuses every ordinary dispatch for an HWND other than the
 published current one, so a stale message cannot act on this activation.

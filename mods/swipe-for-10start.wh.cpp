@@ -18549,9 +18549,9 @@ void DestroyExecutorWindow() {
 }
 
 // Unregisters the fixed class under the instance that registered it. The window
-// is gone by now, so no procedure can still run. A failure other than "already
-// gone" leaves the WndProc reachable through the class, so the unload keeps
-// trying instead of returning into an image the class still points at.
+// is gone by now, so no procedure can still run. One checked call: a failure
+// other than "already gone" leaves the WndProc reachable through the class and
+// blocks the unload once instead of returning into that image.
 void UnregisterExecutorClass() {
     if (!g_execClassRegistered) {
         return;

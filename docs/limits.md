@@ -63,12 +63,13 @@
 - **A teardown that cannot be proved gone blocks the unload.** The image is not
   pinned, so returning while a mod-owned thread, delegate or owner window is
   still reachable would hand it unmapped code. The unload joins the two owned
-  threads `INFINITE`, runs the UI teardown as one synchronous `SendMessage`
-  round trip on the CoreWindow thread (the call returns after the turn), waits
-  once on the module-entry event, then runs one more empty round trip so the
-  releasing destructor has returned. The executor window is destroyed by a
-  synchronous `SendMessage` whose handler calls `DestroyWindow`, and the class
-  unregister is one checked call. A permanently hung UI thread, a worker that
+  threads `INFINITE`, sends the UI teardown to the module's own hidden window on
+  the XAML UI thread (the call returns after the turn), waits on the entry count
+  as a predicate (a stale auto-reset signal is re-checked, not trusted), then
+  runs one more empty message so the releasing destructor has returned. The
+  executor window is destroyed by a synchronous `SendMessage` whose handler
+  calls `DestroyWindow`, and the class unregister is one checked call. A
+  permanently hung UI thread, a worker that
   does not exit or a class that cannot be unregistered therefore blocks the
   disable instead of corrupting the process. There is no bounded-wait success
   path and no residual return.

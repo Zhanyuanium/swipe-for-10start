@@ -401,12 +401,13 @@ unregisters raw input, releases the
 `&__ImageBase` before exiting; a failed unregister blocks the unload once, never
 returned as success. Registration is fixed-name and treats
 `ERROR_CLASS_ALREADY_EXISTS` as failure, exactly as the executor's class does.
-`Wh_ModUninit` runs the UI teardown as one synchronous `SendMessage` round trip
-on the CoreWindow thread recorded before `Loaded` was registered: it revokes the
-XAML handlers and the settle batch, restores resting progress and the neutral
-translation, resets the scroller watches and drops the UI-owned objects
-(`[[clang::no_destroy]]` protects a skipped uninit, not a normal one). The counted
-module entries are waited once and followed by one empty round trip; the IPC view
+`Wh_ModUninit` sends the UI teardown to this module's own hidden window on the
+XAML UI thread recorded before `Loaded` was registered, or runs it inline there:
+it revokes the XAML handlers and the settle batch, restores resting progress and
+the neutral translation, resets the scroller watches and drops the UI-owned
+objects (`[[clang::no_destroy]]` protects a skipped uninit, not a normal one).
+The counted module entries are waited for as a predicate and followed by one
+empty turn; the IPC view
 and handles close last. A revoke or thread proof that cannot be obtained blocks
 the unload once rather than returning success. The root hook is resolved by
 public symbol
@@ -800,9 +801,9 @@ creator drain and reaper, and every residual/deferred-success return. `kExecTear
 and the destructive first-frame work remain.
 
 **Lifecycle.** No pin, no instance guard, no re-enable state. The Start side joins
-its input thread `INFINITE` in BeforeUninit, runs the UI teardown as one
-synchronous `SendMessage` turn on the recorded UI thread, waits once for the
-counted batch entries and follows with one empty turn, then closes the channel.
+its input thread `INFINITE` in BeforeUninit, sends the UI teardown to its own
+window on the recorded UI thread, waits on the counted batch entries as a
+predicate and follows with one empty turn, then closes the channel.
 The bridge joins its posting worker `INFINITE`, destroys the one published window
 on the launcher thread with a synchronous `SendMessage(kExecTeardownMessage)`
 (its handler calls `DestroyWindow`; no window-gone event exists), unregisters the
