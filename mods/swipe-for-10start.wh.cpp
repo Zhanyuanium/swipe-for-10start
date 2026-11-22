@@ -14256,7 +14256,7 @@ OwnSnapshot OwnSync(void* launcher) {
 // The one toggle decision, defined below with the press latch and the press
 // queue. The Hide entry owns the click-away Hide and reaches it from here; every
 // other entry calls it directly.
-bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
+void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags,
                     uint32_t admittingEpoch, int32_t entry);
 
@@ -14618,13 +14618,10 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         // `showMethod` is the Start button's Show(11); the click's ShowStartView
         // reopens through the executor. The close keeps 7 as evidence in the
         // intent; the Start side maps it to the executor's 6.
-        if (!DispatchToggle(clickOwn, kSwipeTriggerClickAway,
-                            kSwipeShowMethodStartButton,
-                            kDismissMethodClickAway, 0, PeerEpochNow(),
-                            kPressEntryHide)) {
-            callOriginal();
-            OwnResyncFromState(self);
-        }
+        DispatchToggle(clickOwn, kSwipeTriggerClickAway,
+                       kSwipeShowMethodStartButton,
+                       kDismissMethodClickAway, 0, PeerEpochNow(),
+                       kPressEntryHide);
         return;
     }
 
@@ -15127,7 +15124,7 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
 // behind an outstanding one is decided from the direction the controller
 // published while applying the press before it. `admission` is the hook's own
 // snapshot for the immediate press; a queued press reacquires it on this thread.
-bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
+void ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
     const uint64_t now = GetTickCount64();
     if (now > press.admittedTick && now - press.admittedTick > kPressQueueWaitMs) {
         TraceLog(L"own press fallback trigger=%s entry=%s reason=queue-wait "
@@ -15135,7 +15132,7 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
                 static_cast<unsigned long long>(now - press.admittedTick));
         RunPressOriginal(press, L"queue-wait");
-        return true;
+        return;
     }
     if (!PeerAliveNow() || PeerEpochNow() != press.admittingEpoch ||
         !BridgeCanServe()) {
@@ -15144,7 +15141,7 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
                 static_cast<unsigned long long>(now - press.admittedTick));
         RunPressOriginal(press, L"peer-gone");
-        return true;
+        return;
     }
     uint64_t state = 0;
     void* launcher = LauncherNow(&state);
@@ -15154,7 +15151,7 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 PressTriggerName(press.trigger), PressEntryName(press.entry),
                 static_cast<unsigned long long>(state));
         RunPressOriginal(press, L"not-ready");
-        return true;
+        return;
     }
     const OwnSnapshot own = admission ? *admission : OwnSync(launcher);
     if (!own.ready) {
@@ -15162,14 +15159,14 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 L"reason=state-not-ready",
                 PressTriggerName(press.trigger), PressEntryName(press.entry));
         RunPressOriginal(press, L"state-not-ready");
-        return true;
+        return;
     }
     if (g_pressLatch.pending) {
         // The latch is earlier presses the landing still owes, not a stale slot
         // for this one to replace. Appending keeps the count and the order: the
         // serve publishes the first open and the remainder follows it.
         LatchPress(own, press);
-        return true;
+        return;
     }
     // One sample of the controller's direction drives both the decision and its
     // line. Reading it twice could log a direction the decision never used.
@@ -15199,7 +15196,7 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                     L"reason=no-panel state=%u dir=%d",
                     own.state, direction);
             RunPressOriginal(press, L"no-panel");
-            return true;
+            return;
         }
     } else {
         kind = IntentShouldClose(own, direction) ? kSwipeIntentClose
@@ -15226,7 +15223,7 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 kind == kSwipeIntentClose ? L"close" : L"open", method,
                 press.flags);
         RunPressOriginal(press, L"unsupported");
-        return true;
+        return;
     }
     // One decision line for every trigger, written when the press actually
     // decides. A press queued behind another therefore logs its own direction,
@@ -15247,12 +15244,11 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
         // latched. A show from either of these states is served at the landing
         // instead of being published into a no-op.
         LatchPress(own, press);
-        return true;
+        return;
     }
     if (PublishPressIntent(kind, press, L"press") <= 0) {
         RunPressOriginal(press, L"publish");
     }
-    return true;
 }
 
 // Drains the queue while nothing is outstanding. A latch, a drop and a fallback
@@ -15276,12 +15272,12 @@ void ServeNextPress(const wchar_t* reason) {
 // One admitted press. The immediate press decides on this hook's own snapshot;
 // a press behind it is queued and decides later. A press that cannot be queued
 // is dropped, never executed out of order; nothing waits on the launcher hook.
-bool AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
+void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
-        return ServePress(press, &own);
+        ServePress(press, &own);
+        return;
     }
     QueuePress(press, L"press");
-    return true;
 }
 
 // The intent ack for the outstanding press. The worker posts this to the
@@ -15424,12 +15420,12 @@ void HandlePressAckTimeout() {
 //
 // A newer press does not supersede a latch: it is appended, because the latch
 // is a count of toggles the user already asked for.
-bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
+void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags,
                     uint32_t admittingEpoch, int32_t entry) {
     const QueuedPress press{trigger, entry, showMethod, dismissMethod, flags,
                             admittingEpoch, GetTickCount64()};
-    return AdmitPress(press, own);
+    AdmitPress(press, own);
 }
 
 using OnHotkeyInvoke_t = HRESULT (*)(void*, uint32_t);
@@ -15500,12 +15496,9 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
                                        : S_OK;
     }
-    if (!DispatchToggle(own, kSwipeTriggerWin, kDismissMethodWin,
-                        kDismissMethodWin, flags, admittingEpoch,
-                        kPressEntryHotkey)) {
-        return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
-                                       : S_OK;
-    }
+    DispatchToggle(own, kSwipeTriggerWin, kDismissMethodWin,
+                   kDismissMethodWin, flags, admittingEpoch,
+                   kPressEntryHotkey);
     return S_OK;
 }
 using OnStartButtonPressed_t = HRESULT (*)(void*, uint32_t, uint32_t);
@@ -15536,13 +15529,8 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                                                    dismissMethod)
                    : S_OK;
     }
-    if (!DispatchToggle(own, kSwipeTriggerStartButton, showMethod,
-                        dismissMethod, 0, admittingEpoch, kPressEntryButton)) {
-        return OnStartButtonPressed_Original
-                   ? OnStartButtonPressed_Original(self, showMethod,
-                                                   dismissMethod)
-                   : S_OK;
-    }
+    DispatchToggle(own, kSwipeTriggerStartButton, showMethod,
+                   dismissMethod, 0, admittingEpoch, kPressEntryButton);
     return S_OK;
 }
 
@@ -15624,11 +15612,8 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
     // this primitive with method 6 and must reach the controller even while the
     // controller owns the panel. Its reopen form asks for Show(11) instead.
     if (method == kDismissMethodStartButton) {
-        if (!DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0,
-                            admittingEpoch, kPressEntryDismiss)) {
-            return Dismiss_Original ? Dismiss_Original(launcher, method)
-                                    : E_FAIL;
-        }
+        DispatchToggle(own, kSwipeTriggerStartButton, 11, method, 0,
+                       admittingEpoch, kPressEntryDismiss);
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
@@ -15670,12 +15655,8 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
     // controller while the controller owns a close, so it is decided here before
     // the duplicate suppression. Its close form asks for Dismiss(6).
     if (method == 11) {
-        if (!DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags,
-                            admittingEpoch, kPressEntryShow)) {
-            return ShowStartView_Original
-                       ? ShowStartView_Original(launcher, method, flags)
-                       : E_FAIL;
-        }
+        DispatchToggle(own, kSwipeTriggerStartButton, method, 6, flags,
+                       admittingEpoch, kPressEntryShow);
         return S_OK;
     }
     if (SwipeIpcControllerDirection(&g_ipc) != kSwipeDirectionUnowned) {
