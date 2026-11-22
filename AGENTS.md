@@ -523,8 +523,10 @@ are implemented and **unverified on this machine**: the code path is the same
   teardown to the module's own hidden window on the XAML UI thread (off the
   owner, it first waits on the entry count so an admitted root publishes its
   window), then requires both counts and one acknowledged empty turn. A missing
-  drain acknowledgement (`ui drain not acknowledged`), a windowless root with
-  entries ever used, or an inline unload with a pending entry blocks rather than
+  drain acknowledgement (`ui drain not acknowledged`), a windowless root after a
+  UI-turn lease was ever used (dispatcher turn or settle batch; the root hook's
+  admission lease does not count), or an inline unload with a pending entry
+  blocks rather than
   waiting past it. The predicate count wait is the only wait that repeats; every
   other wait is a single call. It
   destroys the launcher window with a synchronous `SendMessage` (no window-gone

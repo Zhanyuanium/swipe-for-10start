@@ -70,9 +70,13 @@ reachable.
    empty drain message follows; its handler sets a caller-owned acknowledgement
    only for an accepted message from this activation's published window. A drain
    that did not run blocks (`ui drain not acknowledged`), because zero alone does
-   not prove the last lease destructor returned. A window that is gone with any
-   entry ever used blocks (`no window to drain module entries`); a never-entered
-   process has neither and completes. An unload already on the owner thread never
+   not prove the last lease destructor returned. A window that is gone after a
+   UI-turn lease was ever used (dispatcher turn or settle batch; the root hook's
+   admission lease does not count) blocks
+   (`no window to drain module entries`). That admission lease is why a hook
+   that failed to create the rendezvous and registered nothing still completes:
+   it leaves no window, no registration and no UI-turn flag. A never-entered
+   process has neither and completes too. An unload already on the owner thread never
    waits: a non-zero count blocks (`unload on ui thread with pending entries`).
    A genuine XAML revoke failure blocks once
    (`unload blocked reason=xaml revokes remain`); it is not polled.

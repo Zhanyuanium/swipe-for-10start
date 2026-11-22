@@ -69,7 +69,9 @@
   and one acknowledged empty drain; a drain that did not run blocks
   (`ui drain not acknowledged`), because zero alone does not prove the releasing
   destructor returned. If no
-  window exists and any entry was ever used, or the unload already runs on the
+  window exists and a UI-turn lease was ever used (dispatcher turn or settle
+  batch; the root hook's admission lease does not count), or the unload already
+  runs on the
   owner with a pending entry, it blocks instead of treating a count as the
   destructor's return. The
   executor window is destroyed by a synchronous `SendMessage` whose handler

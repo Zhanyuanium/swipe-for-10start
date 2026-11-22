@@ -1137,15 +1137,30 @@ std::atomic<DWORD> g_hidThreadId{0};
 // the compositor or the dispatcher is counted from before it can run.
 // ---------------------------------------------------------------------------
 std::atomic<int> g_moduleEntryCount{0};
-// Set by the first lease ever constructed. The unload uses it to distinguish
-// "nothing was ever registered, so no drain is needed" from "the UI side was
-// used, and without a window the final destructor cannot be proved returned".
-std::atomic<bool> g_moduleEntryEverUsed{false};
+// Set by the first UI-turn lease ever constructed: a dispatcher turn or the
+// settle batch. Those release inside a destructor whose tail needs the empty
+// drain turn when no window exists. The root hook's admission lease is a
+// control entry for ordering and the count-only wait; it does not mark this.
+// The first turn logs once, so a trace shows the guard's flag is live.
+std::atomic<bool> g_uiTurnEverUsed{false};
+
+// Admission: the root hook's control entry. UiTurn: a dispatcher turn or the
+// settle batch, whose destructor tail the drain barrier covers. Both increment
+// the same count and release it the same way; only UiTurn sets the no-window
+// guard flag.
+enum class ModuleEntryKind {
+    Admission,
+    UiTurn,
+};
 
 class ModuleEntryLease {
   public:
-    ModuleEntryLease() {
-        g_moduleEntryEverUsed.store(true, std::memory_order_release);
+    explicit ModuleEntryLease(
+        ModuleEntryKind kind = ModuleEntryKind::UiTurn) {
+        if (kind == ModuleEntryKind::UiTurn &&
+            !g_uiTurnEverUsed.exchange(true, std::memory_order_release)) {
+            TraceLog(L"module ui turn entry first used");
+        }
         g_moduleEntryCount.fetch_add(1, std::memory_order_seq_cst);
     }
     ~ModuleEntryLease() {
@@ -2179,7 +2194,8 @@ template <typename Fn>
 void PostCountedUiTurn(wucore::CoreDispatcher const& dispatcher, Fn&& turn) {
     std::shared_ptr<ModuleEntryLease> lease;
     try {
-        lease = std::make_shared<ModuleEntryLease>();
+        lease = std::make_shared<ModuleEntryLease>(
+            ModuleEntryKind::UiTurn);
     } catch (...) {
         return;
     }
@@ -3229,7 +3245,8 @@ DismissCloseResult BeginDismissSettle(float from, float velocity) {
         // and no handler is left inside module code.
         std::shared_ptr<ModuleEntryLease> lease;
         try {
-            lease = std::make_shared<ModuleEntryLease>();
+            lease = std::make_shared<ModuleEntryLease>(
+                ModuleEntryKind::UiTurn);
         } catch (...) {
             // Without a counted entry no handler may be registered: the unload
             // could not prove it has finished.
@@ -13039,7 +13056,7 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     // either sees this lease and waits, or this hook sees its flag and adds no
     // state; there is no third ordering in which a registration outlives the
     // proofs.
-    ModuleEntryLease entryLease;
+    ModuleEntryLease entryLease(ModuleEntryKind::Admission);
     if (g_unloading.load(std::memory_order_relaxed)) {
         // No module state is touched. The shell still gets its own root.
         return PrepareRootElement_Original
@@ -14131,12 +14148,15 @@ void RoleUninit() {
     //     returned, so no dispatcher lambda or its delegate thunk outlives it.
     HWND uiWindow = TeardownUiOnUiThread();
 
-    // 4a. Without a window there is no empty-turn barrier. If any entry was ever
-    //     used, two zero reads cannot prove the last destructor returned, so the
-    //     unload blocks instead of freeing under a destructor still running. The
-    //     never-attached case (no hook, no entries) still completes.
+    // 4a. Without a window there is no empty-turn barrier. If any UI-turn lease
+    //     was ever used (a dispatcher turn or the settle batch), two zero reads
+    //     cannot prove the last destructor returned, so the unload blocks
+    //     instead of freeing under a destructor still running. The root hook's
+    //     admission lease does not set this flag: a hook that failed to create
+    //     the window and registered nothing can still complete. The
+    //     never-attached case (no hook, no entries) also completes.
     if (!inlineUnload && !uiWindow &&
-        g_moduleEntryEverUsed.load(std::memory_order_acquire)) {
+        g_uiTurnEverUsed.load(std::memory_order_acquire)) {
         BlockUnload(L"no window to drain module entries");
     }
 
@@ -14158,8 +14178,9 @@ void RoleUninit() {
         }
         TraceLog(L"unload ui drained ack=1");
     } else {
-        // everUsed with no window blocked above; this is the never-attached case.
-        TraceLog(L"unload teardown without a window; never entered");
+        // No UI-turn lease and no window: either never attached, or the
+        // admission hook failed before it registered anything.
+        TraceLog(L"unload teardown without a window; no ui turn");
     }
 
     // 6. The window and then its class: the class must not outlive the image,
