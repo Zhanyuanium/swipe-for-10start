@@ -153,13 +153,17 @@ could act, or before its confirmation could land).
   and no timeout. **A superseded dismiss produces no confirmation**: the
   replacement's probe answers, and the old sequence is answered `superseded` by
   the bridge.
-- **F — latch supersession.** The test needs a **pre-existing latch**: press to
-  close, press again while the hide is in flight to create the slot, then press a
-  third time after the landing but before the 50 ms serve. The third press sees
-  no hide in flight, so the dispatcher discards the slot
-  (`own press latch dropped reason=superseded newer-press wait=...`) and the older
-  slot is never served. A single close-then-press is not the test: the second
-  press only creates the latch. A latch whose dismiss failed logs
+- **F — latch count.** The test needs the shell's hide in flight: press to close,
+  then two presses while `InternalState` is 9/11 (or while our `Dismiss` call is
+  live). Both are latched; the second is appended, not replacing the first
+  (`own press latched ... owed=1`, then `own press latch owed count=2`). The serve
+  publishes the first open (`own press served ... owed=2`), queues the remainder,
+  and the ack barrier makes the next press the opposite direction; the final
+  state is flipped twice (open, then closed), not left open by a lost press. A
+  latch filled to four entries drops the arriving press
+  (`reason=latch-full`) rather than executing it out of order. The old
+  single-slot supersession test (`reason=superseded newer-press`) no longer
+  exists: a newer press is an owed toggle. A latch whose dismiss failed logs
   `reason=dismiss-refused` and stops retrying.
 - **G — landing order.** With Win+Tab immediately after a Win press, the landing
   logs `intent reconcile seq=... kind=external (before landing recovery)` and no

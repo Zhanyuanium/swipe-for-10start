@@ -277,8 +277,9 @@ panel where the retract left it and settles it back to 1
 (`intent open cancel from=...`). Only a press the bridge sees while the shell is
 already hiding (`InternalState` 9/11), or while our own `Dismiss` call is live on
 the launcher thread (`t_execCall`), is
-not published at all: it is latched in one slot (tick, trigger, method, flags,
-and the epoch the admission was decided under, not a fresh read). An armed
+not published at all: it is latched in a counted slot (the first press's tick,
+the whole entry per owed press, and the epoch the admission was decided under,
+not a fresh read). An armed
 executor dismiss is revocable, so it is not a latch condition: the press
 publishes the open and the Start side cancels that command.
 The hidden event arms a 50 ms timer and
@@ -287,16 +288,19 @@ at the hidden event's own tick was swallowed (same tick, `exec visible=0`, state
 stuck at 3, no Shown), while a show 16 ms after it opened normally. The arm is
 posted to the executor window when the event runs on another thread, so the slot
 and its timer stay owned by the launcher thread. A second
-press replaces the slot (`own press latch replaced ...`); the serve logs `own
-press served wait=...` (bottom auto-hidden medians: 219 ms Win close, 210 ms
+press is appended (`own press latch owed count=2`), not replacing the first; the
+serve logs `own press served ... owed=2`, publishes the first open, then queues
+the remainder so the ack barrier makes the next press the opposite direction
+(bottom auto-hidden medians: 219 ms Win close, 210 ms
 Start-button, 234 ms click-away; the gesture latch is rare and measured 94 ms).
-The 400 ms timer is only the fallback for a landing the event missed. Any newer
-press discards the slot through the shared dispatcher
-(`own press latch dropped reason=superseded`), a refused or expired dismiss
-invalidates it (`reason=dismiss-refused|dismiss-expired`), the serve re-reads the
-peer and the epoch (`reason=peer-gone|peer-changed`), and a latch whose first
-timer could not be armed is dropped instead of being left with no guaranteed
-callback. A dismiss
+The 400 ms timer is only the fallback for a landing the event missed. A latch
+past its bound is expired with all its owed presses
+(`own press latch dropped reason=expired`), a refused or expired dismiss
+invalidates it (`reason=dismiss-refused|dismiss-expired`), and a latch filled to
+its four entries drops the arriving press (`reason=latch-full`); no press is
+reordered to keep it. At its serve the latch re-reads the peer and the epoch
+(`reason=peer-gone|peer-changed`), and a latch whose first timer could not be
+armed is dropped instead of being left with no guaranteed callback. A dismiss
 that had already entered the shell's `Dismiss` call when the press landed hides
 the window anyway; the landing reissues the open once
 (`intent open recovered entry=...`). The recovery ticket exists **only** for a

@@ -587,9 +587,12 @@ probe or timer failure is answered `unknown`.
   Start side clears its local slot and any pending command and settles the panel
   back from its live position. Only a close that has left the controller's reach
   latches the press — a hide already in flight (`InternalState` 9/11), or a
-  `Dismiss` our executor has entered (`t_execCall`) — in
-  one slot, tick, the whole `QueuedPress`, and the epoch the admission was decided
-  under. An
+  `Dismiss` our executor has entered (`t_execCall`) — in a counted slot: the
+  whole `QueuedPress` per owed press, the first press's tick, and the epoch the
+  admission was decided under. A second press is appended, never allowed to
+  replace the first (`own press latch owed count=2`); the serve publishes the
+  first open, queues the remainder, and the ack barrier makes the second the
+  opposite direction. An
   armed-but-not-dispatched executor dismiss is revocable, so it publishes the open
   rather than deferring it;
   the hidden event then arms a
@@ -597,9 +600,11 @@ probe or timer failure is answered `unknown`.
   stack. A show at the hidden event's own tick was swallowed (state stuck at 3),
   so the deferral is the serve point. The arm is posted to the executor window
   when the hidden event runs off the launcher thread, so the slot and its timer
-  stay owned by that thread. Supersession lives in the shared
-  `ServePress`, so any newer press — Win key, either Start-button primitive or the
-  click-away — discards the slot (`own press latch dropped reason=superseded`). The serve
+  stay owned by that thread. A newer press — Win key, either Start-button
+  primitive or the click-away — is appended to the counted slot
+  (`own press latch owed count=...`), never discarding an earlier one; the serve
+  publishes the first open and queues the remainder, so their directions
+  alternate behind the ack barrier. The serve
   re-reads the peer and the epoch (`reason=peer-gone|peer-changed`), drops a latch
   whose dismiss was refused or expired (`reason=dismiss-refused|dismiss-expired`)
   or whose hide never landed, and expires after 1200 ms. Timer-arming failures are

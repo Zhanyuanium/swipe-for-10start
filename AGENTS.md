@@ -96,16 +96,19 @@ arrived with the landing (applying the record it examined, not a second read),
 because the cloak event and the intent event are separate wakes and the landing
 reads the intent record itself. A
 shell hide in flight (`InternalState` 9/11), or a `Dismiss` our own executor has
-already entered, latches the press (one slot, with its tick and **the epoch the
-admission was decided under**). A dismiss that is only armed is not that case: it
+already entered, latches the press in a counted slot: the first press is the
+reopen the landing owes, each further press is appended, and the serve publishes
+the first open and then the remainder in order, so their directions alternate.
+The slot keeps the first press's tick and **the epoch the admission was decided
+under**. A dismiss that is only armed is not that case: it
 is still revocable, so the press publishes the open, the Start side revokes the
 command and settles the panel back from its live position. The hidden event arms
 a 50 ms timer and the timer
 serves the same open intent after the event's stack has unwound; a show at the
 event's own tick was swallowed (state stuck at 3, no Shown). The arm is posted to
-the executor window when the event runs off the launcher thread. Supersession
-lives in the shared dispatcher, so a newer press from any primitive discards the
-slot; a serve re-reads the peer and the epoch, a refused or expired dismiss
+the executor window when the event runs off the launcher thread. A newer press
+from any primitive is appended to the counted latch, not allowed to discard an
+earlier one; a serve re-reads the peer and the epoch, a refused or expired dismiss
 invalidates the slot, and a latch whose **initial** timer could not be armed is
 dropped rather than left with no guaranteed callback. The residual loss window is
 the peer's detection budget: a press after the gate closed, or a latch armed

@@ -14747,14 +14747,22 @@ void ServeNextPress(const wchar_t* reason);
 // nothing. Neither the cancel path (the dismiss is already issued) nor a new
 // show can serve the press, so it is latched here and served as the same open
 // intent once the hide has landed (OnStartHidden, or the closed cloak for a
-// landing the event missed). One slot; a newer press replaces the older one and
-// says so. The wait is bounded by the hide, not by a fixed delay.
+// landing the event missed). The slot is counted; a newer press is appended and
+// the serve publishes the first open, then the remainder in order. The wait is
+// bounded by the hide, not by a fixed delay.
+
+// The latch keeps every press that arrived while the hide was in flight. The
+// first press is the reopen the landing owes; every further press is one more
+// toggle that must stay ordered. A newer press is appended, never allowed to
+// replace an older one, so two presses during a hide publish an open and then
+// the opposite direction once the open has been acknowledged.
+constexpr int kPressLatchCapacity = kPressQueueCapacity;
 
 struct PressLatch {
     bool pending = false;
-    uint64_t tick = 0;
-    int32_t kind = kSwipeIntentOpen;
-    QueuedPress press{};
+    uint64_t tick = 0;  // the first press's admission; the bound starts here
+    int32_t count = 0;
+    QueuedPress presses[kPressLatchCapacity];
 };
 
 PressLatch g_pressLatch;  // launcher thread only
@@ -14769,12 +14777,16 @@ const wchar_t* g_pressServeReason = L"timeout";
 constexpr uint64_t kPressLatchMaxWaitMs = 1200;
 
 bool ServeLatchedPress(const wchar_t* reason);
+// Adds one press to the regular FIFO, preserving order. Defined with the queue;
+// the latch's remainder uses it after the first owed press is published.
+bool QueuePress(const QueuedPress& press, const wchar_t* source);
 
 void DropPressLatch(const wchar_t* reason, const wchar_t* detail) {
     if (!g_pressLatch.pending) {
         return;
     }
-    TraceLog(L"own press latch dropped reason=%s %s wait=%llu", reason, detail,
+    TraceLog(L"own press latch dropped reason=%s %s owed=%d wait=%llu", reason,
+            detail, g_pressLatch.count,
             static_cast<unsigned long long>(GetTickCount64() -
                                             g_pressLatch.tick));
     g_pressLatch = PressLatch{};
@@ -14810,18 +14822,45 @@ void LatchPress(const OwnSnapshot& own, const QueuedPress& press) {
         RunPressOriginal(press, L"no-window");
         return;
     }
-    if (g_pressLatch.pending) {
-        TraceLog(L"own press latch replaced old_tick=%llu old_wait=%llu state=%u",
-                static_cast<unsigned long long>(g_pressLatch.tick),
-                static_cast<unsigned long long>(now - g_pressLatch.tick),
-                own.state);
+    if (g_pressLatch.pending &&
+        now > g_pressLatch.tick && now - g_pressLatch.tick > kPressLatchMaxWaitMs) {
+        // The older latch is past its bound; it is not this press's hide any
+        // more. Dropping it here, before appending, keeps the new press's bound
+        // its own.
+        DropPressLatch(L"expired", L"new-press");
     }
-    g_pressLatch = PressLatch{true, now, kSwipeIntentOpen, press};
+    if (g_pressLatch.pending) {
+        if (g_pressLatch.count >= kPressLatchCapacity) {
+            // The arriving press is the one that cannot be held. Running it now
+            // would execute it before the presses already owed, so it is dropped
+            // with the debt in its line.
+            TraceLog(L"own press latch dropped trigger=%s entry=%s "
+                    L"reason=latch-full owed=%d state=%u",
+                    PressTriggerName(press.trigger),
+                    PressEntryName(press.entry), g_pressLatch.count, own.state);
+            return;
+        }
+        g_pressLatch.presses[g_pressLatch.count++] = press;
+        TraceLog(L"own press latch owed count=%d state=%u trigger=%s entry=%s "
+                L"epoch=%u",
+                g_pressLatch.count, own.state,
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                press.admittingEpoch);
+        // The first press armed the fallback timer and the hidden event arms the
+        // serve, so an appended press needs no second arm. Re-arming here would
+        // push a pending serve out by the full fallback again.
+        return;
+    }
+    g_pressLatch = PressLatch{};
+    g_pressLatch.pending = true;
+    g_pressLatch.tick = now;
+    g_pressLatch.count = 1;
+    g_pressLatch.presses[0] = press;
     TraceLog(L"own press latched state=%u trigger=%s entry=%s tick=%llu "
-            L"epoch=%u (hide or dismiss call in flight)",
+            L"epoch=%u owed=1 (hide or dismiss call in flight)",
             own.state, PressTriggerName(press.trigger),
             PressEntryName(press.entry),
-            static_cast<unsigned long long>(now), g_pressLatch.press.admittingEpoch);
+            static_cast<unsigned long long>(now), press.admittingEpoch);
     g_pressServeReason = L"timeout";
     if (SetTimer(window, kPressLatchTimer, kPressLatchTimeoutMs, nullptr) == 0) {
         // The hidden event is a second serve point, but it is not a guaranteed
@@ -14899,10 +14938,10 @@ bool ServeLatchedPress(const wchar_t* reason) {
         return false;
     }
     const uint32_t epoch = PeerEpochNow();
-    if (epoch != g_pressLatch.press.admittingEpoch) {
+    if (epoch != g_pressLatch.presses[0].admittingEpoch) {
         wchar_t detail[80] = {};
         swprintf_s(detail, L"latch_epoch=%u now=%u",
-                   g_pressLatch.press.admittingEpoch, epoch);
+                   g_pressLatch.presses[0].admittingEpoch, epoch);
         DropPressLatch(L"peer-changed", detail);
         return false;
     }
@@ -14929,18 +14968,27 @@ bool ServeLatchedPress(const wchar_t* reason) {
     const PressLatch latch = g_pressLatch;
     g_pressLatch = PressLatch{};
     const uint64_t wait = GetTickCount64() - latch.tick;
+    const QueuedPress& first = latch.presses[0];
     // The served open is a published intent like any other: it becomes the
-    // outstanding press, so a new press arriving before its ack is queued behind
-    // it instead of overwriting the record. A failed publication runs the press's
-    // own primitive, as the queue's fallback does.
-    if (PublishPressIntent(kSwipeIntentOpen, latch.press, L"latch") <= 0) {
-        RunPressOriginal(latch.press, L"latch-publish");
+    // outstanding press, so the remainder waits behind its ack and the first
+    // press that follows is the opposite direction. A failed publication runs the
+    // first press's own primitive, and the remainder still keeps its order.
+    const LONG64 sequence = PublishPressIntent(kSwipeIntentOpen, first, L"latch");
+    if (sequence <= 0) {
+        RunPressOriginal(first, L"latch-publish");
+    }
+    for (int i = 1; i < latch.count; ++i) {
+        QueuePress(latch.presses[i], L"latch");
     }
     TraceLog(L"own press served wait=%llu state=%u trigger=%s entry=%s "
-            L"reason=%s epoch=%u",
+            L"reason=%s epoch=%u owed=%d",
             static_cast<unsigned long long>(wait), own.state,
-            PressTriggerName(latch.press.trigger),
-            PressEntryName(latch.press.entry), reason, epoch);
+            PressTriggerName(first.trigger), PressEntryName(first.entry), reason,
+            epoch, latch.count);
+    if (sequence <= 0) {
+        // Nothing is outstanding, so the remainder's turns start now.
+        ServeNextPress(L"latch");
+    }
     return true;
 }
 
@@ -14995,6 +15043,28 @@ void DropPressQueue(const wchar_t* reason) {
     if (dropped > 1) {
         TraceLog(L"own press queue cleared count=%d reason=%s", dropped, reason);
     }
+}
+
+// Adds one press to the FIFO. The arriving press on a full queue is dropped with
+// the depth in the line: it is the one that cannot be held, and running it now
+// would execute it ahead of the presses already queued. Launcher thread only.
+bool QueuePress(const QueuedPress& press, const wchar_t* source) {
+    if (g_pressQueueCount >= kPressQueueCapacity) {
+        TraceLog(L"own press dropped trigger=%s entry=%s reason=queue-full q=%d "
+                L"outstanding=%d source=%s",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0, source);
+        return false;
+    }
+    const int tail = (g_pressQueueHead + g_pressQueueCount) % kPressQueueCapacity;
+    g_pressQueue[tail] = press;
+    ++g_pressQueueCount;
+    TraceLog(L"own press queued trigger=%s entry=%s q=%d outstanding=%d "
+            L"seq=%lld source=%s",
+            PressTriggerName(press.trigger), PressEntryName(press.entry),
+            g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0,
+            static_cast<long long>(g_pressOutstanding.seq), source);
+    return true;
 }
 
 // Publishes one decision and makes it the outstanding press. The ack timer is
@@ -15077,10 +15147,12 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
         RunPressOriginal(press, L"state-not-ready");
         return true;
     }
-    if (g_pressLatch.pending && !ShellHideInFlight(own)) {
-        // The landing event was missed and this newer press is the one the user
-        // means.
-        DropPressLatch(L"superseded", L"newer-press");
+    if (g_pressLatch.pending) {
+        // The latch is earlier presses the landing still owes, not a stale slot
+        // for this one to replace. Appending keeps the count and the order: the
+        // serve publishes the first open and the remainder follows it.
+        LatchPress(own, press);
+        return true;
     }
     // One sample of the controller's direction drives both the decision and its
     // line. Reading it twice could log a direction the decision never used.
@@ -15175,31 +15247,13 @@ void ServeNextPress(const wchar_t* reason) {
 }
 
 // One admitted press. The immediate press decides on this hook's own snapshot;
-// a press behind it is queued and decides later. A queue overflow serves the new
-// press with its original primitive now, on this same stack, so the shell keeps
-// the toggle; nothing waits on the launcher hook.
+// a press behind it is queued and decides later. A press that cannot be queued
+// is dropped, never executed out of order; nothing waits on the launcher hook.
 bool AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
         return ServePress(press, &own);
     }
-    if (g_pressQueueCount >= kPressQueueCapacity) {
-        // The arriving press is the one that cannot be held. Running its original
-        // here would execute it ahead of the four presses already queued, so it
-        // is dropped with the depth in the line and the queue keeps its order.
-        TraceLog(L"own press dropped trigger=%s entry=%s reason=queue-full q=%d "
-                L"outstanding=%d",
-                PressTriggerName(press.trigger), PressEntryName(press.entry),
-                g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0);
-        return true;
-    }
-    const int tail = (g_pressQueueHead + g_pressQueueCount) % kPressQueueCapacity;
-    g_pressQueue[tail] = press;
-    ++g_pressQueueCount;
-    TraceLog(L"own press queued trigger=%s entry=%s q=%d outstanding=%d "
-            L"seq=%lld",
-            PressTriggerName(press.trigger), PressEntryName(press.entry),
-            g_pressQueueCount, g_pressOutstanding.pending ? 1 : 0,
-            static_cast<long long>(g_pressOutstanding.seq));
+    QueuePress(press, L"press");
     return true;
 }
 
@@ -15311,9 +15365,8 @@ void HandlePressAckTimeout() {
 // the consumer runs no longer overwrite one intent record: the second waits for
 // the first's ack.
 //
-// Supersession lives in ServePress, not in one entry: any newer press whose panel
-// is not hiding makes the older latched reopen obsolete, whichever primitive
-// carried it.
+// A newer press does not supersede a latch: it is appended, because the latch
+// is a count of toggles the user already asked for.
 bool DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags,
                     uint32_t admittingEpoch, int32_t entry) {
