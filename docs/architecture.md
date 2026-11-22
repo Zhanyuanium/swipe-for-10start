@@ -394,7 +394,10 @@ branch publishes the direction before the ack), and the next press's queue-age
 bound is paused, so no later press can be reordered ahead of it. Only a changed
 `peerEpoch` or the peer's explicit state withdrawal releases the slot without the
 ack; a stale tick never releases a claimed press, it only reconciles an unclaimed
-record. An untaken
+record. The admission pre-check is not the last read: reconciliation reads the
+claim again, and a claim found there on the same epoch with the state alive keeps
+the slot (`reason=claimed-at-admission`); a claim between that read and the abort
+holds as `reason=claim-after-abort`. An untaken
 record is aborted (its counter goes odd, so no consumer can copy or claim it) and
 re-read before any replay. A changed epoch at the watchdog **or at the next
 admission** is a restart: the replacement seeded `g_lastIntentSeq` past the record

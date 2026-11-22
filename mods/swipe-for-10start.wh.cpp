@@ -123,9 +123,11 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
  *   is outstanding at a time: an admitted press waits in a four-entry FIFO until
  *   the intent ack for the press before it (or its 1000 ms bound) and then decides
  *   from the direction the controller published by then; an ack timeout reads
- *   the Start side's `intentTaken` claim: a taken sequence is consumed, an
- *   untaken current record with a live peer is reserved (never overwritten), and
- *   only a moved record or a gone/stale peer is replayed.
+ *   the Start side's `intentTaken` claim: a taken sequence is consumed and holds
+ *   the queue until its ack, an untaken current record with a live peer is
+ *   reserved (never overwritten), and only a moved record or a peer whose state
+ *   is gone is replayed. Admission reconciliation reads the same claim and holds
+ *   the slot on a claim found there.
  *   A queue overflow drops the arriving press with the depth and keeps the
  *   queue's order; a press still unpublished past its wait runs the shell's own
  *   primitive under the executor guard. Every
@@ -15653,28 +15655,85 @@ void ServeNextPress(const wchar_t* reason) {
     }
 }
 
+// Keeps the outstanding slot when Start claimed the record during admission
+// reconciliation. The take proves a validated copy may be in hand; the controller
+// will publish its direction and answer. Serving the queue here would let the next
+// press choose before that direction exists, so this is the timeout's claimed
+// case without a timer: only the ack, a changed epoch, or the withdrawn state
+// releases it. Launcher thread only.
+void HoldClaimedPressAtAdmission(const OutstandingPress& press,
+                                 const wchar_t* reason, uint32_t epochNow,
+                                 uint64_t wait) {
+    g_pressOutstanding.consumedAwaitingAck = true;
+    if (press.external) {
+        TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
+                L"claimed=%d decision=reserved reason=%s",
+                static_cast<long long>(press.seq),
+                static_cast<unsigned long long>(wait), press.publishedEpoch,
+                epochNow, 1, reason);
+    } else {
+        TraceLog(L"own press abandoned seq=%lld trigger=%s entry=%s "
+                L"wait=%llu epoch=%u->%u decision=consumed awaiting=ack "
+                L"reason=%s",
+                static_cast<long long>(press.seq),
+                PressTriggerName(press.press.trigger),
+                PressEntryName(press.press.entry),
+                static_cast<unsigned long long>(wait), press.publishedEpoch,
+                epochNow, reason);
+    }
+    AgeOutQueuedPress();
+    if (g_pressQueueCount > 0 && !ArmConsumedPressPoll()) {
+        // The arriving press is not queued yet; QueuePress arms the poll again
+        // for the bound it starts.
+        TraceLog(L"own press poll timer failed err=%u seq=%lld q=%d",
+                GetLastError(), static_cast<long long>(press.seq),
+                g_pressQueueCount);
+    }
+}
+
 // A publication from a healthy replacement proves the activation that owned the
 // outstanding record is gone (or was replaced) before it answered. The watchdog
 // applies the same rule at its bound; this is the timer-free path, for a watchdog
 // that could not be armed or an unarmed external barrier. The rule is the
 // timeout's: an external has no original and is released; a normal press is
 // consumed when it was claimed, otherwise aborted and replayed only when the
-// abort succeeded and no claim landed. Returns true when the slot was reconciled;
-// the caller must then re-read the launcher, because the replay or drain may have
-// changed it.
+// abort succeeded and no claim landed. The claim is read here, after the caller
+// decided to reconcile: a claim that lands in between is the timeout's claimed
+// case, so the slot is kept awaiting its ack and nothing is served. Returns true
+// when the slot was reconciled; the caller must then re-read the launcher,
+// because the replay or drain may have changed it. False means the slot still
+// belongs to the controller.
 bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     const OutstandingPress press = g_pressOutstanding;
     const uint64_t wait = GetTickCount64() - press.publishedTick;
+    const bool epochChanged =
+        press.publishedEpoch != 0 && epochNow != press.publishedEpoch;
+    const LONG64 taken = SwipeIpcTakenIntent(&g_ipc);
+    if (taken == press.seq && !epochChanged && PeerStateAliveNow()) {
+        // The caller read no claim before this call and Start claimed and
+        // validated the copy during it.
+        HoldClaimedPressAtAdmission(press, L"claimed-at-admission", epochNow,
+                                    wait);
+        return false;
+    }
+    bool replay = false;
+    if (!press.external) {
+        const bool revoked = SwipeIpcAbortIntent(&g_ipc, press.seq);
+        const LONG64 takenAfter = SwipeIpcTakenIntent(&g_ipc);
+        if (takenAfter == press.seq && !epochChanged && PeerStateAliveNow()) {
+            // The claim landed between the read above and the abort. The record
+            // may now be unreachable to the controller's copy re-check, but the
+            // copy is in hand and will answer; the slot waits for that answer.
+            HoldClaimedPressAtAdmission(press, L"claim-after-abort", epochNow,
+                                        wait);
+            return false;
+        }
+        replay = revoked && takenAfter != press.seq;
+    }
     g_pressOutstanding = OutstandingPress{};
     HWND window = g_execWindow.load(std::memory_order_relaxed);
     if (window) {
         KillTimer(window, kPressAckTimer);
-    }
-    bool replay = false;
-    if (!press.external && SwipeIpcTakenIntent(&g_ipc) != press.seq) {
-        if (SwipeIpcAbortIntent(&g_ipc, press.seq)) {
-            replay = SwipeIpcTakenIntent(&g_ipc) != press.seq;
-        }
     }
     if (press.external) {
         TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
@@ -15719,32 +15778,38 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
             SwipeIpcTakenIntent(&g_ipc) == g_pressOutstanding.seq;
         const bool staleUnclaimed = !claimed && !PeerAliveNow();
         if (epochChanged || peerGone || staleUnclaimed) {
-            ReconcileOutstandingAtAdmission(
+            const bool reconciled = ReconcileOutstandingAtAdmission(
                 epochChanged ? L"epoch-changed"
                              : (peerGone ? L"peer-gone" : L"stale-unclaimed"),
                 epochNow);
-            // The replay or the drain may have run a native toggle after this
-            // hook's snapshot. Re-read the launcher before deciding this press,
-            // or the arriving toggle can repeat the replay's direction.
-            uint64_t state = 0;
-            void* launcher = LauncherNow(&state);
-            if (!launcher) {
-                TraceLog(L"own press pass trigger=%s entry=%s "
-                        L"reason=state-after-replay state=0x%llX",
-                        PressTriggerName(press.trigger),
-                        PressEntryName(press.entry),
-                        static_cast<unsigned long long>(state));
-                RunPressOriginal(press, L"state-after-replay");
-                return;
-            }
-            current = OwnSync(launcher);
-            if (!current.ready) {
-                TraceLog(L"own press pass trigger=%s entry=%s "
-                        L"reason=state-after-replay state=%u",
-                        PressTriggerName(press.trigger),
-                        PressEntryName(press.entry), current.state);
-                RunPressOriginal(press, L"state-after-replay");
-                return;
+            // A claim found during the reconciliation keeps the slot: the
+            // controller has a validated copy and its direction is still coming,
+            // so this press queues behind it and nothing re-reads the launcher.
+            if (reconciled) {
+                // The replay or the drain may have run a native toggle after
+                // this hook's snapshot. Re-read the launcher before deciding
+                // this press, or the arriving toggle can repeat the replay's
+                // direction.
+                uint64_t state = 0;
+                void* launcher = LauncherNow(&state);
+                if (!launcher) {
+                    TraceLog(L"own press pass trigger=%s entry=%s "
+                            L"reason=state-after-replay state=0x%llX",
+                            PressTriggerName(press.trigger),
+                            PressEntryName(press.entry),
+                            static_cast<unsigned long long>(state));
+                    RunPressOriginal(press, L"state-after-replay");
+                    return;
+                }
+                current = OwnSync(launcher);
+                if (!current.ready) {
+                    TraceLog(L"own press pass trigger=%s entry=%s "
+                            L"reason=state-after-replay state=%u",
+                            PressTriggerName(press.trigger),
+                            PressEntryName(press.entry), current.state);
+                    RunPressOriginal(press, L"state-after-replay");
+                    return;
+                }
             }
         }
     }

@@ -172,7 +172,12 @@ A claim is released only by its ack, a changed peer epoch, or a peer whose
 never releases a claimed press: the controller may be paused between two heartbeats
 with its validated copy in hand. A stale tick releases an **unclaimed** record
 only, under the abort/replay rule; at admission it reconciles as
-`reason=stale-unclaimed`. A different `peerEpoch` at the watchdog **or at the
+`reason=stale-unclaimed`. That classification is the caller's pre-check, not the
+last read: reconciliation reads the claim again, and a claim found there on the
+same epoch with the state alive keeps the slot under
+`reason=claimed-at-admission` — nothing is served until its ack. A claim that
+lands after that read and before the abort is `reason=claim-after-abort` and
+holds the same way. A different `peerEpoch` at the watchdog **or at the
 next admission** means the activation that was asked is gone: the replacement
 seeds `g_lastIntentSeq` past the record and will never answer, so a taken press
 is consumed without its ack (`reason=epoch-changed`), an untaken record is

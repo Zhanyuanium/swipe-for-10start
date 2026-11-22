@@ -672,7 +672,12 @@ probe or timer failure is answered `unknown`.
   **state** going away (`decision=consumed reason=peer-gone`) releases it. A stale
   heartbeat never releases a claimed press: the controller may be paused between
   two heartbeats with its validated copy in hand. A stale tick releases an
-  unclaimed record only; at admission that is `reason=stale-unclaimed`. Every
+  unclaimed record only; at admission that is `reason=stale-unclaimed`, which is
+  the caller's pre-check rather than the last read. Reconciliation re-reads the
+  claim itself: a claim found there on the same epoch with the state alive keeps
+  the slot (`reason=claimed-at-admission`, `decision=consumed awaiting=ack`) and
+  serves nothing until its ack; a claim that lands between that read and the
+  abort holds as `reason=claim-after-abort`. Every
   Start branch publishes the resulting direction before its ack, so the press
   after an ack reads the new direction (close then reopen, not two closes).
   `taken != seq` aborts the record (`SwipeIpcAbortIntent`, the counter's odd

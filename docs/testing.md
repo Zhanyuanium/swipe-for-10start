@@ -282,6 +282,18 @@ could act, or before its confirmation could land).
   arriving press re-reads the launcher and chooses `kind=close` — the opposite
   of the replay. Without the re-read it chooses open again.
 
+## Round-8 runtime checks
+
+- **Claim at admission (A).** Suspend the host, press once, let the heartbeat go
+  stale while the state stays `alive`, then press again before the 1000 ms bound;
+  a test hook pauses the second admission after its pre-check. Resume the host so
+  it claims and validates the first record, then let the admission continue. It
+  logs `own press abandoned ... decision=consumed awaiting=ack
+  reason=claimed-at-admission`, the second press stays queued
+  (`own press queued ... outstanding=1`), and no `own press dequeued` or
+  `published` runs before `own press ack`; after the ack the second press is
+  dequeued and publishes the opposite direction.
+
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges
