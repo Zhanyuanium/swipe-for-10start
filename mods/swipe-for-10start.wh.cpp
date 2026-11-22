@@ -15451,6 +15451,25 @@ void ServeNextPress(const wchar_t* reason) {
 // a press behind it is queued and decides later. A press that cannot be queued
 // is dropped, never executed out of order; nothing waits on the launcher hook.
 void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
+    if (g_pressOutstanding.pending && g_pressOutstanding.external &&
+        !PeerAliveNow()) {
+        // The external barrier's release that needs no timer: no answer can
+        // arrive from a peer that is gone, so held presses must not wait behind
+        // it. The ack path is the other release; silence from a live peer is not.
+        TraceLog(L"own external barrier seq=%lld released reason=peer-gone "
+                L"wait=%llu",
+                static_cast<long long>(g_pressOutstanding.seq),
+                static_cast<unsigned long long>(
+                    GetTickCount64() - g_pressOutstanding.publishedTick));
+        g_pressOutstanding = OutstandingPress{};
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
+        // The presses that queued behind the barrier have no other wake: serve
+        // them now, each falling back to its own primitive under the guard.
+        ServeNextPress(L"external-peer-gone");
+    }
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
         // A held close is requeued by ServePress and served by the gate's timer;
         // its false return needs no action here.
@@ -15557,20 +15576,41 @@ void HandlePressAckTimeout() {
     const LONG64 taken = SwipeIpcTakenIntent(&g_ipc);
     const uint64_t wait = GetTickCount64() - press.publishedTick;
     if (press.external) {
-        // The takeover itself is native and has no original to replay. A live
-        // peer that is silent is treated as having reconciled it so the held
-        // presses can start; a gone/stale peer means they cannot be published,
-        // and their own turns run them natively under the usual timeout policy.
+        // The takeover itself is native and has no original to replay. Its
+        // barrier is cleared by its ack above, or by a peer that can no longer
+        // answer — never by this timer, and never by a guess: a live peer that is
+        // silent may still reconcile the record, and a newer intent published over
+        // it would be lost. The reserve re-checks at the poll cadence, bounded by
+        // the peer's own staleness window.
+        if (peerAlive) {
+            TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
+                    L"epoch=%u decision=reserved",
+                    static_cast<long long>(press.seq),
+                    static_cast<unsigned long long>(wait), peer, peerAge,
+                    PeerEpochNow());
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (!window ||
+                SetTimer(window, kPressAckTimer,
+                         static_cast<UINT>(kPressReservePollMs), nullptr) == 0) {
+                // Keep the barrier. Its ack still clears it through the worker's
+                // event, and the next admission releases it once the peer is
+                // stale; dropping it here would let a press overwrite a record
+                // the controller may still reconcile.
+                TraceLog(L"own external reserve timer failed err=%u seq=%lld",
+                        GetLastError(), static_cast<long long>(press.seq));
+            }
+            return;
+        }
         g_pressOutstanding = OutstandingPress{};
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         if (window) {
             KillTimer(window, kPressAckTimer);
         }
-        TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
-                L"epoch=%u decision=%s",
+        TraceLog(L"own external barrier seq=%lld wait=%llu peer=%s age=%u "
+                L"epoch=%u decision=released reason=peer-gone",
                 static_cast<long long>(press.seq),
                 static_cast<unsigned long long>(wait), peer, peerAge,
-                PeerEpochNow(), peerAlive ? L"consumed" : L"unobserved");
+                PeerEpochNow());
         ServeNextPress(L"timeout");
         return;
     }
@@ -17425,18 +17465,20 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
     if (kind == kSwipeIntentExternal && sequence > 0) {
         // The takeover itself is native and immediate. What follows it is not:
         // until Start answers this record, a press would overwrite the one slot
-        // with an intent the takeover has already made obsolete. The barrier
-        // holds those publications; its bound is the same ack bound.
+        // with an intent the takeover has already made obsolete. The barrier is a
+        // state, not a timer: it stands whether or not the watchdog could be
+        // armed, and only its ack or a peer that can no longer answer clears it.
+        g_pressOutstanding = OutstandingPress{true, sequence, GetTickCount64(),
+                                              QueuedPress{}, true};
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         if (window && SetTimer(window, kPressAckTimer,
                                static_cast<UINT>(kPressAckTimeoutMs),
                                nullptr) != 0) {
-            g_pressOutstanding = OutstandingPress{true, sequence,
-                                                  GetTickCount64(),
-                                                  QueuedPress{}, true};
             TraceLog(L"own external barrier seq=%lld armed",
                     static_cast<long long>(sequence));
         } else {
+            // No watchdog: the ack event still clears the barrier through the
+            // worker, and a later admission releases it once the peer is stale.
             TraceLog(L"own external barrier seq=%lld unarmed err=%u",
                     static_cast<long long>(sequence), GetLastError());
         }

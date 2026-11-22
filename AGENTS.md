@@ -149,9 +149,13 @@ controller is gone before taking, and that press lost rather than duplicated if
 the controller dies after the take. The timeout line carries the sequence, the
 wait, the take, the peer age and the epoch. An
 external takeover is published at once and clears the queue and latch; it then
-arms the same barrier for the presses that follow, because its record is the one
-Start must reconcile before another intent may overwrite it. A held press follows
-the timeout policy above; the takeover itself has no original to replay.
+sets the same barrier for the presses that follow, because its record is the one
+Start must reconcile before another intent may overwrite it. That barrier is a
+state, not a timer: it is set whether or not the watchdog could be armed
+(`own external barrier ... armed|unarmed`), and it is cleared only by its ack or
+by a peer that is gone/stale (`own external barrier ... released
+reason=peer-gone`), never by a timeout and never by an arm failure. A live but
+silent peer keeps it, and a following press waits; a reserve poll re-checks it.
 
 The shell's own click-away while the window is appearing (state 1/3) is
 swallowed: it is the pointer-away check of a keyboard or own show, not a user

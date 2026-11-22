@@ -658,9 +658,12 @@ probe or timer failure is answered `unknown`.
   queue's own lines are
   `own press queued|published|ack|ack timeout|dropped`. An
   `external` intent clears both the queue and the latch, is published at once,
-  and arms the same barrier: a following press waits for its ack or bound
-  (`own external barrier seq=... armed`, `own external ack ... reconciled`), and
-  a timeout with a gone/stale peer serves the held presses natively.
+  and sets the same barrier as a state, not a timer: it stands even when
+  `SetTimer` fails (`own external barrier seq=... armed|unarmed`) and is cleared
+  only by its ack (`own external ack ... reconciled`) or by a peer that is
+  gone/stale (`own external barrier ... released reason=peer-gone`, checked on the
+  reserve poll and at the next admission). A live but silent peer keeps it; the
+  timeout line is `decision=reserved`, never a reconciliation guess.
 
 **Deleted here.** The retract request/plan wait, the arbitration hold, the
 close-record read/seed, `OwnDecideFrom` and its open/close/reopen helpers, the

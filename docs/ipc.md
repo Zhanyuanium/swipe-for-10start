@@ -100,9 +100,13 @@ before it. An arriving press on a full queue is dropped with the depth in its
 line and is never executed ahead of the queue; a press still unpublished past
 1500 ms runs the shell's own original primitive under the executor guard
 (`own press fallback ...`). An `external` intent clears the queue and the latch,
-is published at once, and arms the same barrier: a following press is held until
-Start answers the takeover (`own external ack ... reconciled`) or the bound
-expires; a timeout with a gone/stale peer serves the held presses natively.
+is published at once, and sets the same barrier as a state, not a timer: it
+stands even when the watchdog cannot be armed (`own external barrier ... armed`
+or `unarmed`) and is cleared only by its ack (`own external ack ... reconciled`)
+or by a peer that is gone/stale (`own external barrier ... released
+reason=peer-gone`, checked at the reserve poll and at the next admission). A live
+but silent peer keeps it, and the timeout line is `decision=reserved`; the bridge
+never guesses a reconciliation.
 
 `method` is **evidence about the shell path that produced the trigger**, not an
 execution method. A click-away carries the Hide method `7`. The Start side maps
