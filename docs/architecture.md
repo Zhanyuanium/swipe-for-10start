@@ -392,7 +392,9 @@ never left waiting. Any claim keeps the bridge's slot open: the press waits for
 the ack (the take proves execution, not that the direction is visible; every
 branch publishes the direction before the ack), and the next press's queue-age
 bound is paused, so no later press can be reordered ahead of it. Only a changed
-`peerEpoch` or a gone/stale peer releases the slot without the ack. An untaken
+`peerEpoch` or the peer's explicit state withdrawal releases the slot without the
+ack; a stale tick never releases a claimed press, it only reconciles an unclaimed
+record. An untaken
 record is aborted (its counter goes odd, so no consumer can copy or claim it) and
 re-read before any replay. A changed epoch at the watchdog **or at the next
 admission** is a restart: the replacement seeded `g_lastIntentSeq` past the record

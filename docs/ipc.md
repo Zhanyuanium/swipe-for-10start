@@ -130,7 +130,9 @@ guess. At the 1000 ms bound the bridge re-reads the ack, `intentTaken` and the
 shared intent record. Any claim is `decision=consumed awaiting=ack`: the take
 proves the controller has the record, not that the resulting direction is
 published, so the next press waits for the ack, its queue-age bound stays paused,
-and only the ack, a changed epoch, or a gone/stale peer releases it. A claim that
+and only the ack, a changed epoch, or the peer's **state** going away releases it.
+A stale heartbeat alone does not: the controller may be paused between two
+heartbeats with a validated copy. A claim that
 lands after the bridge's first read but before its abort is the same case
 (`reason=claim-after-abort`): the controller may already hold a validated copy.
 Every Start branch publishes the resulting direction before it answers, so the
@@ -143,7 +145,9 @@ If the abort succeeded and no claim exists, the original runs once
 watchdog **or at the next admission** means the activation that was asked is
 gone: a taken press is consumed without its ack
 (`reason=epoch-changed`), an untaken one is aborted and replayed, and the queue
-advances without a timer. The peer words are evidence;
+advances without a timer. A stale tick reconciles an **unclaimed** record at
+admission (`reason=stale-unclaimed`) but never a claimed one. The peer words are
+evidence;
 the abort and the claim are the proof. A take is never replayed: at most one
 execution, one native execution when the record is aborted before any claim, and
 a press lost rather than duplicated if the controller dies after the take.
@@ -170,7 +174,8 @@ not a lock. The Start side's turn is:
 
 The publisher's timeout then has one proof: a claim for the sequence means the
 controller may still apply it, so no replay follows and the next press waits for
-the ack; only a changed epoch or a gone/stale peer releases it without the ack.
+the ack; only a changed epoch or the peer's state going away releases it without
+the ack. A stale heartbeat is not that proof.
 An untaken record is aborted and re-read; the original runs only when the abort
 succeeded and no claim landed.
 

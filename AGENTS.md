@@ -167,9 +167,12 @@ heartbeat:
 - a record that has already moved cannot be aborted (`decision=superseded
   reason=record-moved`), so nothing is replayed.
 
-A claim is released only by its ack, a changed peer epoch, or a peer that is
-gone/stale (`decision=consumed reason=peer-gone`): those are the proofs that no
-direction is still coming. A different `peerEpoch` at the watchdog **or at the
+A claim is released only by its ack, a changed peer epoch, or a peer whose
+**state is gone** (`decision=consumed reason=peer-gone`). A stale heartbeat alone
+never releases a claimed press: the controller may be paused between two heartbeats
+with its validated copy in hand. A stale tick releases an **unclaimed** record
+only, under the abort/replay rule; at admission it reconciles as
+`reason=stale-unclaimed`. A different `peerEpoch` at the watchdog **or at the
 next admission** means the activation that was asked is gone: the replacement
 seeds `g_lastIntentSeq` past the record and will never answer, so a taken press
 is consumed without its ack (`reason=epoch-changed`), an untaken record is
@@ -186,9 +189,10 @@ sets the same barrier for the presses that follow, because its record is the one
 Start must reconcile before another intent may overwrite it. That barrier is a
 state, not a timer: it is set whether or not the watchdog could be armed
 (`own external barrier ... armed|unarmed`), and it is cleared only by its ack, by
-a changed epoch (`released reason=epoch-changed`), or by a peer that is
-gone/stale (`own external barrier ... released
-reason=peer-gone`), never by a timeout and never by an arm failure. A live but
+a changed epoch (`released reason=epoch-changed`), or by its peer's state going
+away (`released reason=peer-gone|stale-unclaimed`), never by a timeout and never
+by an arm failure. A claimed barrier is held through a stale heartbeat; an
+unclaimed one is released when the tick goes stale. A live but
 silent peer keeps it, and a following press waits; a reserve poll re-checks it
 and runs any held press that has outlived its queue bound.
 

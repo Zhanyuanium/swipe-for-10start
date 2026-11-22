@@ -265,6 +265,17 @@ could act, or before its confirmation could land).
   `own external barrier ... released reason=epoch-changed` (or
   `own press abandoned ...`) with no timer, then the press is published once.
 
+## Round-7 runtime checks
+
+- **Stale tick, claimed (A).** Claim press 1 and pause after the validated copy
+  for 2 s without a heartbeat refresh (the peer state stays `alive`). At 1000 ms
+  the timeout logs `decision=consumed awaiting=ack` with `peer=stale`; press 2
+  stays queued and no `own press fallback ... queue-wait` or `peer-gone` runs.
+  At the ack (2015 ms) press 2 is dequeued and served; the ack is the release.
+  Withdrawing the peer state instead logs the second line
+  `decision=consumed reason=peer-gone`; a hard kill without the withdrawal leaves
+  the claimed slot held (the epoch change at the next attach reconciles it).
+
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges

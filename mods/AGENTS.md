@@ -668,10 +668,13 @@ probe or timer failure is answered `unknown`.
   resolved by proof: any claim for the sequence is
   `decision=consumed awaiting=ack` — including one that lands between the first
   read and the abort (`reason=claim-after-abort`) — and the next press is not
-  served and its bound stays paused until the ack, a changed epoch, or a
-  gone/stale peer (`decision=consumed reason=peer-gone`) releases it. Every Start
-  branch publishes the resulting direction before its ack, so the press after an
-  ack reads the new direction (close then reopen, not two closes).
+  served and its bound stays paused until the ack, a changed epoch, or the peer's
+  **state** going away (`decision=consumed reason=peer-gone`) releases it. A stale
+  heartbeat never releases a claimed press: the controller may be paused between
+  two heartbeats with its validated copy in hand. A stale tick releases an
+  unclaimed record only; at admission that is `reason=stale-unclaimed`. Every
+  Start branch publishes the resulting direction before its ack, so the press
+  after an ack reads the new direction (close then reopen, not two closes).
   `taken != seq` aborts the record (`SwipeIpcAbortIntent`, the counter's odd
   state), re-reads the claim, and only replays when the abort succeeded and no
   claim exists (`decision=replay reason=revoked|epoch-changed`); a record that
@@ -685,9 +688,11 @@ probe or timer failure is answered `unknown`.
   and sets the same barrier as a state, not a timer: it stands even when
   `SetTimer` fails (`own external barrier seq=... armed|unarmed`) and is cleared
   only by its ack (`own external ack ... reconciled`), by a changed epoch
-  (`released reason=epoch-changed`), or by a peer that is gone/stale
-  (`released reason=peer-gone`, checked on the reserve poll and at the next
-  admission). A live but silent peer keeps it; the timeout line is
+  (`released reason=epoch-changed`), or by its peer's state going away
+  (`released reason=peer-gone`), with an unclaimed barrier also released by a
+  stale tick (`released reason=stale-unclaimed`, checked on the reserve poll and
+  at the next admission). A claimed barrier is held through a stale heartbeat; a
+  live but silent peer keeps it; the timeout line is
   `decision=reserved`, never a reconciliation guess, and the poll runs any held
   press past its bound.
 

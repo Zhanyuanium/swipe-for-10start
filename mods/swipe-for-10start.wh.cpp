@@ -14407,6 +14407,14 @@ bool PeerAliveNow() {
     return SwipeIpcPeerAlive(&g_ipc, kSwipePeerStaleMs);
 }
 
+// The peer's explicit state, without the heartbeat age. A stale tick must not
+// release a press the controller already claimed: the process may be paused
+// between two heartbeats, not gone. Only the withdrawal of `alive` is that proof.
+bool PeerStateAliveNow() {
+    return g_ipc.state != nullptr &&
+           SwipeIpcPeerState(&g_ipc) == kSwipePeerAlive;
+}
+
 // The activation that answers right now. 0 on a section with no attach yet.
 uint32_t PeerEpochNow() {
     return g_ipc.state ? SwipeIpcPeerEpoch(&g_ipc) : 0;
@@ -15693,18 +15701,24 @@ void ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
 // is dropped, never executed out of order; nothing waits on the launcher hook.
 void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
     if (g_pressOutstanding.pending) {
-        // The replacement that is admitting this press proves the record's
-        // activation is gone. Reconcile without waiting for a watchdog that may
-        // not be armed: an external barrier is released, a normal press is
-        // consumed or replayed under the claim/abort rule.
+        // A replacement or a withdrawn peer proves the record's activation is
+        // gone. A stale tick alone does not release a claimed record: the
+        // controller may be paused between heartbeats with its validated copy in
+        // hand. An unclaimed record is still reconciled by a stale tick, because
+        // it is then aborted under the timeout's rule.
         const uint32_t epochNow = PeerEpochNow();
         const bool epochChanged =
             g_pressOutstanding.publishedEpoch != 0 &&
             epochNow != g_pressOutstanding.publishedEpoch;
-        const bool peerLost = !PeerAliveNow();
-        if (epochChanged || peerLost) {
+        const bool peerGone = !PeerStateAliveNow();
+        const bool claimed =
+            SwipeIpcTakenIntent(&g_ipc) == g_pressOutstanding.seq;
+        const bool staleUnclaimed = !claimed && !PeerAliveNow();
+        if (epochChanged || peerGone || staleUnclaimed) {
             ReconcileOutstandingAtAdmission(
-                epochChanged ? L"epoch-changed" : L"peer-gone", epochNow);
+                epochChanged ? L"epoch-changed"
+                             : (peerGone ? L"peer-gone" : L"stale-unclaimed"),
+                epochNow);
         }
     }
     if (!g_pressOutstanding.pending && g_pressQueueCount == 0) {
@@ -15763,8 +15777,8 @@ void HandlePressAck() {
 // - any claim for this sequence proves the controller may still apply it. The
 //   press waits for its ack; the queue is not served and the next press's
 //   queue-age bound is paused, so no later press can choose a direction before
-//   this one publishes its own. Only the ack, a changed epoch, or a gone/stale
-//   peer releases it;
+//   this one publishes its own. Only the ack, a changed epoch, or a peer whose
+//   state is gone (not a stale heartbeat) releases it;
 // - `taken != seq` is resolved by aborting the record: the counter is stepped to
 //   its odd state, so no consumer can copy or claim it afterwards. The claim is
 //   then re-read. No claim: the original is the one execution. A claim in that
@@ -15826,9 +15840,10 @@ void HandlePressAckTimeout() {
     if (press.external) {
         // The takeover itself is native and has no original to replay. Its
         // barrier is cleared by its ack, by a changed activation that can no
-        // longer answer it, or by a peer that is gone/stale — never by this
-        // timer and never by a guess: a live peer that is silent may still
-        // reconcile the record.
+        // longer answer it, or by its peer. A claimed barrier is held through a
+        // stale heartbeat; only the withdrawn state (or a change of the
+        // activation) is the proof it cannot be reconciled. An unclaimed one is
+        // released when the tick goes stale: it cannot be applied any more.
         if (epochChanged) {
             g_pressOutstanding = OutstandingPress{};
             HWND window = g_execWindow.load(std::memory_order_relaxed);
@@ -15844,12 +15859,13 @@ void HandlePressAckTimeout() {
             ServeNextPress(L"epoch");
             return;
         }
-        if (peerAlive) {
+        const bool claimed = taken == press.seq;
+        if (peerAlive || (claimed && PeerStateAliveNow())) {
             TraceLog(L"own external ack timeout seq=%lld wait=%llu peer=%s age=%u "
-                    L"epoch=%u decision=reserved",
+                    L"epoch=%u claimed=%d decision=reserved",
                     static_cast<long long>(press.seq),
                     static_cast<unsigned long long>(wait), peer, peerAge,
-                    epochNow);
+                    epochNow, claimed ? 1 : 0);
             // The presses held behind the barrier still reach their own bound
             // while it stands; the poll that re-checks the barrier is also the
             // wake that bound uses.
@@ -15874,10 +15890,11 @@ void HandlePressAckTimeout() {
             KillTimer(window, kPressAckTimer);
         }
         TraceLog(L"own external barrier seq=%lld wait=%llu peer=%s age=%u "
-                L"epoch=%u decision=released reason=peer-gone",
+                L"epoch=%u claimed=%d decision=released reason=%s",
                 static_cast<long long>(press.seq),
                 static_cast<unsigned long long>(wait), peer, peerAge,
-                epochNow);
+                epochNow, claimed ? 1 : 0,
+                PeerStateAliveNow() ? L"stale-unclaimed" : L"peer-gone");
         ResumePressQueueAge();
         ServeNextPress(L"timeout");
         return;
@@ -15919,9 +15936,10 @@ void HandlePressAckTimeout() {
                     static_cast<unsigned long long>(wait),
                     static_cast<long long>(taken), peer, peerAge, epochNow);
         }
-        if (!peerAlive) {
-            // The activation that claimed it can no longer answer. The press may
-            // already have run, so there is no replay; the queue is released.
+        if (!PeerStateAliveNow()) {
+            // The activation that claimed it is gone (the state was withdrawn),
+            // not merely between heartbeats. The press may already have run, so
+            // there is no replay; the queue is released.
             g_pressOutstanding = OutstandingPress{};
             HWND window = g_execWindow.load(std::memory_order_relaxed);
             if (window) {
