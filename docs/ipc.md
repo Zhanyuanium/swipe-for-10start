@@ -1,6 +1,6 @@
 # IPC — the merged mod's channel
 
-> Mod 0.8.0 (one source, two process halves). One session-local section, five
+> Mod 0.8.1 (one source, two process halves). One session-local section, five
 > named events, every record a seqlock. There is no file, no mutex, no command
 > channel and no polling on either side.
 

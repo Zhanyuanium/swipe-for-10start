@@ -7,7 +7,8 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
-| `v0.8.0` | 0.8.0 | — | 232 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger; an executor capability word |
+| `v0.8.1` | 0.8.1 | — | 232 B | the executor proves itself before either half intercepts: one `execCapable` word, one symbol attempt, an unowned show adopted, a close that moves from its first frame |
+| `v0.8.0` | 0.8.0 | — | 216 B | a close that can be interrupted: one ownership record, one grab per contact, a press's open for a band pull, a landing that adopts no finger |
 | `v0.7.0` | 0.7.0 | — | 216 B | one mod, two processes: the collection's review answered (symbol hooks, no pin, deadline-driven wakeups, tap rejection, lean channel) |
 | `v0.6.2` | 0.44.0 | 0.25.0 | v7 | M3.3: one controller, one executor |
 | `v0.6.1` | 0.40.0 | 0.21.0 | v4 | intent direction from the controller state; no press lost after a gesture close |
@@ -21,6 +22,42 @@ pair that shipped before the merge.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.8.1 — the executor proves itself
+
+Windhawk `@version` 0.8.1. The channel grows to 232 bytes, and the two halves
+agree on one capability word before either takes a press in hand.
+
+- **A capability, not a mapping.** The bridge publishes one `execCapable` word
+  only while its worker, the executor window on the recorded launcher thread, the
+  verified launcher layout and the show/dismiss primitives all exist. The Start
+  side advertises, animates and commands only while that word is 1; a drop
+  withdraws the peer, releases the panel and restores its rest. Launcher symbols
+  are resolved once per module per install, with a terminal `unresolved` line,
+  instead of a retry loop that could stall every press. The reference image is
+  `twinui.pcshell.dll` fixed 10.0.26100.10068.
+- **An unowned show is adopted, not replayed.** A show the shell performed while
+  the press was passed keeps its own storyboard: the Start side inserts the
+  resting value and writes `win open adopted reason=unowned` instead of settling
+  from 0, which used to rewind an already presented menu and flash. Only a show
+  this activation requested by intent, touch claim or landing keeps an entry
+  settle.
+- **The shell close moves from its first frame.** The Win key, the Start button
+  and the click-away now apply the keyboard open's spring in the closing
+  direction (`start * (1 - openY(i))`) instead of playing its samples backwards.
+  The old shape covered 1.5 % of the travel in the first 380 ms and then snapped
+  into the bar; the close now starts at once and decelerates into the edge, with
+  the same duration, style and dismiss lead.
+- **The channel is 232 bytes.** `SingleMod3`, magic `0x53333053`, `intentTaken`
+  at 216 and `execCapable` at 224. The 0.8.0 layout was 216 bytes; the 224-byte
+  development image between the two is not a tag. The namespace is the ABI
+  identity, so an old image cannot join.
+
+Still owed, and named in `docs/limits.md`: the top and right docks are
+implemented but unmeasured on this machine, a pen by hand, a second display and
+rotation (untestable here), a finger or pen tap that cannot reverse a close
+(mouse only), and a consumed finger that is silent through a landing and then
+moves.
 
 ## v0.8.0 — a close you can interrupt
 
@@ -48,24 +85,12 @@ can fight.
   retract no longer resurrects the menu afterwards, and a consumed contact ends
   only on its lift or a report that proves another contact — never on the
   digitizer's quiet through a hide.
-- **A capability, not a mapping.** The bridge publishes one `execCapable` word
-  only while its worker, the executor window on the recorded launcher thread, the
-  verified launcher layout and the show/dismiss primitives all exist. The Start
-  side advertises, animates and commands only while that word is 1; a drop
-  withdraws the peer, releases the panel and restores its rest. Launcher symbols
-  are resolved once per module per install, with a terminal `unresolved` line,
-  instead of a retry loop that could stall every press. The reference image is
-  `twinui.pcshell.dll` fixed 10.0.26100.10068.
 - **Two diagnostic lines.** `exec dismiss enter ... at=` dates the launcher call
   from before it was entered, and `motion sample` records the position and slope
   a takeover read. Both are written only with `DiagnosticTrace`.
 - **A tracker for the evidence.** `tools/panel_edge_track.ps1` samples the
   panel's trailing edge for any of the four docks, which is how every claim above
   was judged in pixels rather than in logs.
-- **The channel is 232 bytes.** `intentTaken` at 216 and `execCapable` at 224 are
-  new in this release; the layout grows from the 216 bytes of the previous tag
-  through 224 to 232. The `SingleMod3` namespace is the ABI identity: the tag
-  names one mod built from one layout.
 
 Still owed, and named in `docs/limits.md`: the top and right docks are
 implemented but unmeasured on this machine, a pen by hand, and a consumed finger

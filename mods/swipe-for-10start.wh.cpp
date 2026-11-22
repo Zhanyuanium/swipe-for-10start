@@ -2,7 +2,7 @@
 // @id              swipe-for-10start
 // @name            Legacy Start Swipe
 // @description     Swipe in from the taskbar edge to pull the Start menu out with your finger, and swipe back to close it
-// @version         0.8.0
+// @version         0.8.1
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
@@ -473,7 +473,7 @@ bool SwipeCloseIntentAllowed(uint32_t method) {
 // the mod's @version metadata, so this is the one authored copy; the metadata
 // block above and this constant change in the same commit. A role-start line that
 // says a different release is a bug, not history.
-constexpr wchar_t kModVersion[] = L"0.8.0";
+constexpr wchar_t kModVersion[] = L"0.8.1";
 
 namespace start {
 

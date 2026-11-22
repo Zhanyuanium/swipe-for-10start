@@ -3,7 +3,7 @@
 
 ## Shipping mod
 
-### swipe-for-10start.wh.cpp (0.8.0, StartMenuExperienceHost.exe + explorer.exe)
+### swipe-for-10start.wh.cpp (0.8.1, StartMenuExperienceHost.exe + explorer.exe)
 One image, installed once and loaded into two hosts that never share a process.
 The file holds both halves in named namespaces — `start` (the controller and the
 touch gesture) and `bridge` (the launcher executor and the non-touch triggers) —
