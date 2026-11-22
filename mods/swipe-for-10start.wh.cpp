@@ -14317,7 +14317,8 @@ OwnSnapshot OwnSync(void* launcher) {
 // other entry calls it directly.
 void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags,
-                    uint32_t admittingEpoch, int32_t entry);
+                    uint32_t admittingEpoch, int32_t entry,
+                    bool pointer = false);
 
 // The same adoption after a close the executor passed or served. It reads the
 // state the hook received, which is the IXamlLauncherState interface.
@@ -14561,6 +14562,31 @@ bool HideCanServeClose(const wchar_t** reason) {
     return true;
 }
 
+// A method-7 Hide from the ActiveZBand scope is a click-away only while a real
+// pointer button is down. The same z-band change is produced by Alt+Tab, a
+// foreground switch and a taskbar activation, which carry no button and must not
+// reopen a close. A click on the taskbar itself is excluded by the window under
+// the cursor: activating another app is not a click on the menu's owner surface.
+bool ClickAwayPointerNow() {
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) {
+        return false;
+    }
+    POINT point{};
+    if (!GetCursorPos(&point)) {
+        return false;
+    }
+    const HWND under = WindowFromPoint(point);
+    if (!under) {
+        return false;
+    }
+    wchar_t className[64]{};
+    if (GetClassNameW(under, className, ARRAYSIZE(className)) == 0) {
+        return false;
+    }
+    return wcscmp(className, L"Shell_TrayWnd") != 0 &&
+           wcscmp(className, L"MSTaskListWClass") != 0;
+}
+
 // XamlLauncherState::HideStartAndCortana(void* self, uint32_t method)
 // twinui.pcshell.dll 26100.9949, RVA 0x24BCB0. The function reads the dismiss
 // method in edx, writes the transient state at [self+0x28] and calls the
@@ -14624,7 +14650,8 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
                     execState, t_execCall);
             DispatchToggle(clickOwn, kSwipeTriggerClickAway,
                            kSwipeShowMethodStartButton, method, 0,
-                           PeerEpochNow(), kPressEntryHide);
+                           PeerEpochNow(), kPressEntryHide,
+                           ClickAwayPointerNow());
             return;
         }
         TraceLog(L"exec pass hide caller=%s method=%u state=%u depth=%d "
@@ -14741,7 +14768,7 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         DispatchToggle(clickOwn, kSwipeTriggerClickAway,
                        kSwipeShowMethodStartButton,
                        kDismissMethodClickAway, 0, PeerEpochNow(),
-                       kPressEntryHide);
+                       kPressEntryHide, ClickAwayPointerNow());
         return;
     }
 
@@ -14837,6 +14864,10 @@ struct QueuedPress {
     // queue bound counts from here, not from admission behind an older press; 0
     // means the head's bound is paused. Launcher thread only.
     uint64_t servableTick = 0;
+    // A click-away's real-pointer evidence: the button was down when the shell
+    // delivered method 7. A z-band change from Alt+Tab, a taskbar activation or a
+    // foreground switch carries no pointer and must not reopen a close.
+    bool pointer = false;
 };
 
 const wchar_t* PressEntryName(int32_t entry) {
@@ -15585,11 +15616,11 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
         // serialised, but not re-decided.
         kind = kSwipeIntentClose;
     } else if (press.trigger == kSwipeTriggerClickAway) {
-        // A click-away is not a close by definition. The controller's closing
-        // direction is the whole reversal rule; a panel it owns (or the shell's
-        // own open) is the close the click has always been. A callback with no
-        // panel and no close is not a toggle: pass it, never open a closed menu.
-        if (direction == kSwipeDirectionClosing) {
+        // A click-away is the shell's dismissal, not a toggle. Only a real
+        // pointer down makes it the reopen that interrupts a close; a z-band
+        // change from Alt+Tab, a taskbar activation or a foreground switch
+        // carries no pointer and is a close (or a pass), never a reopen.
+        if (direction == kSwipeDirectionClosing && press.pointer) {
             kind = kSwipeIntentOpen;
         } else if (own.open || own.state == 1 || own.state == 3 ||
                    own.state == 5) {
@@ -15650,11 +15681,11 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
     // decides. A press queued behind another therefore logs its own direction,
     // which is the one the earlier press published.
     TraceLog(L"own toggle decide trigger=%s entry=%s state=%u open=%d kind=%s "
-            L"dir=%d q=%d",
+            L"dir=%d q=%d ptr=%d",
             PressTriggerName(press.trigger), PressEntryName(press.entry),
             own.state, own.open ? 1 : 0,
             kind == kSwipeIntentClose ? L"close" : L"open", direction,
-            g_pressQueueCount);
+            g_pressQueueCount, press.pointer ? 1 : 0);
     if (kind == kSwipeIntentOpen &&
         (ShellHideInFlight(own) || t_execCall > 0)) {
         // The shell is already hiding, or our own `Dismiss` call is live on this
@@ -16309,9 +16340,9 @@ void HandlePressAckTimeout() {
 // is a count of toggles the user already asked for.
 void DispatchToggle(const OwnSnapshot& own, int32_t trigger, uint32_t showMethod,
                     uint32_t dismissMethod, uint32_t flags,
-                    uint32_t admittingEpoch, int32_t entry) {
+                    uint32_t admittingEpoch, int32_t entry, bool pointer) {
     const QueuedPress press{trigger, entry, showMethod, dismissMethod, flags,
-                            admittingEpoch, GetTickCount64()};
+                            admittingEpoch, GetTickCount64(), 0, pointer};
     AdmitPress(press, own);
 }
 

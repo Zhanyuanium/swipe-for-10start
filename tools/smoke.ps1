@@ -128,14 +128,16 @@ public static void Click(int x, int y) {
     SetCursorPos(x, y);
     System.Threading.Thread.Sleep(60);
     mouse_event(0x0002, 0, 0, 0, System.UIntPtr.Zero);
+    System.Threading.Thread.Sleep(60);
     mouse_event(0x0004, 0, 0, 0, System.UIntPtr.Zero);
 }
-// The same click without the pointer-settle sleep: a click-away that must land
-// inside a retract has only a few hundred milliseconds, and the cursor move is
-// synchronous.
+// The same click without the pointer-settle move sleep: a click-away that must
+// land inside a retract has only a few hundred milliseconds. The button is still
+// held for 60 ms so GetAsyncKeyState sees a real pointer-down at the Hide.
 public static void ClickNow(int x, int y) {
     SetCursorPos(x, y);
     mouse_event(0x0002, 0, 0, 0, System.UIntPtr.Zero);
+    System.Threading.Thread.Sleep(60);
     mouse_event(0x0004, 0, 0, 0, System.UIntPtr.Zero);
 }
 '@

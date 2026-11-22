@@ -527,7 +527,10 @@ probe or timer failure is answered `unknown`.
 - `HideStartAndCortana_Hook` (0x24BCB0): lock/unknown/Win+Tab and a forwarded
   modified press publish `intent=external` and pass. An admitted click-away is not
   a close by definition: it reaches the one dispatcher, so `closing` makes it the
-  reopen and a panel the controller owns makes it the close (method 7 stays the
+  reopen only while a real left button is down (`ClickAwayPointerNow`); a z-band
+  change from Alt+Tab, a foreground switch or a taskbar activation carries no
+  button and is a close, as is a click whose cursor is over the taskbar window.
+  A panel the controller owns makes it the close (method 7 stays the
   click-away evidence, mapped to 6 on the Start side). A click with no panel to
   close and no close to reverse passes to the shell through the dispatcher's one
   no-panel branch (`own press pass trigger=clickaway entry=hide reason=no-panel`),

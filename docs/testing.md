@@ -330,6 +330,20 @@ could act, or before its confirmation could land).
   re-read find none: `decision=released reason=stale-unclaimed`, then the queued
   press is served in order.
 
+## Round-11 runtime check
+
+- **Click-away reopen evidence.** Five tries each on the release build
+  (2026-11-22), during a Win close: Alt+Tab produced 5 click-away decisions and
+  0 opens (all `ptr=0 kind=close`); bringing Notepad forward produced 0
+  click-away decisions and 0 opens; a real desktop click with a 60 ms button hold
+  produced 5 click-away decisions and 5 opens (`ptr=1 kind=open`), the positive
+  control. A taskbar app button could not be activated: the auto-hidden taskbar
+  does not reveal a pointer target in this session and its focused buttons do not
+  expose InvokePattern, so that case is not measured. `main` (8b55ddf) was
+  sampled with Alt+Tab once: it published `intent close trigger=clickaway` and
+  ended closed, so the pre-fix review reopen was a regression; the release build
+  now matches it without a button and keeps the desktop-click reopen.
+
 ## The one-pass smoke
 
 `tools/smoke.ps1` drives the four triggers through their real paths and judges

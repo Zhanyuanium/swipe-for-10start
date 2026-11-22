@@ -32,9 +32,11 @@ The controller decides; the executor performs. The Win key
 `Dismiss` method 6) and the click-away (`HideStartAndCortana` method 7) reach one
 toggle decision and publish one `intent(seq, kind, trigger, method, flags, open)`;
 the Start side applies it — `exec show`, or the one mirrored close settle and then
-`exec dismiss` — and answers `intent ack`. A click on the desktop therefore
-closes a settled panel and reverses a close that is still in flight, exactly like
-the other two presses; method 7 stays the click-away evidence in the intent and
+`exec dismiss` — and answers `intent ack`. A real pointer click on the desktop
+therefore closes a settled panel and reverses a close that is still in flight,
+exactly like the other two presses; a z-band change with no left button down
+(Alt+Tab, a foreground switch, a taskbar activation) is not that click and
+closes instead; method 7 stays the click-away evidence in the intent and
 the Start side maps it to the executor's 6. External takeovers (Win+Tab, lock,
 display change, a forwarded modified Win press) publish `intent=external` and are
 never held; Win+Tab's `Dismiss(5)` runs the shell's original (Task View) and the
@@ -75,8 +77,10 @@ A press is recovered, not guaranteed. The bridge's one dispatch reads the
 controller's published direction: `closing` (a close in flight)
 makes the press an open and `open` makes it a close. The launcher's
 state is only the resync for a panel the controller does not own. The click-away
-is the same dispatch, so a desktop click reverses a close exactly as the Win key
-and the Start button do; a method-7 callback with no panel and no close passes to
+is the same dispatch, but only a real left button down makes it reverse a close
+exactly as the Win key and the Start button do; without a button the z-band
+change (Alt+Tab, a foreground switch, a taskbar activation) closes, and a
+method-7 callback with no panel and no close passes to
 the shell instead of opening a closed menu. That direction
 cannot come from the shell: a gesture close retracts the panel with
 `InternalState` 5 and the cloak still open for the whole settle, until the
