@@ -10,11 +10,12 @@ edge pull opens it, an injected panel drag closes it, and a click on the desktop
 closes it. It then interrupts three closes with a different trigger — a Win close
 with a desktop click, a Start-button close with a Win press, and a gesture close
 with a desktop click — and requires each to publish an open with dir=2, cancel the
-close's dismiss, end the close as `reason=open-cancel`, and leave the panel
-uncloaked. Every step is judged by the state report from start_menu.ps1 plus the
-decision and executor lines the pair wrote during that step, and the last step
-fails if the run produced any error-shaped line (a non-zero HRESULT, a timeout, a
-refusal, a dropped press, a lost latch).
+close's dismiss, end the close as `reason=open-cancel`, have left the panel's rest
+(the cancel line's `from=` below 1), and still be uncloaked after that close's own
+dismiss deadline. Every step is judged by the state report from start_menu.ps1
+plus the decision and executor lines the pair wrote during that step, and the last
+step fails if the run produced any error-shaped line (a non-zero HRESULT, a
+timeout, a refusal, a dropped press, a lost latch).
 
 Each row requires the pair its claim rests on, not a substring: a touch open is
 `reveal pull qualified` plus the executor's ack for the exact show sequence the
@@ -394,10 +395,12 @@ function Invoke-StartButtonClick {
 
 # The three mixed-trigger rows share one claim: the second trigger publishes an
 # open while the controller is closing, the first close's dismiss never runs,
-# and the panel ends open. The bridge's decision line names the direction, the
-# Start side's cancel line names the command (or the local slot), and the
-# landing line must be absent because the close never landed.
-function Test-InterruptedClose {
+# the panel was already off its rest when the reversal happened, and it is still
+# open after the cancelled dismiss's own deadline. The bridge's decision line
+# names the direction, the Start side's cancel line names the command (or the
+# local slot) and its `from=`, and the close's request line (or the gesture's
+# settle) gives the deadline the final cloak read must outlast.
+function Get-InterruptedCloseProof {
     param([string]$bridge, [string]$start, [string]$opener)
     $opened = $bridge -match ("own toggle decide trigger=$opener[^\r\n]*kind=open dir=2")
     $intent = $bridge -match ("intent kind=open trigger=$opener")
@@ -405,7 +408,42 @@ function Test-InterruptedClose {
         ($start -match 'close dismiss cancelled kind=')
     $ended = $start -match 'close ended[^\r\n]*reason=open-cancel'
     $landed = $start -match 'win close observed'
-    return ($opened -and $intent -and $cancel -and $ended -and -not $landed)
+    $from = 1.0
+    $fromMatch = [regex]::Match($start, 'intent open cancel from=([0-9.]+)')
+    if ($fromMatch.Success) { $from = [double]$fromMatch.Groups[1].Value }
+    # The cancelled dismiss's deadline. An intent close carries the executor
+    # request; a gesture close that is cancelled before that line exists uses
+    # its own settle end plus the 30 ms bridge lead.
+    $deadline = 0
+    $request = [regex]::Matches($start,
+        '(?m)^t=(\d+) exec dismiss request[^\r\n]*executeAt=(\d+)') |
+        Select-Object -Last 1
+    if ($request) {
+        $deadline = [long]$request.Groups[2].Value
+    } elseif ($start -match '(?m)^t=(\d+) [^\r\n]*intent close from=[0-9.]+ dur=(\d+)') {
+        $deadline = [long]$Matches[1] + [long]$Matches[2] + 30
+    } elseif ($start -match '(?m)^t=(\d+) [^\r\n]*settle [^\r\n]*dir=close[^\r\n]*dur=(\d+)') {
+        $deadline = [long]$Matches[1] + [long]$Matches[2] + 30
+    }
+    $proof = $opened -and $intent -and $cancel -and $ended -and -not $landed -and
+        $from -lt 1.0 -and $deadline -gt 0
+    return [pscustomobject]@{
+        Ok = $proof; From = $from; Deadline = $deadline
+        Opened = $opened; Intent = $intent; Cancel = $cancel; Ended = $ended
+        Landed = $landed
+    }
+}
+
+# The final read for a reversal: wait until the cancelled close's own deadline
+# plus a margin has passed, then read the cloak. A `Wait-For $true` would return
+# before the deadline and could not see a command that was not actually
+# cancelled.
+function Wait-Past-CloseDeadline {
+    param([long]$Deadline)
+    if ($Deadline -le 0) { return $false }
+    $left = $Deadline + 150 - [Environment]::TickCount64
+    if ($left -gt 0) { Start-Sleep -Milliseconds $left }
+    return (State)
 }
 
 $runMark = Mark
@@ -549,7 +587,7 @@ function Open-Settled {
 
 # 6. a Windows-key close interrupted by a desktop click
 if ($SkipClickAway) {
-    Add-Row 'win close + click reopen' $true 'skipped'
+    Write-Host 'skipped: win close + click reopen (-SkipClickAway)'
 } elseif (-not $layout.Complete) {
     Add-Row 'win close + click reopen' $false "layout incomplete: $layoutGap"
 } else {
@@ -559,14 +597,15 @@ if ($SkipClickAway) {
     [Smoke.Native]::WinTap()
     Start-Sleep -Milliseconds 120
     [Smoke.Native]::ClickNow($desk[0], $desk[1])
-    $ended = Wait-For $true 3000
-    Start-Sleep -Milliseconds 400
+    $cancelSeen = Wait-Log $m 'intent open cancel from=' 2500
     $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
     $startLines = (New-Lines $m) -join "`n"
     $first = $bridgeLines -match 'own toggle decide trigger=win[^\r\n]*kind=close'
-    $ok = $opened -and $ended -and $first -and
-        (Test-InterruptedClose $bridgeLines $startLines 'clickaway')
-    Add-Row 'win close + click reopen' $ok ''
+    $proof = Get-InterruptedCloseProof $bridgeLines $startLines 'clickaway'
+    $finalOpen = if ($cancelSeen) { Wait-Past-CloseDeadline $proof.Deadline } else { $false }
+    $ok = $opened -and $first -and $proof.Ok -and $finalOpen
+    Add-Row 'win close + click reopen' $ok (
+        "interrupt=click from=$($proof.From) deadline=$($proof.Deadline) final=$finalOpen")
 }
 
 # 7. a Start-button close interrupted by a Windows-key press
@@ -577,14 +616,15 @@ if (-not (Invoke-StartButtonClick)) {
 } else {
     Start-Sleep -Milliseconds 120
     [Smoke.Native]::WinTap()
-    $ended = Wait-For $true 3000
-    Start-Sleep -Milliseconds 400
+    $cancelSeen = Wait-Log $m 'intent open cancel from=' 2500
     $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
     $startLines = (New-Lines $m) -join "`n"
     $first = $bridgeLines -match 'own toggle decide trigger=startbutton[^\r\n]*kind=close'
-    $ok = $opened -and $ended -and $first -and
-        (Test-InterruptedClose $bridgeLines $startLines 'win')
-    Add-Row 'start close + win reopen' $ok ''
+    $proof = Get-InterruptedCloseProof $bridgeLines $startLines 'win'
+    $finalOpen = if ($cancelSeen) { Wait-Past-CloseDeadline $proof.Deadline } else { $false }
+    $ok = $opened -and $first -and $proof.Ok -and $finalOpen
+    Add-Row 'start close + win reopen' $ok (
+        "interrupt=win from=$($proof.From) deadline=$($proof.Deadline) final=$finalOpen")
 }
 
 # 8. a gesture close interrupted by a desktop click. The drag reaches the shell
@@ -592,7 +632,7 @@ if (-not (Invoke-StartButtonClick)) {
 # accepted, and the cancel names the local slot or the executor command. The
 # click must land inside the retract, so a miss is retried from a fresh open.
 if ($SkipClickAway) {
-    Add-Row 'gesture close + click reopen' $true 'skipped'
+    Write-Host 'skipped: gesture close + click reopen (-SkipClickAway)'
 } elseif (-not $layout.Complete) {
     Add-Row 'gesture close + click reopen' $false "layout incomplete: $layoutGap"
 } else {
@@ -608,16 +648,24 @@ if ($SkipClickAway) {
         # about to be. Click at once, with no pointer-settle sleep: the retract is
         # the only window in which the click is the reopen.
         [Smoke.Native]::ClickNow($desk[0], $desk[1])
-        $ended = Wait-For $true 3000
-        Start-Sleep -Milliseconds 400
+        $cancelSeen = Wait-Log $m 'intent open cancel from=|close dismiss cancelled kind=' 2500
         $bridgeLines = (New-Lines $m $BridgeLog) -join "`n"
         $startLines = (New-Lines $m) -join "`n"
         $first = ($startLines -match 'close accepted serial=\d+ kind=dismiss') -or
             ($startLines -match 'close dismiss kind=') -or
             ($bridgeLines -match 'own toggle decide trigger=clickaway[^\r\n]*kind=close')
-        $ok = $opened -and $ended -and $first -and
-            (Test-InterruptedClose $bridgeLines $startLines 'clickaway')
-        if (-not $ok) { $detail = "attempt $i" }
+        $proof = Get-InterruptedCloseProof $bridgeLines $startLines 'clickaway'
+        $finalOpen = if ($cancelSeen) { Wait-Past-CloseDeadline $proof.Deadline } else { $false }
+        $ok = $opened -and $first -and $proof.Ok -and $finalOpen
+        $closeProducer = if ($startLines -match 'close accepted serial=\d+ kind=dismiss' -or
+            $startLines -match 'close dismiss kind=') { 'hid' } else { 'pointer' }
+        if ($ok) {
+            $detail = "interrupt=click close=$closeProducer from=$($proof.From) " +
+                "deadline=$($proof.Deadline) final=$finalOpen"
+        } else {
+            $detail = "attempt $i close=$closeProducer from=$($proof.From) " +
+                "deadline=$($proof.Deadline) final=$finalOpen"
+        }
     }
     Add-Row 'gesture close + click reopen' $ok $detail
 }

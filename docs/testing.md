@@ -232,9 +232,14 @@ accepted ... kind=dismiss` for a gesture the click interrupts before its
 `close dismiss kind=` line), the reopen decision (`own toggle decide ... kind=open
 dir=2`), the cancel that retired the close (`exec cancel request target=...
 reason=open-intent`, or `close dismiss cancelled kind=...`), `close ended ...
-reason=open-cancel`, no `win close observed`, and the panel ending uncloaked.
-These are the rows that fail when a click or a press re-closes instead of
-reversing; the older smoke passed while the click did exactly that.
+reason=open-cancel`, no `win close observed`, and a cancellation `from=` below 1
+(the panel had already left its rest). The final cloak is read only after that
+close's own dismiss deadline — the request's `executeAt`, or the gesture settle's
+end plus 30 ms — so a command that was not actually cancelled fails the row. The
+row reports the interrupting producer, `from=` and the deadline. A click row
+skipped by `-SkipClickAway` is printed as skipped and not added as a passed
+reversal. These are the rows that fail when a click or a press re-closes instead
+of reversing; the older smoke passed while the click did exactly that.
 
 The last step fails on any error-shaped line in the run —
 a non-zero
