@@ -539,7 +539,8 @@ Add-Row 'touch close (injected)' $closed $detail
 
 # 5. a click on the desktop closes it, once the window is past its presentation
 if ($SkipClickAway) {
-    Add-Row 'click-away' $true 'skipped'
+    # No row: a skipped check is not a pass, as with the two reversal rows below.
+    Write-Host 'skipped: click-away (-SkipClickAway)'
 } else {
     $m = Mark
     [Smoke.Native]::WinTap()
