@@ -144,6 +144,11 @@ serve. The bound is **paused while a normal press is executing** (`servableTick`
 0 until the slot is released): the head's 1500 ms restarts then, so a press that
 waited behind a claimed predecessor is never aged out ahead of it. An external
 barrier is not an executing press, so the presses held behind it keep the bound.
+The pause is not an absolute cap: a queued press older than 2500 ms from its
+admission (`kPressQueueWaitMs + kPressAckTimeoutMs`) is dropped
+(`own press dropped ... reason=stale`) and never run natively, so a freeze or a
+hard kill cannot produce a ghost toggle minutes later. The 100 ms reserve poll
+stops when no slot is outstanding.
 The Start side claims the
 sequence **before** it copies the record and re-checks the claim after the copy;
 a record the bridge aborted in between is dropped **and answered as superseded**

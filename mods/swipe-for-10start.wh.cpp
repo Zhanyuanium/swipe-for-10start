@@ -13924,6 +13924,11 @@ constexpr uint64_t kPressAckTimeoutMs = 1000;
 // record and the native replay is safe.
 constexpr uint64_t kPressReservePollMs = 100;
 constexpr uint64_t kPressQueueWaitMs = 1500;
+// The queue-age bound pauses behind a claimed press, so it is not an absolute
+// cap. A press that waited behind a frozen or killed activation is dropped once
+// this total passes, not run natively: its direction is minutes old and the
+// shell has long since moved on.
+constexpr uint64_t kPressQueueStaleMs = kPressQueueWaitMs + kPressAckTimeoutMs;
 constexpr int kPressQueueCapacity = 4;
 // The controller's own budget for one command (its kBridgeAckTimeoutMs): a show
 // is answered within 400 ms of its publication, a dismiss within 400 ms of the
@@ -15353,10 +15358,41 @@ void RequeuePressFront(const QueuedPress& press) {
     ++g_pressQueueCount;
 }
 
+// Drops a queued press that has outlived the absolute bound. The queue-age
+// bound is paused behind a claimed press and is not an absolute cap; after a
+// freeze or a hard kill the old press must not toggle the menu minutes later.
+// Launcher thread only.
+bool DropStaleQueuedPress() {
+    if (g_pressQueueCount == 0) {
+        return false;
+    }
+    const QueuedPress& head = g_pressQueue[g_pressQueueHead];
+    const uint64_t now = GetTickCount64();
+    if (now <= head.admittedTick ||
+        now - head.admittedTick <= kPressQueueStaleMs) {
+        return false;
+    }
+    TraceLog(L"own press dropped trigger=%s entry=%s reason=stale wait=%llu "
+            L"q=%d",
+            PressTriggerName(head.trigger), PressEntryName(head.entry),
+            static_cast<unsigned long long>(now - head.admittedTick),
+            g_pressQueueCount - 1);
+    g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
+    --g_pressQueueCount;
+    if (g_pressQueueCount > 0) {
+        g_pressQueue[g_pressQueueHead].servableTick = now;
+    }
+    return true;
+}
+
 // Dequeues the head press and runs the shell's own primitive for it, under the
 // executor guard. Used for the queue-age fallback while the outstanding slot is
-// unreachable, and when the poll that enforces that bound cannot be armed.
+// unreachable, and when the poll that enforces that bound cannot be armed. A
+// press past the absolute bound is dropped, never run natively.
 void ServeQueuedOriginal(const wchar_t* reason) {
+    if (DropStaleQueuedPress()) {
+        return;
+    }
     if (g_pressQueueCount == 0) {
         return;
     }
@@ -15376,21 +15412,27 @@ void ServeQueuedOriginal(const wchar_t* reason) {
 }
 
 // Runs the oldest queued press natively once it has outlived the queue bound.
-// True means one press was dequeued and served. A head whose bound is paused
-// (0) is behind an executing press and is never aged out: ordering outranks the
-// bound.
+// True means one press was dequeued and served or dropped. A head whose bound is
+// paused (0) is behind an executing press and is never aged out by the bound:
+// ordering outranks it. The absolute cap is checked even when the bound is
+// paused, so a press behind a frozen activation is dropped instead of running
+// minutes later.
 bool AgeOutQueuedPress() {
+    bool dropped = false;
+    while (DropStaleQueuedPress()) {
+        dropped = true;
+    }
     if (g_pressQueueCount == 0) {
-        return false;
+        return dropped;
     }
     const QueuedPress& head = g_pressQueue[g_pressQueueHead];
     if (head.servableTick == 0) {
-        return false;
+        return dropped;
     }
     const uint64_t now = GetTickCount64();
     if (now <= head.servableTick ||
         now - head.servableTick <= kPressQueueWaitMs) {
-        return false;
+        return dropped;
     }
     ServeQueuedOriginal(L"queue-wait");
     return true;
@@ -15465,6 +15507,15 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
 // close parked on the open-generation gate, and the gate's timer owns its turn.
 bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
     const uint64_t now = GetTickCount64();
+    if (now > press.admittedTick &&
+        now - press.admittedTick > kPressQueueStaleMs) {
+        // The absolute cap also covers a press dequeued just before the head
+        // check saw it. Its direction is stale; drop it without a native run.
+        TraceLog(L"own press dropped trigger=%s entry=%s reason=stale wait=%llu",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                static_cast<unsigned long long>(now - press.admittedTick));
+        return true;
+    }
     // The bound counts from when this press became the servable head, not from
     // its admission behind a press that was still executing.
     const uint64_t ageStart =
@@ -15640,6 +15691,9 @@ void ServeNextPress(const wchar_t* reason) {
         }
     }
     while (!g_pressOutstanding.pending && g_pressQueueCount > 0) {
+        if (DropStaleQueuedPress()) {
+            continue;
+        }
         const QueuedPress press = g_pressQueue[g_pressQueueHead];
         g_pressQueueHead = (g_pressQueueHead + 1) % kPressQueueCapacity;
         --g_pressQueueCount;
@@ -15965,6 +16019,12 @@ bool ReserveExternalBarrier(const OutstandingPress& press, const wchar_t* peer,
 // A crash after the take loses that press rather than duplicating it.
 void HandlePressAckTimeout() {
     if (!g_pressOutstanding.pending) {
+        // No slot needs the poll. A repeating reserve timer that outlived its
+        // slot stops here instead of waking the launcher thread every 100 ms.
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kPressAckTimer);
+        }
         return;
     }
     const OutstandingPress press = g_pressOutstanding;

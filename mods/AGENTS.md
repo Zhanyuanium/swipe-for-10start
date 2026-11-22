@@ -660,7 +660,11 @@ probe or timer failure is answered `unknown`.
   The bound is paused while a normal press is executing (`servableTick=0`): the
   head's clock restarts when that slot is released, so a press behind a claimed
   predecessor is never aged out ahead of it. An external barrier is not an
-  executing press, so its held presses keep the bound. The Start side claims the
+  executing press, so its held presses keep the bound. The pause is not an
+  absolute cap: a queued press older than 2500 ms from its admission
+  (`kPressQueueWaitMs + kPressAckTimeoutMs`) is dropped
+  (`own press dropped ... reason=stale`) and never run natively. The 100 ms
+  reserve poll is killed when no slot is outstanding. The Start side claims the
   sequence before it copies the record and re-checks the claim after the copy
   (`intent drop ... reason=record-gone`); a claimed record it cannot apply is
   answered `intent revoked seq=...` with `kSwipeAckSuperseded`, so the publisher
