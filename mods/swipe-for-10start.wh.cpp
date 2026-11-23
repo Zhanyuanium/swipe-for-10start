@@ -15851,8 +15851,21 @@ bool HideCanServeClose(const wchar_t** reason) {
         return false;
     }
     // The same admission-path acquisition as the decision gate: this close enters
-    // the same queue and claim machinery.
-    WarmPeerProcess();
+    // the same queue and claim machinery. A host whose process is gone cannot
+    // answer this intent, so the shell's own close runs — unless an older press
+    // is held, which must be reconciled first, so the close still reaches
+    // admission and keeps its FIFO place.
+    const PeerProcess process = WarmPeerProcess();
+    if (process != PeerProcess::Alive) {
+        const wchar_t* processName =
+            process == PeerProcess::Dead ? L"process-dead" : L"process-unknown";
+        if (OnRecordedLauncherThread() && PressQueueHeld()) {
+            TraceLog(L"exec hide process-held reason=%s", processName);
+        } else {
+            *reason = processName;
+            return false;
+        }
+    }
     if (!ExecutorWorkerReady()) {
         *reason = L"no-executor";
         return false;
@@ -16537,6 +16550,16 @@ bool ServeLatchedPress(const wchar_t* reason) {
         DropPressLatch(L"peer-gone", reason);
         return false;
     }
+    // The publication's own death proof, as in ServePress: a latch can outlive
+    // the host that armed it, and the heartbeat alone does not prove the process
+    // still answers.
+    const PeerProcess process = WarmPeerProcess();
+    if (process != PeerProcess::Alive) {
+        DropPressLatch(process == PeerProcess::Dead ? L"process-dead"
+                                                    : L"process-unknown",
+                       reason);
+        return false;
+    }
     const uint32_t epoch = PeerEpochNow();
     if (epoch != g_pressLatch.presses[0].admittingEpoch) {
         wchar_t detail[80] = {};
@@ -17043,6 +17066,21 @@ bool ServePress(const QueuedPress& press, const OwnSnapshot* admission) {
                 static_cast<unsigned long long>(g_pressOpenGenBefore),
                 g_pressQueueCount);
         return false;
+    }
+    // The publication's own death proof. The gate at admission and the peer read
+    // above are earlier samples: the controller can claim this press, exit, and
+    // have its pid reused between them. Only the head about to be written is
+    // checked; a press already published is never replayed.
+    const PeerProcess process = WarmPeerProcess();
+    if (process != PeerProcess::Alive) {
+        const wchar_t* processReason =
+            process == PeerProcess::Dead ? L"process-dead" : L"process-unknown";
+        TraceLog(L"own press fallback trigger=%s entry=%s reason=%s wait=%llu",
+                PressTriggerName(press.trigger), PressEntryName(press.entry),
+                processReason,
+                static_cast<unsigned long long>(now - press.admittedTick));
+        RunPressOriginal(press, processReason);
+        return true;
     }
     // One decision line for every trigger, written when the press actually
     // decides. A press queued behind another therefore logs its own direction,
