@@ -10903,7 +10903,7 @@ bool HideCanServeClose(const wchar_t** reason) {
     return true;
 }
 
-bool ClickAwayPointerNow() {
+bool ClickAwayReopensNow() {
 
     const int primary =
         GetSystemMetrics(SM_SWAPBUTTON) != 0 ? VK_RBUTTON : VK_LBUTTON;
@@ -10927,8 +10927,20 @@ bool ClickAwayPointerNow() {
     if (GetClassNameW(root, className, ARRAYSIZE(className)) == 0) {
         return false;
     }
-    return wcscmp(className, L"Shell_TrayWnd") != 0 &&
-           wcscmp(className, L"Shell_SecondaryTrayWnd") != 0;
+    if (wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0) {
+        return false;
+    }
+
+    // Only the menu's own window or the desktop can reverse a close; a click on
+    // another app keeps its close.
+    DWORD pid = 0;
+    GetWindowThreadProcessId(root, &pid);
+    if (pid != 0 && pid == SwipeIpcPeerPid(&g_ipc)) {
+        return true;
+    }
+    return root == GetShellWindow() || wcscmp(className, L"Progman") == 0 ||
+           wcscmp(className, L"WorkerW") == 0;
 }
 
 void HideStartAndCortana_Hook(void* self, uint32_t method) {
@@ -10987,7 +10999,7 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
             DispatchToggle(clickOwn, kSwipeTriggerClickAway,
                            kSwipeShowMethodStartButton, method, 0,
                            PeerEpochNow(), kPressEntryHide,
-                           ClickAwayPointerNow());
+                           ClickAwayReopensNow());
             return;
         }
         TraceLog(L"exec pass hide caller=%s method=%u state=%u depth=%d "
@@ -11070,7 +11082,7 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         DispatchToggle(clickOwn, kSwipeTriggerClickAway,
                        kSwipeShowMethodStartButton,
                        kDismissMethodClickAway, 0, PeerEpochNow(),
-                       kPressEntryHide, ClickAwayPointerNow());
+                       kPressEntryHide, ClickAwayReopensNow());
         return;
     }
 
