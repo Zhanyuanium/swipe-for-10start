@@ -14412,7 +14412,31 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
     return sequence;
 }
 
+constexpr int kShellOwnerWaitTries = 100;
+constexpr DWORD kShellOwnerWaitStepMs = 50;
+
+// Only the shell's explorer.exe owns Shell_TrayWnd; a second one must not share
+// the channel, its capability word or its auto-reset events.
+bool ShellTrayOwnerProcess() {
+    for (int attempt = 0; attempt < kShellOwnerWaitTries; ++attempt) {
+        HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (tray) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(tray, &pid);
+            return pid == GetCurrentProcessId();
+        }
+        Sleep(kShellOwnerWaitStepMs);
+    }
+    return false;
+}
+
 BOOL RoleInit() {
+    if (!ShellTrayOwnerProcess()) {
+        Wh_Log(L"This explorer.exe does not own Shell_TrayWnd; the bridge stays "
+               L"inert in this process");
+        return TRUE;
+    }
+
     SetTraceFileName(L"bridge.log");
     RefreshTraceSetting();
     Wh_Log(L"Swipe for 10Start %s initializing (explorer role)", kModVersion);
