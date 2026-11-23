@@ -14826,6 +14826,7 @@ std::atomic<int> g_execHookFrames{0};
 HANDLE g_execHookIdle = nullptr;
 
 void StopExecutorTeardown(HWND window);
+void RetireExecutorTeardown(HWND window);
 void RemoveExecutorThreadHook();
 
 constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
@@ -18986,6 +18987,8 @@ void ExecutePendingCommand() {
     }
 }
 
+// The unload's stop: the worker is already joined and this window is about to
+// be destroyed, so readiness ends here for good.
 void StopExecutorTeardown(HWND window) {
     g_execTeardownPending = false;
     g_execRetirePending = false;
@@ -19000,6 +19003,22 @@ void StopExecutorTeardown(HWND window) {
     if (g_execTeardownAck) {
         SetEvent(g_execTeardownAck);
     }
+}
+
+// A thread correction's stop. The worker keeps running for the replacement
+// window, so only this window's dispatch and timers end: readiness is left
+// true, and the replacement's creation publishes the capability again.
+void RetireExecutorTeardown(HWND window) {
+    g_execTeardownPending = false;
+    g_execRetirePending = false;
+    KillTimer(window, kExecDismissTimer);
+    KillTimer(window, kExecProbeTimer);
+    KillTimer(window, kPressLatchTimer);
+    KillTimer(window, kExecDismissProbeTimer);
+    KillTimer(window, kPressAckTimer);
+    KillTimer(window, kPressOpenGenTimer);
+    g_execDispatchClosed.store(true, std::memory_order_release);
+    PublishExecutorCapability(L"retire");
 }
 
 LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
@@ -19020,7 +19039,7 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         }
         TraceLog(L"exec window retire served hwnd=%p tid=%u", window,
                 GetCurrentThreadId());
-        StopExecutorTeardown(window);
+        RetireExecutorTeardown(window);
         DestroyWindow(window);
         return 0;
     }
@@ -19284,7 +19303,7 @@ void ReplaceLauncherThread(const wchar_t* source, DWORD previous) {
         // This entry's own thread owns the window: the same-thread path, taken
         // only when no frame is below it.
         if (g_execOwnerDepth == 0) {
-            StopExecutorTeardown(window);
+            RetireExecutorTeardown(window);
             DestroyWindow(window);
         } else {
             g_execRetirePending = true;
