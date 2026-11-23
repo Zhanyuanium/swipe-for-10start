@@ -10267,8 +10267,10 @@ void MaybeAttachToRunningStartHost() {
     if (g_attachAttempted.load(std::memory_order_acquire)) {
         return;
     }
-    if (!g_rootHookReady.load(std::memory_order_acquire) &&
-        !g_rootHookRefused.load(std::memory_order_acquire)) {
+    // Only a successful install is an attach. A refused symbol set leaves a root
+    // this activation can never observe: attaching a renderer and marking it
+    // ready would let raw HID drive the panel while the peer stays unpublished.
+    if (!g_rootHookReady.load(std::memory_order_acquire)) {
         return;
     }
     if (g_attachAttempted.exchange(true, std::memory_order_acq_rel)) {
