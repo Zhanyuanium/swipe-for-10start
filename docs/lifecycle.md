@@ -43,6 +43,8 @@ cannot be proved gone **blocks the unload**.
    windowless root after a lease was ever used blocks too. The rendezvous window is
    destroyed, its class unregistered, and only then are the IPC view and handles
    closed.
+   An inline unload needs no drain: it runs on that UI thread and cannot dispatch
+   another turn before it returns.
 
 `[[clang::no_destroy]]` protects process termination when uninit is skipped; a
 normal unload still clears every one of those objects.

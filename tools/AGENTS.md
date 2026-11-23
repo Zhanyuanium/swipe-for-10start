@@ -42,7 +42,7 @@ probe_cursor_follow.ps1: cursor samples during an injected drag into
 `artifacts/cursor-follow.csv`, then restores the cursor. The cursor is
 suppressed, so every sample is one point.
 ipc.ps1: read-only channel view. `-State` prints the records, the peer
-epoch/tick/state and `execCapable`; it refuses `initState != ready` (2), a
+epoch/tick/state, `execCapable` and `execPid`; it refuses `initState != ready` (2), a
 foreign magic or `layoutBytes != 240`. No command publisher exists.
 native_flyout_frames.ps1: the Quick Settings flyout (`Win+A`) as BMPs at ~10 ms,
 with `ControlCenterWindow` visibility polled as t=0. Captured with the bar on

@@ -1,13 +1,14 @@
 # Architecture — one controller, one executor
 
 > Mod 0.8.5: one source, two process halves. Channel 240 B, no product version
-> word (`SingleMod5` namespace). Measured on the machine in `../AGENTS.md`.
+> word (`SingleMod6` namespace). Measured on the machine in `../AGENTS.md`.
 
 ## What ships
 
 One Windhawk mod, installed once and loaded into both hosts. `Wh_ModInit` picks
 one role table from the host executable name; the other half's hooks, threads and
-handles never exist there.
+handles never exist there. The bridge elects itself: only the Explorer that owns
+`Shell_TrayWnd` opens the channel and starts the worker.
 
 - **`start`** (`StartMenuExperienceHost.exe`) — the controller: Raw Input, the
   panel's `Progress`, the settle planner, the close record, the gates, the peer
@@ -79,7 +80,7 @@ cloak still reports open for the whole retract.
 
 - **Precondition.** Peer (`peerState=alive`, tick younger than 600 ms, clock read
   after the tick), then an open channel, a started worker, the recorded launcher
-  thread, a window on it, `execCapable=1`. Otherwise the trigger passes
+  thread, a window on it, `execCapable=1` with a live `execPid` handle. Otherwise the trigger passes
   (`own pass trigger=... reason=no-peer|wrong-thread|no-capability|...`).
 - **One intent at a time.** A four-entry FIFO on the launcher thread, one press
   published per ack (1000 ms bound). `intentTaken` is the claim written before the
@@ -155,6 +156,6 @@ One session-local section of **240 bytes** and five events
 (`Intent/IntentAck/Exec/ExecAck/Capability`), every record a seqlock. The records
 are the open generation, the intent and its ack and `intentTaken`, the executor
 command and its ack, one controller direction word plus the touch flag, the peer
-identity, and `execCapable`. The prefix is `Local\SwipeFor10Start_SingleMod5_*`;
+identity, `execCapable` and its `execPid`. The prefix is `Local\SwipeFor10Start_SingleMod6_*`;
 the namespace is the ABI identity, and there is no product version word.
 `tools/ipc.ps1` is read-only. See [ipc.md](ipc.md).

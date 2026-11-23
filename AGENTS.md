@@ -21,7 +21,9 @@ One mod, two processes. `mods/swipe-for-10start.wh.cpp` is installed once and
 loaded into `StartMenuExperienceHost.exe` (namespace `start`) and into
 `explorer.exe` (namespace `bridge`). `Wh_ModInit` picks one role table from the
 host executable name before either half runs; the other half's hooks, threads
-and handles are never created there.
+and handles are never created there. The bridge elects itself: only the Explorer
+that owns `Shell_TrayWnd` opens the channel, publishes `execPid` and starts the
+worker; any other `explorer.exe` stays inert.
 
 The controller decides; the executor performs. The controller (`start`) owns the
 Raw Input gesture, the panel's `Progress`, every settle, the close record and the
@@ -44,10 +46,10 @@ registered message, a targeted `WH_GETMESSAGE` hook runs on its UI thread, and
 
 Interception needs three things, and no one implies another: a **live peer**
 (`peerState=alive`, `peerTick` younger than 600 ms), a **usable executor**
-(`execCapable`: worker, window on the recorded launcher thread, verified layout,
-primitives) and a **proven launcher thread** (a launcher entry proved it, and a
-close finds the callable `Dismiss`). A Hide never adopts;
-`ShowStartView`/`Dismiss` never adopt and never prove.
+(`execCapable` with a live `execPid` handle: worker, window on the recorded
+launcher thread, verified layout, primitives) and a **proven launcher thread** (a
+launcher entry proved it, and a close finds the callable `Dismiss`). A Hide never
+adopts; `ShowStartView`/`Dismiss` never adopt and never prove.
 
 Launcher symbols are resolved once per module per install, on the executor
 worker, never in a hook. `HookSymbols` blocks on Windhawk's PDB fetch (measured
@@ -80,11 +82,11 @@ unknown, never hidden.
 and five named events (`Intent/IntentAck/Exec/ExecAck/Capability`; six objects),
 every record a seqlock with its own counter and an `offsetof` assert, plus the
 single-word claims `controllerDirection`, `controllerTouch`, `intentTaken` and
-the bridge's `execCapable`. Names are `Local\SwipeFor10Start_SingleMod5_*`: the
+the bridge's `execCapable`. Names are `Local\SwipeFor10Start_SingleMod6_*`: the
 namespace is the ABI identity, and there is no product version word.
 
 - `peerTick` 204 / `peerState` 208 / `peerEpoch` 212; `peerPid` 216 /
-  `peerUiThread` 220; `intentTaken` 224; `execCapable` 232.
+  `peerUiThread` 220; `intentTaken` 224; `execCapable` 232; `execPid` 236.
 - `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an
   unknown `initState` are refused. Each role opens the channel at its `RoleInit`,
   never in a hook. `tools/ipc.ps1 -State` reads the 240 bytes read-only.
@@ -127,7 +129,7 @@ sessions with captured numbers.
 - A mapped channel is not a live peer. Interception needs `peerState=alive` and
   a `peerTick` younger than 600 ms; otherwise the shell's own path runs.
   Availability is published only by the ready consumer, only while
-  `execCapable=1`, and withdrawn before it is stopped or when the word drops.
+  `execCapable=1` with the bridge process alive, and withdrawn before it is stopped or when either drops.
 - A live peer is not a usable executor. The gate also proves the recorded
   launcher thread, a launcher entry that proved it, a window this activation
   created on it, a running worker, the verified layout and the primitive.

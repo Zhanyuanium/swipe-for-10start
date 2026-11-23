@@ -46,7 +46,7 @@ the other session is refused until it lifts.
 - **Late release** — a pull that lifts before the open keeps its travel, mapped
   position and end speed in one record for 300 ms; the open settles from it. A
   grab never writes a record.
-- **Held idle** — while `controllerTouch`/`g_intentOpenActive` is set, or the
+- **Held idle** — for at most 1.2 s after the claim, while `controllerTouch`/`g_intentOpenActive` is set, or the
   close record owns the panel with a reveal candidate, the idle release is
   skipped: silence during the uncloak or the key/hide is not a lift. A lift
   report still ends the contact.

@@ -6,12 +6,12 @@
 ## Names and layout
 
 ```
-Local\SwipeFor10Start_SingleMod5_State      SwipeIpcState (240 bytes)
-Local\SwipeFor10Start_SingleMod5_Intent     auto-reset, bridge -> Start
-Local\SwipeFor10Start_SingleMod5_IntentAck  auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod5_Exec       auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod5_ExecAck    auto-reset, bridge -> Start
-Local\SwipeFor10Start_SingleMod5_Capability auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod6_State      SwipeIpcState (240 bytes)
+Local\SwipeFor10Start_SingleMod6_Intent     auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod6_IntentAck  auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod6_Exec       auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod6_ExecAck    auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod6_Capability auto-reset, bridge -> Start
 ```
 
 `kSwipeIpcMagic = 0x53333053`. There is no product version word: the
@@ -41,6 +41,7 @@ a reader that sees another value refuses with `ERROR_INVALID_DATA`.
 216  peerPid          220  peerUiThread
 224  intentTaken
 232  execCapable
+236  execPid
 size 240
 ```
 
@@ -98,7 +99,9 @@ reader instead of spinning it.
 - **Executor capability** (bridge → Start): `execCapable` is 1 only while the
   worker runs, the hidden window exists on the recorded launcher thread, the
   loaded `twinui.pcshell.dll` is the verified layout, and the show/dismiss
-  primitives and visibility probe are resolved. Any loss clears it and signals
+  primitives and visibility probe are resolved, and its `execPid` is published.
+  The Start side holds a process handle to that pid: a signalled handle makes the
+  word unusable even before a replacement bridge clears it. Any loss clears it and signals
   `Capability`. The Start side withdraws the peer on a 1 → 0 transition
   (`reason=capability-lost`), clears the shared direction/touch, ends the gesture
   or close it was driving and restores `Progress` at the rest the cloak shows. The
@@ -148,8 +151,8 @@ name)`; an existing section is opened and validated. `initState` is a four-value
 CAS state machine (`Blank -> Initialising -> Ready`, `Abandoned` after a dead
 claim) with a 550 ms budget, so a young claim is abandoned inside the call rather
 than waited on. A missing event disables only the direction it carries; a missing
-`Capability` event leaves the 100 ms fallback read. Both mods call it at
-`Wh_ModInit`, never in a hook.
+`Capability` event leaves the 100 ms fallback read. The Start side opens it at
+`Wh_ModInit`; the bridge opens it on its shell-election thread, never in a hook.
 
 A reinstall loads a fresh image at a fresh base; the old image is unmapped by its
 unload and the new one opens the same section because the namespace is unchanged.
