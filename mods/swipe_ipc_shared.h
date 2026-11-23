@@ -13,16 +13,18 @@
 // number, and a reader accepts a record only when that number did not move
 // while the record was being copied.
 //
-//   Local\SwipeFor10Start_SingleMod4_State      SwipeIpcState
-//   Local\SwipeFor10Start_SingleMod4_Intent     auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod4_IntentAck  auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod4_Exec       auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod4_ExecAck    auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod4_Capability auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod5_State      SwipeIpcState
+//   Local\SwipeFor10Start_SingleMod5_Intent     auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod5_IntentAck  auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod5_Exec       auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod5_ExecAck    auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod5_Capability auto-reset, bridge -> Start
 //
 // The names are session-local because both processes run as the same user in the
 // same session. There is no product version word: the ABI namespace *is* the
-// layout identity. The `4` marks the 240-byte layout that added `peerPid`; a
+// layout identity. The `5` marks the layout that added `peerUiThread` (it fills
+// the tail padding beside `peerPid`, so the byte count stays 240 while the meaning
+// of that word changed); a
 // future incompatible layout changes the prefix again, so an old
 // pinned development image can never join this channel and a same-size change is
 // never reinterpreted across a staggered update. Only a single shipping mod
@@ -114,12 +116,15 @@
 // never a pair of flags, so it cannot see new ownership beside a stale phase.
 // Values: kSwipeDirectionUnowned / Open / Closing.
 //
-// Peer liveness (Start -> bridge): peerEpoch, peerPid, peerTick and peerState.
+// Peer liveness (Start -> bridge): peerEpoch, peerPid, peerUiThread, peerTick
+// and peerState.
 // The bridge creates the section, so a mapped section says nothing about whether
 // the Start side is running; these words are the answer the bridge's gate needs.
 // peerEpoch identifies the activation: it is incremented once per attach,
 // before the tick, so a decision the bridge latched against one activation can
-// tell that a different one now answers. peerState is alive after the consumer
+// tell that a different one now answers. peerPid is the process that owns that
+// epoch, written before the epoch; peerUiThread is the Start side's own XAML UI
+// thread, written when the attach records it. peerState is alive after the consumer
 // is running and gone as soon as that consumer stops; peerTick is the low 32 bits
 // of GetTickCount64, refreshed from the Start side's input thread at most once
 // per kSwipePeerTickIntervalMs. The bridge intercepts only while the state is
@@ -138,17 +143,17 @@
 // and the event only says that it changed.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_SingleMod4_State";
+    L"Local\\SwipeFor10Start_SingleMod5_State";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod4_Intent";
+    L"Local\\SwipeFor10Start_SingleMod5_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod4_IntentAck";
+    L"Local\\SwipeFor10Start_SingleMod5_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod4_Exec";
+    L"Local\\SwipeFor10Start_SingleMod5_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod4_ExecAck";
+    L"Local\\SwipeFor10Start_SingleMod5_ExecAck";
 constexpr wchar_t kSwipeIpcCapabilityEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod4_Capability";
+    L"Local\\SwipeFor10Start_SingleMod5_Capability";
 
 constexpr uint32_t kSwipeIpcMagic = 0x53333053;  // 'S' '3' '0' 'S', LE
 
@@ -311,6 +316,12 @@ struct SwipeIpcState {
     // is not proof of death.
     volatile LONG peerPid;
 
+    // The Start side's own UI thread, written when the attach records it. It is a
+    // thread of the peer process (`peerPid`), so it can never name a thread of the
+    // bridge's process: the bridge reads it as the peer activation's identity,
+    // never as a launcher candidate. 0 means this activation has not recorded one.
+    volatile LONG peerUiThread;
+
     // Start -> bridge: the sequence of the intent the consumer has taken for
     // processing. The Start side writes it before it acts, so a publisher whose
     // ack timed out can tell "the controller has this record" from "the record
@@ -363,6 +374,7 @@ static_assert(offsetof(SwipeIpcState, peerTick) == 204, "layout");
 static_assert(offsetof(SwipeIpcState, peerState) == 208, "layout");
 static_assert(offsetof(SwipeIpcState, peerEpoch) == 212, "layout");
 static_assert(offsetof(SwipeIpcState, peerPid) == 216, "layout");
+static_assert(offsetof(SwipeIpcState, peerUiThread) == 220, "layout");
 static_assert(offsetof(SwipeIpcState, intentTaken) == 224, "layout");
 static_assert(offsetof(SwipeIpcState, execCapable) == 232, "layout");
 static_assert(sizeof(SwipeIpcState) == 240, "layout");
@@ -1011,6 +1023,23 @@ inline uint32_t SwipeIpcPeerEpoch(SwipeIpcChannel* channel) {
                ? static_cast<uint32_t>(
                      InterlockedCompareExchange(&channel->state->peerEpoch, 0,
                                                 0))
+               : 0;
+}
+
+// The peer's own UI thread. Written by the Start side when the attach records
+// it and cleared when that thread is released; the bridge reads it as the peer
+// activation's identity, never as a thread of its own process.
+inline void SwipeIpcSetPeerUiThread(SwipeIpcChannel* channel, uint32_t tid) {
+    if (channel->state) {
+        InterlockedExchange(&channel->state->peerUiThread,
+                            static_cast<LONG>(tid));
+    }
+}
+
+inline uint32_t SwipeIpcPeerUiThread(SwipeIpcChannel* channel) {
+    return channel->state
+               ? static_cast<uint32_t>(InterlockedCompareExchange(
+                     &channel->state->peerUiThread, 0, 0))
                : 0;
 }
 

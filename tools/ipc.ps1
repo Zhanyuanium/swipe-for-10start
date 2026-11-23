@@ -4,8 +4,8 @@
 #          defines.
 # [OUTPUT]: `pwsh -File tools/ipc.ps1 -State` prints one snapshot of the channel
 #           (each record with the sequence it was copied under, plus the controller
-#           words, the peer tick/state/epoch/pid and the bridge's execCapable
-#           word) and
+#           words, the peer tick/state/epoch/pid/uiThread and the bridge's
+#           execCapable word) and
 #           refuses a section whose initState is not ready or whose magic or
 #           layoutBytes is not this header's.
 # [POS]: the read-only view of the merged mod's channel. There is no command
@@ -31,7 +31,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_SingleMod4_State'
+$StateName = 'Local\SwipeFor10Start_SingleMod5_State'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -71,6 +71,7 @@ $OffsetPeerTick = 204
 $OffsetPeerState = 208
 $OffsetPeerEpoch = 212
 $OffsetPeerPid = 216
+$OffsetPeerUiThread = 220
 $OffsetIntentTaken = 224
 $OffsetExecCapable = 232
 $StateBytes = 240
@@ -219,6 +220,7 @@ try {
         peerState           = $view.ReadInt32($OffsetPeerState)
         peerEpoch           = $view.ReadUInt32($OffsetPeerEpoch)
         peerPid             = $view.ReadUInt32($OffsetPeerPid)
+        peerUiThread        = $view.ReadUInt32($OffsetPeerUiThread)
         execCapable         = $view.ReadInt32($OffsetExecCapable)
     } | Format-List
     $view.Dispose()

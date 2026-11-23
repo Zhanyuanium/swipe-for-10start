@@ -2203,6 +2203,29 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason);
 // command through it.
 SwipeIpcChannel g_ipc;
 
+// The Start side's own UI thread, recorded in g_uiThreadId and published beside
+// peerPid: the bridge reads it as this activation's identity. The publish happens
+// before the epoch can be read as alive, because PublishPeerReady requires an
+// attached root, which is only reached after one of these records.
+void RecordPeerUiThread() {
+    const DWORD tid = GetCurrentThreadId();
+    g_uiThreadId.store(tid, std::memory_order_relaxed);
+    if (!g_ipc.state || SwipeIpcPeerUiThread(&g_ipc) == tid) {
+        return;
+    }
+    SwipeIpcSetPeerUiThread(&g_ipc, tid);
+    TraceLog(L"ipc peer ui tid=%u", tid);
+}
+
+// The UI thread is released with the root. The next activation records its own,
+// so a stale value must not outlive this one.
+void ClearPeerUiThread() {
+    g_uiThreadId.store(0, std::memory_order_relaxed);
+    if (g_ipc.state) {
+        SwipeIpcSetPeerUiThread(&g_ipc, 0);
+    }
+}
+
 // The close's executor command goes through the shared channel below, on the
 // input thread: the intent is read and answered, and the dismiss is published
 // for the end of the settle. The bridge is the only launcher caller.
@@ -3637,8 +3660,11 @@ void OpenIpcChannel() {
     // see that a different one answers, even though both run the same image.
     // image.
     // The pid goes before the epoch: the pair a reader can see is the new
-    // process under the old epoch, never a dead pid under a live one.
+    // process under the old epoch, never a dead pid under a live one. The UI
+    // thread is cleared in the same step: this activation has not recorded one
+    // yet, and the previous activation's thread must not be read as its own.
     SwipeIpcSetPeerPid(&g_ipc, GetCurrentProcessId());
+    SwipeIpcSetPeerUiThread(&g_ipc, 0);
     g_peerEpoch = SwipeIpcBeginPeerActivation(&g_ipc);
 
     // A show or dismiss from the previous activation can still be queued or
@@ -13075,7 +13101,7 @@ bool Setup(wux::FrameworkElement const& root) {
         }
     }
 
-    g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    RecordPeerUiThread();
     g_root = root;
     g_panelTrailLogged = false;  // one reveal trail line per open
 
@@ -13276,7 +13302,7 @@ void* PrepareRootElement_Hook(void* frame, void* perFrameData, bool flag) {
     // the new root, before Setup runs. Record the UI thread and create this
     // module's own rendezvous window on it here, before any registration: an
     // unload in that window can then run the teardown on the owner thread.
-    g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    RecordPeerUiThread();
     CaptureCoreWindowHandle();
     if (!EnsureUiRendezvousWindow()) {
         // A replacement root installs no handlers here, so the previous root's
@@ -13845,7 +13871,7 @@ void TeardownUi() {
     g_sizeRoot = nullptr;
     g_layoutRoot = nullptr;
     g_dispatcher = nullptr;
-    g_uiThreadId.store(0, std::memory_order_relaxed);
+    ClearPeerUiThread();
     std::lock_guard lock(g_compositionMutex);
     g_settleLease.reset();
 }
@@ -14039,7 +14065,7 @@ void AttachToRunningStartHost() {
             TraceLog(L"attach existing host: unloading");
             return;
         }
-        g_uiThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        RecordPeerUiThread();
         CaptureCoreWindowHandle();
         if (!EnsureUiRendezvousWindow()) {
             TraceLog(L"attach existing host: no rendezvous window");
@@ -14771,6 +14797,10 @@ std::atomic<HWND> g_execWindow{nullptr};
 // read after it, so a non-null g_execWindow carries its owner.
 DWORD g_execThreadId = 0;
 std::atomic<DWORD> g_launcherThread{0};
+// True when a launcher entry (OnHotkeyInvoke or OnStartButtonPressed) named the
+// committed thread. A thread committed only because its loop pumped a message is
+// provisional: the first launcher entry on another thread corrects it.
+std::atomic<bool> g_launcherProven{false};
 thread_local int t_execCall = 0;
 HANDLE g_execStopEvent = nullptr;
 // Set by the depth-0 stop, which cancels the timers and withdraws the
@@ -14779,6 +14809,10 @@ HANDLE g_execStopEvent = nullptr;
 HANDLE g_execTeardownAck = nullptr;
 int g_execOwnerDepth = 0;          // launcher thread only
 bool g_execTeardownPending = false;  // launcher thread only
+// A launcher entry corrected the committed thread, and this window's loop must
+// retire it. Same deferral as the teardown: a shell call on this thread's stack
+// may still touch the launcher after a nested message returns.
+bool g_execRetirePending = false;   // launcher thread only
 // The one targeted WH_GETMESSAGE hook that proves a proposed launcher thread
 // pumps. The manager's Show proposes the thread; the hook fires there, commits
 // it and creates the window on its first message.
@@ -14792,37 +14826,63 @@ std::atomic<int> g_execHookFrames{0};
 HANDLE g_execHookIdle = nullptr;
 
 void StopExecutorTeardown(HWND window);
+void RemoveExecutorThreadHook();
 
 constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
 constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
+// A replacement's stop and destroy on the window's own thread. Sent by the
+// launcher entry that corrected a provisional commitment, through PostMessage.
+constexpr UINT kExecRetireMessage = WM_APP + 0x5F;
+constexpr WPARAM kExecRetireMagic = 0x53575252;   // "SWRR"
 
 class ExecDepthGuard {
   public:
     ExecDepthGuard() { ++g_execOwnerDepth; }
     ~ExecDepthGuard() {
-        if (--g_execOwnerDepth > 0 || !g_execTeardownPending) {
+        if (--g_execOwnerDepth > 0) {
             return;
         }
-        g_execTeardownPending = false;
-        const HWND window = g_execWindow.load(std::memory_order_acquire);
-        if (!window) {
-            TraceLog(L"exec teardown post skipped hwnd=null; acknowledging");
-            if (g_execTeardownAck) {
-                SetEvent(g_execTeardownAck);
+        if (g_execTeardownPending) {
+            g_execTeardownPending = false;
+            const HWND window = g_execWindow.load(std::memory_order_acquire);
+            if (!window) {
+                TraceLog(L"exec teardown post skipped hwnd=null; acknowledging");
+                if (g_execTeardownAck) {
+                    SetEvent(g_execTeardownAck);
+                }
+                return;
             }
-            return;
-        }
-        // Post; the loop serves it after this frame has returned.
-        if (!PostMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0)) {
-            const DWORD error = GetLastError();
-            TraceLog(L"exec teardown post failed hwnd=%p err=%u; acknowledging",
-                    window, error);
-            if (g_execTeardownAck) {
-                SetEvent(g_execTeardownAck);
+            // Post; the loop serves it after this frame has returned.
+            if (!PostMessageW(window, kExecTeardownMessage, kExecTeardownMagic,
+                              0)) {
+                const DWORD error = GetLastError();
+                TraceLog(
+                        L"exec teardown post failed hwnd=%p err=%u; "
+                        L"acknowledging",
+                        window, error);
+                if (g_execTeardownAck) {
+                    SetEvent(g_execTeardownAck);
+                }
+                return;
             }
+            TraceLog(L"exec teardown posted hwnd=%p", window);
             return;
         }
-        TraceLog(L"exec teardown posted hwnd=%p", window);
+        if (g_execRetirePending) {
+            g_execRetirePending = false;
+            const HWND window = g_execWindow.load(std::memory_order_acquire);
+            if (window) {
+                // A replacement's stop follows the same rule as the unload's: it
+                // runs after this frame has returned.
+                if (PostMessageW(window, kExecRetireMessage, kExecRetireMagic,
+                                 0)) {
+                    TraceLog(L"exec retire posted hwnd=%p", window);
+                } else {
+                    TraceLog(L"exec retire post failed hwnd=%p err=%u", window,
+                            GetLastError());
+                }
+            }
+        }
     }
 
     ExecDepthGuard(const ExecDepthGuard&) = delete;
@@ -14940,6 +15000,10 @@ constexpr UINT kExecDismissConfirmMs = 300;
 // dismiss that never comes. A failed worker startup leaves it false and the
 // shell's own path serves every trigger.
 std::atomic<bool> g_execReady{false};
+// True while a corrected launcher thread has closed the replaced window's
+// dispatch and no replacement exists yet. The capability word is 0 for that
+// whole interval, so the Start side stops driving the old thread at once.
+std::atomic<bool> g_execDispatchClosed{false};
 // The published capability: the worker, the window on the recorded launcher
 // thread, the verified layout and the primitives that window will call. It is
 // the bridge's own copy of the shared word; every lifecycle point publishes it
@@ -15432,6 +15496,14 @@ uint32_t PeerEpochNow() {
     return g_ipc.state ? SwipeIpcPeerEpoch(&g_ipc) : 0;
 }
 
+// The peer's own UI thread. 0 means this activation has not recorded one.
+// Thread ids are system-wide but belong to their process, so this value names a
+// thread of the peer (`peerPid`), never one of ours: it is read as the peer
+// activation's identity, not as a candidate launcher thread.
+DWORD PeerUiThreadNow() {
+    return g_ipc.state ? static_cast<DWORD>(SwipeIpcPeerUiThread(&g_ipc)) : 0;
+}
+
 // How old the last heartbeat is, in milliseconds. Only the ack timeout's
 // diagnostic reads it: the liveness decision is PeerAliveNow's, which pairs the
 // state with the tick so a just-started activation is not read through the
@@ -15540,6 +15612,7 @@ bool ExecutorWorkerReady() {
 // mapped channel.
 bool ExecutorCapabilityNow() {
     if (!ExecutorWorkerReady() ||
+        g_execDispatchClosed.load(std::memory_order_acquire) ||
         !g_launcherLayoutVerified.load(std::memory_order_acquire)) {
         return false;
     }
@@ -18875,6 +18948,7 @@ void ExecutePendingCommand() {
 
 void StopExecutorTeardown(HWND window) {
     g_execTeardownPending = false;
+    g_execRetirePending = false;
     KillTimer(window, kExecDismissTimer);
     KillTimer(window, kExecProbeTimer);
     KillTimer(window, kPressLatchTimer);
@@ -18890,6 +18964,26 @@ void StopExecutorTeardown(HWND window) {
 
 LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                                     LPARAM lParam) {
+    if (message == kExecRetireMessage) {
+        // A launcher entry corrected a provisional thread. The window that ran on
+        // the old one stops and destroys itself here, on its own thread; the
+        // caller that posted this never waits for it.
+        if (wParam != kExecRetireMagic ||
+            window != g_execWindow.load(std::memory_order_acquire)) {
+            TraceLog(L"exec retire ignored hwnd=%p", window);
+            return 0;
+        }
+        if (g_execOwnerDepth > 0) {
+            g_execRetirePending = true;
+            TraceLog(L"exec retire deferred depth=%d", g_execOwnerDepth);
+            return 0;
+        }
+        TraceLog(L"exec window retire served hwnd=%p tid=%u", window,
+                GetCurrentThreadId());
+        StopExecutorTeardown(window);
+        DestroyWindow(window);
+        return 0;
+    }
     if (message == kExecTeardownMessage) {
         // The owner-thread shutdown. This is a private request, not a generic
         // WM_CLOSE: the one-shot timers would otherwise outlive the window, and a
@@ -18958,8 +19052,10 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         return DefWindowProcW(window, message, wParam, lParam);
     }
     if (!g_execReady.load(std::memory_order_acquire) ||
+        g_execDispatchClosed.load(std::memory_order_acquire) ||
         g_disabled.load(std::memory_order_relaxed)) {
-        // An unload is in flight: no command and no timer may touch the launcher
+        // An unload is in flight, or this thread was corrected and its window is
+        // waiting to be destroyed: no command and no timer may touch the launcher
         // or the channel after this point.
         return DefWindowProcW(window, message, wParam, lParam);
     }
@@ -19082,6 +19178,13 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
 // Dismiss/ShowStartView never adopt; a non-pumping COM/taskbar caller passes
 // natively, and if its internal manager Show then runs on that thread, that
 // Show only proposes it.
+//
+// The pump is a proposal, not a proof, so a launcher entry may correct it. That
+// correction needs a live peer that has named its own UI thread: it is what says
+// the activation is attached and that this entry belongs to it, and it can never
+// equal this process's thread id.
+void ReplaceLauncherThread(const wchar_t* source, DWORD previous);
+
 DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
     const DWORD tid = GetCurrentThreadId();
     DWORD known = g_launcherThread.load(std::memory_order_relaxed);
@@ -19091,16 +19194,69 @@ DWORD NoteLauncherThread(const wchar_t* source, bool adopt) {
             return 0;
         }
         if (g_launcherThread.compare_exchange_strong(known, tid)) {
+            g_launcherProven.store(true, std::memory_order_release);
             TraceLog(L"exec launcher thread tid=%u source=%s", tid, source);
             known = tid;
         }
     }
     if (known != tid) {
+        if (adopt && PeerUiThreadNow() != 0 &&
+            !g_launcherProven.load(std::memory_order_acquire)) {
+            // An entry inside the launcher is the authority a Show caller only
+            // proposed. The window built for the proposal is retired; the next
+            // entry on this thread creates the replacement.
+            ReplaceLauncherThread(source, known);
+            return tid;
+        }
         TraceLog(L"exec launcher thread mismatch known=%u tid=%u source=%s",
                 known, tid, source);
         return 0;
     }
+    if (adopt) {
+        g_launcherProven.store(true, std::memory_order_release);
+    }
     return tid;
+}
+
+// Corrects a provisional commitment. `PeerUiThreadNow() != 0` is the caller's
+// authorisation; the entry itself, inside the launcher, is the proof. The new
+// thread is committed first so every later entry and the capability read see it,
+// and the window on the old thread is told to stop and destroy itself on its own
+// thread. The next entry on this thread builds the replacement: this call is on
+// a hook and never waits.
+void ReplaceLauncherThread(const wchar_t* source, DWORD previous) {
+    const DWORD tid = GetCurrentThreadId();
+    g_launcherThread.store(tid, std::memory_order_release);
+    g_launcherProven.store(true, std::memory_order_release);
+    TraceLog(L"exec launcher thread corrected known=%u tid=%u source=%s peerTid=%u",
+            previous, tid, source, PeerUiThreadNow());
+    // The old proposal must not fire on a thread that no longer owns anything.
+    RemoveExecutorThreadHook();
+    // Dispatch closes with the capability, before the window is asked to stop:
+    // a command already posted to the old thread must not reach the launcher.
+    g_execDispatchClosed.store(true, std::memory_order_release);
+    PublishExecutorCapability(L"thread-corrected");
+    HWND window = g_execWindow.load(std::memory_order_acquire);
+    if (!window) {
+        return;
+    }
+    if (g_execThreadId == tid) {
+        // This entry's own thread owns the window: the same-thread path, taken
+        // only when no frame is below it.
+        if (g_execOwnerDepth == 0) {
+            StopExecutorTeardown(window);
+            DestroyWindow(window);
+        } else {
+            g_execRetirePending = true;
+        }
+        return;
+    }
+    if (!PostMessageW(window, kExecRetireMessage, kExecRetireMagic, 0)) {
+        TraceLog(L"exec window retire post failed hwnd=%p err=%u", window,
+                GetLastError());
+        return;
+    }
+    TraceLog(L"exec window retire hwnd=%p owner=%u", window, g_execThreadId);
 }
 
 // The one targeted hook's lifetime. A Show candidate may differ from a later
@@ -19128,6 +19284,16 @@ bool EnsureExecutorThreadHook(DWORD target) {
     // removed the hook.
     if (g_disabled.load(std::memory_order_relaxed)) {
         ReleaseSRWLockExclusive(&g_execThreadHookLock);
+        return false;
+    }
+    // A proposal may only prove a thread nothing is committed to. A hook on any
+    // other thread would commit a second launcher thread, which is exactly how a
+    // pumping caller used to take the executor from the real launcher entry.
+    const DWORD known = g_launcherThread.load(std::memory_order_acquire);
+    if (known != 0 && known != target) {
+        ReleaseSRWLockExclusive(&g_execThreadHookLock);
+        TraceLog(L"exec thread proposal refused known=%u target=%u", known,
+                target);
         return false;
     }
     if (g_execThreadHook.load(std::memory_order_acquire) &&
@@ -19201,6 +19367,15 @@ void EnsureExecutorWindow() {
         g_execWindow.load(std::memory_order_relaxed)) {
         return;
     }
+    // A window exists to run the launcher's own primitives, so it may only be
+    // created on the committed launcher thread. A thread that merely pumps — a
+    // COM or taskbar caller — must not build one even if it reached here.
+    const DWORD committed = g_launcherThread.load(std::memory_order_acquire);
+    if (committed != 0 && committed != GetCurrentThreadId()) {
+        TraceLog(L"exec window refused tid=%u launcher=%u reason=wrong-thread",
+                GetCurrentThreadId(), committed);
+        return;
+    }
     // Admission: the creation path's checks, class registration and window
     // creation are all under this shared hold. A try failure is the unload's
     // exclusive writer; the flag it set is the reason not to create now.
@@ -19240,6 +19415,9 @@ void EnsureExecutorWindow() {
     // sees is never a window without its thread.
     g_execThreadId = GetCurrentThreadId();
     g_execWindow.store(window, std::memory_order_release);
+    // A frame on this thread dispatches again: the window is on the committed
+    // launcher thread and the replacement a correction was waiting for exists.
+    g_execDispatchClosed.store(false, std::memory_order_release);
     // A created window on the recorded thread is the last missing piece when the
     // symbols are already resolved; publish before any decision can read it.
     PublishExecutorCapability(L"window");
@@ -19269,7 +19447,12 @@ LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
         if (known == 0) {
             if (g_launcherThread.compare_exchange_strong(
                     known, tid, std::memory_order_acq_rel)) {
-                TraceLog(L"exec launcher thread tid=%u source=show-pump", tid);
+                // A pump is a proposal: it proves the loop runs, not that it is
+                // the launcher. The launcher entry may correct it.
+                g_launcherProven.store(false, std::memory_order_release);
+                TraceLog(L"exec launcher thread tid=%u source=show-pump "
+                        L"provisional=1",
+                        tid);
                 known = tid;
             }
         }
@@ -19277,6 +19460,9 @@ LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
             // The loop pumps: this is the same entry the Win and Start-button
             // hooks take, and the window is created on this thread.
             EnsureExecutorWindow();
+        } else {
+            // Only a launcher entry may replace a commitment.
+            TraceLog(L"exec thread pump refused known=%u tid=%u", known, tid);
         }
         // One proposal, one attempt. A failed creation is retried by the next
         // Show or trigger, never by a hook that fires on every message.
@@ -19720,6 +19906,8 @@ BOOL RoleInit() {
     }
     g_execOwnerDepth = 0;
     g_execTeardownPending = false;
+    g_execRetirePending = false;
+    g_execDispatchClosed.store(false, std::memory_order_release);
 
     if (g_ipc.state) {
         StartExecutorWorker();
