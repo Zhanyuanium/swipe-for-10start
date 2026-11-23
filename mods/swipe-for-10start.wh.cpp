@@ -80,10 +80,10 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
     flyout; Windows 10 is the looser spring the mod shipped with. Both run the
     same spring; the choice changes the feel, never the mechanism, and it also
     decides how opening and closing with the Windows key look.
-  $description:zh-CN: 滑动动画的曲线形状。Windows 11 拟合自系统自带面板（快速设置弹出面板）的动作；Windows 10 是本模组最初发布时的手感，弹簧更松，可能略微过冲。两者跑的是同一条弹簧——这个选择只改手感，不改机制——同一个选择也决定按 Windows 键开合菜单时的动画。
+  $description:zh-CN: 滑动动画的曲线形状。Windows 11 拟合自系统自带面板（快速设置弹出面板）的动作；Windows 10 是本模组最初发布时的手感，弹簧更松。两者跑的是同一条弹簧——这个选择只改手感，不改机制——同一个选择也决定按 Windows 键开合菜单时的动画。
   $options:
   - Windows 11: glides like the Quick Settings flyout
-  - Windows 10: looser spring, can overshoot slightly
+  - Windows 10: looser spring
 - GestureStartSpeedPercent: 100
   $name: Animation start speed (% of swipe speed)
   $name:zh-CN: 动画起步速度（占滑动速度的百分比）
@@ -334,7 +334,7 @@ bool SwipeCloseIntentAllowed(uint32_t method) {
            method == kSwipeDismissMethodClickAwayEvidence;
 }
 
-constexpr wchar_t kModVersion[] = L"0.8.3";
+constexpr wchar_t kModVersion[] = L"0.8.5";
 
 namespace start {
 
@@ -482,10 +482,13 @@ constexpr DWORD kCreateWaitableTimerHighResolution = 0x00000002;
 std::atomic<TimePeriod_t> g_timeBeginPeriod{nullptr};
 std::atomic<TimePeriod_t> g_timeEndPeriod{nullptr};
 
+std::atomic<bool> g_highResolutionDeadlineTimer{false};
+
 bool g_timerPeriodHeld = false;
 
 void BeginContactTiming() {
-    if (g_timerPeriodHeld) {
+    if (g_timerPeriodHeld ||
+        g_highResolutionDeadlineTimer.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -6559,8 +6562,17 @@ void HandleRawInput(HRAWINPUT rawHandle) {
     delete[] heapBuffer;
 }
 
+UINT g_taskbarCreatedMessage = 0;
+
 LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
                                LPARAM lParam) {
+    // A restart of the taskbar invalidates the appbar cache; refresh it here
+    // rather than blocking on SHAppBarMessage from the next input.
+    if (g_taskbarCreatedMessage != 0 && msg == g_taskbarCreatedMessage) {
+        TraceLog(L"taskbar recreated; appbar cache refreshed");
+        RefreshTaskbarAppBarCache();
+        return 0;
+    }
     switch (msg) {
         case WM_INPUT:
             HandleRawInput(reinterpret_cast<HRAWINPUT>(lParam));
@@ -6696,10 +6708,14 @@ DWORD WINAPI HidInputThread(LPVOID) {
 
     g_hidHwnd.store(hwnd, std::memory_order_relaxed);
 
+    g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+
     RegisterHidUsage(kUsageTouchScreen, hwnd);
     RegisterHidUsage(kUsagePen, hwnd);
 
     HANDLE deadlineTimer = CreateDeadlineTimer();
+    g_highResolutionDeadlineTimer.store(deadlineTimer != nullptr,
+                                        std::memory_order_relaxed);
     if (!deadlineTimer) {
         TraceLog(L"hid timer fallback err=%u",
                 static_cast<unsigned>(GetLastError()));
@@ -9098,7 +9114,6 @@ void AttachRootElement(wux::FrameworkElement const& root, bool replaceExisting) 
 
 std::atomic<HMODULE> g_startUIModuleSeen{nullptr};
 std::atomic<HMODULE> g_startUIHookModule{nullptr};
-std::atomic<bool> g_loadHookMatchLogged{false};
 
 constexpr uint64_t kRootPendingDeadlineMs = 120000;
 uint64_t g_rootProbeNextTick = 0;
@@ -9249,26 +9264,6 @@ void ProbeRootSymbolFromInputThread() {
            L"StartUI_.dll on the one attempt this session makes; the root hook "
            L"is refused and the controller advertises no service");
     PublishPeerGone(L"root-hook-refused");
-}
-
-using LoadLibraryExW_t = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
-LoadLibraryExW_t LoadLibraryExW_Original = nullptr;
-
-HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR fileName, HANDLE file,
-                                   DWORD flags) {
-    HMODULE module = LoadLibraryExW_Original
-                         ? LoadLibraryExW_Original(fileName, file, flags)
-                         : nullptr;
-
-    if (module && module == GetModuleHandleW(kStartUIModuleName)) {
-        g_startUIModuleSeen.store(module, std::memory_order_release);
-        if (!g_loadHookMatchLogged.exchange(true)) {
-            TraceLog(L"ll hook startui returned=%p file=%s", module,
-                    fileName ? fileName : L"(null)");
-        }
-    }
-
-    return module;
 }
 
 void RevokeHandlers() {
@@ -9422,18 +9417,14 @@ constexpr int kUiDrainRetries = 8;
 bool g_uiRendezvousClassRegistered = false;
 HINSTANCE g_uiRendezvousClassInstance = nullptr;
 
-struct UiTeardownCall {
-    bool ran;
-};
-
-struct UiDrainCall {
-    bool ran;
-};
+// The unload handshakes carry no pointer: a same-user process can reach the
+// message-only window, and these flags are the whole answer.
+std::atomic<bool> g_uiTeardownServed{false};
+std::atomic<bool> g_uiDrainServed{false};
 
 LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
                                   LPARAM lParam) {
     if (message == kUiTeardownMessage) {
-        auto* call = reinterpret_cast<UiTeardownCall*>(lParam);
         if (wParam != kUiTeardownMagic ||
             hwnd != g_uiRendezvousHwnd.load(std::memory_order_acquire)) {
             TraceLog(L"ui rendezvous teardown ignored hwnd=%p", hwnd);
@@ -9444,9 +9435,7 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
             g_uiTeardownPending = true;
             TraceLog(L"ui teardown deferred depth=%d",
                     g_uiOwnerDepth.load(std::memory_order_relaxed));
-            if (call) {
-                call->ran = true;
-            }
+            g_uiTeardownServed.store(true, std::memory_order_release);
             return 0;
         }
         try {
@@ -9454,9 +9443,7 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
         } catch (...) {
 
         }
-        if (call) {
-            call->ran = true;
-        }
+        g_uiTeardownServed.store(true, std::memory_order_release);
         if (g_uiTeardownAck) {
             SetEvent(g_uiTeardownAck);
         }
@@ -9488,15 +9475,12 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
         return 0;
     }
     if (message == kUiDrainMessage) {
-        auto* call = reinterpret_cast<UiDrainCall*>(lParam);
         if (wParam != kUiDrainMagic ||
             hwnd != g_uiRendezvousHwnd.load(std::memory_order_acquire)) {
             TraceLog(L"ui rendezvous drain ignored hwnd=%p", hwnd);
             return 0;
         }
-        if (call) {
-            call->ran = true;
-        }
+        g_uiDrainServed.store(true, std::memory_order_release);
         return 0;
     }
     if (message == kUiDestroyMessage) {
@@ -9675,10 +9659,9 @@ HWND TeardownUiOnUiThread() {
     ResetEvent(g_uiTeardownAck);
     g_uiTeardownPending = false;
 
-    UiTeardownCall call{false};
-    SendMessageW(hwnd, kUiTeardownMessage, kUiTeardownMagic,
-                 reinterpret_cast<LPARAM>(&call));
-    if (call.ran) {
+    g_uiTeardownServed.store(false, std::memory_order_release);
+    SendMessageW(hwnd, kUiTeardownMessage, kUiTeardownMagic, 0);
+    if (g_uiTeardownServed.load(std::memory_order_acquire)) {
 
         TraceLog(L"unload teardown wait hwnd=%p depth=%d", hwnd,
                 g_uiOwnerDepth.load(std::memory_order_relaxed));
@@ -9722,17 +9705,16 @@ void RequireNoModuleCallbacks(bool waitForEntries) {
 }
 
 bool DrainUiThread(HWND hwnd) {
-    UiDrainCall call{false};
+    g_uiDrainServed.store(false, std::memory_order_release);
     if (hwnd) {
         if (!IsWindow(hwnd)) {
             TraceLog(L"unload drain window gone; no acknowledgement");
         } else {
-            SendMessageW(hwnd, kUiDrainMessage, kUiDrainMagic,
-                         reinterpret_cast<LPARAM>(&call));
+            SendMessageW(hwnd, kUiDrainMessage, kUiDrainMagic, 0);
         }
     }
     RequireNoModuleCallbacks(true);
-    return call.ran;
+    return g_uiDrainServed.load(std::memory_order_acquire);
 }
 
 void WaitForAttachFramesThenDrainUi(HWND hwnd) {
@@ -9852,24 +9834,6 @@ BOOL RoleInit() {
         !g_timeEndPeriod.load(std::memory_order_relaxed)) {
         Wh_Log(L"timeBeginPeriod not resolved; release keeps the default timer "
                L"quantum");
-    }
-
-    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
-    auto loadLibraryExW = kernelBase
-                              ? reinterpret_cast<LoadLibraryExW_t>(
-                                    GetProcAddress(kernelBase,
-                                                   "LoadLibraryExW"))
-                              : nullptr;
-    if (!loadLibraryExW) {
-
-        Wh_Log(L"LoadLibraryExW not found; the late StartUI_ load is not "
-               L"notified");
-    } else if (!Wh_SetFunctionHook(
-                   reinterpret_cast<void*>(loadLibraryExW),
-                   reinterpret_cast<void*>(LoadLibraryExW_Hook),
-                   reinterpret_cast<void**>(&LoadLibraryExW_Original))) {
-        Wh_Log(L"Failed to hook LoadLibraryExW; the late StartUI_ load is not "
-               L"notified");
     }
 
     RecordLoadedStartUIModule();
@@ -10180,9 +10144,10 @@ constexpr UINT kExecDrainMessage = WM_APP + 0x60;
 constexpr WPARAM kExecDrainMagic = 0x53575244;
 constexpr int kExecDrainRetries = 8;
 
-struct ExecDrainCall {
-    bool ran;
-};
+// The unload handshakes carry no pointer: a same-user process can reach this
+// window, and these flags are the whole answer.
+std::atomic<bool> g_execDrainServed{false};
+std::atomic<bool> g_execDestroyServed{false};
 
 class ExecDepthGuard {
   public:
@@ -10290,9 +10255,6 @@ constexpr WPARAM kExecIntentAckMagic = 0x53574141;
 constexpr WPARAM kExecDestroyMagic = 0x53574458;
 constexpr int kExecDestroyRetries = 1000;
 
-struct ExecDestroyCall {
-    bool ran;
-};
 constexpr UINT_PTR kExecDismissTimer = 0x5358;
 constexpr UINT_PTR kExecProbeTimer = 0x5359;
 constexpr UINT_PTR kPressLatchTimer = 0x535A;
@@ -13576,14 +13538,11 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                                     LPARAM lParam) {
     if (message == kExecDrainMessage) {
 
-        auto* call = reinterpret_cast<ExecDrainCall*>(lParam);
         if (wParam != kExecDrainMagic ||
             window != g_execWindow.load(std::memory_order_acquire)) {
             return 0;
         }
-        if (call) {
-            call->ran = true;
-        }
+        g_execDrainServed.store(true, std::memory_order_release);
         return 0;
     }
     if (message == kExecRetireMessage) {
@@ -13623,20 +13582,14 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         return 0;
     }
     if (message == kExecDestroyMessage) {
-        auto* call = reinterpret_cast<ExecDestroyCall*>(lParam);
         if (wParam != kExecDestroyMagic ||
             window != g_execWindow.load(std::memory_order_acquire)) {
             return 0;
         }
         if (g_execOwnerDepth > 0) {
-            if (call) {
-                call->ran = false;
-            }
             return 0;
         }
-        if (call) {
-            call->ran = true;
-        }
+        g_execDestroyServed.store(true, std::memory_order_release);
         TraceLog(L"exec destroy served hwnd=%p tid=%u", window,
                 GetCurrentThreadId());
         DestroyWindow(window);
@@ -14285,10 +14238,9 @@ void DrainExecutorThread(HWND window) {
             TraceLog(L"unload exec drain skipped reason=window-gone");
             return;
         }
-        ExecDrainCall call{false};
-        SendMessageW(window, kExecDrainMessage, kExecDrainMagic,
-                     reinterpret_cast<LPARAM>(&call));
-        if (!call.ran) {
+        g_execDrainServed.store(false, std::memory_order_release);
+        SendMessageW(window, kExecDrainMessage, kExecDrainMagic, 0);
+        if (!g_execDrainServed.load(std::memory_order_acquire)) {
             TraceLog(L"unload exec drain not served hwnd=%p", window);
             return;
         }
@@ -14340,10 +14292,9 @@ void DestroyExecutorWindow() {
             if (!IsWindow(window)) {
                 break;
             }
-            ExecDestroyCall call{false};
-            SendMessageW(window, kExecDestroyMessage, kExecDestroyMagic,
-                         reinterpret_cast<LPARAM>(&call));
-            if (call.ran) {
+            g_execDestroyServed.store(false, std::memory_order_release);
+            SendMessageW(window, kExecDestroyMessage, kExecDestroyMagic, 0);
+            if (g_execDestroyServed.load(std::memory_order_acquire)) {
                 destroyed = true;
                 break;
             }
@@ -14560,6 +14511,13 @@ void RoleUninit() {
 
     RemoveExecutorThreadHook();
     DrainExecutorThread(g_execWindow.load(std::memory_order_acquire));
+
+    // Every hook frame has returned, so a zero count means no later SetEvent.
+    HANDLE hookIdle = g_execHookIdle;
+    g_execHookIdle = nullptr;
+    if (hookIdle) {
+        CloseHandle(hookIdle);
+    }
 
     {
         ExecAdmissionExclusive admission;

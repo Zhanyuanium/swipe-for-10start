@@ -57,9 +57,9 @@ restart is needed.
 - **Menu animation style** (`AnimationStyle`, default `Windows 11`) — the
   shape of the slide. `Windows 11` is fitted to the motion of the system's own
   panels (the Quick Settings flyout); `Windows 10` is the feel the mod shipped
-  with originally, a looser spring that can overshoot slightly. Both run the
-  same spring — the choice changes the feel, never the mechanism — and it also
-  decides how opening and closing with the Windows key looks.
+  with originally, a looser spring. Both run the same spring — the choice
+  changes the feel, never the mechanism — and it also decides how opening and
+  closing with the Windows key looks.
 - **Animation start speed (% of swipe speed)** (`GestureStartSpeedPercent`,
   default 100, range 0-300) — how fast the menu keeps moving the moment you
   lift your finger, as a percentage of the finger's speed in the direction the
