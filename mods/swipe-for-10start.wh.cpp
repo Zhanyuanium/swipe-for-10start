@@ -4555,7 +4555,6 @@ using RunFromWindowThreadProc = void(WINAPI*)(PVOID);
 struct RunFromWindowThreadParam {
     RunFromWindowThreadProc proc;
     PVOID param;
-    HHOOK hook;
     bool ran;
 };
 
@@ -4565,7 +4564,7 @@ std::atomic<HHOOK> g_startAttachHook{nullptr};
 // The attach hook's counted frames. A proc that entered before the unload can be
 // preempted and resume after the hook was removed; the image must not be freed
 // under it. The count is incremented at the proc's first line and decremented
-// after CallNextHookEx returns, and the decrement to zero signals the event.
+// after CallNextHookEx returns; the last frame signals the event before it.
 std::atomic<int> g_startAttachFrames{0};
 HANDLE g_startAttachIdle = nullptr;
 
@@ -4586,11 +4585,13 @@ LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam,
             g_attachCall.proc) {
             g_attachCall.ran = true;
             g_attachCall.proc(g_attachCall.param);
-            const HHOOK hook = g_attachCall.hook;
-            g_attachCall.hook = nullptr;
-            g_startAttachHook.store(nullptr, std::memory_order_release);
+            // One owner for the hook: the hook and RemoveStartAttachHook exchange it.
+            const HHOOK hook =
+                g_startAttachHook.exchange(nullptr, std::memory_order_acq_rel);
             message->lParam = 0;
-            UnhookWindowsHookEx(hook);
+            if (hook) {
+                UnhookWindowsHookEx(hook);
+            }
         }
     }
     // One exit: CallNextHookEx can pump a sent message, so the frame stays
@@ -4637,7 +4638,7 @@ bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc proc,
                 GetLastError());
         return false;
     }
-    g_attachCall = RunFromWindowThreadParam{proc, param, hook, false};
+    g_attachCall = RunFromWindowThreadParam{proc, param, false};
     g_startAttachHook.store(hook, std::memory_order_release);
     if (!PostMessageW(hwnd, message, kRunFromWindowThreadMagic,
                       reinterpret_cast<LPARAM>(&g_attachCall))) {
@@ -4770,10 +4771,13 @@ bool StartWindowIsOpenThrottled(uint64_t tickMs) {
     return g_openCheckOpen;
 }
 
-float HidDpiScale() {
-    static HWND cachedHwnd = nullptr;
-    static float cachedScale = 1.0f;
+HWND g_hidDpiHwnd = nullptr;  // input thread only
+float g_hidDpiScale = 1.0f;   // input thread only
 
+// A settings or display change can keep the window and change its DPI.
+void ResetHidDpiScale() { g_hidDpiHwnd = nullptr; }
+
+float HidDpiScale() {
     HWND hwnd = g_coreHwnd.load(std::memory_order_relaxed);
     if (!hwnd) {
         hwnd = FindStartCoreWindow();
@@ -4785,18 +4789,18 @@ float HidDpiScale() {
         return 1.0f;
     }
 
-    if (hwnd != cachedHwnd) {
+    if (hwnd != g_hidDpiHwnd) {
         const UINT dpi = GetDpiForWindow(hwnd);
         if (dpi == 0) {
             // The window may still be initializing; retry on the next report
             // instead of caching a wrong scale for the whole session.
             return 1.0f;
         }
-        cachedHwnd = hwnd;
-        cachedScale = static_cast<float>(dpi) / 96.0f;
+        g_hidDpiHwnd = hwnd;
+        g_hidDpiScale = static_cast<float>(dpi) / 96.0f;
     }
 
-    return cachedScale;
+    return g_hidDpiScale;
 }
 
 struct HidGestureSession {
@@ -10244,6 +10248,7 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
         // thread; the measurement is posted to the UI thread, which owns the XAML
         // root and the property set.
         case WM_SETTINGCHANGE:
+            ResetHidDpiScale();
             if (wParam == SPI_SETWORKAREA) {
                 TraceLog(L"work area changed");
                 RefreshTaskbarAppBarCache();
@@ -10255,6 +10260,7 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
             return 0;
         case WM_DISPLAYCHANGE:
             TraceLog(L"work area changed");
+            ResetHidDpiScale();
             RefreshTaskbarAppBarCache();
             PostGeometryMeasurement(
                 StartMeasureRequest(!g_hidSession.active &&
@@ -10309,7 +10315,8 @@ void AttachToRunningStartHost();
 std::atomic<bool> g_attachAttempted{false};
 
 void MaybeAttachToRunningStartHost() {
-    if (g_attachAttempted.load(std::memory_order_acquire)) {
+    if (g_unloading.load(std::memory_order_relaxed) ||
+        g_attachAttempted.load(std::memory_order_acquire)) {
         return;
     }
     // Only a successful install is an attach. A refused symbol set leaves a root
@@ -12564,7 +12571,8 @@ void CacheScrollableElement(uint32_t expectedGeneration, uint64_t requestId) {
     answer.state = ScrollerState::Scrollable;
     answer.generation = expectedGeneration;
     answer.layoutVersion = layoutVersion;
-    wuxc::ScrollViewer answerViewers[kMaxScrollRegions]{nullptr};
+    wuxc::ScrollViewer answerViewers[kMaxScrollRegions]{
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
     for (int i = 0; i < survey.count && answer.count < kMaxScrollRegions; ++i) {
         const ScrollerFound& found = survey.found[i];
         float verticalOffset = 0.0f;
@@ -14302,11 +14310,6 @@ BOOL RoleInit() {
     TraceLog(L"mod init");
     Wh_Log(L"Swipe for 10Start %s initializing (start role)", kModVersion);
 
-    // The appbar dock record feeds the axis and band and is read from the XAML
-    // handlers. Fill it here, on this init thread, and refresh it from the input
-    // thread's broadcasts; no UI path makes the cross-process call.
-    RefreshTaskbarAppBarCache();
-
     LoadAnimationStyle();
     LoadGestureStartSpeed();
     LoadCommitDistance();
@@ -14333,8 +14336,8 @@ BOOL RoleInit() {
         TraceLog(L"module entry event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
-    // The attach hook's frame wake. Auto-reset: the decrement to zero sets it,
-    // and the unload's wait is that count, never a sleep loop.
+    // The attach hook's frame wake. Auto-reset: the last frame signals it at count
+    // one, and the unload re-checks the count after every wake.
     g_startAttachIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_startAttachIdle) {
         TraceLog(L"attach hook frame event failed err=%u",
@@ -14622,6 +14625,12 @@ void RoleUninit() {
         TraceLog(L"unload teardown without a window; no ui turn");
     }
 
+    // Every frame is nested on one thread, so no SetEvent can follow a zero count.
+    if (g_startAttachIdle) {
+        CloseHandle(g_startAttachIdle);
+        g_startAttachIdle = nullptr;
+    }
+
     // 6. The window and then its class: the class must not outlive the image,
     //    and the window must be gone before the class is unregistered.
     DestroyUiRendezvousWindow();
@@ -14645,10 +14654,7 @@ void RoleUninit() {
         CloseHandle(g_moduleEntriesGone);
         g_moduleEntriesGone = nullptr;
     }
-    // The attach hook's idle event stays with the process. A frame decrements
-    // to zero and only then signals it; a frame descheduled in that tail would
-    // signal a handle closed here, possibly recycled by the shell. The counter
-    // and the drain prove the loop, not the last instruction of a frame.
+    // The attach hook's idle event was closed above, right after the frame wait.
     TraceLog(L"unload done elapsed=%llums",
             static_cast<unsigned long long>(
                 g_unloadStartTick != 0 && GetTickCount64() >= g_unloadStartTick
@@ -14852,7 +14858,7 @@ std::atomic<DWORD> g_execThreadHookTarget{0};
 // The hook's counted frames. A proc that entered before the unload can be
 // preempted and resume after the hook was removed; the image must not be freed
 // under it. Incremented at the first line, decremented after CallNextHookEx
-// returns, and the decrement to zero signals the event.
+// returns; the last frame signals the event before its decrement.
 std::atomic<int> g_execHookFrames{0};
 HANDLE g_execHookIdle = nullptr;
 
@@ -18042,6 +18048,8 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
                 own.state);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                             kDismissMethodWin, flags);
+        // The original's synchronous close is this takeover's, not a second record.
+        OwnExternalForwardGuard guard(kDismissMethodWin);
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
                                        : S_OK;
     }
@@ -19971,8 +19979,7 @@ DWORD WINAPI ExecutorWorkerProc(LPVOID) {
         // executor's own timers — the dismiss delay, the visibility confirmation,
         // the press latch and the press ack bound — are message timers on the
         // launcher thread's window, which the worker never services, so they add
-        // no wake here; they are listed in the AGENTS contract so a later change
-        // does not turn this into a poll again.
+        // no wake here, so they do not turn this into a poll.
         DWORD waitMs = INFINITE;
         if (!g_explorerSymbolAttempted.load(std::memory_order_acquire) &&
             !g_explorerSymbolsReady.load(std::memory_order_acquire) &&
@@ -20185,8 +20192,18 @@ void DestroyExecutorWindow() {
                 static_cast<unsigned>(g_execThreadId));
         TraceLog(L"exec window teardown wait hwnd=%p tid=%u", window,
                 static_cast<unsigned>(g_execThreadId));
-        SendMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0);
-        if (WaitForSingleObject(g_execTeardownAck, INFINITE) != WAIT_OBJECT_0) {
+        const LRESULT sent =
+            SendMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0);
+        if (!IsWindow(window)) {
+            // The window died between the lookup and the send; no procedure of this image
+            // can answer, so no acknowledgement is coming.
+            TraceLog(L"exec window gone before teardown hwnd=%p sent=%lld", window,
+                    static_cast<long long>(sent));
+            if (g_execWindow.load(std::memory_order_acquire) == window) {
+                g_execWindow.store(nullptr, std::memory_order_release);
+            }
+        } else if (WaitForSingleObject(g_execTeardownAck, INFINITE) !=
+                   WAIT_OBJECT_0) {
             BlockBridgeUnload(L"executor teardown acknowledgement failed");
         }
         bool destroyed = false;
@@ -20479,10 +20496,9 @@ void RoleUninit() {
         CloseHandle(g_execTeardownAck);
         g_execTeardownAck = nullptr;
     }
-    // The hook frame's idle event stays with the process. A frame decrements to
-    // zero and only then signals it; a frame descheduled in that tail would
-    // signal a handle closed here, possibly recycled by the shell. The count
-    // and the drain prove the loop, not the last instruction of a frame.
+    // The hook frame's idle event stays with the process: the drain and the
+    // uninit wait on it again, and the last frame signals at count one before
+    // its decrement.
 
     // The peer's process handle ends with the channel view that named it.
     ReleasePeerProcess();
