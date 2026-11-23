@@ -88,8 +88,9 @@ namespace is the ABI identity, and there is no product version word.
 - `peerTick` 204 / `peerState` 208 / `peerEpoch` 212; `peerPid` 216 /
   `peerUiThread` 220; `intentTaken` 224; `execCapable` 232; `execPid` 236.
 - `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an
-  unknown `initState` are refused. Each role opens the channel at its `RoleInit`,
-  never in a hook. `tools/ipc.ps1 -State` reads the 240 bytes read-only.
+  unknown `initState` are refused. The Start side opens the channel at its
+  `RoleInit`, the bridge after its shell election; never in a hook.
+  `tools/ipc.ps1 -State` reads the 240 bytes read-only.
 
 ## Machine
 

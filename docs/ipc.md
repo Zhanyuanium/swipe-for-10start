@@ -151,7 +151,9 @@ name)`; an existing section is opened and validated. `initState` is a four-value
 CAS state machine (`Blank -> Initialising -> Ready`, `Abandoned` after a dead
 claim) with a 550 ms budget, so a young claim is abandoned inside the call rather
 than waited on. A missing event disables only the direction it carries; a missing
-`Capability` event leaves the 100 ms fallback read. The Start side opens it at
+`Capability` event leaves the 100 ms fallback read, and a missing bridge `Intent`
+event leaves capability 0 because a takeover could not be delivered. The Start
+side opens it at
 `Wh_ModInit`; the bridge opens it on its shell-election thread, never in a hook.
 
 A reinstall loads a fresh image at a fresh base; the old image is unmapped by its

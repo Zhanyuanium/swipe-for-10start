@@ -14871,11 +14871,6 @@ HANDLE g_shellElectStop = nullptr;
 void InitialiseBridge() {
     Wh_Log(L"Swipe for 10Start %s initializing (explorer role)", kModVersion);
 
-    // The election can wait for a shell to appear, and the host delivers a
-    // settings change to a role that is not initialised yet: sample the trace
-    // setting here so a change made while the election waited is honoured.
-    RefreshTraceSetting();
-
     g_pressQueueHead = 0;
     g_pressQueueCount = 0;
     g_pressOutstanding = OutstandingPress{};
@@ -15131,10 +15126,12 @@ void RoleUninit() {
 }
 
 void RoleSettingsChanged() {
+    // The trace setting is independent of the role's state: a change can arrive
+    // while the election is still waiting for the shell.
+    RefreshTraceSetting();
     if (!g_initialised.load(std::memory_order_acquire)) {
         return;
     }
-    RefreshTraceSetting();
 }
 
 const SwipeModRole Role = {RoleInit, RoleAfterInit, RoleBeforeUninit,
