@@ -12855,6 +12855,7 @@ ExplorerHookOutcome InstallExplorerHooks(HMODULE module) {
     }
     TraceLog(L"exec launcher symbols begin module=%p", module);
 
+    // twinui.pcshell.dll
     WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
         {{L"public: virtual long __cdecl "
           L"CStartExperienceManager::Show(unsigned char,unsigned char,"
