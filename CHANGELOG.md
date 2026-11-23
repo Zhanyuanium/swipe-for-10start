@@ -7,6 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
+| `v0.8.4` | 0.8.4 | — | 240 B | the collection's second review answered: a proven executor thread, a press never swallowed without a live process, hook frames and teardown that outlive the image, takeovers forwarded |
 | `v0.8.3` | 0.8.3 | — | 232 B | one drag-intent setting for every side, a mod page composed from both guides with localized names and settings, and two full-screen demos |
 | `v0.8.2` | 0.8.2 | — | 232 B | an unload proved on the owner threads: one UI rendezvous window, counted proofs on every path, the manager's `Show` as the one adoption bootstrap, an open during a close handed to the controller, the version gate before the PDB fetch |
 | `v0.8.1` | 0.8.1 | — | 232 B | the executor proves itself before either half intercepts: one `execCapable` word, one symbol attempt, an unowned show adopted, a close that moves from its first frame |
@@ -24,6 +25,36 @@ pair that shipped before the merge.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.8.4 — the collection's second review answered
+
+Windhawk `@version` 0.8.4. The channel is 240 bytes and moves to `SingleMod5_`:
+the Start half publishes its process id and UI thread beside its activation
+epoch.
+
+- **A proven executor thread.** A manager `Show` only proposes its caller: the
+  window is created there, but the capability word stays 0 until a Windows key,
+  Start-button or click-away entry proves the thread. A real entry can replace a
+  thread the shell only pumped. A `ShowStartView` executed on the taskbar thread
+  fails fast inside the shell, so the mod never takes that chance.
+- **A press is not swallowed without a live process.** A claimed press is
+  released only by its ack, a changed activation, a gone peer, or a signalled
+  process handle — never by a stale heartbeat. A refused press replays the
+  shell's own primitive once.
+- **The image outlives its hooks and its teardown.** Hook frames and the
+  executor's window procedure are counted, a teardown that arrives nested is
+  served by the outermost frame, and the destroy is proved by a sent message
+  whose return follows it. A proof that cannot be obtained blocks the unload
+  instead of guessing.
+- **Takeovers are forwarded, not swallowed.** Other callers' `Dismiss` and
+  `ShowStartView` pass once, and a native show retires a dismiss that was still
+  queued.
+- **Enabling attaches to a running host**; neither process needs a restart. Both
+  halves load only while ExplorerPatcher keeps the classic Start
+  (`Start_ShowClassicMode=1`).
+- **Capability loss restores the panel**, so the next native open is never an
+  empty window, and a dismiss drag without an executor does not retract it.
+- **The close repair bound is 800 ms** (measured landings 578-610 ms).
 
 ## v0.8.3 — the drag distance is yours
 

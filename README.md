@@ -96,6 +96,9 @@ restart is needed.
   opens the menu, as it always does. A pull that starts further in does not open
   it: only the taskbar edge does that.
 - Mouse drag is deliberately not enabled.
+- After Explorer restarts, or the first time the mod is enabled, the first open
+  and close are the shell's own: that press is what proves which thread may run
+  the launcher calls. From the next press on, every trigger is the mod's.
 
 ## Try it
 
