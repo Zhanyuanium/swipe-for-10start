@@ -21,6 +21,8 @@ By Zhanyuanium, distributed as a Windhawk mod.
   `twinui.pcshell.dll` build. After a Windows update changes it, the menu still
   opens and closes, but the close is instant until the mod is updated for the
   new build.
+  After switching ExplorerPatcher to the Windows 10 Start, restart Explorer and
+  StartMenuExperienceHost, or sign out and back in, so the mod can load.
 - **Windhawk**.
 - A touchscreen or pen. (The mouse is deliberately not used for these
   gestures.)
