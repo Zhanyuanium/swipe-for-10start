@@ -15055,6 +15055,9 @@ uint32_t g_dispatchEpoch = 0;  // launcher thread only
 // is marked accepted when it is armed, and its timer runs the record directly
 // (ExecuteDueDismiss does not consult the watermark).
 LONG64 g_execAcceptedSeq = 0;  // launcher thread only
+// The dismiss a native show already answered superseded before its dispatch read
+// it. The dispatch skips exactly this sequence once; a newer record has its own.
+LONG64 g_suppressedExecSeq = 0;  // launcher thread only
 // A bounded retry for a dismiss record that could not be read at its deadline.
 int g_dismissReadRetries = 0;  // launcher thread only
 constexpr int kExecDismissReadRetries = 10;
@@ -15951,11 +15954,20 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         OwnResyncFromState(self);
         return;
     }
+    // The mark a forwarded original leaves means that original's own takeover
+    // was already published. A Hide nested inside it is the same request, and a
+    // second record would replace the barrier and clear a press queued behind it.
+    if (OwnTakeExternalForward(method)) {
+        TraceLog(L"exec pass hide method=%u reason=forwarded", method);
+        callOriginal();
+        OwnResyncFromState(self);
+        return;
+    }
     // External and lock precedence, before any opening or touch-owner
-    // suppression: a lock, an unattributed caller, Win+Tab's method 5 and a
-    // forwarded Win press are takeovers, not this mod's close, and they pass.
+    // suppression: a lock, an unattributed caller and Win+Tab's method 5 are
+    // takeovers, not this mod's close, and they pass.
     if (caller == OwnCaller::Lock || caller == OwnCaller::Unknown ||
-        method == kDismissMethodWinTab || OwnTakeExternalForward(method)) {
+        method == kDismissMethodWinTab) {
         TraceLog(L"intent external trigger=hide caller=%s method=%u",
                 OwnCallerName(caller), method);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
@@ -18842,27 +18854,55 @@ void ExecuteDueDismiss() {
     ExecuteDismiss(command);
 }
 
-// A native show takes the window over while a close may still be armed. The
-// queued dismiss is revoked here; a call already inside the shell is not.
+// A native show takes the window over while a close may still be armed or may
+// only be published. The armed timer is revoked here; a record the worker has not
+// dispatched yet is answered superseded and remembered, so a dispatch that
+// already read it skips it. A call already inside the shell is not recallable.
 void CancelArmedDismissForNativeShow() {
-    if (g_pendingDismissSeq == 0) {
+    if (g_pendingDismissSeq != 0) {
+        const LONG64 target = g_pendingDismissSeq;
+        g_pendingDismissSeq = 0;
+        g_pendingDismissEpoch = 0;
+        HWND window = g_execWindow.load(std::memory_order_relaxed);
+        if (window) {
+            KillTimer(window, kExecDismissTimer);
+        }
+        AnswerExec(target, kSwipeAckSuperseded, S_OK, kSwipeVisibilityUnknown);
+        TraceLog(L"exec cancel target=%lld reason=native-show",
+                static_cast<long long>(target));
+    }
+    // The other half: Start published the dismiss but this thread has not read it
+    // yet. A record past the watermark was never accepted, so `ExecutePendingCommand`
+    // would arm or run it after the show; answer it here and mark it skipped, in
+    // case that dispatch already read it before this answer.
+    SwipeIpcExecCommand published{};
+    if (!SwipeIpcReadExec(&g_ipc, &published) || published.seq == 0) {
         return;
     }
-    const LONG64 target = g_pendingDismissSeq;
-    g_pendingDismissSeq = 0;
-    g_pendingDismissEpoch = 0;
-    HWND window = g_execWindow.load(std::memory_order_relaxed);
-    if (window) {
-        KillTimer(window, kExecDismissTimer);
+    if (published.kind != kSwipeExecDismiss ||
+        published.seq <= g_execAcceptedSeq) {
+        return;
     }
-    AnswerExec(target, kSwipeAckSuperseded, S_OK, kSwipeVisibilityUnknown);
-    TraceLog(L"exec cancel target=%lld reason=native-show",
-            static_cast<long long>(target));
+    g_suppressedExecSeq = published.seq;
+    AnswerExec(published.seq, kSwipeAckSuperseded, S_OK,
+               kSwipeVisibilityUnknown);
+    TraceLog(L"exec cancel target=%lld reason=native-show-published",
+            static_cast<long long>(published.seq));
 }
 
 void ExecutePendingCommand() {
     SwipeIpcExecCommand command{};
     if (!SwipeIpcReadExec(&g_ipc, &command) || command.seq == 0) {
+        return;
+    }
+    if (command.seq == g_suppressedExecSeq) {
+        // A native show took the window over after this record was published but
+        // before it was dispatched. Running it now would hide the menu that show
+        // just presented; the answer was already written by the cancel.
+        g_suppressedExecSeq = 0;
+        g_execAcceptedSeq = command.seq;
+        TraceLog(L"exec superseded seq=%lld reason=native-show",
+                static_cast<long long>(command.seq));
         return;
     }
     if (command.seq == g_execAcceptedSeq) {
@@ -19871,6 +19911,7 @@ BOOL RoleInit() {
     g_pressQueueCount = 0;
     g_pressOutstanding = OutstandingPress{};
     g_pressLatch = PressLatch{};
+    g_suppressedExecSeq = 0;
     ClearPressOpenGeneration();
 
     // The channel to the Start side. Opening it here means the section and its
