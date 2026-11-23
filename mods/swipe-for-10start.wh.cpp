@@ -15637,9 +15637,11 @@ PeerProcess PeerProcessProbe() {
 
 // The handle is acquired on the admission path, not only when a claim needs its
 // death proof: a host that claimed and died before the first press's probe would
-// otherwise leave an identity that can never be opened or retried.
-void WarmPeerProcess() {
-    PeerProcessProbe();
+// otherwise leave an identity that can never be opened or retried. The answer is
+// an admission condition, not a warm-up: a cached handle whose process has
+// exited is death, exactly like a withdrawn peer.
+PeerProcess WarmPeerProcess() {
+    return PeerProcessProbe();
 }
 
 void ReleasePeerProcess() {
@@ -15769,8 +15771,26 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
     // The death proof's handle is acquired here, on the admission path, not only
     // when a claimed record needs it: a host that claimed and exited before the
     // first claim-path probe would otherwise leave an identity whose failed open
-    // was cached, and its slot would stay reserved forever.
-    WarmPeerProcess();
+    // was cached, and its slot would stay reserved forever. The answer is itself
+    // an admission condition: a handle that is signalled is a dead peer even
+    // while the section still advertises one.
+    const PeerProcess process = WarmPeerProcess();
+    if (process != PeerProcess::Alive) {
+        const wchar_t* processName =
+            process == PeerProcess::Dead ? L"dead" : L"unknown";
+        // A dead peer passes natively when nothing is held; a held or queued
+        // press still reaches admission, where the existing reconciliation
+        // releases it. An unopened handle is not death: a fresh press passes
+        // natively and the reservation, if any, stays — never a replay.
+        if (OnRecordedLauncherThread() && PressQueueHeld()) {
+            TraceLog(L"own pass trigger=%s reason=process-%s-queued", trigger,
+                    processName);
+        } else {
+            TraceLog(L"own pass trigger=%s reason=process-%s", trigger,
+                    processName);
+            return false;
+        }
+    }
     if (!ExecutorWorkerReady()) {
         TraceLog(L"own pass trigger=%s reason=no-executor", trigger);
         return false;
