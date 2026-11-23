@@ -14554,6 +14554,7 @@ void RemoveExecutorThreadHook();
 void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr);
 LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                            uint32_t flags);
+void CancelArmedDismissForNativeShow();
 
 // twinui.pcshell.dll is resolved by public symbol, not by address. The hook
 // array in InstallExplorerHooks carries every name inline: each is the exact
@@ -15124,9 +15125,14 @@ struct OwnExternalForwardGuard {
 
 // Consumes the mark, and only for the method it was armed with. One-shot: a
 // second close nested inside the same original call is a different request and
-// is decided on its own.
+// is decided on its own. A forwarded open has no method to match: every close it
+// causes synchronously is part of that open.
+constexpr uint32_t kOwnExternalForwardAny = 0xFFFFFFFFu;
+
 bool OwnTakeExternalForward(uint32_t method) {
-    if (t_ownExternalMethod == 0 || t_ownExternalMethod != method) {
+    if (t_ownExternalMethod == 0 ||
+        (t_ownExternalMethod != kOwnExternalForwardAny &&
+         t_ownExternalMethod != method)) {
         return false;
     }
     t_ownExternalMethod = 0;
@@ -17732,6 +17738,7 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
                     method, own.state);
             PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                                 method, 0);
+            OwnExternalForwardGuard guard(method);
             const HRESULT hr =
                 Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
             OwnResyncFromState(OwnStateOf(launcher));
@@ -17741,6 +17748,7 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
                 method, own.state);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride, method,
                             0);
+        OwnExternalForwardGuard guard(method);
         const HRESULT hr =
             Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
         OwnResyncFromState(OwnStateOf(launcher));
@@ -17789,6 +17797,9 @@ HRESULT ShowStartView_Hook(void* launcher, uint32_t method, uint32_t flags) {
                 method, flags, own.state);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride, method,
                             flags);
+        // The show takes the window back; an armed dismiss would hide it.
+        CancelArmedDismissForNativeShow();
+        OwnExternalForwardGuard guard(kOwnExternalForwardAny);
         const HRESULT hr = ShowStartView_Original
                                ? ShowStartView_Original(launcher, method, flags)
                                : E_FAIL;
@@ -18622,6 +18633,24 @@ void ExecuteDueDismiss() {
     }
     g_pendingDismissSeq = 0;
     ExecuteDismiss(command);
+}
+
+// A native show takes the window over while a close may still be armed. The
+// queued dismiss is revoked here; a call already inside the shell is not.
+void CancelArmedDismissForNativeShow() {
+    if (g_pendingDismissSeq == 0) {
+        return;
+    }
+    const LONG64 target = g_pendingDismissSeq;
+    g_pendingDismissSeq = 0;
+    g_pendingDismissEpoch = 0;
+    HWND window = g_execWindow.load(std::memory_order_relaxed);
+    if (window) {
+        KillTimer(window, kExecDismissTimer);
+    }
+    AnswerExec(target, kSwipeAckSuperseded, S_OK, kSwipeVisibilityUnknown);
+    TraceLog(L"exec cancel target=%lld reason=native-show",
+            static_cast<long long>(target));
 }
 
 void ExecutePendingCommand() {
