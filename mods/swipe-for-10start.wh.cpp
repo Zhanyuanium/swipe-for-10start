@@ -13695,6 +13695,9 @@ void CancelArmedDismissForNativeShow() {
 }
 
 void ExecutePendingCommand() {
+    // Sample the epoch before the copy. Sampling it after the copy labels a
+    // command from the previous controller with the next controller's epoch.
+    const uint32_t epochBefore = PeerEpochNow();
     SwipeIpcExecCommand command{};
     if (!SwipeIpcReadExec(&g_ipc, &command) || command.seq == 0) {
         return;
@@ -13713,7 +13716,7 @@ void ExecutePendingCommand() {
     }
     g_execAcceptedSeq = command.seq;
 
-    g_dispatchEpoch = PeerEpochNow();
+    g_dispatchEpoch = epochBefore;
     if (!ValidExecCommand(command)) {
         TraceLog(L"exec refused seq=%lld kind=%d method=%u flags=%u target=%lld "
                 L"reason=invalid",
@@ -13748,6 +13751,19 @@ void ExecutePendingCommand() {
             TraceLog(L"exec cancel show target=%lld reason=withdrawn",
                     static_cast<long long>(g_pendingShowSeq));
             g_pendingShowSeq = 0;
+        }
+        return;
+    }
+    const uint32_t epochAfter = PeerEpochNow();
+    if (epochAfter != epochBefore) {
+
+        TraceLog(L"exec %s seq=%lld superseded epoch=%u now=%u",
+                command.kind == kSwipeExecShow ? L"show" : L"dismiss",
+                static_cast<long long>(command.seq), epochBefore, epochAfter);
+        AnswerExec(command.seq, kSwipeAckSuperseded,
+                   HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
+        if (command.kind == kSwipeExecDismiss) {
+            DropPressLatch(L"dismiss-superseded", L"epoch");
         }
         return;
     }
