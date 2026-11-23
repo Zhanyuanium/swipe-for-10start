@@ -15057,6 +15057,8 @@ constexpr uint64_t kPressQueueWaitMs = 1500;
 // this total passes, not run natively: its direction is minutes old and the
 // shell has long since moved on.
 constexpr uint64_t kPressQueueStaleMs = kPressQueueWaitMs + kPressAckTimeoutMs;
+// A claim held this long is spent; below kPressQueueStaleMs so the press behind it still runs.
+constexpr uint64_t kClaimAbandonMs = 2000;
 constexpr int kPressQueueCapacity = 4;
 // The controller's own budget for one command (its kBridgeAckTimeoutMs): a show
 // is answered within 400 ms of its publication, a dismiss within 400 ms of the
@@ -17333,6 +17335,35 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
         return true;
     }
     if (taken == press.seq && !epochChanged && PeerStateAliveNow()) {
+        if (wait >= kClaimAbandonMs) {
+            // A live host that never answers has spent the claim; no replay, and the queue is released.
+            g_pressOutstanding = OutstandingPress{};
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                KillTimer(window, kPressAckTimer);
+            }
+            if (press.external) {
+                TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
+                        L"decision=released reason=claim-deadline bound=%llu",
+                        static_cast<long long>(press.seq),
+                        static_cast<unsigned long long>(wait), press.publishedEpoch,
+                        epochNow,
+                        static_cast<unsigned long long>(kClaimAbandonMs));
+            } else {
+                TraceLog(L"own press abandoned seq=%lld trigger=%s entry=%s "
+                        L"wait=%llu epoch=%u->%u decision=consumed "
+                        L"reason=claim-deadline bound=%llu",
+                        static_cast<long long>(press.seq),
+                        PressTriggerName(press.press.trigger),
+                        PressEntryName(press.press.entry),
+                        static_cast<unsigned long long>(wait), press.publishedEpoch,
+                        epochNow,
+                        static_cast<unsigned long long>(kClaimAbandonMs));
+            }
+            ResumePressQueueAge();
+            ServeNextPress(L"claim-deadline");
+            return true;
+        }
         // The caller read no claim before this call and Start claimed and
         // validated the copy during it.
         HoldOutstandingAtAdmission(press, L"claimed-at-admission", epochNow,
@@ -17435,13 +17466,20 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
         // validated copy in hand.
         const bool deadClaimed =
             claimed && PeerProcessProbe() == PeerProcess::Dead;
-        if (epochChanged || peerGone || staleUnclaimed || deadClaimed) {
+        // A claim past the deadline is spent even from a live host; the arriving press must not
+        // queue behind it until its own bound.
+        const bool claimStale =
+            claimed && GetTickCount64() - g_pressOutstanding.publishedTick >=
+                           kClaimAbandonMs;
+        if (epochChanged || peerGone || staleUnclaimed || deadClaimed ||
+            claimStale) {
             reconciled = ReconcileOutstandingAtAdmission(
                 epochChanged
                     ? L"epoch-changed"
                     : (peerGone ? L"peer-gone"
                                 : (deadClaimed ? L"peer-dead"
-                                               : L"stale-unclaimed")),
+                                               : (claimStale ? L"claim-deadline"
+                                                             : L"stale-unclaimed"))),
                 epochNow);
         }
     }
@@ -17705,6 +17743,24 @@ void HandlePressAckTimeout() {
         // original to replay, so a proved dead process releases it without one.
         const bool deadClaimed =
             claimed && PeerProcessProbe() == PeerProcess::Dead;
+        if (claimed && !deadClaimed && PeerStateAliveNow() &&
+            wait >= kClaimAbandonMs) {
+            // A live host that never answers has spent the barrier; no replay, and the queue is released.
+            g_pressOutstanding = OutstandingPress{};
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                KillTimer(window, kPressAckTimer);
+            }
+            TraceLog(L"own external barrier seq=%lld wait=%llu peer=%s age=%u "
+                    L"epoch=%u decision=released reason=claim-deadline bound=%llu",
+                    static_cast<long long>(press.seq),
+                    static_cast<unsigned long long>(wait), peer, peerAge,
+                    epochNow,
+                    static_cast<unsigned long long>(kClaimAbandonMs));
+            ResumePressQueueAge();
+            ServeNextPress(L"claim-deadline");
+            return;
+        }
         if (!deadClaimed &&
             (peerAlive || (claimed && PeerStateAliveNow()))) {
             ReserveExternalBarrier(press, peer, peerAge, epochNow, wait, claimed,
@@ -17829,6 +17885,26 @@ void HandlePressAckTimeout() {
                     static_cast<long long>(taken), peer, peerAge, epochNow);
             ResumePressQueueAge();
             ServeNextPress(L"timeout");
+            return;
+        }
+        if (wait >= kClaimAbandonMs) {
+            // A live host that never answers has spent the claim; no replay, and the queue is released.
+            g_pressOutstanding = OutstandingPress{};
+            HWND window = g_execWindow.load(std::memory_order_relaxed);
+            if (window) {
+                KillTimer(window, kPressAckTimer);
+            }
+            TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s "
+                    L"wait=%llu taken=%lld peer=%s age=%u epoch=%u "
+                    L"decision=consumed reason=claim-deadline bound=%llu",
+                    static_cast<long long>(press.seq),
+                    PressTriggerName(press.press.trigger),
+                    PressEntryName(press.press.entry),
+                    static_cast<unsigned long long>(wait),
+                    static_cast<long long>(taken), peer, peerAge, epochNow,
+                    static_cast<unsigned long long>(kClaimAbandonMs));
+            ResumePressQueueAge();
+            ServeNextPress(L"claim-deadline");
             return;
         }
         AgeOutQueuedPress();
