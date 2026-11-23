@@ -830,21 +830,21 @@ delegate that does not revoke, a window that does not go away) blocks the unload
 once; there is no residual success, no deferred close and no retry loop.
 `docs/lifecycle.md` has the order and the blocking cases.
 
-### swipe_ipc_shared.h (merged mod, 232 bytes)
+### swipe_ipc_shared.h (merged mod, 240 bytes)
 The channel contract. See `docs/ipc.md`. The M2 close/retract slots are **gone**,
 and so is the debug command channel (0.7.0): its record, mutex, event and parser
 were deleted. The records that ship are the open generation, the
 intent and its ack and the `intentTaken` claim, the executor command and its ack,
 one controller direction
-word, the touch flag, the peer liveness triple `peerTick` (204,
+word, the touch flag, the peer identity `peerPid` (216) / `peerUiThread` (220) and the liveness triple `peerTick` (204,
 GetTickCount64 low bits) / `peerState` (208, alive/gone) / `peerEpoch` (212, the
-activation identity), `intentTaken` (216, the consumer's claim, written
-before it acts), and `execCapable` (224, the bridge's one-word executor promise).
+activation identity), `intentTaken` (224, the consumer's claim, written
+before it acts), and `execCapable` (232, the bridge's one-word executor promise).
 Every offset is asserted; the magic is `0x53333053`. There
 is **no version word**: the object namespace
-(`Local\SwipeFor10Start_SingleMod3_*`) is the ABI identity, so an old development
+(`Local\SwipeFor10Start_SingleMod5_*`) is the ABI identity, so an old development
 image cannot join and a future layout changes the prefix (the `3` marks the
-232-byte layout and the `Capability` event). The executor validates
+240-byte layout and the `Capability` event). The executor validates
 each command before any launcher call: show method 1/11/16 with flags under the
 `0x8|0x4` mask, dismiss method 1/6 with no flags, cancel method/flags 0; anything
 else is refused, never clamped. The producer checks the same shared vocabulary

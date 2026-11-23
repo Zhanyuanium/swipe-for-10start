@@ -1,7 +1,7 @@
 # M3.2 architecture — one controller, one executor
 
 > L3-level design record. Mod **0.8.3** (one source, two process halves),
-> channel **232 B, no product version word** (`SingleMod3` namespace). The measured evidence is quoted with the build and the
+> channel **240 B, no product version word** (`SingleMod5` namespace). The measured evidence is quoted with the build and the
 > layout it came from; everything below was run on this machine. **Layouts:**
 > *left docked* (live, measured 2026-11-21) = `axis=0`, work `48,0,1440,900`,
 > the bar at `0,0..48,900` (96 physical wide), band `0..96`, panel
@@ -808,8 +808,8 @@ a root. A capability drop withdraws the peer even when the root is healthy, and 
 capability gain does not republish until the root and the renderer are both
 usable.
 
-The merged channel is **232 bytes** with one section and five events. The names
-use one merged-mod prefix (`Local\SwipeFor10Start_SingleMod3_*`) and there is **no
+The merged channel is **240 bytes** with one section and five events. The names
+use one merged-mod prefix (`Local\SwipeFor10Start_SingleMod5_*`) and there is **no
 product version word**: the ABI namespace is the identity, so an old development
 image cannot join and a future layout changes the prefix. The records are the open
 generation, the intent and its ack and the `intentTaken` claim, the executor

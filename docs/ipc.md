@@ -7,18 +7,19 @@
 ## Names and layout
 
 ```
-Local\SwipeFor10Start_SingleMod3_State      SwipeIpcState (232 bytes)
-Local\SwipeFor10Start_SingleMod3_Intent     auto-reset, bridge -> Start
-Local\SwipeFor10Start_SingleMod3_IntentAck  auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod3_Exec       auto-reset, Start -> bridge
-Local\SwipeFor10Start_SingleMod3_ExecAck    auto-reset, bridge -> Start
-Local\SwipeFor10Start_SingleMod3_Capability auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod5_State      SwipeIpcState (240 bytes)
+Local\SwipeFor10Start_SingleMod5_Intent     auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod5_IntentAck  auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod5_Exec       auto-reset, Start -> bridge
+Local\SwipeFor10Start_SingleMod5_ExecAck    auto-reset, bridge -> Start
+Local\SwipeFor10Start_SingleMod5_Capability auto-reset, bridge -> Start
 ```
 
 `kSwipeIpcMagic = 0x53333053` (`S03S`). There is no product version word: the
-**namespace is the ABI identity**. The `3` in the prefix is the layout identity:
-the `execCapable` word made the section 232 bytes, so the old 224-byte namespace
-must never be joined. A future incompatible layout changes the
+**namespace is the ABI identity**. The `5` in the prefix is the layout identity:
+`execCapable` made the section 232 bytes and `peerPid`/`peerUiThread` made it
+240, so an older namespace must never be joined. A future incompatible layout
+changes the
 prefix again, so an old pinned development image can never join this channel and a
 same-size change is never reinterpreted across a staggered update. Every field's
 offset is pinned by a `static_assert` in `mods/swipe_ipc_shared.h`;
@@ -43,9 +44,10 @@ layout.
 196  controllerDirection
 200  controllerTouch
 204  peerTick         208  peerState        212  peerEpoch
-216  intentTaken
-224  execCapable
-size 232
+216  peerPid          220  peerUiThread
+224  intentTaken
+232  execCapable
+size 240
 ```
 
 The debug command channel is **gone**: its record, mutex, event and parser were
@@ -56,7 +58,8 @@ deleted in 0.7.0, and `tools/ipc.ps1` is read-only.
 The channel is trusted by name, not authenticated. `Local\` scopes the objects
 to the logon session, and any process in that session that opens these names can
 read every record and publish any record. The mod has no caller identity to
-check: `peerState`, `peerTick` and `peerEpoch` prove that a Start half is alive
+check: `peerState`, `peerTick`, `peerEpoch`, `peerPid` and `peerUiThread` prove
+that a Start half is alive
 and which activation it is, not that the writer is the Start host. The names are
 a contract between the two halves, not a security boundary; a hostile
 same-session process is outside the threat model.

@@ -51,7 +51,8 @@ record retires the controller's pending dismiss.
 The bridge intercepts only while the Start side is alive, and the Start side is
 alive only while the bridge is capable. The bridge creates the
 channel, so a mapped section says nothing about the controller; the Start side
-publishes `peerEpoch` (its activation identity, claimed at attach), `peerState`
+publishes `peerEpoch` (its activation identity, claimed at attach), `peerPid` and
+`peerUiThread` (the process and UI thread that identity belongs to), `peerState`
 (alive/gone) and `peerTick` (refreshed from its input thread at most once per
 100 ms), and every consuming hook reads them before any decision. Availability is
 published **from the ready consumer** — the input thread, once its window, its
@@ -446,25 +447,25 @@ header.
 
 ## Channel
 
-`mods/swipe_ipc_shared.h`: one session-local section (`State`, 232 bytes) and
+`mods/swipe_ipc_shared.h`: one session-local section (`State`, 240 bytes) and
 five named events (`Intent/IntentAck/Exec/ExecAck/Capability` — six objects),
 every record a
 seqlock with its own counter and an `offsetof` assert, plus single-word
 claims (`controllerDirection`, `intentTaken`) and the bridge's `execCapable`.
 The names carry the merged
-mod's own prefix with the layout identity (`SwipeFor10Start_SingleMod3_`) and
+mod's own prefix with the layout identity (`SwipeFor10Start_SingleMod5_`) and
 there is **no product version
 word**: the namespace is the ABI identity, so an older development image cannot
 join, and a future layout changes the prefix. The records are the open
 generation, the intent and its ack and the taken sequence (the ack is the
 bridge's next-press barrier; the take is the timeout's proof), the executor
 command and its ack, one
-controller direction word plus the touch flag, the liveness triple
-`peerTick` (204) / `peerState` (208) / `peerEpoch` (212), and `execCapable`
-(224). The consumer claim
-`intentTaken` (216) is a separate word, not liveness. The debug command
+controller direction word plus the touch flag, liveness
+`peerTick` (204) / `peerState` (208) / `peerEpoch` (212), the peer identity
+`peerPid` (216) / `peerUiThread` (220), and `execCapable` (232). The consumer
+claim `intentTaken` (224) is a separate word, not liveness. The debug command
 channel — its record, mutex, event and parser — is **gone**.
-`tools/ipc.ps1` is read-only: `-State` reads 232 bytes and prints the records, the
+`tools/ipc.ps1` is read-only: `-State` reads 240 bytes and prints the records, the
 peer epoch and the capability.
 `SwipeIpcOpen` may wait the whole 550 ms init budget; generation 0 and an unknown
 `initState` are refused, never waited on. Each role opens the channel at its

@@ -137,7 +137,7 @@
   it is a prerequisite, and behaviour on the Windows 11 Start is unmeasured,
   not adapted.
 - **The channel is trusted by name, not authenticated.** The section and the
-  five events live under `Local\SwipeFor10Start_SingleMod3_*`, so any process in
+  five events live under `Local\SwipeFor10Start_SingleMod5_*`, so any process in
   the same session that opens those names can read every record and publish any
   record. `peerState`, `peerTick` and `peerEpoch` prove that a Start half is
   alive and which activation it is; they do not prove that the writer is the
