@@ -4665,6 +4665,13 @@ void RemoveStartAttachHook() {
 [[noreturn]] void BlockUnload(const wchar_t* reason);
 
 void WaitForStartAttachFrames() {
+    // A disable can run on the host's UI thread with an attach frame below it.
+    // The wait would then include this frame, which cannot return while the
+    // unload is on it: block instead of waiting for itself.
+    if (g_startAttachFrames.load(std::memory_order_acquire) != 0 &&
+        g_uiThreadId.load(std::memory_order_relaxed) == GetCurrentThreadId()) {
+        BlockUnload(L"own hook frame");
+    }
     if (g_startAttachFrames.load(std::memory_order_acquire) == 0) {
         return;
     }
@@ -13903,6 +13910,7 @@ constexpr UINT kUiDrainMessage = WM_APP + 0x64;
 constexpr WPARAM kUiTeardownMagic = 0x53575455;  // "SWTU"
 constexpr WPARAM kUiDestroyMagic = 0x53575458;   // "SWTX"
 constexpr WPARAM kUiDrainMagic = 0x53575452;     // "SWTR"
+constexpr int kUiDrainRetries = 8;
 
 bool g_uiRendezvousClassRegistered = false;
 HINSTANCE g_uiRendezvousClassInstance = nullptr;
@@ -14267,6 +14275,38 @@ bool DrainUiThread(HWND hwnd) {
     return call.ran;
 }
 
+// The attach hook's counted frames, then the empty UI turn, in the order that
+// makes the turn the barrier: a frame decrements before it signals and returns,
+// and a sent message can be dispatched from inside that tail. Waiting for the
+// frames first and sending the drain after means the turn is served only once
+// the frame has returned. A frame that entered while the drain was dispatched
+// from inside its own CallNextHookEx is waited for, and the turn is proven
+// again; bounded, because the hook is already removed.
+void WaitForAttachFramesThenDrainUi(HWND hwnd) {
+    WaitForStartAttachFrames();
+    if (!hwnd) {
+        // No window was ever created, or it is already gone: the counter is the
+        // only barrier this path has.
+        TraceLog(L"unload ui drain skipped reason=no-window");
+        return;
+    }
+    for (int attempt = 0; attempt < kUiDrainRetries; ++attempt) {
+        if (!IsWindow(hwnd)) {
+            TraceLog(L"unload ui drain skipped reason=window-gone");
+            return;
+        }
+        if (!DrainUiThread(hwnd)) {
+            BlockUnload(L"ui drain not acknowledged");
+        }
+        if (g_startAttachFrames.load(std::memory_order_acquire) == 0) {
+            TraceLog(L"unload ui drained ack=1 attempt=%d", attempt + 1);
+            return;
+        }
+        WaitForStartAttachFrames();
+    }
+    BlockUnload(L"attach hook frames after drain");
+}
+
 BOOL RoleInit() {
     SetTraceFileName(L"renderer.log");
     RefreshTraceSetting();
@@ -14573,27 +14613,25 @@ void RoleUninit() {
     //     off the owner the count is the predicate.
     RequireNoModuleCallbacks(!inlineUnload);
 
-    // 5. One more synchronous empty turn when a window exists, so the UI thread
-    //    has left every callback and delegate destructor it was inside. The
-    //    counts are re-checked after it; a window that is gone cannot skip them.
+    // 5. The attach hook's own frames, then one more synchronous empty turn, in
+    //    that order: the teardown above proves the dispatch reached the UI
+    //    thread, not that an independent hook frame below it has left
+    //    CallNextHookEx, and the turn is only dispatched once that frame
+    //    returned. The counts are re-checked after it; a window that is gone
+    //    cannot skip them.
     if (inlineUnload) {
         // TeardownUi ran on this thread and the counts above are zero; no turn
-        // is needed and none can be sent anywhere.
+        // is needed and none can be sent anywhere. The frame wait is still the
+        // barrier, and it blocks above rather than waiting for its own frame.
+        WaitForStartAttachFrames();
     } else if (uiWindow) {
-        if (!DrainUiThread(uiWindow)) {
-            BlockUnload(L"ui drain not acknowledged");
-        }
-        TraceLog(L"unload ui drained ack=1");
+        WaitForAttachFramesThenDrainUi(uiWindow);
     } else {
         // No UI-turn lease and no window: either never attached, or the
         // admission hook failed before it registered anything.
+        WaitForStartAttachFrames();
         TraceLog(L"unload teardown without a window; no ui turn");
     }
-
-    // 5b. The attach hook's own frames. The teardown send above proves the
-    //     dispatch reached the UI thread, not that an independent hook frame
-    //     below it has left CallNextHookEx; the counter is what proves that.
-    WaitForStartAttachFrames();
 
     // 6. The window and then its class: the class must not outlive the image,
     //    and the window must be gone before the class is unregistered.
@@ -14835,6 +14873,16 @@ constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
 // launcher entry that corrected a provisional commitment, through PostMessage.
 constexpr UINT kExecRetireMessage = WM_APP + 0x5F;
 constexpr WPARAM kExecRetireMagic = 0x53575252;   // "SWRR"
+// The unload's return proof for the hook thread: a counted frame decrements
+// before it signals and returns, so only a message the thread actually
+// dispatches proves it is back in its loop.
+constexpr UINT kExecDrainMessage = WM_APP + 0x60;
+constexpr WPARAM kExecDrainMagic = 0x53575244;  // "SWRD"
+constexpr int kExecDrainRetries = 8;
+
+struct ExecDrainCall {
+    bool ran;
+};
 
 class ExecDepthGuard {
   public:
@@ -19023,6 +19071,21 @@ void RetireExecutorTeardown(HWND window) {
 
 LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
                                     LPARAM lParam) {
+    if (message == kExecDrainMessage) {
+        // The unload's proof that this thread is back in its loop, served from
+        // the top: it must not depend on the dispatch gate, the depth or any
+        // window state. A sent message can only be dispatched between two
+        // messages, so its handler running means the counted frame returned.
+        auto* call = reinterpret_cast<ExecDrainCall*>(lParam);
+        if (wParam != kExecDrainMagic ||
+            window != g_execWindow.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        if (call) {
+            call->ran = true;
+        }
+        return 0;
+    }
     if (message == kExecRetireMessage) {
         // A launcher entry corrected a provisional thread. The window that ran on
         // the old one stops and destroys itself here, on its own thread; the
@@ -19761,6 +19824,14 @@ void JoinExecutorWorker() {
 // The count is the predicate and the event is its wake; a count that never
 // reaches zero blocks the unload.
 void WaitForExecutorHookFrames() {
+    // A disable can run from inside a counted frame (a hook on the launcher
+    // thread triggers the unload). The wait would then include this frame, which
+    // cannot return while the unload is on it: block instead of waiting for
+    // itself.
+    if (g_execHookFrames.load(std::memory_order_acquire) != 0 &&
+        g_execThreadId == GetCurrentThreadId()) {
+        BlockBridgeUnload(L"own hook frame");
+    }
     if (g_execHookFrames.load(std::memory_order_acquire) == 0) {
         return;
     }
@@ -19773,6 +19844,43 @@ void WaitForExecutorHookFrames() {
         }
     }
     TraceLog(L"unload executor hook frames drained");
+}
+
+// The count proves the decrement, not the return: a frame decrements to zero,
+// signals the event and only then returns, and a sent message can be dispatched
+// from inside those last instructions. This send is dispatched only when the
+// thread is back in its message loop, so its return is the barrier. A frame
+// that entered while the drain was dispatched from inside its own
+// CallNextHookEx is waited for, and the loop is proven again; bounded, because
+// the hook is already removed and no new frame can enter.
+void DrainExecutorThread(HWND window) {
+    WaitForExecutorHookFrames();
+    if (!window) {
+        // No window was ever created, or it is already gone: the counter is the
+        // only barrier this path has.
+        TraceLog(L"unload exec drain skipped reason=no-window");
+        return;
+    }
+    for (int attempt = 0; attempt < kExecDrainRetries; ++attempt) {
+        if (!IsWindow(window)) {
+            TraceLog(L"unload exec drain skipped reason=window-gone");
+            return;
+        }
+        ExecDrainCall call{false};
+        SendMessageW(window, kExecDrainMessage, kExecDrainMagic,
+                     reinterpret_cast<LPARAM>(&call));
+        if (!call.ran) {
+            TraceLog(L"unload exec drain not served hwnd=%p", window);
+            return;
+        }
+        if (g_execHookFrames.load(std::memory_order_acquire) == 0) {
+            TraceLog(L"unload exec drain served hwnd=%p attempt=%d", window,
+                    attempt + 1);
+            return;
+        }
+        WaitForExecutorHookFrames();
+    }
+    BlockBridgeUnload(L"executor hook frames after drain");
 }
 
 // Stop, wait for the ack, then a sent destroy whose return is the proof.
@@ -20045,9 +20153,11 @@ void RoleUninit() {
 
     // Then the thread hook, and any frame of it that was already running. The
     // normal path did both in BeforeUninit; this covers an uninit that skipped
-    // it.
+    // it. The drain send follows the frame wait and comes before the stop send,
+    // so the loop is proven by a message that can only be dispatched after the
+    // last frame returned.
     RemoveExecutorThreadHook();
-    WaitForExecutorHookFrames();
+    DrainExecutorThread(g_execWindow.load(std::memory_order_acquire));
 
     // Then the one window, on its owner thread, with the worker already joined:
     // no new post can arrive and no timer can survive the destruction. The
