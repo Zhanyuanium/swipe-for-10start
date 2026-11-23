@@ -14699,8 +14699,10 @@ std::atomic<HHOOK> g_execThreadHook{nullptr};
 std::atomic<DWORD> g_execThreadHookTarget{0};
 
 void CompleteExecutorTeardown(HWND window);
-// Counts one module frame on the launcher thread. A teardown that arrives
-// nested marks pending and is completed by the outermost unwind.
+
+constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
+constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
+
 class ExecDepthGuard {
   public:
     ExecDepthGuard() { ++g_execOwnerDepth; }
@@ -14708,15 +14710,26 @@ class ExecDepthGuard {
         if (--g_execOwnerDepth > 0 || !g_execTeardownPending) {
             return;
         }
-        HWND window = g_execWindow.load(std::memory_order_acquire);
-        if (window) {
-            CompleteExecutorTeardown(window);
-        } else {
-            g_execTeardownPending = false;
+        g_execTeardownPending = false;
+        const HWND window = g_execWindow.load(std::memory_order_acquire);
+        if (!window) {
+            TraceLog(L"exec teardown post skipped hwnd=null; acknowledging");
             if (g_execTeardownAck) {
                 SetEvent(g_execTeardownAck);
             }
+            return;
         }
+        // Post; the loop serves it after this frame has returned.
+        if (!PostMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0)) {
+            const DWORD error = GetLastError();
+            TraceLog(L"exec teardown post failed hwnd=%p err=%u; acknowledging",
+                    window, error);
+            if (g_execTeardownAck) {
+                SetEvent(g_execTeardownAck);
+            }
+            return;
+        }
+        TraceLog(L"exec teardown posted hwnd=%p", window);
     }
 
     ExecDepthGuard(const ExecDepthGuard&) = delete;
@@ -14770,18 +14783,13 @@ class ExecAdmissionExclusive {
 };
 
 constexpr UINT kExecMessage = WM_APP + 0x5A;
-// The private shutdown and latch messages. A generic WM_CLOSE says only "some
-// window should close"; the teardown is a request this activation made about
-// its own window, and the WndProc answers it only for the published HWND. The
-// latch message moves the hidden event's arm onto the executor's owner thread,
-// where the timer and the slot live.
-constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
+// The latch message moves the hidden event's arm onto the executor's owner
+// thread, where the timer and the slot live.
 constexpr UINT kExecLatchMessage = WM_APP + 0x5C;
 // The intent ack travels worker -> launcher window: the worker is the only
 // thread that can wait on the channel's ack event, and the queue belongs to the
 // launcher thread. This is a notification, not a second record.
 constexpr UINT kExecIntentAckMessage = WM_APP + 0x5D;
-constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
 constexpr WPARAM kExecLatchMagic = 0x53574C41;     // "SWLA"
 constexpr WPARAM kExecIntentAckMagic = 0x53574141;  // "SWAA"
 constexpr UINT_PTR kExecDismissTimer = 0x5358;
@@ -18670,6 +18678,8 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
             TraceLog(L"exec teardown deferred depth=%d", g_execOwnerDepth);
             return 0;
         }
+        TraceLog(L"exec teardown served hwnd=%p tid=%u", window,
+                GetCurrentThreadId());
         CompleteExecutorTeardown(window);
         return 0;
     }
