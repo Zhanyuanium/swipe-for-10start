@@ -5108,6 +5108,23 @@ void RunPendingCloseTap(uint64_t tickMs) {
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
 
+    // The close belongs to the menu it was accepted on. A keyboard reopen
+    // between acceptance and this deadline is a different menu, and a dismiss
+    // naming the old generation cannot be aimed at it.
+    uint64_t openGeneration = 0;
+    uint64_t openTick = 0;
+    if (!SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick) ||
+        openGeneration != g_close.openGeneration) {
+        TraceLog(L"close dismiss skipped kind=%s reason=menu-changed gen=%llu "
+                L"now=%llu",
+                CloseKindName(kind),
+                static_cast<unsigned long long>(g_close.openGeneration),
+                static_cast<unsigned long long>(openGeneration));
+        EndClose(L"menu-changed");
+        ReleaseExecutorOwnership();
+        return;
+    }
+
     if (!StartWindowIsOpen()) {
         TraceLog(L"close dismiss skipped kind=%s (already closed)",
                 CloseKindName(kind));
@@ -5118,9 +5135,6 @@ void RunPendingCloseTap(uint64_t tickMs) {
 
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
 
-    uint64_t openGeneration = 0;
-    uint64_t openTick = 0;
-    SwipeIpcReadOpen(&g_ipc, &openGeneration, &openTick);
     if (!RequestBridgeDismiss(1, GetTickCount64(), openGeneration)) {
 
         EndClose(L"no-executor");
