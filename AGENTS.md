@@ -541,9 +541,12 @@ checked by hand, and the table lists the sessions with captured numbers.
   owner, it takes the root admission lock exclusive before choosing the
   teardown), then requires the UI-turn count and registration count and one
   acknowledged empty turn. A XAML handler or an executor window frame on the
-  stack defers the teardown to its outermost unwind; the unload waits for the
+  stack defers the teardown; the UI guard posts a private message to the
+  rendezvous window and returns, and the message loop serves it only after the
+  handler and its delegate thunk have returned. The unload waits for the
   acknowledgement event, so it never frees under a frame that can still call the
-  shell. A missing
+  shell. Every dispatcher turn carries the same guard, not only its counted
+  entry. A missing
   drain acknowledgement (`ui drain not acknowledged`), a windowless root after a
   UI-turn lease was ever used (dispatcher turn or settle batch), or an inline
   unload with a pending entry

@@ -71,10 +71,15 @@ image goes.
    a hook arriving after the flag sees it and registers nothing. This also lets
    the teardown revoke a gesture close's settle batch instead of waiting for a
    lease only that teardown can release. A top-level handler runs the turn
-   immediately. A XAML handler on the stack defers it with
-   `g_uiTeardownPending`; the last `UiDepthGuard` unwinds, runs the turn and sets
-   `g_uiTeardownAck`, and the unload waits for that event instead of returning
-   into the handler. The turn revokes the `Loaded`,
+   immediately. A XAML handler on the stack sets `g_uiTeardownPending`; the last
+   `UiDepthGuard` posts `kUiDeferredTeardownMessage` to the rendezvous window and
+   returns. The message loop serves it only after that handler and its C++/WinRT
+   delegate thunk have returned; the handler at depth 0 runs the turn and sets
+   `g_uiTeardownAck`. The unload waits for that event instead of returning into
+   the handler. `PostCountedUiTurn` carries the same guard inside every
+   dispatcher turn: its `ModuleEntryLease` keeps the image alive, while the
+   guard defers the teardown until the turn and its thunk have returned. The
+   turn revokes the `Loaded`,
    `SizeChanged`, `LayoutUpdated` and scroller
    `ViewChanged` handlers, detaches the settle batch's `Completed`, stops the
    animations, restores resting `Progress` and the neutral translation, resets

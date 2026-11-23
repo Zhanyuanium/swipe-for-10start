@@ -1196,9 +1196,19 @@ class ModuleEntryLease {
 
 void TeardownUi();
 
-// Counts one entry of module code on the XAML UI thread. A deferred teardown
-// runs when the last guard unwinds, after the handler that was on the stack has
-// returned, and then acknowledges the unload. The destructor must not unwind.
+// The deferred teardown's wake. A guard cannot run TeardownUi itself: its
+// destructor runs inside the XAML handler, before the C++/WinRT delegate thunk
+// has returned. The posted message is dispatched only after that frame and the
+// thunk are gone.
+constexpr UINT kUiDeferredTeardownMessage = WM_APP + 0x65;
+constexpr WPARAM kUiDeferredTeardownMagic = 0x53575444;  // "SWTD"
+extern std::atomic<HWND> g_uiRendezvousHwnd;
+
+// Counts one entry of module code on the XAML UI thread. The lease keeps the
+// image alive; this counter decides when the teardown may run. The last guard
+// unwinds after the handler body, posts the deferred message, and returns; the
+// message loop serves it only after the delegate thunk and its closure have
+// returned. The destructor must not unwind and must not tear down directly.
 class UiDepthGuard {
   public:
     UiDepthGuard() { ++g_uiOwnerDepth; }
@@ -1207,13 +1217,13 @@ class UiDepthGuard {
             return;
         }
         g_uiTeardownPending = false;
-        try {
-            TeardownUi();
-        } catch (...) {
-            // A handler must not unwind into the shell's message loop.
-        }
-        if (g_uiTeardownAck) {
-            SetEvent(g_uiTeardownAck);
+        const HWND hwnd = g_uiRendezvousHwnd.load(std::memory_order_acquire);
+        if (!hwnd ||
+            !PostMessageW(hwnd, kUiDeferredTeardownMessage,
+                          kUiDeferredTeardownMagic, 0)) {
+            // No acknowledgement: the unload cannot prove this thread is free.
+            TraceLog(L"ui deferred teardown post failed hwnd=%p err=%u", hwnd,
+                    hwnd ? GetLastError() : 0);
         }
     }
 
@@ -2245,8 +2255,12 @@ void PostCountedUiTurn(wucore::CoreDispatcher const& dispatcher, Fn&& turn) {
             wucore::CoreDispatcherPriority::Normal,
             [lease = std::move(lease), turn = std::forward<Fn>(turn)]() {
                 // Holding the lease is the point of the capture: it keeps the
-                // count up until this callable is destroyed.
+                // count up until this callable is destroyed. The guard is the
+                // separate answer to a teardown that arrives while this turn
+                // runs: it defers the teardown until the lambda and its
+                // delegate thunk have returned.
                 static_cast<void>(lease);
+                UiDepthGuard depth;
                 turn();
             });
     } catch (...) {
@@ -13773,8 +13787,10 @@ void TeardownUi() {
 // The unload's rendezvous is this module's own message-only window, created on
 // the XAML UI thread by PrepareRootElement before Loaded. No shell window is
 // subclassed and no shell procedure is replaced. The private messages run only
-// on this window: teardown returns after TeardownUi and its delegate thunks,
-// drain is an empty turn, and destroy tears the window down on its owner.
+// on this window: a top-level teardown returns after TeardownUi; a deferred one
+// is posted by the last UiDepthGuard and served after the handler thunk has
+// returned, then sets the acknowledgement the unload waits for; drain is an
+// empty turn, and destroy tears the window down on its owner.
 constexpr wchar_t kUiRendezvousClassName[] =
     L"WindhawkLegacyStartSwipeUiRendezvous";
 constexpr UINT kUiTeardownMessage = WM_APP + 0x62;
@@ -13830,6 +13846,33 @@ LRESULT CALLBACK UiRendezvousProc(HWND hwnd, UINT message, WPARAM wParam,
         if (g_uiTeardownAck) {
             SetEvent(g_uiTeardownAck);
         }
+        return 0;
+    }
+    if (message == kUiDeferredTeardownMessage) {
+        if (wParam != kUiDeferredTeardownMagic ||
+            hwnd != g_uiRendezvousHwnd.load(std::memory_order_acquire)) {
+            TraceLog(L"ui deferred teardown ignored hwnd=%p", hwnd);
+            return 0;
+        }
+        if (g_uiOwnerDepth > 0) {
+            // Defensive only: the posted message should not be dispatched while
+            // a handler is on the stack. Keep it pending for that guard.
+            g_uiTeardownPending = true;
+            TraceLog(L"ui deferred teardown still nested depth=%d",
+                    g_uiOwnerDepth.load(std::memory_order_relaxed));
+            return 0;
+        }
+        try {
+            TeardownUi();
+        } catch (...) {
+            // A callback must not unwind into the shell's message loop.
+        }
+        if (g_uiTeardownAck) {
+            SetEvent(g_uiTeardownAck);
+        }
+        // The unload wakes on this event, but its next step is the drain send to
+        // this same window; that send cannot run before this handler returns.
+        TraceLog(L"ui deferred teardown served hwnd=%p", hwnd);
         return 0;
     }
     if (message == kUiDrainMessage) {
@@ -14007,7 +14050,8 @@ void DestroyUiRendezvousWindow() {
 // used for the later drain, or null when the teardown ran inline or no window
 // could run it. A missing window is not a proof that the UI thread is gone: the
 // caller still requires the entry and registration counts to say that nothing
-// can call back. No dispatcher and no completion event are involved.
+// can call back. No dispatcher is involved; a deferred teardown is acknowledged
+// by `g_uiTeardownAck` after its handler thunk has returned.
 HWND TeardownUiOnUiThread() {
     const DWORD uiThread = g_uiThreadId.load(std::memory_order_relaxed);
     if (uiThread != 0 && uiThread == GetCurrentThreadId()) {
@@ -14049,10 +14093,11 @@ HWND TeardownUiOnUiThread() {
     SendMessageW(hwnd, kUiTeardownMessage, kUiTeardownMagic,
                  reinterpret_cast<LPARAM>(&call));
     if (call.ran) {
-        // A handler on the stack defers the teardown to its outermost unwind;
-        // the event is set there. A top-level teardown sets it before the send
-        // returns. Waiting here is what makes the count later see a returned
-        // handler, not a nested one.
+        // A handler on the stack sets pending and returns; the last guard posts
+        // the deferred message, and the UI loop serves it only after that
+        // handler and its delegate thunk have returned. A top-level teardown
+        // sets the event before the send returns. Waiting here is what makes
+        // the count later see a returned handler, not a nested one.
         TraceLog(L"unload teardown wait hwnd=%p depth=%d", hwnd,
                 g_uiOwnerDepth.load(std::memory_order_relaxed));
         if (WaitForSingleObject(g_uiTeardownAck, INFINITE) != WAIT_OBJECT_0) {
