@@ -1428,9 +1428,8 @@ uint32_t g_layoutWatchMint = 0;
 // with genuinely nothing scrollable could never be dismissed from inside. They
 // are separate states:
 //
-// - Unknown: no measurement that speaks for this open — nothing measured yet, a
-//   measurement that failed, or the open-time pass whose rects belong to a window
-//   the shell is still moving. The gate defers while the press is inside the
+// - Unknown: no measurement that speaks for this open — nothing measured yet, or
+//   a measurement that failed. The gate defers while the press is inside the
 //   panel and lets a press outside it pass.
 // - Nothing: measured after the shell settled, and nothing in the panel can
 //   scroll vertically. Every vertical press belongs to the dismiss.
@@ -1516,9 +1515,9 @@ std::array<ScrollerWatch, kMaxScrollRegions>& ScrollerWatches() {
     return *g_scrollerWatches;
 }
 // The rect lines speak once per open per region, not once per measurement: the
-// open transition and the settled pass both measure the same elements, and only
-// a rect that actually moved is worth a second line. The `scroller none` line is
-// the settled pass telling the log that nothing here scrolls vertically.
+// settled pass and a resize measure the same elements, and only a rect that
+// actually moved is worth a second line. The `scroller none` line tells the log
+// that nothing here scrolls vertically.
 bool g_scrollerNoneLogged = false;
 bool g_scrollerOverflowLogged = false;
 bool g_scrollerRegionLogged[kMaxScrollRegions] = {};
@@ -2165,8 +2164,7 @@ void StopSettledTrailWatchIfGeneration(uint32_t maxGeneration);
 // and drops the cached element and its ViewChanged handler on close/teardown. It
 // validates the request and the epoch when it commits, and an incomplete or
 // owned pass leaves the state Unknown for the retry below.
-void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
-                            uint64_t requestId);
+void CacheScrollableElement(uint32_t expectedGeneration, uint64_t requestId);
 void ReleaseScrollableElement();
 void ReleaseScrollableElementIfGeneration(uint32_t maxGeneration);
 void ClearScrollerRetry();
@@ -8308,11 +8306,12 @@ void RunGeometryMeasurement(const SettledMeasureRequest& request, bool settled) 
         if (!MeasureRequestLive(request.generation, request.id)) {
             return;
         }
-        // The dismiss gate needs the scrolling element of this open. The
-        // open-time pass records it, the settled pass records it again with the
-        // list's final extent, and the settled pass is what arms the gate. It
-        // validates the same request and epoch before it commits.
-        CacheScrollableElement(settled, request.generation, request.id);
+        // The dismiss gate needs the scrolling element of this open. Only the
+        // settled pass measures it, with the list's final extent; it validates
+        // the same request and epoch before it commits.
+        if (settled) {
+            CacheScrollableElement(request.generation, request.id);
+        }
     } catch (...) {
         // A closing menu must not break the dispatcher turn.
         EndMeasureRequest(request.generation, request.id);
@@ -12450,16 +12449,10 @@ void PublishScrollerUnknown(uint32_t generation) {
 }
 
 // Surveys the menu for every place a vertical drag can scroll. Runs on the UI
-// thread from the open transition and again from the settled layout pass; the
-// second call replaces the first survey, which can still belong to the
-// storyboard.
+// thread from the settled layout pass; the open transition no longer surveys,
+// because a rect that belongs to a storyboard can only answer Unknown.
 //
-// Only the settled pass can arm the gate. The open-time pass records the regions
-// (so their ViewChanged handlers are attached early and their rects are logged)
-// but leaves the state Unknown: the rects belong to a window the shell is still
-// moving, and the old code armed the gate against it as soon as a rect existed.
-//
-// A settled pass that completes and finds no scrollable element records Nothing,
+// A pass that completes and finds no scrollable element records Nothing,
 // not Unknown. That is the state that lets a vertical press inside the panel
 // dismiss the menu, which is what a panel with genuinely nothing scrollable has
 // to do; Unknown is reserved for "no whole measurement speaks for this open".
@@ -12471,8 +12464,7 @@ void PublishScrollerUnknown(uint32_t generation) {
 // request, the epoch, the layout version and panel ownership are all decided and
 // the cache is written before the section ends, so a close or a resize cannot
 // slip between the decision and the write. Nothing is measured there.
-void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
-                            uint64_t requestId) {
+void CacheScrollableElement(uint32_t expectedGeneration, uint64_t requestId) {
     wux::FrameworkElement root = g_root;
     if (!root) {
         return;
@@ -12482,9 +12474,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     float originY = 0.0f;
     if (!XamlOriginDip(originX, originY)) {
         PublishScrollerUnknown(expectedGeneration);
-        if (settled) {
-            NoteScrollerFailure(L"origin", expectedGeneration, true);
-        }
+        NoteScrollerFailure(L"origin", expectedGeneration, true);
         return;
     }
 
@@ -12526,19 +12516,14 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     if (survey.count == 0 && !survey.complete) {
         // Unknown so the vertical gate keeps deferring; the retry is bounded.
         PublishScrollerUnknown(expectedGeneration);
-        if (settled) {
-            NoteScrollerFailure(L"incomplete", expectedGeneration, true);
-        }
+        NoteScrollerFailure(L"incomplete", expectedGeneration, true);
         return;
     }
 
     if (survey.count == 0) {
-        // Nothing scrolls here, and only the settled pass can make that a fact:
-        // the open transition can see an empty tree while the shell is still
-        // building the lists.
+        // Nothing scrolls here.
         ScrollerCache answer;
-        answer.state =
-            settled ? ScrollerState::Nothing : ScrollerState::Unknown;
+        answer.state = ScrollerState::Nothing;
         answer.generation = expectedGeneration;
         answer.layoutVersion = layoutVersion;
         switch (CommitScrollerCache(answer, expectedGeneration, requestId,
@@ -12549,16 +12534,11 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
                 return;
             case ScrollerCommitState::Owned:
                 PublishScrollerUnknown(expectedGeneration);
-                if (settled) {
-                    NoteScrollerFailure(L"not-allowed", expectedGeneration,
-                                        false);
-                }
+                NoteScrollerFailure(L"not-allowed", expectedGeneration, false);
                 return;
             case ScrollerCommitState::Moved:
                 PublishScrollerUnknown(expectedGeneration);
-                if (settled) {
-                    NoteScrollerFailure(L"commit", expectedGeneration, true);
-                }
+                NoteScrollerFailure(L"commit", expectedGeneration, true);
                 return;
         }
         // The old handlers belong to elements this answer no longer names, so a
@@ -12569,7 +12549,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         for (int i = 0; i < kMaxScrollRegions; ++i) {
             RevokeScrollerWatch(i);
         }
-        if (settled && !g_scrollerNoneLogged) {
+        if (!g_scrollerNoneLogged) {
             g_scrollerNoneLogged = true;
             TraceLog(L"scroller none (measured, nothing scrolls)");
         }
@@ -12581,7 +12561,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     // unreadable viewer is not a reason to leave the gate Unknown. A survey left
     // with no readable region answers Unknown like a failed pass.
     ScrollerCache answer;
-    answer.state = settled ? ScrollerState::Scrollable : ScrollerState::Unknown;
+    answer.state = ScrollerState::Scrollable;
     answer.generation = expectedGeneration;
     answer.layoutVersion = layoutVersion;
     wuxc::ScrollViewer answerViewers[kMaxScrollRegions]{nullptr};
@@ -12612,9 +12592,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
         // A viewer that cannot be read is no better than no viewer, and it does
         // not tell the gate anything: this pass publishes Unknown.
         PublishScrollerUnknown(expectedGeneration);
-        if (settled) {
-            NoteScrollerFailure(L"offsets", expectedGeneration, true);
-        }
+        NoteScrollerFailure(L"offsets", expectedGeneration, true);
         return;
     }
 
@@ -12627,9 +12605,7 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
     if (!XamlOriginDip(commitOriginX, commitOriginY) ||
         commitOriginX != originX || commitOriginY != originY) {
         PublishScrollerUnknown(expectedGeneration);
-        if (settled) {
-            NoteScrollerFailure(L"commit", expectedGeneration, true);
-        }
+        NoteScrollerFailure(L"commit", expectedGeneration, true);
         return;
     }
 
@@ -12642,15 +12618,11 @@ void CacheScrollableElement(bool settled, uint32_t expectedGeneration,
             return;  // the turn a newer request or a close replaced writes nothing
         case ScrollerCommitState::Owned:
             PublishScrollerUnknown(expectedGeneration);
-            if (settled) {
-                NoteScrollerFailure(L"not-allowed", expectedGeneration, false);
-            }
+            NoteScrollerFailure(L"not-allowed", expectedGeneration, false);
             return;
         case ScrollerCommitState::Moved:
             PublishScrollerUnknown(expectedGeneration);
-            if (settled) {
-                NoteScrollerFailure(L"commit", expectedGeneration, true);
-            }
+            NoteScrollerFailure(L"commit", expectedGeneration, true);
             return;
     }
 
@@ -13255,10 +13227,8 @@ bool Setup(wux::FrameworkElement const& root) {
                     // press outside the new list read as inside the old one. The
                     // pass is settled: the size is a fact of this layout, and an
                     // incomplete search publishes Unknown and retries.
-                    CacheScrollableElement(true,
-                                           g_openGeneration.load(
-                                               std::memory_order_relaxed),
-                                           0);
+                    CacheScrollableElement(
+                        g_openGeneration.load(std::memory_order_relaxed), 0);
                 } catch (winrt::hresult_error const& e) {
                     Wh_Log(L"SizeChanged update failed: %08X", e.code());
                 } catch (...) {
