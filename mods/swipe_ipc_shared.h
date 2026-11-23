@@ -13,16 +13,16 @@
 // number, and a reader accepts a record only when that number did not move
 // while the record was being copied.
 //
-//   Local\SwipeFor10Start_SingleMod3_State      SwipeIpcState
-//   Local\SwipeFor10Start_SingleMod3_Intent     auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod3_IntentAck  auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod3_Exec       auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod3_ExecAck    auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod3_Capability auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod4_State      SwipeIpcState
+//   Local\SwipeFor10Start_SingleMod4_Intent     auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod4_IntentAck  auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod4_Exec       auto-reset, Start -> bridge
+//   Local\SwipeFor10Start_SingleMod4_ExecAck    auto-reset, bridge -> Start
+//   Local\SwipeFor10Start_SingleMod4_Capability auto-reset, bridge -> Start
 //
 // The names are session-local because both processes run as the same user in the
 // same session. There is no product version word: the ABI namespace *is* the
-// layout identity. The `3` marks the 232-byte layout that added `execCapable`; a
+// layout identity. The `4` marks the 240-byte layout that added `peerPid`; a
 // future incompatible layout changes the prefix again, so an old
 // pinned development image can never join this channel and a same-size change is
 // never reinterpreted across a staggered update. Only a single shipping mod
@@ -114,10 +114,10 @@
 // never a pair of flags, so it cannot see new ownership beside a stale phase.
 // Values: kSwipeDirectionUnowned / Open / Closing.
 //
-// Peer liveness (Start -> bridge): peerEpoch, peerTick and peerState. The bridge
-// creates the section, so a mapped section says nothing about whether the Start
-// side is running; this triple is the answer the bridge's interception gate
-// needs. peerEpoch identifies the activation: it is incremented once per attach,
+// Peer liveness (Start -> bridge): peerEpoch, peerPid, peerTick and peerState.
+// The bridge creates the section, so a mapped section says nothing about whether
+// the Start side is running; these words are the answer the bridge's gate needs.
+// peerEpoch identifies the activation: it is incremented once per attach,
 // before the tick, so a decision the bridge latched against one activation can
 // tell that a different one now answers. peerState is alive after the consumer
 // is running and gone as soon as that consumer stops; peerTick is the low 32 bits
@@ -138,17 +138,17 @@
 // and the event only says that it changed.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_SingleMod3_State";
+    L"Local\\SwipeFor10Start_SingleMod4_State";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod3_Intent";
+    L"Local\\SwipeFor10Start_SingleMod4_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod3_IntentAck";
+    L"Local\\SwipeFor10Start_SingleMod4_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod3_Exec";
+    L"Local\\SwipeFor10Start_SingleMod4_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod3_ExecAck";
+    L"Local\\SwipeFor10Start_SingleMod4_ExecAck";
 constexpr wchar_t kSwipeIpcCapabilityEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod3_Capability";
+    L"Local\\SwipeFor10Start_SingleMod4_Capability";
 
 constexpr uint32_t kSwipeIpcMagic = 0x53333053;  // 'S' '3' '0' 'S', LE
 
@@ -305,6 +305,11 @@ struct SwipeIpcState {
     volatile LONG peerTick;
     volatile LONG peerState;
     volatile LONG peerEpoch;
+    // The process that owns `peerEpoch`, written at attach before the epoch and
+    // before anything is published. The bridge opens a process handle for it and
+    // treats a claim as dead only when that handle is signalled: a heartbeat age
+    // is not proof of death.
+    volatile LONG peerPid;
 
     // Start -> bridge: the sequence of the intent the consumer has taken for
     // processing. The Start side writes it before it acts, so a publisher whose
@@ -357,9 +362,10 @@ static_assert(offsetof(SwipeIpcState, controllerTouch) == 200, "layout");
 static_assert(offsetof(SwipeIpcState, peerTick) == 204, "layout");
 static_assert(offsetof(SwipeIpcState, peerState) == 208, "layout");
 static_assert(offsetof(SwipeIpcState, peerEpoch) == 212, "layout");
-static_assert(offsetof(SwipeIpcState, intentTaken) == 216, "layout");
-static_assert(offsetof(SwipeIpcState, execCapable) == 224, "layout");
-static_assert(sizeof(SwipeIpcState) == 232, "layout");
+static_assert(offsetof(SwipeIpcState, peerPid) == 216, "layout");
+static_assert(offsetof(SwipeIpcState, intentTaken) == 224, "layout");
+static_assert(offsetof(SwipeIpcState, execCapable) == 232, "layout");
+static_assert(sizeof(SwipeIpcState) == 240, "layout");
 
 struct SwipeIpcChannel {
     SwipeIpcState* state;
@@ -980,6 +986,24 @@ inline uint32_t SwipeIpcBeginPeerActivation(SwipeIpcChannel* channel) {
     }
     return static_cast<uint32_t>(
         InterlockedIncrement(&channel->state->peerEpoch));
+}
+
+// The process id that owns the current epoch. The writer publishes the pid
+// before the epoch, so a reader that re-reads the epoch around the pid can see
+// the new pid under the old epoch, never the old pid under the new one: the
+// conservative pair can only keep a claim reserved.
+inline void SwipeIpcSetPeerPid(SwipeIpcChannel* channel, uint32_t pid) {
+    if (channel->state) {
+        InterlockedExchange(&channel->state->peerPid,
+                            static_cast<LONG>(pid));
+    }
+}
+
+inline uint32_t SwipeIpcPeerPid(SwipeIpcChannel* channel) {
+    return channel->state
+               ? static_cast<uint32_t>(
+                     InterlockedCompareExchange(&channel->state->peerPid, 0, 0))
+               : 0;
 }
 
 inline uint32_t SwipeIpcPeerEpoch(SwipeIpcChannel* channel) {

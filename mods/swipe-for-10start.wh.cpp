@@ -3636,6 +3636,9 @@ void OpenIpcChannel() {
     // bridge decision that was latched against the previous activation can then
     // see that a different one answers, even though both run the same image.
     // image.
+    // The pid goes before the epoch: the pair a reader can see is the new
+    // process under the old epoch, never a dead pid under a live one.
+    SwipeIpcSetPeerPid(&g_ipc, GetCurrentProcessId());
     g_peerEpoch = SwipeIpcBeginPeerActivation(&g_ipc);
 
     // A show or dismiss from the previous activation can still be queued or
@@ -14819,11 +14822,6 @@ constexpr uint64_t kPressLatchRetryMs = 100;
 // press may spend behind older presses (four entries, each at most the ack bound)
 // before its own decision is served by the shell for the same reason.
 constexpr uint64_t kPressAckTimeoutMs = 1000;
-// A claimed record whose controller stops heartbeating is treated as gone for
-// the claim too. The threshold is three times the 600 ms detection budget and
-// three times the 1000 ms ack bound, so a paused but live Start host keeps its
-// claim; a killed one is released without a replay (the press may have run).
-constexpr uint32_t kClaimedPeerStaleMs = 3000;
 // While a timed-out press is reserved (not taken, peer still alive), the
 // publisher re-checks its claim at this cadence. The peer's own staleness window
 // is the outer bound: once the controller stops ticking it cannot take the
@@ -15351,6 +15349,58 @@ uint32_t PeerTickAgeMs() {
     }
     return static_cast<uint32_t>(GetTickCount64()) -
            SwipeIpcPeerTick(&g_ipc);
+}
+
+// Death proof for a claimed record. A live-but-paused host holds a validated
+// copy, so only its process handle being signalled releases the claim; a handle
+// that could not be opened proves nothing. One handle per epoch, opened on the
+// launcher thread and closed on an epoch change or at unload.
+SRWLOCK g_peerProcessLock = SRWLOCK_INIT;
+HANDLE g_peerProcess = nullptr;
+uint32_t g_peerProcessPid = 0;
+uint32_t g_peerProcessEpoch = 0;
+
+void ClosePeerProcessLocked() {
+    if (g_peerProcess) {
+        CloseHandle(g_peerProcess);
+        g_peerProcess = nullptr;
+    }
+    g_peerProcessPid = 0;
+    g_peerProcessEpoch = 0;
+}
+
+bool PeerProcessDead() {
+    if (!g_ipc.state || g_disabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const uint32_t epoch = SwipeIpcPeerEpoch(&g_ipc);
+    const uint32_t pid = SwipeIpcPeerPid(&g_ipc);
+    if (epoch == 0 || pid == 0 || SwipeIpcPeerEpoch(&g_ipc) != epoch) {
+        return false;
+    }
+    bool dead = false;
+    AcquireSRWLockExclusive(&g_peerProcessLock);
+    if (g_peerProcessEpoch != epoch || g_peerProcessPid != pid) {
+        ClosePeerProcessLocked();
+        g_peerProcessPid = pid;
+        g_peerProcessEpoch = epoch;
+        g_peerProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (!g_peerProcess) {
+            TraceLog(L"peer process open failed pid=%u epoch=%u err=%u", pid,
+                    epoch, GetLastError());
+        }
+    }
+    if (g_peerProcess) {
+        dead = WaitForSingleObject(g_peerProcess, 0) == WAIT_OBJECT_0;
+    }
+    ReleaseSRWLockExclusive(&g_peerProcessLock);
+    return dead;
+}
+
+void ReleasePeerProcess() {
+    AcquireSRWLockExclusive(&g_peerProcessLock);
+    ClosePeerProcessLocked();
+    ReleaseSRWLockExclusive(&g_peerProcessLock);
 }
 
 // The executor half of the gate: the worker that turns a command into a
@@ -16844,13 +16894,12 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     const bool epochChanged =
         press.publishedEpoch != 0 && epochNow != press.publishedEpoch;
     const LONG64 taken = SwipeIpcTakenIntent(&g_ipc);
-    const uint32_t peerAge = PeerTickAgeMs();
-    if (taken == press.seq && peerAge >= kClaimedPeerStaleMs &&
-        !epochChanged && PeerStateAliveNow()) {
+    if (taken == press.seq && PeerProcessDead() && !epochChanged &&
+        PeerStateAliveNow()) {
         // The claim still reads alive only because a hard-killed Start host
-        // cannot withdraw peerState. Three seconds without a heartbeat is the
-        // proof that the claim is dead; the press may already have run, so it is
-        // consumed without a replay and the queue is released.
+        // cannot withdraw peerState. Its signalled process is the proof that the
+        // claim is dead; the press may already have run, so it is consumed
+        // without a replay and the queue is released.
         g_pressOutstanding = OutstandingPress{};
         HWND window = g_execWindow.load(std::memory_order_relaxed);
         if (window) {
@@ -16858,14 +16907,14 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
         }
         if (press.external) {
             TraceLog(L"own external barrier seq=%lld wait=%llu epoch=%u->%u "
-                    L"decision=released reason=peer-stale-claimed",
+                    L"decision=released reason=peer-dead",
                     static_cast<long long>(press.seq),
                     static_cast<unsigned long long>(wait), press.publishedEpoch,
                     epochNow);
         } else {
             TraceLog(L"own press abandoned seq=%lld trigger=%s entry=%s "
                     L"wait=%llu epoch=%u->%u decision=consumed "
-                    L"reason=peer-stale-claimed",
+                    L"reason=peer-dead",
                     static_cast<long long>(press.seq),
                     PressTriggerName(press.press.trigger),
                     PressEntryName(press.press.entry),
@@ -16975,15 +17024,16 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
         const bool claimed =
             SwipeIpcTakenIntent(&g_ipc) == g_pressOutstanding.seq;
         const bool staleUnclaimed = !claimed && !PeerAliveNow();
-        const bool staleClaimed =
-            claimed && PeerTickAgeMs() >= kClaimedPeerStaleMs;
-        if (epochChanged || peerGone || staleUnclaimed || staleClaimed) {
+        // A heartbeat age is not proof of death: the host may be paused with a
+        // validated copy in hand.
+        const bool deadClaimed = claimed && PeerProcessDead();
+        if (epochChanged || peerGone || staleUnclaimed || deadClaimed) {
             reconciled = ReconcileOutstandingAtAdmission(
                 epochChanged
                     ? L"epoch-changed"
                     : (peerGone ? L"peer-gone"
-                                : (staleClaimed ? L"peer-stale-claimed"
-                                                : L"stale-unclaimed")),
+                                : (deadClaimed ? L"peer-dead"
+                                               : L"stale-unclaimed")),
                 epochNow);
         }
     }
@@ -17211,13 +17261,14 @@ void HandlePressAckTimeout() {
     if (press.external) {
         // The takeover itself is native and has no original to replay. Its
         // barrier is cleared by its ack, by a changed activation that can no
-        // longer answer it, or by its peer. A claimed barrier is held through a
-        // stale heartbeat. A stale heartbeat with no claim at the first read is
-        // not proof either: Start may claim before the abort, so the release
-        // uses the admission path's evidence — abort the record, re-read the
-        // claim, and release only when the abort succeeded and no claim landed.
-        // A claim in between, or a record that cannot be aborted, reserves the
-        // barrier; the withdrawn state releases it on its own.
+        // longer answer it, by a proved dead process, or by its peer. A claimed
+        // barrier is held through a stale heartbeat. A stale heartbeat with no
+        // claim at the first read is not proof either: Start may claim before
+        // the abort, so the release uses the admission path's evidence — abort
+        // the record, re-read the claim, and release only when the abort
+        // succeeded and no claim landed. A claim in between, or a record that
+        // cannot be aborted, reserves the barrier; the withdrawn state releases
+        // it on its own.
         if (epochChanged) {
             g_pressOutstanding = OutstandingPress{};
             HWND window = g_execWindow.load(std::memory_order_relaxed);
@@ -17234,11 +17285,10 @@ void HandlePressAckTimeout() {
             return;
         }
         const bool claimed = taken == press.seq;
-        // A claim on a heartbeat that has been stale for kClaimedPeerStaleMs is
-        // treated as gone. The takeover has no original to replay, so the
-        // barrier is released without one.
-        const bool staleClaimed = claimed && peerAge >= kClaimedPeerStaleMs;
-        if (!staleClaimed &&
+        // A claimed barrier outlives a stale heartbeat. The takeover has no
+        // original to replay, so a proved dead process releases it without one.
+        const bool deadClaimed = claimed && PeerProcessDead();
+        if (!deadClaimed &&
             (peerAlive || (claimed && PeerStateAliveNow()))) {
             ReserveExternalBarrier(press, peer, peerAge, epochNow, wait, claimed,
                                    peerAlive ? L"peer-alive" : L"claimed");
@@ -17246,8 +17296,8 @@ void HandlePressAckTimeout() {
         }
         const wchar_t* releaseReason = nullptr;
         bool claimedNow = claimed;
-        if (staleClaimed) {
-            releaseReason = L"peer-stale-claimed";
+        if (deadClaimed) {
+            releaseReason = L"peer-dead";
         } else if (!PeerStateAliveNow()) {
             releaseReason = L"peer-gone";
         } else {
@@ -17308,10 +17358,10 @@ void HandlePressAckTimeout() {
             ServeNextPress(L"epoch");
             return;
         }
-        if (peerAge >= kClaimedPeerStaleMs) {
-            // The claimed record's activation has not heartbeated for three
-            // seconds. It may have applied the press, so there is no replay; the
-            // slot is released and the next press may proceed.
+        if (PeerProcessDead()) {
+            // The claimed record's process is signalled. It may have applied the
+            // press, so there is no replay; the slot is released and the next
+            // press may proceed.
             g_pressOutstanding = OutstandingPress{};
             HWND window = g_execWindow.load(std::memory_order_relaxed);
             if (window) {
@@ -17319,7 +17369,7 @@ void HandlePressAckTimeout() {
             }
             TraceLog(L"own press ack timeout seq=%lld trigger=%s entry=%s "
                     L"wait=%llu taken=%lld peer=%s age=%u epoch=%u "
-                    L"decision=consumed reason=peer-stale-claimed",
+                    L"decision=consumed reason=peer-dead",
                     static_cast<long long>(press.seq),
                     PressTriggerName(press.press.trigger),
                     PressEntryName(press.press.entry),
@@ -19555,6 +19605,9 @@ void RoleUninit() {
         CloseHandle(g_execTeardownAck);
         g_execTeardownAck = nullptr;
     }
+
+    // The peer's process handle ends with the channel view that named it.
+    ReleasePeerProcess();
 
     // The channel last: no hook path and no worker reads it after this point.
     if (g_ipc.state) {
