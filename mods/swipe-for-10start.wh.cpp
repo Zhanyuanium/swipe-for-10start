@@ -10209,7 +10209,7 @@ DWORD NoteLauncherThread(const wchar_t* source, bool adopt);
 void EnsureExecutorOnLauncherThread(const wchar_t* source);
 LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam);
 bool EnsureExecutorThreadHook(DWORD target);
-void RemoveExecutorThreadHook();
+bool RemoveExecutorThreadHook();
 void* LauncherNow(uint64_t* stateOut, void** outerOut = nullptr);
 LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                            uint32_t flags);
@@ -10315,7 +10315,7 @@ HANDLE g_execHookIdle = nullptr;
 
 void StopExecutorTeardown(HWND window);
 void RetireExecutorTeardown(HWND window);
-void RemoveExecutorThreadHook();
+bool RemoveExecutorThreadHook();
 
 constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
 constexpr WPARAM kExecTeardownMagic = 0x53575444;
@@ -13995,12 +13995,31 @@ void ReplaceLauncherThread(const wchar_t* source, DWORD previous) {
 
 SRWLOCK g_execThreadHookLock = SRWLOCK_INIT;
 
-void RemoveExecutorThreadHookLocked() {
-    HHOOK hook = g_execThreadHook.exchange(nullptr, std::memory_order_acq_rel);
-    g_execThreadHookTarget.store(0, std::memory_order_release);
-    if (hook && !UnhookWindowsHookEx(hook)) {
-        TraceLog(L"exec thread hook remove failed err=%u", GetLastError());
+bool RemoveExecutorThreadHookLocked() {
+    HHOOK hook = g_execThreadHook.load(std::memory_order_acquire);
+    if (!hook) {
+        g_execThreadHookTarget.store(0, std::memory_order_release);
+        return true;
     }
+    if (UnhookWindowsHookEx(hook)) {
+        g_execThreadHook.store(nullptr, std::memory_order_release);
+        g_execThreadHookTarget.store(0, std::memory_order_release);
+        return true;
+    }
+    const DWORD error = GetLastError();
+    if (error == ERROR_INVALID_HOOK_HANDLE) {
+
+        // The thread that owned the hook is gone, so it cannot enter again.
+        g_execThreadHook.store(nullptr, std::memory_order_release);
+        g_execThreadHookTarget.store(0, std::memory_order_release);
+        TraceLog(L"exec thread hook already gone err=%u", error);
+        return true;
+    }
+
+    // Keep the handle: a zero frame count proves nothing about the next
+    // message entering a hook that is still installed.
+    TraceLog(L"exec thread hook remove failed err=%u (kept for retry)", error);
+    return false;
 }
 
 bool EnsureExecutorThreadHook(DWORD target) {
@@ -14026,7 +14045,11 @@ bool EnsureExecutorThreadHook(DWORD target) {
         ReleaseSRWLockExclusive(&g_execThreadHookLock);
         return true;
     }
-    RemoveExecutorThreadHookLocked();
+    if (!RemoveExecutorThreadHookLocked()) {
+        ReleaseSRWLockExclusive(&g_execThreadHookLock);
+        TraceLog(L"exec thread hook replace refused target=%u", target);
+        return false;
+    }
     HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, ExecutorThreadHook, nullptr,
                                    target);
     if (!hook) {
@@ -14042,10 +14065,11 @@ bool EnsureExecutorThreadHook(DWORD target) {
     return true;
 }
 
-void RemoveExecutorThreadHook() {
+bool RemoveExecutorThreadHook() {
     AcquireSRWLockExclusive(&g_execThreadHookLock);
-    RemoveExecutorThreadHookLocked();
+    const bool removed = RemoveExecutorThreadHookLocked();
     ReleaseSRWLockExclusive(&g_execThreadHookLock);
+    return removed;
 }
 
 void RemoveExecutorThreadHookIfCurrent(HHOOK serviced) {
@@ -14714,7 +14738,9 @@ void RoleUninit() {
     }
     JoinExecutorWorker();
 
-    RemoveExecutorThreadHook();
+    if (!RemoveExecutorThreadHook()) {
+        BlockBridgeUnload(L"executor thread hook removal failed");
+    }
     DrainExecutorThread(g_execWindow.load(std::memory_order_acquire));
 
     // Every hook frame has returned, so a zero count means no later SetEvent.
