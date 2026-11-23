@@ -14699,7 +14699,7 @@ bool g_execTeardownPending = false;  // launcher thread only
 std::atomic<HHOOK> g_execThreadHook{nullptr};
 std::atomic<DWORD> g_execThreadHookTarget{0};
 
-void CompleteExecutorTeardown(HWND window);
+void StopExecutorTeardown(HWND window);
 
 constexpr UINT kExecTeardownMessage = WM_APP + 0x5B;
 constexpr WPARAM kExecTeardownMagic = 0x53575444;  // "SWTD"
@@ -14791,8 +14791,15 @@ constexpr UINT kExecLatchMessage = WM_APP + 0x5C;
 // thread that can wait on the channel's ack event, and the queue belongs to the
 // launcher thread. This is a notification, not a second record.
 constexpr UINT kExecIntentAckMessage = WM_APP + 0x5D;
+constexpr UINT kExecDestroyMessage = WM_APP + 0x5E;
 constexpr WPARAM kExecLatchMagic = 0x53574C41;     // "SWLA"
 constexpr WPARAM kExecIntentAckMagic = 0x53574141;  // "SWAA"
+constexpr WPARAM kExecDestroyMagic = 0x53574458;   // "SWDX"
+constexpr int kExecDestroyRetries = 1000;
+
+struct ExecDestroyCall {
+    bool ran;
+};
 constexpr UINT_PTR kExecDismissTimer = 0x5358;
 constexpr UINT_PTR kExecProbeTimer = 0x5359;
 constexpr UINT_PTR kPressLatchTimer = 0x535A;
@@ -18652,10 +18659,7 @@ void ExecutePendingCommand() {
     }
 }
 
-// The owner-thread teardown, run at the outermost module frame. Killing the
-// timers and destroying the window is safe only after any handler that may
-// still touch the root has returned; the acknowledgement releases the unload.
-void CompleteExecutorTeardown(HWND window) {
+void StopExecutorTeardown(HWND window) {
     g_execTeardownPending = false;
     KillTimer(window, kExecDismissTimer);
     KillTimer(window, kExecProbeTimer);
@@ -18663,7 +18667,8 @@ void CompleteExecutorTeardown(HWND window) {
     KillTimer(window, kExecDismissProbeTimer);
     KillTimer(window, kPressAckTimer);
     KillTimer(window, kPressOpenGenTimer);
-    DestroyWindow(window);
+    g_execReady.store(false, std::memory_order_release);
+    PublishExecutorCapability(L"teardown");
     if (g_execTeardownAck) {
         SetEvent(g_execTeardownAck);
     }
@@ -18691,7 +18696,27 @@ LRESULT CALLBACK ExecutorWindowProc(HWND window, UINT message, WPARAM wParam,
         }
         TraceLog(L"exec teardown served hwnd=%p tid=%u", window,
                 GetCurrentThreadId());
-        CompleteExecutorTeardown(window);
+        StopExecutorTeardown(window);
+        return 0;
+    }
+    if (message == kExecDestroyMessage) {
+        auto* call = reinterpret_cast<ExecDestroyCall*>(lParam);
+        if (wParam != kExecDestroyMagic ||
+            window != g_execWindow.load(std::memory_order_acquire)) {
+            return 0;
+        }
+        if (g_execOwnerDepth > 0) {
+            if (call) {
+                call->ran = false;
+            }
+            return 0;
+        }
+        if (call) {
+            call->ran = true;
+        }
+        TraceLog(L"exec destroy served hwnd=%p tid=%u", window,
+                GetCurrentThreadId());
+        DestroyWindow(window);
         return 0;
     }
     ExecDepthGuard depth;
@@ -19241,13 +19266,7 @@ void JoinExecutorWorker() {
     __builtin_unreachable();
 }
 
-// Destroys the one published window synchronously on its owner thread.
-// A top-level teardown runs the private handler, DestroyWindow and
-// WM_NCDESTROY before the send returns. A teardown that lands while a module
-// frame is on the stack marks pending and is completed by that frame's
-// outermost unwind; the acknowledgement event releases this call only then. A
-// destroyed window means this activation's window is gone, not that the owner
-// thread is gone; a window that does not answer blocks.
+// Stop, wait for the ack, then a sent destroy whose return is the proof.
 void DestroyExecutorWindow() {
     HWND window = g_execWindow.load(std::memory_order_acquire);
     if (!window) {
@@ -19257,7 +19276,8 @@ void DestroyExecutorWindow() {
         if (g_execOwnerDepth > 0) {
             BlockBridgeUnload(L"executor teardown while a module frame is active");
         }
-        CompleteExecutorTeardown(window);
+        StopExecutorTeardown(window);
+        DestroyWindow(window);
     } else {
         if (!g_execTeardownAck) {
             BlockBridgeUnload(L"executor teardown event missing");
@@ -19271,6 +19291,23 @@ void DestroyExecutorWindow() {
         SendMessageW(window, kExecTeardownMessage, kExecTeardownMagic, 0);
         if (WaitForSingleObject(g_execTeardownAck, INFINITE) != WAIT_OBJECT_0) {
             BlockBridgeUnload(L"executor teardown acknowledgement failed");
+        }
+        bool destroyed = false;
+        for (int attempt = 0; attempt < kExecDestroyRetries; ++attempt) {
+            if (!IsWindow(window)) {
+                break;
+            }
+            ExecDestroyCall call{false};
+            SendMessageW(window, kExecDestroyMessage, kExecDestroyMagic,
+                         reinterpret_cast<LPARAM>(&call));
+            if (call.ran) {
+                destroyed = true;
+                break;
+            }
+            Sleep(1);
+        }
+        if (!destroyed && IsWindow(window)) {
+            BlockBridgeUnload(L"executor destroy not served");
         }
     }
     if (g_execWindow.load(std::memory_order_acquire) == window) {
