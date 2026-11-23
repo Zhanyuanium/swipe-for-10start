@@ -11094,10 +11094,23 @@ bool TaskbarBandDip(DismissAxis axis, const RECT& bar, const RECT& monitor,
     return false;
 }
 
+const wchar_t* TaskbarEdgeName(DismissAxis axis) {
+    switch (axis) {
+        case DismissAxis::Left:
+            return L"left";
+        case DismissAxis::Top:
+            return L"top";
+        case DismissAxis::Right:
+            return L"right";
+        case DismissAxis::Bottom:
+            return L"bottom";
+    }
+    return L"none";
+}
+
 // Reads every source once and decides the edge in a fixed order: the shell's
-// dock record first, the bar window second, the work-area inset last. A source
-// that answers differently from an earlier one is left in the struct so the one
-// log line reports both.
+// dock record first, the bar window second, the work-area inset last. A live bar
+// that disagrees with the cached dock record wins, and one line names both.
 TaskbarProbe ProbeTaskbar(const MONITORINFO& info, float scale) {
     TaskbarProbe probe;
     const RECT& monitorRect = info.rcMonitor;
@@ -11125,6 +11138,7 @@ TaskbarProbe ProbeTaskbar(const MONITORINFO& info, float scale) {
 
     RECT bar{};
     DismissAxis barAxis = DismissAxis::Bottom;
+    bool liveBarWins = false;
     if (BarWindowForMonitor(monitorRect, bar, barAxis)) {
         probe.barWindow = true;
         probe.barWindowEdge = barAxis;
@@ -11133,17 +11147,29 @@ TaskbarProbe ProbeTaskbar(const MONITORINFO& info, float scale) {
             probe.decided = true;
             probe.edge = barAxis;
             probe.source = L"bar";
+        } else if (probe.edge != barAxis) {
+            // A bar moved without a work-area broadcast still describes itself.
+            TraceLog(L"taskbar edge appbar=%s bar=%s (live bar wins)",
+                    TaskbarEdgeName(probe.edge), TaskbarEdgeName(barAxis));
+            probe.edge = barAxis;
+            probe.source = L"bar";
+            liveBarWins = true;
         }
     }
 
     // The band follows the decided edge and prefers the docked rectangle: it is
     // the bar's registered position, while the window may be translated by
     // auto-hide. The window's own thickness is the same number when the bar is
-    // shown and still the same number when it is hidden.
-    const RECT* bandRect = probe.appBarRect
-                               ? &probe.appBarRectPx
-                               : (probe.barWindow ? &probe.barWindowRectPx
-                                                  : nullptr);
+    // shown and still the same number when it is hidden. A live bar that won the
+    // edge also supplies the rect; the cached one belongs to the old dock.
+    const RECT* bandRect = nullptr;
+    if (liveBarWins) {
+        bandRect = &probe.barWindowRectPx;
+    } else if (probe.appBarRect) {
+        bandRect = &probe.appBarRectPx;
+    } else if (probe.barWindow) {
+        bandRect = &probe.barWindowRectPx;
+    }
     if (probe.decided && bandRect) {
         probe.band = TaskbarBandDip(probe.edge, *bandRect, monitorRect, scale,
                                     probe.bandLow, probe.bandHigh);
