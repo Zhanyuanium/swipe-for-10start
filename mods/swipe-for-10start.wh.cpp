@@ -17169,7 +17169,10 @@ void HandlePressAck() {
         if (ReplayPastBound(press.press)) {
             DropPastBoundReplay(press.press);
         } else {
-            RunPressOriginal(press.press, L"revoked-before-copy");
+            RunPressOriginal(press.press,
+                             ack.state == kSwipeAckSuperseded
+                                 ? L"revoked-before-copy"
+                                 : L"refused");
         }
     }
     ResumePressQueueAge();
@@ -17272,7 +17275,12 @@ void HandlePressAckTimeout() {
             if (ReplayPastBound(press.press)) {
                 DropPastBoundReplay(press.press);
             } else {
-                RunPressOriginal(press.press, L"revoked-before-copy");
+                // The ack says which proof this was: a plain refusal is not an
+                // aborted record.
+                RunPressOriginal(press.press,
+                                 ack.state == kSwipeAckSuperseded
+                                     ? L"revoked-before-copy"
+                                     : L"refused");
             }
         }
         ResumePressQueueAge();
