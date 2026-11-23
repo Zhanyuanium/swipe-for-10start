@@ -17,6 +17,10 @@ By Zhanyuanium, distributed as a Windhawk mod.
 - **Windows 11** with **ExplorerPatcher** set to the Windows 10 (legacy) Start
   menu (`Start_ShowClassicMode=1`). Verified on Windows 11 build 26300.10075
   (`twinui.pcshell.dll` fixed 10.0.26100.10068) and ExplorerPatcher 26100.9711.
+  The Explorer half enables its private launcher calls only on that exact
+  `twinui.pcshell.dll` build. After a Windows update changes it, the menu still
+  opens and closes, but the close is instant until the mod is updated for the
+  new build.
 - **Windhawk**.
 - A touchscreen or pen. (The mouse is deliberately not used for these
   gestures.)

@@ -11,7 +11,7 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 ## 你需要什么
 
 - **Windows 11**，且 **ExplorerPatcher** 已设置为 Windows 10（经典）开始菜单（`Start_ShowClassicMode=1`）。已在 Windows 11 build 26300.10075（`twinui.pcshell.dll` 固定版本 10.0.26100.10068）和
-  ExplorerPatcher 26100.9711 上验证。
+  ExplorerPatcher 26100.9711 上验证。Explorer 半边只在这个精确的 `twinui.pcshell.dll` 版本上启用私有启动器调用；Windows 更新改变该文件后，菜单仍能开合，但关闭会变成瞬间的，直到模组针对新版本更新。
 - **Windhawk**。
 - 触摸屏或手写笔。（本模组刻意不响应鼠标拖动。）
 
