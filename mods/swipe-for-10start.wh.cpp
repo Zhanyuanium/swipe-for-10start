@@ -9775,6 +9775,36 @@ BOOL RoleInit() {
     LoadGestureStartSpeed();
     LoadCommitDistance();
 
+    g_uiTeardownAck = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_uiTeardownAck) {
+        Wh_Log(L"UI teardown event unavailable err=%u; the start role stays "
+               L"inert",
+               static_cast<unsigned>(GetLastError()));
+        return FALSE;
+    }
+
+    g_moduleEntriesGone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_moduleEntriesGone) {
+        Wh_Log(L"Module entry event unavailable err=%u; the start role stays "
+               L"inert",
+               static_cast<unsigned>(GetLastError()));
+        CloseHandle(g_uiTeardownAck);
+        g_uiTeardownAck = nullptr;
+        return FALSE;
+    }
+
+    g_startAttachIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_startAttachIdle) {
+        Wh_Log(L"Attach frame event unavailable err=%u; the start role stays "
+               L"inert",
+               static_cast<unsigned>(GetLastError()));
+        CloseHandle(g_uiTeardownAck);
+        g_uiTeardownAck = nullptr;
+        CloseHandle(g_moduleEntriesGone);
+        g_moduleEntriesGone = nullptr;
+        return FALSE;
+    }
+
     g_hidStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_hidStopEvent) {
         TraceLog(L"hid stop event failed err=%u",
@@ -9784,24 +9814,6 @@ BOOL RoleInit() {
     g_rendererEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!g_rendererEvent) {
         TraceLog(L"renderer event failed err=%u",
-                static_cast<unsigned>(GetLastError()));
-    }
-
-    g_moduleEntriesGone = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_moduleEntriesGone) {
-        TraceLog(L"module entry event failed err=%u",
-                static_cast<unsigned>(GetLastError()));
-    }
-
-    g_startAttachIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_startAttachIdle) {
-        TraceLog(L"attach hook frame event failed err=%u",
-                static_cast<unsigned>(GetLastError()));
-    }
-
-    g_uiTeardownAck = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_uiTeardownAck) {
-        TraceLog(L"ui teardown event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
 
@@ -14461,6 +14473,23 @@ BOOL RoleInit() {
     g_suppressedExecSeq = 0;
     ClearPressOpenGeneration();
 
+    g_execTeardownAck = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_execTeardownAck) {
+        Wh_Log(L"Executor teardown event unavailable err=%u; the bridge stays "
+               L"inert",
+               static_cast<unsigned>(GetLastError()));
+        return FALSE;
+    }
+
+    g_execHookIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_execHookIdle) {
+        Wh_Log(L"Executor hook event unavailable err=%u; the bridge stays inert",
+               static_cast<unsigned>(GetLastError()));
+        CloseHandle(g_execTeardownAck);
+        g_execTeardownAck = nullptr;
+        return FALSE;
+    }
+
     bool created = false;
     DWORD ipcError = 0;
     if (!SwipeIpcOpen(&g_ipc, &created, &ipcError)) {
@@ -14473,15 +14502,6 @@ BOOL RoleInit() {
         PublishExecutorCapability(L"init");
     }
 
-    g_execTeardownAck = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_execTeardownAck) {
-        TraceLog(L"exec teardown event failed err=%u", GetLastError());
-    }
-
-    g_execHookIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!g_execHookIdle) {
-        TraceLog(L"exec hook frame event failed err=%u", GetLastError());
-    }
     g_execOwnerDepth = 0;
     g_execTeardownPending = false;
     g_execRetirePending = false;
