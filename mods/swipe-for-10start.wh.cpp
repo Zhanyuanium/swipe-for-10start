@@ -9907,16 +9907,16 @@ void WaitForAttachFramesThenDrainUi(HWND hwnd) {
         if (g_startAttachFrames.load(std::memory_order_acquire) != 0) {
             BlockUnload(L"attach hook frames without a window");
         }
-        TraceLog(L"unload ui drain skipped reason=no-window");
-        return;
+        // No drain message means no acknowledgement. A zero frame count now
+        // does not prove that no frame enters after the image is freed.
+        BlockUnload(L"ui drain window gone");
     }
     for (int attempt = 0; attempt < kUiDrainRetries; ++attempt) {
         if (!IsWindow(hwnd)) {
             if (g_startAttachFrames.load(std::memory_order_acquire) != 0) {
                 BlockUnload(L"attach hook frames without a window");
             }
-            TraceLog(L"unload ui drain skipped reason=window-gone");
-            return;
+            BlockUnload(L"ui drain window gone");
         }
         if (!DrainUiThread(hwnd)) {
             BlockUnload(L"ui drain not acknowledged");
