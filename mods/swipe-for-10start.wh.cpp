@@ -898,6 +898,7 @@ uint32_t g_closeSerial = 0;
 void TakeCloseOwnership(CloseKind kind, uint64_t tickMs, bool contactStillDown);
 void EndClose(const wchar_t* reason);
 void ReleaseExecutorOwnership();
+void RetireShowWatch(const wchar_t* reason);
 
 uint32_t g_pullSerial = 0;
 
@@ -1046,6 +1047,15 @@ std::atomic<LONG64> g_pendingDismissExec{0};
 std::atomic<uint64_t> g_pendingDismissExecAt{0};
 std::atomic<LONG64> g_pendingShowExec{0};
 std::atomic<uint64_t> g_pendingShowUntil{0};
+
+// A show the executor calls successful is not yet an open menu: the shell
+// animates it in. If no open sample arrives inside this bound, the menu never
+// appeared and the controller must stop owning it.
+constexpr uint64_t kShowUnfulfilledMs = 600;
+
+uint64_t g_showWatchUntil = 0;
+LONG64 g_showWatchSeq = 0;
+
 LONG64 g_lastIntentSeq = 0;
 
 struct CloseCancelTicket {
@@ -2272,6 +2282,9 @@ bool RequestBridgeDismiss(uint32_t method, uint64_t executeAt, uint64_t open) {
     g_pendingDismissExecAt.store(executeAt, std::memory_order_relaxed);
 
     g_pendingDismissExecGeneration = commandOpen;
+
+    // A close answers the show's question: the menu is not still opening.
+    RetireShowWatch(L"dismiss");
 
     ForgetConfirmedDismiss();
 
@@ -3523,6 +3536,8 @@ void ResetActivationState() {
 
     g_pendingShowExec.store(0, std::memory_order_relaxed);
     g_pendingShowUntil.store(0, std::memory_order_relaxed);
+    g_showWatchUntil = 0;
+    g_showWatchSeq = 0;
 
     ForgetPendingDismiss();
     g_intentOpenActive.store(false, std::memory_order_relaxed);
@@ -5549,6 +5564,58 @@ void ReleaseExecutorOwnership() {
     g_intentOpenEntry.store(0.0f, std::memory_order_relaxed);
 }
 
+void ArmShowWatch(LONG64 sequence) {
+    if (CloseInFlight() || CloseHideMayLand()) {
+
+        // A close owns the menu now; its own record answers whether it opened.
+        TraceLog(L"show watch skipped seq=%lld reason=close",
+                static_cast<long long>(sequence));
+        return;
+    }
+    g_showWatchUntil = GetTickCount64() + kShowUnfulfilledMs;
+    g_showWatchSeq = sequence;
+    TraceLog(L"show watch armed seq=%lld bound=%llu",
+            static_cast<long long>(sequence),
+            static_cast<unsigned long long>(kShowUnfulfilledMs));
+}
+
+void RetireShowWatch(const wchar_t* reason) {
+    if (g_showWatchUntil == 0) {
+        return;
+    }
+    g_showWatchUntil = 0;
+    g_showWatchSeq = 0;
+    TraceLog(L"show watch retired reason=%s", reason);
+}
+
+void CheckShowWatch(uint64_t tickMs) {
+    if (g_showWatchUntil == 0) {
+        return;
+    }
+    if (CloseInFlight() || CloseHideMayLand()) {
+        RetireShowWatch(L"close");
+        return;
+    }
+    if (tickMs < g_showWatchUntil) {
+        return;
+    }
+    const LONG64 sequence = g_showWatchSeq;
+    const CloakState cloak = ReadCloakState();
+    RetireShowWatch(cloak == CloakState::Open ? L"cloak-open"
+                                              : L"show-unfulfilled");
+    if (cloak == CloakState::Open) {
+        return;
+    }
+
+    // The show succeeded but no open sample arrived: the menu never appeared.
+    // Give it back to the shell instead of owning a hidden menu as open.
+    ShowAtRest();
+    g_commitNeedsProgressReset = false;
+    ReleaseExecutorOwnership();
+    TraceLog(L"show unfulfilled seq=%lld cloak=%s",
+            static_cast<long long>(sequence), CloakStateName(cloak));
+}
+
 bool DismissGenerationCurrent(uint64_t commandGeneration) {
     uint64_t currentGeneration = 0;
     uint64_t openTick = 0;
@@ -5721,6 +5788,13 @@ void ApplyExecAck() {
         TraceLog(L"exec show failed command=%lld state=%u hr=%08X",
                 static_cast<long long>(ack.command), ack.state,
                 static_cast<unsigned>(ack.hr));
+        return;
+    }
+    if (executed && ack.visible != kSwipeVisibilityVisible) {
+
+        // Hidden is expected while the shell animates the reveal in; the watch
+        // decides whether the menu appeared at all. Unknown proves no more.
+        ArmShowWatch(ack.command);
     }
 }
 
@@ -5920,6 +5994,10 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
         return false;
     }
     const bool open = sample == CloakState::Open;
+    if (open) {
+
+        RetireShowWatch(L"cloak-open");
+    }
     const bool wasOpen = g_rootWasOpen;
 
     const bool capable = BridgeCapabilityNow();
@@ -6152,6 +6230,9 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
     if (showUntil != 0) {
         considerTick(showUntil);
     }
+    if (g_showWatchUntil != 0) {
+        considerTick(g_showWatchUntil);
+    }
     const uint64_t dismissAt =
         g_pendingDismissExecAt.load(std::memory_order_relaxed);
     if (g_pendingDismissExec.load(std::memory_order_relaxed) != 0 &&
@@ -6190,6 +6271,7 @@ void ServiceDeadlineWork(uint64_t tickMs) {
     RepairExpiredClose(tickMs);
     CheckHidIdleRelease(tickMs);
     CheckExecAckTimeout(tickMs);
+    CheckShowWatch(tickMs);
     if (g_visibilityPollUntil != 0) {
         if (tickMs >= g_visibilityPollUntil) {
 
@@ -6210,6 +6292,8 @@ void ResetDrivenStateForCapabilityLoss() {
     ForgetPendingDismiss();
     g_pendingShowExec.store(0, std::memory_order_relaxed);
     g_pendingShowUntil.store(0, std::memory_order_relaxed);
+    g_showWatchUntil = 0;
+    g_showWatchSeq = 0;
     g_intentCancel = CloseCancelTicket{};
     ReleaseExecutorOwnership();
     if (g_hidSession.active) {
