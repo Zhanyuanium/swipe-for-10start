@@ -10579,7 +10579,7 @@ std::atomic<bool> g_explorerSymbolAttempted{false};
 
 std::atomic<bool> g_closeHookEnabled{false};
 
-bool g_initialised = false;
+std::atomic<bool> g_initialised{false};
 
 uint64_t g_unloadStartTick = 0;
 
@@ -14737,33 +14737,17 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
     return sequence;
 }
 
-constexpr int kShellOwnerWaitTries = 100;
-constexpr DWORD kShellOwnerWaitStepMs = 50;
+constexpr DWORD kShellOwnerWaitStepMs = 250;
+constexpr ULONGLONG kShellOwnerWaitMs = 120000;
 
-// Only the shell's explorer.exe owns Shell_TrayWnd; a second one must not share
-// the channel, its capability word or its auto-reset events.
-bool ShellTrayOwnerProcess() {
-    for (int attempt = 0; attempt < kShellOwnerWaitTries; ++attempt) {
-        HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-        if (tray) {
-            DWORD pid = 0;
-            GetWindowThreadProcessId(tray, &pid);
-            return pid == GetCurrentProcessId();
-        }
-        Sleep(kShellOwnerWaitStepMs);
-    }
-    return false;
-}
+HANDLE g_shellElectThread = nullptr;
+DWORD g_shellElectThreadId = 0;
+HANDLE g_shellElectStop = nullptr;
 
-BOOL RoleInit() {
-    if (!ShellTrayOwnerProcess()) {
-        Wh_Log(L"This explorer.exe does not own Shell_TrayWnd; the bridge stays "
-               L"inert in this process");
-        return TRUE;
-    }
-
-    SetTraceFileName(L"bridge.log");
-    RefreshTraceSetting();
+// The bridge body: the events, the channel, the executor pid and capability
+// word, and the executor worker. It runs once, in the explorer.exe that owns
+// Shell_TrayWnd, on that process's election thread.
+void InitialiseBridge() {
     Wh_Log(L"Swipe for 10Start %s initializing (explorer role)", kModVersion);
 
     g_pressQueueHead = 0;
@@ -14778,7 +14762,7 @@ BOOL RoleInit() {
         Wh_Log(L"Executor teardown event unavailable err=%u; the bridge stays "
                L"inert",
                static_cast<unsigned>(GetLastError()));
-        return FALSE;
+        return;
     }
 
     g_execHookIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -14787,7 +14771,7 @@ BOOL RoleInit() {
                static_cast<unsigned>(GetLastError()));
         CloseHandle(g_execTeardownAck);
         g_execTeardownAck = nullptr;
-        return FALSE;
+        return;
     }
 
     bool created = false;
@@ -14814,19 +14798,122 @@ BOOL RoleInit() {
         StartExecutorWorker();
     }
 
-    g_initialised = true;
+    g_initialised.store(true, std::memory_order_release);
+}
+
+// Waits for the shell's taskbar window in bounded steps, then runs the bridge
+// body once in its owner. A second explorer.exe owns no Shell_TrayWnd, so it
+// never opens the channel; its thread ends at the deadline or at unload.
+DWORD WINAPI ShellOwnerElectionProc(LPVOID) {
+    TraceLog(L"bridge election start step=%ums deadline=%llums",
+            static_cast<unsigned>(kShellOwnerWaitStepMs),
+            static_cast<unsigned long long>(kShellOwnerWaitMs));
+
+    const ULONGLONG started = GetTickCount64();
+    const ULONGLONG deadline = started + kShellOwnerWaitMs;
+    HWND ownerTray = nullptr;
+    for (;;) {
+        if (WaitForSingleObject(g_shellElectStop, 0) == WAIT_OBJECT_0) {
+            const ULONGLONG waited = GetTickCount64() - started;
+            TraceLog(L"bridge inert: election stopped after %llums before a "
+                     L"Shell_TrayWnd owned by this explorer.exe appeared; the "
+                     L"shell's path serves every trigger",
+                     static_cast<unsigned long long>(waited));
+            return 0;
+        }
+        const HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+        if (tray) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(tray, &pid);
+            if (pid == GetCurrentProcessId()) {
+                ownerTray = tray;
+                break;
+            }
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            TraceLog(L"bridge inert: this explorer.exe owns no Shell_TrayWnd "
+                     L"after %llums; the shell's path serves every trigger",
+                     static_cast<unsigned long long>(kShellOwnerWaitMs));
+            return 0;
+        }
+        const ULONGLONG left = deadline - now;
+        const DWORD step = static_cast<DWORD>(
+            left < kShellOwnerWaitStepMs ? left : kShellOwnerWaitStepMs);
+        WaitForSingleObject(g_shellElectStop, step);
+    }
+    if (WaitForSingleObject(g_shellElectStop, 0) == WAIT_OBJECT_0) {
+        TraceLog(L"bridge election stopped before init");
+        return 0;
+    }
+
+    TraceLog(L"bridge elected tid=%u hwnd=%p", GetCurrentThreadId(), ownerTray);
+    InitialiseBridge();
+    g_afterInit.store(true, std::memory_order_relaxed);
+    return 0;
+}
+
+// The trace is the only work safe on the host's init thread: the bridge waits
+// in RoleAfterInit for the explorer.exe that owns Shell_TrayWnd, so a restarted
+// shell can still elect a new owner. Every callback keys on g_initialised.
+BOOL RoleInit() {
+    SetTraceFileName(L"bridge.log");
+    RefreshTraceSetting();
     return TRUE;
 }
 
 void RoleAfterInit() {
-    if (!g_initialised) {
+    if (g_shellElectThread) {
         return;
     }
-    g_afterInit = true;
+    g_shellElectStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_shellElectStop) {
+        TraceLog(L"bridge election event failed err=%u", GetLastError());
+        return;
+    }
+    g_shellElectThread = CreateThread(nullptr, 0, ShellOwnerElectionProc,
+                                      nullptr, 0, &g_shellElectThreadId);
+    if (!g_shellElectThread) {
+        TraceLog(L"bridge election thread failed err=%u", GetLastError());
+        CloseHandle(g_shellElectStop);
+        g_shellElectStop = nullptr;
+    }
+}
+
+// Signals a pending election and proves it gone before the bridge teardown.
+// An election inside the init body is allowed to finish; the join then hands
+// its g_initialised write to this thread.
+void StopShellOwnerElection() {
+    if (!g_shellElectThread) {
+        if (g_shellElectStop) {
+            CloseHandle(g_shellElectStop);
+            g_shellElectStop = nullptr;
+        }
+        return;
+    }
+    if (g_shellElectStop) {
+        SetEvent(g_shellElectStop);
+    }
+    if (g_shellElectThreadId == GetCurrentThreadId()) {
+        BlockBridgeUnload(L"bridge election join on its own thread");
+    }
+    if (WaitForSingleObject(g_shellElectThread, INFINITE) != WAIT_OBJECT_0) {
+        BlockBridgeUnload(L"bridge election join failed");
+    }
+    CloseHandle(g_shellElectThread);
+    g_shellElectThread = nullptr;
+    g_shellElectThreadId = 0;
+    if (g_shellElectStop) {
+        CloseHandle(g_shellElectStop);
+        g_shellElectStop = nullptr;
+    }
+    TraceLog(L"bridge election joined elected=%d",
+            g_initialised.load(std::memory_order_acquire) ? 1 : 0);
 }
 
 void RoleBeforeUninit() {
-    if (!g_initialised) {
+    StopShellOwnerElection();
+    if (!g_initialised.load(std::memory_order_acquire)) {
         return;
     }
     g_unloadStartTick = GetTickCount64();
@@ -14849,7 +14936,8 @@ void RoleBeforeUninit() {
 }
 
 void RoleUninit() {
-    if (!g_initialised) {
+    StopShellOwnerElection();
+    if (!g_initialised.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -14910,12 +14998,12 @@ void RoleUninit() {
                 g_unloadStartTick != 0 && GetTickCount64() >= g_unloadStartTick
                     ? GetTickCount64() - g_unloadStartTick
                     : 0));
-    g_initialised = false;
+    g_initialised.store(false, std::memory_order_release);
     Wh_Log(L"Swipe for 10Start uninitialized (explorer role)");
 }
 
 void RoleSettingsChanged() {
-    if (!g_initialised) {
+    if (!g_initialised.load(std::memory_order_acquire)) {
         return;
     }
     RefreshTraceSetting();
