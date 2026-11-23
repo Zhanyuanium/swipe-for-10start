@@ -2300,6 +2300,24 @@ LONG64 CancelPendingDismiss(const wchar_t* reason) {
     return target;
 }
 
+// A show the executor has not dispatched still opens the menu it was published
+// for. An external takeover cancels it on the same record the dismiss path
+// uses, so the executor answers it superseded instead of running it.
+LONG64 CancelPendingShow(const wchar_t* reason) {
+    const LONG64 target =
+        g_pendingShowExec.exchange(0, std::memory_order_relaxed);
+    g_pendingShowUntil.store(0, std::memory_order_relaxed);
+    if (target == 0) {
+        return 0;
+    }
+    if (g_ipc.state) {
+        SwipeIpcPublishExec(&g_ipc, kSwipeExecCancel, 0, 0, 0, 0, target);
+    }
+    TraceLog(L"exec cancel request target=%lld reason=%s",
+            static_cast<long long>(target), reason);
+    return target;
+}
+
 struct DismissBeforeCancel {
     uint64_t executeAt = 0;
     LONG64 confirm = 0;
@@ -5396,6 +5414,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
     if (intent.kind == kSwipeIntentExternal) {
 
         const CloseScheduleCancel dropped = CancelCloseSchedules(L"external");
+        const LONG64 show = CancelPendingShow(L"external");
         g_intentCancel = CloseCancelTicket{};
         EndClose(L"external");
         g_intentOpenActive.store(false, std::memory_order_relaxed);
@@ -5412,8 +5431,10 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         g_commitNeedsProgressReset = false;
 
         NoteVisibilityTransition(kVisibilityWantClosed);
-        TraceLog(L"intent external drop trigger=%s slot=%d command=%d", trigger,
-                dropped.slot ? 1 : 0, dropped.command ? 1 : 0);
+        TraceLog(L"intent external drop trigger=%s slot=%d command=%d "
+                L"show=%lld",
+                trigger, dropped.slot ? 1 : 0, dropped.command ? 1 : 0,
+                static_cast<long long>(show));
     } else if (intent.kind == kSwipeIntentOpen) {
         const GestureGeometry geometry = ReadGestureGeometry();
         if (StartWindowIsOpen()) {
@@ -13459,6 +13480,27 @@ void ExecuteDueDismiss() {
     ExecuteDismiss(command);
 }
 
+// A command the executor has not dispatched is still in the section. Answering
+// it superseded and naming it for the dispatch loop is how a native show or an
+// external takeover skips an action its publisher has withdrawn.
+bool SuppressPublishedCommand(int32_t kind, const wchar_t* reason) {
+    SwipeIpcExecCommand published{};
+    if (!SwipeIpcReadExec(&g_ipc, &published) || published.seq == 0) {
+        return false;
+    }
+    if (published.kind != kind || published.seq <= g_execAcceptedSeq ||
+        published.seq == g_pendingDismissSeq ||
+        published.seq == g_pendingShowSeq) {
+        return false;
+    }
+    g_suppressedExecSeq = published.seq;
+    AnswerExec(published.seq, kSwipeAckSuperseded, S_OK,
+               kSwipeVisibilityUnknown);
+    TraceLog(L"exec cancel target=%lld reason=%s",
+            static_cast<long long>(published.seq), reason);
+    return true;
+}
+
 void CancelArmedDismissForNativeShow() {
     if (g_pendingDismissSeq != 0) {
         const LONG64 target = g_pendingDismissSeq;
@@ -13473,19 +13515,7 @@ void CancelArmedDismissForNativeShow() {
                 static_cast<long long>(target));
     }
 
-    SwipeIpcExecCommand published{};
-    if (!SwipeIpcReadExec(&g_ipc, &published) || published.seq == 0) {
-        return;
-    }
-    if (published.kind != kSwipeExecDismiss ||
-        published.seq <= g_execAcceptedSeq) {
-        return;
-    }
-    g_suppressedExecSeq = published.seq;
-    AnswerExec(published.seq, kSwipeAckSuperseded, S_OK,
-               kSwipeVisibilityUnknown);
-    TraceLog(L"exec cancel target=%lld reason=native-show-published",
-            static_cast<long long>(published.seq));
+    SuppressPublishedCommand(kSwipeExecDismiss, L"native-show-published");
 }
 
 void ExecutePendingCommand() {
@@ -13497,7 +13527,7 @@ void ExecutePendingCommand() {
 
         g_suppressedExecSeq = 0;
         g_execAcceptedSeq = command.seq;
-        TraceLog(L"exec superseded seq=%lld reason=native-show",
+        TraceLog(L"exec superseded seq=%lld reason=suppressed",
                 static_cast<long long>(command.seq));
         return;
     }
@@ -13533,6 +13563,15 @@ void ExecutePendingCommand() {
             g_pendingDismissEpoch = 0;
         } else {
             AnswerExec(command.seq, kSwipeAckExecuted, S_OK, 0);
+        }
+        if (g_pendingShowSeq != 0 &&
+            (command.target == 0 || command.target == g_pendingShowSeq)) {
+            KillTimer(g_execWindow.load(), kExecProbeTimer);
+            AnswerExec(g_pendingShowSeq, kSwipeAckSuperseded, S_OK,
+                       kSwipeVisibilityUnknown);
+            TraceLog(L"exec cancel show target=%lld reason=withdrawn",
+                    static_cast<long long>(g_pendingShowSeq));
+            g_pendingShowSeq = 0;
         }
         return;
     }
@@ -14409,6 +14448,10 @@ LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
 
         DropPressLatch(L"external", L"intent");
         DropPressQueue(L"external");
+
+        // A show the executor has not dispatched must not open the menu the
+        // takeover is about to hand back to the shell.
+        SuppressPublishedCommand(kSwipeExecShow, L"external");
     }
     uint64_t open = 0;
     uint64_t openTick = 0;
