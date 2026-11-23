@@ -11,7 +11,7 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 ## 你需要什么
 
 - **Windows 11**，且 **ExplorerPatcher** 已设置为 Windows 10（经典）开始菜单（`Start_ShowClassicMode=1`）。已在 Windows 11 build 26300.10075（`twinui.pcshell.dll` 固定版本 10.0.26100.10068）和
-  ExplorerPatcher 26100.9711 上验证。Explorer 半边只在这个精确的 `twinui.pcshell.dll` 版本上启用私有启动器调用；Windows 更新改变该文件后，菜单仍能开合，但关闭会变成瞬间的，直到模组针对新版本更新。切换到 Windows 10 开始菜单后，请重启 Explorer 和 StartMenuExperienceHost，或注销后重新登录，模组才会加载。
+  ExplorerPatcher 26100.9711 上验证。Explorer 半边只在这个精确的 `twinui.pcshell.dll` 版本上启用私有启动器调用；Windows 更新改变该文件后，模组整体不生效：两边的触摸和手写笔手势都不会跟随手指，系统开始菜单与未安装本模组时完全一致，直到新版本支持该镜像。切换到 Windows 10 开始菜单后，请重启 Explorer 和 StartMenuExperienceHost，或注销后重新登录，模组才会加载。
 - **Windhawk**。
 - 触摸屏或手写笔。（本模组刻意不响应鼠标拖动。）
 
@@ -23,7 +23,7 @@ ExplorerPatcher 在 Windows 11 上恢复了经典的 Windows 10 开始菜单；�
 
 关闭过程中再按一次或再拉一次，只要窗口还在屏幕上，就会取消这次关闭，并从当前位置反向回弹；已经落地的关闭不会被同一根手指重新打开，下一次打开需要新的触摸。Win+Tab、锁屏和显示变化直接透传。
 
-如果 Explorer 的半边在当前系统版本上无法运行，菜单仍能开合，但关闭是瞬间的；Start 半边里的触摸和手写笔手势仍会跟随手指。
+如果 Explorer 的半边在当前系统版本上无法运行，模组整体不生效：两边的触摸和手写笔手势都不会跟随手指，系统开始菜单与未安装本模组时完全一致，直到新版本支持该镜像。
 
 ## 安装
 

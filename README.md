@@ -18,9 +18,10 @@ By Zhanyuanium, distributed as a Windhawk mod.
   menu (`Start_ShowClassicMode=1`). Verified on Windows 11 build 26300.10075
   (`twinui.pcshell.dll` fixed 10.0.26100.10068) and ExplorerPatcher 26100.9711.
   The Explorer half enables its private launcher calls only on that exact
-  `twinui.pcshell.dll` build. After a Windows update changes it, the menu still
-  opens and closes, but the close is instant until the mod is updated for the
-  new build.
+  `twinui.pcshell.dll` build. After a Windows update changes it, the mod is
+  inactive until a release supports the new image: no gesture follows your
+  finger in either half, and the shell's Start opens and closes exactly as if
+  the mod were not installed.
   After switching ExplorerPatcher to the Windows 10 Start, restart Explorer and
   StartMenuExperienceHost, or sign out and back in, so the mod can load.
 - **Windhawk**.
@@ -41,9 +42,9 @@ screen: the close stops where it is and the panel reverses. A close that has
 already landed is final for that finger; the next open needs a new touch.
 Win+Tab, the lock screen and a display change pass through untouched.
 
-If Explorer's half cannot run on this build, the menu still opens and closes,
-but the close is instant; touch and pen gestures keep following your finger in
-the Start host.
+If Explorer's half cannot run on this build, the mod is inactive: no gesture
+follows your finger in either half, and the shell's Start behaves exactly as if
+the mod were not installed, until a release supports the new image.
 
 ## Install
 
