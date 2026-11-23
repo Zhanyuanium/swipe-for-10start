@@ -20517,14 +20517,29 @@ const SwipeModRole* g_modRole = nullptr;
 // ExplorerPatcher is the host this mod is written for. Its legacy Start mode is
 // a hard gate: without it the Start host would keep a raw-input registration and
 // the Explorer half would fetch the twinui PDB for a UI this mod does not hook.
-// The value is read, never written.
+// ExplorerPatcher reuses the Windows value under Advanced; the EP key is the
+// older location and answers only when Advanced carries no value. Read, never
+// written.
 bool LegacyStartMenuEnabled() {
     DWORD value = 0;
     DWORD size = sizeof(value);
-    const LSTATUS status = RegGetValueW(
-        HKEY_CURRENT_USER, L"Software\\ExplorerPatcher",
+    LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced",
         L"Start_ShowClassicMode", RRF_RT_REG_DWORD, nullptr, &value, &size);
-    return status == ERROR_SUCCESS && value == 1;
+    if (status == ERROR_SUCCESS) {
+        Wh_Log(L"Start_ShowClassicMode=%u source=advanced", value);
+        return value == 1;
+    }
+    size = sizeof(value);
+    status = RegGetValueW(HKEY_CURRENT_USER, L"Software\\ExplorerPatcher",
+                          L"Start_ShowClassicMode", RRF_RT_REG_DWORD, nullptr,
+                          &value, &size);
+    if (status == ERROR_SUCCESS) {
+        Wh_Log(L"Start_ShowClassicMode=%u source=explorerpatcher", value);
+        return value == 1;
+    }
+    return false;
 }
 
 BOOL Wh_ModInit() {
