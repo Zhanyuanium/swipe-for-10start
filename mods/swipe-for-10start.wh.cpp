@@ -17476,8 +17476,12 @@ OnHotkeyInvoke_t OnHotkeyInvoke_Original = nullptr;
 HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
     uint32_t admittingEpoch = 0;
     if (!g_ownWinEnabled.load(std::memory_order_relaxed) ||
-        g_disabled.load(std::memory_order_relaxed) ||
-        !BridgeCanServeOnLauncherThread(L"win", &admittingEpoch)) {
+        g_disabled.load(std::memory_order_relaxed)) {
+        return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
+                                       : S_OK;
+    }
+    EnsureExecutorOnLauncherThread(L"hotkey");
+    if (!BridgeCanServeOnLauncherThread(L"win", &admittingEpoch)) {
         // No controller, no worker, or no window on this thread: the shell's own
         // toggle serves the press instead of an intent nobody can execute.
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
@@ -17546,8 +17550,14 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                                   uint32_t dismissMethod) {
     uint32_t admittingEpoch = 0;
     if (!g_ownButtonEnabled.load(std::memory_order_relaxed) ||
-        g_disabled.load(std::memory_order_relaxed) ||
-        !BridgeCanServeOnLauncherThread(L"startbutton", &admittingEpoch)) {
+        g_disabled.load(std::memory_order_relaxed)) {
+        return OnStartButtonPressed_Original
+                   ? OnStartButtonPressed_Original(self, showMethod,
+                                                   dismissMethod)
+                   : S_OK;
+    }
+    EnsureExecutorOnLauncherThread(L"startbutton");
+    if (!BridgeCanServeOnLauncherThread(L"startbutton", &admittingEpoch)) {
         return OnStartButtonPressed_Original
                    ? OnStartButtonPressed_Original(self, showMethod,
                                                    dismissMethod)
