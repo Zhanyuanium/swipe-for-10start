@@ -6771,6 +6771,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     }
     while (running) {
 
+        PublishPeerTick(GetTickCount64());
         ProbeRootSymbolFromInputThread();
         MaybeAttachToRunningStartHost();
 
