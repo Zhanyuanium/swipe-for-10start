@@ -14851,6 +14851,10 @@ bool g_execTeardownPending = false;  // launcher thread only
 // retire it. Same deferral as the teardown: a shell call on this thread's stack
 // may still touch the launcher after a nested message returns.
 bool g_execRetirePending = false;   // launcher thread only
+// The window a retire was posted to and that has not gone yet. A failed post
+// leaves this null, so the next entry tries again; a successful one keeps later
+// entries from posting a second message for the same window.
+std::atomic<HWND> g_execRetirePosted{nullptr};
 // The one targeted WH_GETMESSAGE hook that proves a proposed launcher thread
 // pumps. The manager's Show proposes the thread; the hook fires there, commits
 // it and creates the window on its first message.
@@ -19438,8 +19442,10 @@ void ReplaceLauncherThread(const wchar_t* source, DWORD previous) {
     if (!PostMessageW(window, kExecRetireMessage, kExecRetireMagic, 0)) {
         TraceLog(L"exec window retire post failed hwnd=%p err=%u", window,
                 GetLastError());
+        g_execRetirePosted.store(nullptr, std::memory_order_release);
         return;
     }
+    g_execRetirePosted.store(window, std::memory_order_release);
     TraceLog(L"exec window retire hwnd=%p owner=%u", window, g_execThreadId);
 }
 
@@ -19518,6 +19524,54 @@ void RemoveExecutorThreadHookIfCurrent(HHOOK serviced) {
     ReleaseSRWLockExclusive(&g_execThreadHookLock);
 }
 
+// A correction's retire can fail to post (an exhausted posted-message quota, a
+// window that is already going). The old window then stays published, dispatch
+// is closed and a replacement cannot be created while a window exists, so the
+// executor would be dead for the session. Every later entry tries the post
+// again, once: the marker suppresses a second message for a live window, and a
+// failed post leaves it clear for the next entry. Creation stays refused while
+// the window on the superseded thread is alive.
+bool RetireSupersededWindow(const wchar_t* source) {
+    if (g_disabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    HWND window = g_execWindow.load(std::memory_order_acquire);
+    if (!window) {
+        g_execRetirePosted.store(nullptr, std::memory_order_release);
+        return false;
+    }
+    const DWORD committed = g_launcherThread.load(std::memory_order_acquire);
+    if (committed == 0 || g_execThreadId == committed) {
+        return false;
+    }
+    if (g_execRetirePosted.load(std::memory_order_acquire) == window) {
+        // The retire for this window is already in its queue.
+        return true;
+    }
+    if (g_execThreadId == GetCurrentThreadId()) {
+        // This entry runs on the window's own thread, so the same-thread path a
+        // correction takes applies: destroy it here, or defer behind the frame.
+        if (g_execOwnerDepth == 0) {
+            TraceLog(L"exec window retire retry source=%s hwnd=%p tid=%u", source,
+                    window, g_execThreadId);
+            RetireExecutorTeardown(window);
+            DestroyWindow(window);
+        } else {
+            g_execRetirePending = true;
+        }
+        return true;
+    }
+    if (!PostMessageW(window, kExecRetireMessage, kExecRetireMagic, 0)) {
+        TraceLog(L"exec window retire retry failed source=%s hwnd=%p err=%u",
+                source, window, GetLastError());
+        return true;
+    }
+    g_execRetirePosted.store(window, std::memory_order_release);
+    TraceLog(L"exec window retire retry source=%s hwnd=%p owner=%u", source,
+            window, g_execThreadId);
+    return true;
+}
+
 // The manager's Show is the bootstrap. It runs on whichever thread the shell
 // called it on, and that thread may be a COM or taskbar caller that never
 // pumps. It therefore only proposes the thread: the targeted WH_GETMESSAGE
@@ -19526,6 +19580,7 @@ void RemoveExecutorThreadHookIfCurrent(HHOOK serviced) {
 // native; a Win or Start-button entry on the real launcher thread commits and
 // creates it directly.
 void EnsureExecutorOnLauncherThread(const wchar_t* source) {
+    RetireSupersededWindow(source);
     if (ExecutorWindowOnThisThread()) {
         return;
     }
@@ -19547,8 +19602,16 @@ void EnsureExecutorOnLauncherThread(const wchar_t* source) {
 }
 
 void EnsureExecutorWindow() {
-    if (g_disabled.load(std::memory_order_relaxed) ||
-        g_execWindow.load(std::memory_order_relaxed)) {
+    if (g_disabled.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (RetireSupersededWindow(L"window")) {
+        // A window exists on a thread that is no longer the committed launcher
+        // thread. It is being retired, and a second window is never created
+        // beside it: the class is one window per image.
+        return;
+    }
+    if (g_execWindow.load(std::memory_order_relaxed)) {
         return;
     }
     // A window exists to run the launcher's own primitives, so it may only be
@@ -19599,6 +19662,9 @@ void EnsureExecutorWindow() {
     // sees is never a window without its thread.
     g_execThreadId = GetCurrentThreadId();
     g_execWindow.store(window, std::memory_order_release);
+    // A new window has never had a retire posted for it; the marker can only
+    // name the one this replaces.
+    g_execRetirePosted.store(nullptr, std::memory_order_release);
     // A frame on this thread dispatches again: the window is on the committed
     // launcher thread and the replacement a correction was waiting for exists.
     g_execDispatchClosed.store(false, std::memory_order_release);
