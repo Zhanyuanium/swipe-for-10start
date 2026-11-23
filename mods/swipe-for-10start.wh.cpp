@@ -4522,13 +4522,7 @@ HWND FindStartCoreWindow() {
     return nullptr;
 }
 
-// Runs a small procedure on the thread that owns `hwnd`, without blocking the
-// caller. A thread-targeted WH_GETMESSAGE hook sees the posted registered
-// message before the loop dispatches it, so the procedure runs on the UI thread
-// with its message loop active; the hook removes itself and frees the call.
-// This is the enable path's way onto an already-running Start host, whose root
-// hook is not guaranteed to run again. A host that is suspended keeps the hook
-// and the posted message until it next pumps; the unload removes the hook.
+// Posts one call to the owning UI thread; the hook admits only this image's message.
 using RunFromWindowThreadProc = void(WINAPI*)(PVOID);
 
 struct RunFromWindowThreadParam {
@@ -4538,6 +4532,8 @@ struct RunFromWindowThreadParam {
     bool ran;
 };
 
+constexpr WPARAM kRunFromWindowThreadMagic = 0x53575441;  // "SWTA"
+RunFromWindowThreadParam g_attachCall{};
 std::atomic<HHOOK> g_startAttachHook{nullptr};
 
 UINT RunFromWindowThreadMessage() {
@@ -4550,19 +4546,17 @@ LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam,
                                          LPARAM lParam) {
     if (code == HC_ACTION && wParam == PM_REMOVE) {
         auto* message = reinterpret_cast<MSG*>(lParam);
-        if (message && message->message == RunFromWindowThreadMessage()) {
-            auto* call =
-                reinterpret_cast<RunFromWindowThreadParam*>(message->lParam);
-            if (call && call->proc) {
-                call->ran = true;
-                call->proc(call->param);
-                const HHOOK hook = call->hook;
-                call->hook = nullptr;
-                g_startAttachHook.store(nullptr, std::memory_order_release);
-                message->lParam = 0;
-                UnhookWindowsHookEx(hook);
-                delete call;
-            }
+        if (message && message->message == RunFromWindowThreadMessage() &&
+            message->wParam == kRunFromWindowThreadMagic &&
+            message->lParam == reinterpret_cast<LPARAM>(&g_attachCall) &&
+            g_attachCall.proc) {
+            g_attachCall.ran = true;
+            g_attachCall.proc(g_attachCall.param);
+            const HHOOK hook = g_attachCall.hook;
+            g_attachCall.hook = nullptr;
+            g_startAttachHook.store(nullptr, std::memory_order_release);
+            message->lParam = 0;
+            UnhookWindowsHookEx(hook);
         }
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -4571,6 +4565,10 @@ LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam,
 bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc proc,
                          PVOID param) {
     if (!hwnd || !proc) {
+        return false;
+    }
+    if (g_startAttachHook.load(std::memory_order_acquire)) {
+        TraceLog(L"run on window thread already posted");
         return false;
     }
     const UINT message = RunFromWindowThreadMessage();
@@ -4593,17 +4591,12 @@ bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc proc,
                 GetLastError());
         return false;
     }
-    auto* call = new (std::nothrow)
-        RunFromWindowThreadParam{proc, param, hook, false};
-    if (!call) {
-        UnhookWindowsHookEx(hook);
-        return false;
-    }
+    g_attachCall = RunFromWindowThreadParam{proc, param, hook, false};
     g_startAttachHook.store(hook, std::memory_order_release);
-    if (!PostMessageW(hwnd, message, 0, reinterpret_cast<LPARAM>(call))) {
+    if (!PostMessageW(hwnd, message, kRunFromWindowThreadMagic,
+                      reinterpret_cast<LPARAM>(&g_attachCall))) {
         g_startAttachHook.store(nullptr, std::memory_order_release);
         UnhookWindowsHookEx(hook);
-        delete call;
         return false;
     }
     TraceLog(L"run on window thread posted hwnd=%p tid=%u", hwnd, threadId);
