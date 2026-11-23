@@ -5125,12 +5125,18 @@ void RunPendingCloseTap(uint64_t tickMs) {
         return;
     }
 
-    if (!StartWindowIsOpen()) {
-        TraceLog(L"close dismiss skipped kind=%s (already closed)",
+    const CloakState cloak = ReadCloakState();
+    if (cloak == CloakState::Hidden) {
+        TraceLog(L"close dismiss skipped kind=%s (window hidden)",
                 CloseKindName(kind));
         EndClose(L"window-closed");
         ReleaseExecutorOwnership();
         return;
+    }
+    if (cloak == CloakState::Unknown) {
+        // An unknown sample is never evidence of a closed menu: a dismiss on a
+        // hidden window is harmless, one on a visible window is the repair.
+        TraceLog(L"close dismiss kind=%s cloak=unknown", CloseKindName(kind));
     }
 
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
