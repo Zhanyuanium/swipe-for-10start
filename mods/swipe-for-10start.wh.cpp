@@ -18990,6 +18990,12 @@ bool EnsureExecutorThreadHook(DWORD target) {
         return false;
     }
     AcquireSRWLockExclusive(&g_execThreadHookLock);
+    // A worker past its caller's flag check must not install after the unload
+    // removed the hook.
+    if (g_disabled.load(std::memory_order_relaxed)) {
+        ReleaseSRWLockExclusive(&g_execThreadHookLock);
+        return false;
+    }
     if (g_execThreadHook.load(std::memory_order_acquire) &&
         g_execThreadHookTarget.load(std::memory_order_acquire) == target) {
         ReleaseSRWLockExclusive(&g_execThreadHookLock);
@@ -19014,6 +19020,17 @@ bool EnsureExecutorThreadHook(DWORD target) {
 void RemoveExecutorThreadHook() {
     AcquireSRWLockExclusive(&g_execThreadHookLock);
     RemoveExecutorThreadHookLocked();
+    ReleaseSRWLockExclusive(&g_execThreadHookLock);
+}
+
+// The serviced registration, not whatever is current: a hook that replaced this
+// one while its callback ran belongs to a later proposal.
+void RemoveExecutorThreadHookIfCurrent(HHOOK serviced) {
+    AcquireSRWLockExclusive(&g_execThreadHookLock);
+    if (serviced &&
+        g_execThreadHook.load(std::memory_order_acquire) == serviced) {
+        RemoveExecutorThreadHookLocked();
+    }
     ReleaseSRWLockExclusive(&g_execThreadHookLock);
 }
 
@@ -19104,9 +19121,14 @@ void EnsureExecutorWindow() {
 }
 
 LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
-    if (code == HC_ACTION &&
-        GetCurrentThreadId() ==
-            g_execThreadHookTarget.load(std::memory_order_acquire)) {
+    HHOOK serviced = nullptr;
+    DWORD target = 0;
+    AcquireSRWLockShared(&g_execThreadHookLock);
+    serviced = g_execThreadHook.load(std::memory_order_acquire);
+    target = g_execThreadHookTarget.load(std::memory_order_acquire);
+    ReleaseSRWLockShared(&g_execThreadHookLock);
+    if (code == HC_ACTION && serviced &&
+        GetCurrentThreadId() == target) {
         const DWORD tid = GetCurrentThreadId();
         DWORD known = g_launcherThread.load(std::memory_order_acquire);
         if (known == 0) {
@@ -19123,7 +19145,7 @@ LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
         }
         // One proposal, one attempt. A failed creation is retried by the next
         // Show or trigger, never by a hook that fires on every message.
-        RemoveExecutorThreadHook();
+        RemoveExecutorThreadHookIfCurrent(serviced);
     }
     return CallNextHookEx(nullptr, code, wParam, lParam);
 }
@@ -19582,18 +19604,20 @@ void RoleUninit() {
     // this there already.
     g_disabled = true;
 
-    // The thread hook can create the window from the launcher thread; take it
-    // down before the exclusive admission so no new creation can start.
-    RemoveExecutorThreadHook();
-
     // The posting worker first. It never calls the launcher synchronously, so
     // the join does not depend on the launcher thread; it sees the stop event
-    // set in BeforeUninit.
+    // set in BeforeUninit. A worker still inside its creation attempt would
+    // otherwise install the thread hook after the removal.
     g_execReady.store(false, std::memory_order_release);
     if (g_execStopEvent) {
         SetEvent(g_execStopEvent);
     }
     JoinExecutorWorker();
+
+    // Then the thread hook, before the exclusive admission. It is a
+    // WH_GETMESSAGE on the window's own thread, so its callback has returned
+    // before the sent teardown can be dispatched; no extra event is needed.
+    RemoveExecutorThreadHook();
 
     // Then the one window, on its owner thread, with the worker already joined:
     // no new post can arrive and no timer can survive the destruction. The
