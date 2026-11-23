@@ -8480,9 +8480,10 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                 TraceLog(L"intent close from=%.3f dur=%lld", from,
                         static_cast<long long>(duration.count()));
             } else {
-                // Nothing will hide this window. The settle already retracted the
-                // panel; the record ends as a refusal, the ownership goes back
-                // now and the unhealed rule restores the panel.
+                // Nothing will hide this window, so the retracting panel is
+                // restored here, not by the unhealed heal after a native replay.
+                ShowAtRest();
+                g_commitNeedsProgressReset = false;
                 EndClose(L"no-executor");
                 ReleaseExecutorOwnership();
                 ackState = kSwipeAckRefused;
