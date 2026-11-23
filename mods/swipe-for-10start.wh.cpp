@@ -12867,6 +12867,16 @@ HRESULT Dismiss_Hook(void* launcher, uint32_t method) {
         g_disabled.load(std::memory_order_relaxed) || t_execCall > 0) {
         return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
     }
+    if (OwnExternalForwarded(method)) {
+
+        // The hotkey hook published this press's external intent and forwarded
+        // it; the shell's own Dismiss is that forward, not a second takeover.
+        TraceLog(L"exec pass dismiss method=%u reason=forwarded", method);
+        const HRESULT hr =
+            Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
+        OwnResyncFromState(OwnStateOf(launcher));
+        return hr;
+    }
     if (!BridgeCanServeOnLauncherThread(L"dismiss", &admittingEpoch)) {
         return Dismiss_Original ? Dismiss_Original(launcher, method) : E_FAIL;
     }
