@@ -7,6 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
+| `v0.8.5` | 0.8.5 | — | 240 B | the fourth review answered: the classic-Start gate reads the value ExplorerPatcher writes, a frozen host's claim expires, the open-time survey is gone, the guides state the real cost of an unsupported build |
 | `v0.8.4` | 0.8.4 | — | 240 B | the collection's second review answered: a proven executor thread, a press never swallowed without a live process, hook frames and teardown that outlive the image, takeovers forwarded |
 | `v0.8.3` | 0.8.3 | — | 232 B | one drag-intent setting for every side, a mod page composed from both guides with localized names and settings, and two full-screen demos |
 | `v0.8.2` | 0.8.2 | — | 232 B | an unload proved on the owner threads: one UI rendezvous window, counted proofs on every path, the manager's `Show` as the one adoption bootstrap, an open during a close handed to the controller, the version gate before the PDB fetch |
@@ -25,6 +26,26 @@ pair that shipped before the merge.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.8.5 — the fourth review answered
+
+Windhawk `@version` 0.8.5. No channel change.
+
+- **The classic-Start gate reads the value ExplorerPatcher actually writes.**
+  `Start_ShowClassicMode` is taken from `Explorer\Advanced` first, with the
+  `Software\ExplorerPatcher` value as the fallback when that key is absent. On a
+  clean profile 0.8.4 could refuse to load.
+- **A frozen Start host no longer blocks the Win key.** A claimed press is spent
+  after 2000 ms without an ack — below the 2500 ms queue bound, so the press
+  behind it still runs natively. A host that resumes later may apply the copy it
+  validated, which is a possible extra transition; before this, the Win and Start
+  buttons did nothing until the host answered.
+- **The guide states the real cost of an unsupported `twinui.pcshell.dll`:** the
+  mod is inactive in both processes, not merely un-animated.
+- **The open-time scroller survey is gone.** It could only publish "unknown",
+  which the gate already treats as no measurement; the settled survey answers it.
+- Attach-hook ownership, the DPI cache on a scaling change, and a window that
+  disappears between the unload's lookup and its send.
 
 ## v0.8.4 — the collection's second review answered
 

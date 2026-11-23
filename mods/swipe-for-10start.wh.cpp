@@ -4,7 +4,7 @@
 // @name:zh-CN      Swipe for 10Start
 // @description     Touch and pen swipe gestures for ExplorerPatcher's legacy Windows 10 Start menu: pull it out with your finger, drag it back to close, with the same animation on the Windows key.
 // @description:zh-CN 为 ExplorerPatcher 恢复的 Windows 10 经典开始菜单加上触摸与手写笔滑动：手指拉出、拖回关闭，Win 键开合播放同一套动画。
-// @version         0.8.4
+// @version         0.8.5
 // @author          Zhanyuanium
 // @include         explorer.exe
 // @include         StartMenuExperienceHost.exe
