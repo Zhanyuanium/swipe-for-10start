@@ -47,7 +47,7 @@ and its 24 DIP qualified open claim (a tap requests nothing), the down's author
 and the 2.2 DIP/ms chase (the live takeover of an interrupted retract continues
 from the panel's position), the one close path (`TakeProgressNow` → shell-close
 settle → scheduled `exec dismiss`), the close record (serial, acceptance tick, the
-menu, a phase, the 600 ms repair bound) and its endings including the logged
+menu, a phase, the 800 ms repair bound) and its endings including the logged
 repair, the grab's down hit-test (the trail along the axis **and** the panel
 rect's cross range) and its one
 transfer attempt (a taken transfer follows from the live position, a band down
@@ -87,7 +87,7 @@ the smoke's `DiagnosticTrace` precondition and the tap tests.
 
 limits.md: the measured limits — the shell cap, the launcher readiness, the
 launcher thread, the 24 DIP band threshold with the native-gesture trade-off,
-the close's 600 ms repair bound (and why a late hide costs latency, not the
+the close's 800 ms repair bound (and why a late hide costs latency, not the
 pull), the touch-show idle suppression, the cold entry, the taskbar auto-hide
 state,
 the engine's symbol cache layout and four-hour error cache, and the hardware

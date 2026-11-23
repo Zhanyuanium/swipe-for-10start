@@ -394,7 +394,7 @@ An intent close is
 `TakeProgressNow()` + the shell-close settle + `exec dismiss` at +30 ms; a gesture
 close asks for the same dismiss at its own settle's end. The bridge's timer runs
 `Dismiss` on the launcher thread. The close record — one accepted close with its
-serial, acceptance tick, the menu it was accepted against, a phase and the 600 ms
+serial, acceptance tick, the menu it was accepted against, a phase and the 800 ms
 repair bound — keeps the visibility service from healing the retracted panel
 before the dismiss lands, and it is the only answer to "is a close in flight?":
 no reader asks a clock. The record is retired by its landing, a pull cancel, an

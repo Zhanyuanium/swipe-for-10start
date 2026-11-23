@@ -658,9 +658,9 @@ close and the gesture close suppress the same way. The record is not the landing
 identity: the
 landing is this mod's close when its dismiss command is still queued/armed or
 executed-unconfirmed, or when the open-cancel ticket names that command. A
-maximum-duration close measured 562–593 ms from takeover to `win close
-observed` over ten runs (mean 578, 7 ms inside the record's 600 ms repair bound at
-the worst), so a
+maximum-duration close measured 562–610 ms from takeover to `win close
+observed` over ten runs and this session's unload runs (mean 578; the 800 ms
+repair bound leaves about 190 ms at the worst), so a
 busy launcher can pass the bound and must not decide a pull's fate (see
 [limits.md](limits.md)); the bound's ending is the logged repair, never a silent
 expiry.

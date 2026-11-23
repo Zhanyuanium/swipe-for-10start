@@ -216,7 +216,7 @@ input thread, answers every "is a close in flight?" question:
 | `acceptedTick` | when the ownership was taken |
 | `openTick`, `openGeneration` | the menu it was accepted against, read from the open record at that instant (diagnostics — a landing is identified by its dismiss command and its open generation) |
 | `phase` | `Settling` (the retract runs, this side has not published its dismiss), `AwaitingHide` (the dismiss is published, the shell's hide is ahead), `Done` |
-| `repairAt` | `acceptedTick + kRestoreSuppressMs` (600 ms): the bound after which a close that never landed is repaired |
+| `repairAt` | `acceptedTick + kCloseRepairMs` (800 ms): the bound after which a close that never landed is repaired |
 
 The tick fields are data; `phase` is the answer. `CloseInFlight()` reads the
 phase, and the record's own tick fields never decide anything: a duration is not

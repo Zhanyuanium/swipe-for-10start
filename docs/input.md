@@ -51,7 +51,7 @@ state has:
 | band candidate's watchdog | QPC | `kCandidateIdleHoldMs`, 120 ms |
 | contact latch and tracked identity expiry | tick | the same 18 ms |
 | the armed close tap | tick | the settle's end (`ScheduleCloseTap`) |
-| the close record's repair bound | tick | `kRestoreSuppressMs`, 600 ms after acceptance (`RepairExpiredClose`) |
+| the close record's repair bound | tick | `kCloseRepairMs`, 800 ms after acceptance (`RepairExpiredClose`) |
 | a show's executor budget | tick | `kBridgeAckTimeoutMs`, 400 ms |
 | a dismiss's executor budget | tick | `executeAt + 400 ms` |
 | the settled measurement's guaranteed turn | tick | `kSettledMeasureDeadlineMs`, 400 ms |

@@ -592,16 +592,19 @@ constexpr int kCommitDistancePercentMax = 50;
 
 // A close this mod started hides the menu a moment later. Until then the shell
 // still reports the window open, so the visibility service must not read that as
-// a fresh open and restore Progress while the close is in flight.
-constexpr uint64_t kRestoreSuppressMs = 600;
+// a fresh open and restore Progress while the close is in flight. The record's
+// repair bound is the only clock: 800 ms is above the measured 578-610 ms
+// landing window (a 600 ms bound left 7 ms at the worst and repaired a hide that
+// was still performing).
+constexpr uint64_t kCloseRepairMs = 800;
 
 // The scheduled dismiss has to run inside that window, or the visibility service
 // reads the still-open window as a fresh open and restores Progress while the
 // close is in flight. Both styles must land inside it, and the clamp is their
 // upper bound.
 static_assert(static_cast<uint64_t>(kSettleMaxDuration.count()) <=
-                  kRestoreSuppressMs,
-              "the close dismiss must run inside the restore suppression");
+                  kCloseRepairMs,
+              "the close dismiss must run inside the repair bound");
 
 // Gesture thresholds. Delta and Distance are DIP, velocity is DIP/ms.
 constexpr float kCommitVelocity = 0.45f;
@@ -1582,10 +1585,9 @@ enum class CloseKind {
 //   repair (`RepairExpiredClose`).
 //
 // The tick fields are data. No reader derives its answer from them: a duration is
-// not a state, and the measured close lands 562-593 ms after the ownership
-// (docs/limits.md) — 7 ms inside the 600 ms window at the worst — so a window can
-// expire under a close that is still performing, and a close that never started
-// can hold one open.
+// not a state, and the measured close lands 578-610 ms after the ownership
+// (docs/limits.md), so the 800 ms bound leaves margin for a busy shell; a close
+// that never started can still hold one open.
 enum class ClosePhase {
     Settling,      // the retract runs; this side has not published its dismiss
     AwaitingHide,  // the dismiss is published; the shell's hide is ahead
@@ -5093,7 +5095,7 @@ void TakeCloseOwnership(CloseKind kind, uint64_t tickMs,
     g_close.serial = ++g_closeSerial;
     g_close.phase = ClosePhase::Settling;
     g_close.acceptedTick = tickMs;
-    g_close.repairAt = tickMs + kRestoreSuppressMs;
+    g_close.repairAt = tickMs + kCloseRepairMs;
     g_close.kind = kind;
     // The menu this close belongs to, for the record and its lines. A failed read
     // leaves zeros: the record names no menu, and nothing downstream decides by
@@ -10134,7 +10136,8 @@ LRESULT CALLBACK HidWindowProc(HWND hwnd, UINT msg, WPARAM wParam,
     switch (msg) {
         case WM_INPUT:
             HandleRawInput(reinterpret_cast<HRAWINPUT>(lParam));
-            return 0;
+            // Required so the system can free the raw-input buffer.
+            return DefWindowProcW(hwnd, msg, wParam, lParam);
         case WM_TIMER:
             // The fallback tick, armed by the wait planner only when the
             // high-resolution timer could not be created and only while a
@@ -10637,8 +10640,14 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // thread is already leaving the intent loop, so the gate closes here, not
     // after the last device is detached.
     PublishPeerGone(L"consumer-exit");
-    UnregisterHidUsage(kUsageTouchScreen);
-    UnregisterHidUsage(kUsagePen);
+    if (g_touchRegistered) {
+        UnregisterHidUsage(kUsageTouchScreen);
+        g_touchRegistered = false;
+    }
+    if (g_penRegistered) {
+        UnregisterHidUsage(kUsagePen);
+        g_penRegistered = false;
+    }
 
     // One per-activation reset, the same function Wh_ModInit calls, so a clean
     // fresh image starts from the state the first activation
@@ -14238,10 +14247,10 @@ void RoleAfterInit() {
     if (!g_initialised) {
         return;
     }
-    // The LoadLibraryExW notification takes effect here. Record an image that
-    // loaded during init; the input thread installs from the record, so no
-    // symbol work runs on this host thread.
-    Wh_ApplyHookOperations();
+    // Windhawk applies the hooks registered in Wh_ModInit before this call, so
+    // the LoadLibraryExW notification is live. Record an image that loaded
+    // during init; the input thread installs from the record, so no symbol work
+    // runs on this host thread.
     RecordLoadedStartUIModule();
 
     // A host that was already running when this image loaded has created its
@@ -14788,6 +14797,9 @@ std::atomic<bool> g_execReady{false};
 // the bridge's own copy of the shared word; every lifecycle point publishes it
 // through PublishExecutorCapability and the Start side reads only the word.
 std::atomic<bool> g_execCapable{false};
+// Serialises the compute-and-write of the word: a press publish that computed 1
+// before the unload must not write it after the unload's 0.
+SRWLOCK g_execCapabilityLock = SRWLOCK_INIT;
 // The hidden event does not publish the latched open from its own stack. A show
 // that ran at the hidden event's own tick was swallowed by the completing hide
 // (measured on the auto-hidden layout: `own state event=hidden`, show and
@@ -15316,9 +15328,13 @@ void PublishExecutorCapability(const wchar_t* reason) {
     if (!g_ipc.state) {
         return;
     }
+    // The value is computed and written under one lock, so a publish that began
+    // before the unload cannot overwrite the unload's 0 with a stale 1.
+    AcquireSRWLockExclusive(&g_execCapabilityLock);
     const bool capable = ExecutorCapabilityNow();
     const bool was = g_execCapable.exchange(capable, std::memory_order_acq_rel);
     SwipeIpcPublishExecCapable(&g_ipc, capable);
+    ReleaseSRWLockExclusive(&g_execCapabilityLock);
     if (was != capable) {
         TraceLog(L"exec capable=%d reason=%s window=%p tid=%u launcher=%u "
                 L"layout=%d worker=%d",
@@ -19346,7 +19362,6 @@ void RoleAfterInit() {
         return;
     }
     g_afterInit = true;
-    Wh_ApplyHookOperations();
 }
 
 void RoleBeforeUninit() {

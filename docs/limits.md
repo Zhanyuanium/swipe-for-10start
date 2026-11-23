@@ -245,14 +245,15 @@ so it is covered too.
 the retracted panel: one accepted close (serial, acceptance tick, the menu it was
 accepted against, a phase and a repair bound) is retired by its landing, a pull
 cancel, an external takeover, a terminal repair, or the repair bound itself
-(`kRestoreSuppressMs`, 600 ms after acceptance). The landing's identity is still
+(`kCloseRepairMs`, 800 ms after acceptance). The landing's identity is still
 its dismiss command and its open generation: the landing is this mod's close when
 its dismiss command is still queued/armed or executed-unconfirmed, or when the
 open-cancel ticket names that command. Measured on this machine, close takeover →
-`win close observed` was **562–593 ms over ten maximum-duration (520 ms settle)
-closes**, mean 578, so the worst sample sat 7 ms inside the 600 ms bound — a busy
-launcher can pass it, which is why the bound is a repair and never the answer to
-"is a close in flight". The repair ending is deliberate: it logs one `close ended
+`win close observed` was **562–610 ms over the ten maximum-duration (520 ms
+settle) closes and this session's unload runs**, mean 578, so the worst sample
+sat 7 ms inside the old 600 ms bound; the 800 ms bound leaves about 190 ms — a
+busy launcher can still pass it, which is why the bound is a repair and never
+the answer to "is a close in flight". The repair ending is deliberate: it logs one `close ended
 ... reason=repair-deadline` line, releases the published direction so the bridge's
 next toggle reads the cloak and the internal state again, and leaves the dismiss
 command and the ticket naming the hide that may still land — the unhealed heal
@@ -316,7 +317,7 @@ Win press opens exactly once; the transition itself is never synthesized.
   those windows ends it with `src=idle`. A held release arms no deadline at all:
   the hold ends on the cloak event or on the executor's answer. A close that is
   still owed its landing holds the release until that ending arrives, and the
-  close's repair bound (600 ms) is the one deadline the record arms.
+  close's repair bound (800 ms) is the one deadline the record arms.
 - **Silence is not a lift for a contact a close consumed.** The latch and the
   dismiss mute survive the quiet through the hide: while a close owns the panel no
   idle expiry runs at all. A consumed contact ends on its lift report or on a
