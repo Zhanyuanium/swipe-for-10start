@@ -1200,6 +1200,41 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason);
 
 SwipeIpcChannel g_ipc;
 
+// The touch word is the bridge's read-only signal that a touch owns the open.
+// Only the claim and its activation set it, and a report stream that stops
+// mid-reveal never clears it. The hold therefore expires: after this window the
+// idle release runs and clears the word through the normal release path.
+constexpr uint64_t kOpenClaimHoldMs = 1200;
+
+uint64_t g_openClaimTick = 0;
+
+void NoteOpenClaimTick() {
+    g_openClaimTick = GetTickCount64();
+}
+
+void SetControllerTouch(bool touch) {
+    if (touch) {
+        NoteOpenClaimTick();
+    }
+    SwipeIpcSetControllerTouch(&g_ipc, touch);
+}
+
+uint64_t OpenClaimHoldUntil() {
+    if (g_openClaimTick == 0) {
+        return 0;
+    }
+    if (!SwipeIpcControllerTouch(&g_ipc) &&
+        !g_intentOpenActive.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    return g_openClaimTick + kOpenClaimHoldMs;
+}
+
+bool OpenClaimHoldActive() {
+    const uint64_t until = OpenClaimHoldUntil();
+    return until != 0 && GetTickCount64() < until;
+}
+
 void RecordPeerUiThread() {
     const DWORD tid = GetCurrentThreadId();
     g_uiThreadId.store(tid, std::memory_order_relaxed);
@@ -2059,7 +2094,7 @@ void SetPeerGone(const wchar_t* why, bool terminal) {
     }
     SwipeIpcSetPeerState(&g_ipc, kSwipePeerGone);
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
-    SwipeIpcSetControllerTouch(&g_ipc, false);
+    SetControllerTouch(false);
     logged = g_peerPublished.exchange(false, std::memory_order_relaxed);
     ReleaseSRWLockExclusive(&g_peerLock);
     if (logged) {
@@ -3271,7 +3306,7 @@ void TakeCloseOwnership(CloseKind kind, uint64_t tickMs,
             static_cast<unsigned long long>(g_close.openGeneration),
             static_cast<unsigned long long>(g_close.repairAt));
 
-    SwipeIpcSetControllerTouch(&g_ipc, false);
+    SetControllerTouch(false);
 
     ForgetConfirmedDismiss();
 
@@ -3474,6 +3509,7 @@ void ResetActivationState() {
     ForgetPendingDismiss();
     g_intentOpenActive.store(false, std::memory_order_relaxed);
     g_intentOpenEntry.store(0.0f, std::memory_order_relaxed);
+    g_openClaimTick = 0;
 
     g_lastIntentSeq = 0;
     g_intentCancel = CloseCancelTicket{};
@@ -3787,7 +3823,8 @@ bool PublishOpenClaim(const GestureGeometry& geometry, bool touch,
     g_intentOpenActive.store(true, std::memory_order_relaxed);
     g_intentOpenEntry.store(entry, std::memory_order_relaxed);
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
-    SwipeIpcSetControllerTouch(&g_ipc, touch);
+    NoteOpenClaimTick();
+    SetControllerTouch(touch);
     entryOut = entry;
     if (!RequestBridgeShow(1, 0)) {
         ReleaseExecutorOwnership();
@@ -4096,6 +4133,7 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
             reveal.activationGap, reveal.liveTakeover ? 1 : 0);
 
     g_intentOpenActive.store(false, std::memory_order_relaxed);
+    NoteOpenClaimTick();
     return true;
 }
 
@@ -4407,7 +4445,7 @@ bool ConsumeLateRevealRelease(const GestureGeometry& geometry) {
 
     g_commitNeedsProgressReset = false;
 
-    SwipeIpcSetControllerTouch(&g_ipc, false);
+    SetControllerTouch(false);
     g_intentOpenActive.store(false, std::memory_order_relaxed);
     TraceLog(L"reveal adopt late travel=%.0f vel=%.2f age=%llu gen=%u from=%.3f "
             L"pos=%.3f",
@@ -4447,7 +4485,7 @@ void ReleaseRevealSession(const GestureGeometry& geometry) {
     reveal.edgeCandidate = false;
     reveal.granted = false;
 
-    SwipeIpcSetControllerTouch(&g_ipc, false);
+    SetControllerTouch(false);
     if (!reveal.active) {
         if (grab) {
 
@@ -4953,9 +4991,7 @@ void MaybeCoast(const GestureGeometry& geometry, uint64_t qpcNow) {
 }
 
 bool IdleReleaseHeld() {
-    const bool touchShowInFlight =
-        SwipeIpcControllerTouch(&g_ipc) ||
-        g_intentOpenActive.load(std::memory_order_relaxed);
+    const bool touchShowInFlight = OpenClaimHoldActive();
     const bool holdThroughClose =
         CloseInFlight() && (g_reveal.edgeCandidate || g_reveal.active);
     return touchShowInFlight || holdThroughClose;
@@ -5352,7 +5388,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
         g_contactOrigin = HidContactOrigin{};
         g_lateRelease = RevealLateRelease{};
         SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
-        SwipeIpcSetControllerTouch(&g_ipc, false);
+        SetControllerTouch(false);
         g_commitNeedsProgressReset = false;
 
         NoteVisibilityTransition(kVisibilityWantClosed);
@@ -5379,6 +5415,7 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
                 std::clamp(RevealEntryProgress(geometry), 0.0f, 1.0f);
             g_intentOpenEntry.store(entry, std::memory_order_relaxed);
             g_intentOpenActive.store(true, std::memory_order_relaxed);
+            NoteOpenClaimTick();
             g_panel.Begin(&entry);
             if (RequestBridgeShow(intent.method ? intent.method : 1,
                                   intent.flags)) {
@@ -5466,7 +5503,7 @@ void ApplyBridgeIntent() {
 
 void ReleaseExecutorOwnership() {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
-    SwipeIpcSetControllerTouch(&g_ipc, false);
+    SetControllerTouch(false);
     g_intentOpenActive.store(false, std::memory_order_relaxed);
     g_intentOpenEntry.store(0.0f, std::memory_order_relaxed);
 }
@@ -5807,7 +5844,7 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
         TraceLog(L"win close observed muted=%d", muted);
     }
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
-    SwipeIpcSetControllerTouch(&g_ipc, false);
+    SetControllerTouch(false);
     g_intentOpenActive.store(false, std::memory_order_relaxed);
 
     ForgetPendingDismiss();
@@ -5855,7 +5892,7 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
             CancelCloseSchedules(L"open");
             g_intentCancel = CloseCancelTicket{};
             SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionOpen);
-            SwipeIpcSetControllerTouch(&g_ipc, false);
+            SetControllerTouch(false);
             EndClose(L"open");
 
         }
@@ -6006,6 +6043,13 @@ uint64_t NextInputDeadlineMs(uint64_t nowTick, uint64_t nowQpc) {
     if (coasting) {
         considerQpc(g_panel.coastStartQpc +
                     static_cast<uint64_t>(kCoastDuration.count()));
+    }
+
+    // A hold that is still owed must wake when it expires: nothing else arms a
+    // deadline while it holds the idle release back.
+    const uint64_t holdUntil = OpenClaimHoldUntil();
+    if (holdUntil > nowTick) {
+        consider(holdUntil - nowTick);
     }
 
     if (!IdleReleaseHeld()) {
