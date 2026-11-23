@@ -5673,11 +5673,25 @@ void ApplyExecAck() {
             ForgetConfirmedDismiss();
 
             EndClose(L"repair");
+
+            // The close is over, but the panel can sit off its rest with the
+            // menu still visible. Restore at once when the cloak says open;
+            // otherwise keep a bounded watch so the unhealed repair restores it
+            // when the window is next observed open.
+            const CloakState cloak = ReadCloakState();
+            if (cloak == CloakState::Open) {
+                ShowAtRest();
+                g_commitNeedsProgressReset = false;
+            } else {
+                NoteVisibilityTransition(kVisibilityWantOpen);
+            }
             ReleaseExecutorOwnership();
-            TraceLog(L"exec dismiss %s command=%lld state=%u hr=%08X visible=%d",
+            TraceLog(L"exec dismiss %s command=%lld state=%u hr=%08X visible=%d "
+                    L"cloak=%s",
                     unconfirmed ? L"unconfirmed" : L"failed",
                     static_cast<long long>(ack.command), ack.state,
-                    static_cast<unsigned>(ack.hr), ack.visible);
+                    static_cast<unsigned>(ack.hr), ack.visible,
+                    CloakStateName(cloak));
             return;
         }
 
