@@ -13414,11 +13414,24 @@ void KillDismissConfirm() {
 
 bool ExecCommandForCurrentMenu(const SwipeIpcExecCommand& command,
                                const wchar_t* kind) {
+    if (command.kind == kSwipeExecShow) {
+
+        // A show names no menu: it claims the next open, it does not dismiss
+        // one, so the epoch and the ack bound are its only checks.
+        return true;
+    }
     uint64_t open = 0;
     uint64_t openTick = 0;
-    SwipeIpcReadOpen(&g_ipc, &open, &openTick);
+    if (!SwipeIpcReadOpen(&g_ipc, &open, &openTick)) {
 
-    if (command.open == 0 || open == 0 || command.open == open) {
+        // A failed read leaves the generation unknown; a dismiss naming a menu
+        // cannot be proven to hit that menu.
+        TraceLog(L"exec %s seq=%lld superseded reason=unreadable menu=%llu",
+                kind, static_cast<long long>(command.seq),
+                static_cast<unsigned long long>(command.open));
+        return false;
+    }
+    if (open == command.open) {
         return true;
     }
     TraceLog(L"exec %s seq=%lld superseded menu=%llu now=%llu", kind,
