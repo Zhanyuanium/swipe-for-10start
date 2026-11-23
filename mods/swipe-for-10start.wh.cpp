@@ -15996,6 +15996,19 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         return;
     }
 
+    // The mark a forwarded original leaves means that original's own takeover
+    // was already published. A Hide nested inside it is the same request, and a
+    // second record would replace the barrier and clear a press queued behind
+    // it. It is consumed before every publishing branch below — including the
+    // unexpected-method one — so a forwarded show's nested Hide can never
+    // publish the takeover a second time.
+    if (OwnTakeExternalForward(method)) {
+        TraceLog(L"exec pass hide method=%u reason=forwarded", method);
+        callOriginal();
+        OwnResyncFromState(self);
+        return;
+    }
+
     // The close intent is a command the Start side will ask the executor to run:
     // one line names the missing capability and the shell's own close runs. Peer,
     // caller sites and the executor come from HideCanServeClose, which also keeps
@@ -16019,15 +16032,6 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
                 method);
         PublishBridgeIntent(kSwipeIntentExternal, kSwipeTriggerOverride,
                             method, 0);
-        callOriginal();
-        OwnResyncFromState(self);
-        return;
-    }
-    // The mark a forwarded original leaves means that original's own takeover
-    // was already published. A Hide nested inside it is the same request, and a
-    // second record would replace the barrier and clear a press queued behind it.
-    if (OwnTakeExternalForward(method)) {
-        TraceLog(L"exec pass hide method=%u reason=forwarded", method);
         callOriginal();
         OwnResyncFromState(self);
         return;
