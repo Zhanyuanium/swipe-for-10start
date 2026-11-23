@@ -15460,32 +15460,60 @@ void ClosePeerProcessLocked() {
     g_peerProcessEpoch = 0;
 }
 
-bool PeerProcessDead() {
+// The answer a claimed record's process can give. A handle that could not be
+// opened is not evidence of death: the identity is not cached, so the next probe
+// retries it, and the claim stays reserved in the meantime.
+enum class PeerProcess : int { Unknown = 0, Alive, Dead };
+
+// One handle per (epoch, pid). A different identity closes the old handle first;
+// a failed open caches nothing. `ERROR_INVALID_PARAMETER` is the documented
+// answer for a pid that no longer exists, so it is the one open failure that is
+// death rather than silence. The caller may be a hook: the probe never waits past
+// a zero-time signalled test.
+PeerProcess PeerProcessProbe() {
     if (!g_ipc.state || g_disabled.load(std::memory_order_relaxed)) {
-        return false;
+        return PeerProcess::Unknown;
     }
     const uint32_t epoch = SwipeIpcPeerEpoch(&g_ipc);
     const uint32_t pid = SwipeIpcPeerPid(&g_ipc);
     if (epoch == 0 || pid == 0 || SwipeIpcPeerEpoch(&g_ipc) != epoch) {
-        return false;
+        return PeerProcess::Unknown;
     }
-    bool dead = false;
+    PeerProcess answer = PeerProcess::Unknown;
     AcquireSRWLockExclusive(&g_peerProcessLock);
-    if (g_peerProcessEpoch != epoch || g_peerProcessPid != pid) {
+    if (g_peerProcessEpoch != 0 &&
+        (g_peerProcessEpoch != epoch || g_peerProcessPid != pid)) {
+        // A replacement answers: the old handle belongs to another identity.
         ClosePeerProcessLocked();
+    }
+    if (!g_peerProcess) {
+        HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (!process) {
+            const DWORD error = GetLastError();
+            TraceLog(L"peer process open failed pid=%u epoch=%u err=%u", pid,
+                    epoch, error);
+            ReleaseSRWLockExclusive(&g_peerProcessLock);
+            return error == ERROR_INVALID_PARAMETER ? PeerProcess::Dead
+                                                    : PeerProcess::Unknown;
+        }
+        g_peerProcess = process;
         g_peerProcessPid = pid;
         g_peerProcessEpoch = epoch;
-        g_peerProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
-        if (!g_peerProcess) {
-            TraceLog(L"peer process open failed pid=%u epoch=%u err=%u", pid,
-                    epoch, GetLastError());
-        }
     }
-    if (g_peerProcess) {
-        dead = WaitForSingleObject(g_peerProcess, 0) == WAIT_OBJECT_0;
-    }
+    const DWORD wait = WaitForSingleObject(g_peerProcess, 0);
+    answer = wait == WAIT_OBJECT_0
+                 ? PeerProcess::Dead
+                 : (wait == WAIT_TIMEOUT ? PeerProcess::Alive
+                                         : PeerProcess::Unknown);
     ReleaseSRWLockExclusive(&g_peerProcessLock);
-    return dead;
+    return answer;
+}
+
+// The handle is acquired on the admission path, not only when a claim needs its
+// death proof: a host that claimed and died before the first press's probe would
+// otherwise leave an identity that can never be opened or retried.
+void WarmPeerProcess() {
+    PeerProcessProbe();
 }
 
 void ReleasePeerProcess() {
@@ -15611,6 +15639,11 @@ bool BridgeCanServeOnLauncherThread(const wchar_t* trigger,
         }
     }
     const uint32_t epoch = PeerEpochNow();
+    // The death proof's handle is acquired here, on the admission path, not only
+    // when a claimed record needs it: a host that claimed and exited before the
+    // first claim-path probe would otherwise leave an identity whose failed open
+    // was cached, and its slot would stay reserved forever.
+    WarmPeerProcess();
     if (!ExecutorWorkerReady()) {
         TraceLog(L"own pass trigger=%s reason=no-executor", trigger);
         return false;
@@ -15670,6 +15703,9 @@ bool HideCanServeClose(const wchar_t** reason) {
         *reason = L"callers-unverified";
         return false;
     }
+    // The same admission-path acquisition as the decision gate: this close enters
+    // the same queue and claim machinery.
+    WarmPeerProcess();
     if (!ExecutorWorkerReady()) {
         *reason = L"no-executor";
         return false;
@@ -16985,7 +17021,8 @@ bool ReconcileOutstandingAtAdmission(const wchar_t* reason, uint32_t epochNow) {
     const bool epochChanged =
         press.publishedEpoch != 0 && epochNow != press.publishedEpoch;
     const LONG64 taken = SwipeIpcTakenIntent(&g_ipc);
-    if (taken == press.seq && PeerProcessDead() && !epochChanged &&
+    if (taken == press.seq && PeerProcessProbe() == PeerProcess::Dead &&
+        !epochChanged &&
         PeerStateAliveNow()) {
         // The claim still reads alive only because a hard-killed Start host
         // cannot withdraw peerState. Its signalled process is the proof that the
@@ -17117,7 +17154,8 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
         const bool staleUnclaimed = !claimed && !PeerAliveNow();
         // A heartbeat age is not proof of death: the host may be paused with a
         // validated copy in hand.
-        const bool deadClaimed = claimed && PeerProcessDead();
+        const bool deadClaimed =
+            claimed && PeerProcessProbe() == PeerProcess::Dead;
         if (epochChanged || peerGone || staleUnclaimed || deadClaimed) {
             reconciled = ReconcileOutstandingAtAdmission(
                 epochChanged
@@ -17386,7 +17424,8 @@ void HandlePressAckTimeout() {
         const bool claimed = taken == press.seq;
         // A claimed barrier outlives a stale heartbeat. The takeover has no
         // original to replay, so a proved dead process releases it without one.
-        const bool deadClaimed = claimed && PeerProcessDead();
+        const bool deadClaimed =
+            claimed && PeerProcessProbe() == PeerProcess::Dead;
         if (!deadClaimed &&
             (peerAlive || (claimed && PeerStateAliveNow()))) {
             ReserveExternalBarrier(press, peer, peerAge, epochNow, wait, claimed,
@@ -17457,7 +17496,7 @@ void HandlePressAckTimeout() {
             ServeNextPress(L"epoch");
             return;
         }
-        if (PeerProcessDead()) {
+        if (PeerProcessProbe() == PeerProcess::Dead) {
             // The claimed record's process is signalled. It may have applied the
             // press, so there is no replay; the slot is released and the next
             // press may proceed.
