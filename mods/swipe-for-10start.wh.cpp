@@ -540,6 +540,11 @@ uint64_t g_visibilityPollUntil = 0;
 uint32_t g_visibilityWant = kVisibilityWantNone;
 uint64_t g_lastVisibilityPollTick = 0;
 
+// An unconfirmed dismiss can leave a visible menu at Progress=0. The open
+// sample is the evidence that the menu owns the rest position; this watch is
+// armed by that ack and spent by the first open sample.
+uint64_t g_unconfirmedRepairUntil = 0;
+
 void NoteVisibilityTransition(uint32_t want) {
     g_visibilityWant = want;
     const uint64_t now = GetTickCount64();
@@ -905,6 +910,7 @@ uint32_t g_pullSerial = 0;
 uint64_t g_pendingTapTick = 0;
 CloseKind g_pendingTapKind = CloseKind::None;
 uint32_t g_pendingTapPull = 0;
+uint32_t g_pendingTapSerial = 0;
 
 struct CloseScheduleCancel {
     bool slot = false;
@@ -919,6 +925,7 @@ void ScheduleCloseTap(CloseKind kind, uint64_t delayMs) {
     g_pendingTapTick = GetTickCount64() + delayMs;
     g_pendingTapKind = kind;
     g_pendingTapPull = g_pullSerial;
+    g_pendingTapSerial = g_close.serial;
 }
 
 std::atomic<HWND> g_coreHwnd{nullptr};
@@ -1055,6 +1062,7 @@ constexpr uint64_t kShowUnfulfilledMs = 600;
 
 uint64_t g_showWatchUntil = 0;
 LONG64 g_showWatchSeq = 0;
+LONG64 g_controllerShowSeq = 0;
 
 LONG64 g_lastIntentSeq = 0;
 
@@ -2133,20 +2141,22 @@ void CloseExecProcessLocked() {
     g_execProcessEpoch = 0;
 }
 
+// The probe keeps the handle across reads, so the Start unload is the one place
+// that releases it: without this, every activation leaves one process handle
+// in StartMenuExperienceHost.exe.
+void ReleaseExecProcess() {
+    AcquireSRWLockExclusive(&g_execProcessLock);
+    CloseExecProcessLocked();
+    ReleaseSRWLockExclusive(&g_execProcessLock);
+}
+
 enum class ExecProcess : int { Unknown = 0, Alive, Dead };
 
-ExecProcess ExecProcessProbe() {
-    if (!g_ipc.state) {
+ExecProcess ExecProcessProbe(uint32_t pid) {
+    if (!g_ipc.state || pid == 0) {
         return ExecProcess::Unknown;
     }
-    const uint32_t pid = SwipeIpcExecPid(&g_ipc);
     const uint32_t epoch = g_peerEpoch;
-    if (pid == 0) {
-
-        // The bridge publishes its pid before it can prove capability, so a
-        // missing pid is a bridge that has not announced itself: unknown.
-        return ExecProcess::Unknown;
-    }
     ExecProcess answer = ExecProcess::Unknown;
     AcquireSRWLockExclusive(&g_execProcessLock);
     if (g_execProcessEpoch != 0 &&
@@ -2176,13 +2186,31 @@ ExecProcess ExecProcessProbe() {
     return answer;
 }
 
-bool ExecutorProcessAlive() {
-    return ExecProcessProbe() == ExecProcess::Alive;
+bool ExecutorProcessAlive(uint32_t pid) {
+    return ExecProcessProbe(pid) == ExecProcess::Alive;
 }
 
+// The bridge clears the capability word, then publishes the new execPid, and
+// only the worker sets the word again. One read of the two words can pair the
+// old 1 with the new identity, so read the pid around the word, then probe that
+// same pid: a changed pid is an election in flight, and a settled pair alone
+// decides.
 bool BridgeCapabilityNow() {
-    return g_ipc.state != nullptr && SwipeIpcExecCapable(&g_ipc) &&
-           ExecutorProcessAlive();
+    if (!g_ipc.state) {
+        return false;
+    }
+    for (int attempt = 0; attempt < 2; attempt++) {
+        const uint32_t pid = SwipeIpcExecPid(&g_ipc);
+        if (pid == 0) {
+            return false;
+        }
+        const bool capable = SwipeIpcExecCapable(&g_ipc);
+        if (SwipeIpcExecPid(&g_ipc) != pid) {
+            continue;
+        }
+        return capable && ExecutorProcessAlive(pid);
+    }
+    return false;
 }
 
 bool PublishPeerReady(const wchar_t* why) {
@@ -2294,6 +2322,9 @@ bool RequestBridgeShow(uint32_t method, uint32_t flags) {
     g_pendingShowExec.store(sequence, std::memory_order_relaxed);
     g_pendingShowUntil.store(GetTickCount64() + kBridgeAckTimeoutMs,
                              std::memory_order_relaxed);
+    g_controllerShowSeq = sequence;
+    g_unconfirmedRepairUntil = 0;
+    RetireShowWatch(L"new-show");
 
     NoteVisibilityTransition(kVisibilityWantOpen);
     TraceLog(L"exec show request seq=%lld method=%u flags=%u",
@@ -3404,6 +3435,9 @@ void TakeCloseOwnership(CloseKind kind, uint64_t tickMs,
 
     SetControllerTouch(false);
 
+    g_unconfirmedRepairUntil = 0;
+    RetireShowWatch(L"close");
+
     ForgetConfirmedDismiss();
 
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionClosing);
@@ -3595,6 +3629,7 @@ void ResetActivationState() {
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
+    g_pendingTapSerial = 0;
     g_pullSerial = 0;
     g_touchRegistered = false;
     g_penRegistered = false;
@@ -3603,6 +3638,8 @@ void ResetActivationState() {
     g_pendingShowUntil.store(0, std::memory_order_relaxed);
     g_showWatchUntil = 0;
     g_showWatchSeq = 0;
+    g_controllerShowSeq = 0;
+    g_unconfirmedRepairUntil = 0;
 
     ForgetPendingDismiss();
     g_intentOpenActive.store(false, std::memory_order_relaxed);
@@ -3631,6 +3668,7 @@ void ResetActivationState() {
     g_scrollerRejectLogTick = 0;
     g_bandTailLogTick = 0;
     g_closeCancelledTick = 0;
+    g_unconfirmedRepairUntil = 0;
 
     g_ipcOpenTickLow = 0;
     g_peerTickLast = 0;
@@ -4164,6 +4202,14 @@ void SeedRevealEndVelocity(const GestureGeometry& geometry, float distance) {
     }
 }
 
+void AbandonRevealActivation(HidRevealSession& reveal, const wchar_t* reason) {
+    reveal.edgeCandidate = false;
+    EndContactTiming();
+    SetControllerTouch(false);
+    g_intentOpenActive.store(false, std::memory_order_relaxed);
+    TraceLog(L"reveal activation abandoned reason=%s", reason);
+}
+
 bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
                           uint64_t sampleQpc) {
     HidRevealSession& reveal = g_reveal;
@@ -4173,13 +4219,13 @@ bool ActivateRevealFollow(const GestureGeometry& geometry, float x, float y,
     }
     if (CloseInFlight()) {
 
+        AbandonRevealActivation(reveal, L"close");
         return false;
     }
     const float distance = geometry.distance();
     if (!(distance > 0.0f)) {
 
-        reveal.edgeCandidate = false;
-        EndContactTiming();
+        AbandonRevealActivation(reveal, L"geometry");
         return false;
     }
 
@@ -4243,6 +4289,7 @@ bool ClearLocalCloseTap() {
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
+    g_pendingTapSerial = 0;
     TraceLog(L"close dismiss cancelled kind=%s", CloseKindName(dropped));
     return true;
 }
@@ -5194,6 +5241,19 @@ void RunPendingCloseTap(uint64_t tickMs) {
     const CloseKind kind = g_pendingTapKind;
     const uint32_t pull = g_pendingTapPull;
 
+    if (g_pendingTapSerial != g_close.serial ||
+        g_close.phase == ClosePhase::Done) {
+        TraceLog(L"close dismiss skipped kind=%s reason=record-changed tap=%u "
+                L"close=%u phase=%s",
+                CloseKindName(kind), g_pendingTapSerial, g_close.serial,
+                ClosePhaseName(g_close.phase));
+        g_pendingTapTick = 0;
+        g_pendingTapKind = CloseKind::None;
+        g_pendingTapPull = 0;
+        g_pendingTapSerial = 0;
+        return;
+    }
+
     if (g_pullSerial != pull || g_reveal.active ||
         (g_reveal.edgeCandidate && !g_reveal.granted)) {
 
@@ -5205,6 +5265,7 @@ void RunPendingCloseTap(uint64_t tickMs) {
     g_pendingTapTick = 0;
     g_pendingTapKind = CloseKind::None;
     g_pendingTapPull = 0;
+    g_pendingTapSerial = 0;
 
     // The close belongs to the menu it was accepted on. A keyboard reopen
     // between acceptance and this deadline is a different menu, and a dismiss
@@ -5495,6 +5556,9 @@ void ApplyBridgeIntentRecord(const SwipeIpcIntent& intent) {
 
         const CloseScheduleCancel dropped = CancelCloseSchedules(L"external");
         const LONG64 show = CancelPendingShow(L"external");
+        RetireShowWatch(L"external");
+        g_controllerShowSeq = 0;
+        g_unconfirmedRepairUntil = 0;
         g_intentCancel = CloseCancelTicket{};
         EndClose(L"external");
         g_intentOpenActive.store(false, std::memory_order_relaxed);
@@ -5671,6 +5735,14 @@ void CheckShowWatch(uint64_t tickMs) {
     if (cloak == CloakState::Open) {
         return;
     }
+    if (sequence != g_controllerShowSeq ||
+        !g_intentOpenActive.load(std::memory_order_relaxed)) {
+        TraceLog(L"show watch stale seq=%lld current=%lld open=%d",
+                static_cast<long long>(sequence),
+                static_cast<long long>(g_controllerShowSeq),
+                g_intentOpenActive.load(std::memory_order_relaxed) ? 1 : 0);
+        return;
+    }
 
     // The show succeeded but no open sample arrived: the menu never appeared.
     // Give it back to the shell instead of owning a hidden menu as open.
@@ -5816,6 +5888,8 @@ void ApplyExecAck() {
                 g_commitNeedsProgressReset = false;
             } else {
                 NoteVisibilityTransition(kVisibilityWantOpen);
+                g_unconfirmedRepairUntil =
+                    GetTickCount64() + kVisibilityGraceMs;
             }
             ReleaseExecutorOwnership();
             TraceLog(L"exec dismiss %s command=%lld state=%u hr=%08X visible=%d "
@@ -5855,10 +5929,10 @@ void ApplyExecAck() {
                 static_cast<unsigned>(ack.hr));
         return;
     }
-    if (executed && ack.visible != kSwipeVisibilityVisible) {
+    if (executed) {
 
-        // Hidden is expected while the shell animates the reveal in; the watch
-        // decides whether the menu appeared at all. Unknown proves no more.
+        // The visibility probe is advisory: the Start side has not observed the
+        // open until its own cloak sample says so.
         ArmShowWatch(ack.command);
     }
 }
@@ -6040,6 +6114,9 @@ void LandClosedMenu(uint64_t tickMs, const wchar_t* reason) {
     SwipeIpcSetControllerDirection(&g_ipc, kSwipeDirectionUnowned);
     SetControllerTouch(false);
     g_intentOpenActive.store(false, std::memory_order_relaxed);
+    g_unconfirmedRepairUntil = 0;
+    RetireShowWatch(L"closed");
+    g_controllerShowSeq = 0;
 
     ForgetPendingDismiss();
 
@@ -6062,6 +6139,16 @@ bool ServiceRootVisibility(uint64_t tickMs, bool viaFallback) {
     if (open) {
 
         RetireShowWatch(L"cloak-open");
+    }
+    const bool unconfirmedRepair =
+        open && g_unconfirmedRepairUntil != 0 &&
+        tickMs <= g_unconfirmedRepairUntil;
+    if (unconfirmedRepair) {
+        g_unconfirmedRepairUntil = 0;
+        ShowAtRest();
+        g_commitNeedsProgressReset = false;
+        TraceLog(L"win open repair unconfirmed progress=%.3f",
+                PeekProgressNow());
     }
     const bool wasOpen = g_rootWasOpen;
 
@@ -6342,6 +6429,7 @@ void ServiceDeadlineWork(uint64_t tickMs) {
 
             g_visibilityPollUntil = 0;
             g_visibilityWant = kVisibilityWantNone;
+            g_unconfirmedRepairUntil = 0;
             ServiceRootVisibility(tickMs, true);
         } else if (g_lastVisibilityPollTick == 0 ||
                    tickMs - g_lastVisibilityPollTick >= kVisibilityFallbackMs) {
@@ -6359,6 +6447,8 @@ void ResetDrivenStateForCapabilityLoss() {
     g_pendingShowUntil.store(0, std::memory_order_relaxed);
     g_showWatchUntil = 0;
     g_showWatchSeq = 0;
+    g_controllerShowSeq = 0;
+    g_unconfirmedRepairUntil = 0;
     g_intentCancel = CloseCancelTicket{};
     ReleaseExecutorOwnership();
     if (g_hidSession.active) {
@@ -9952,6 +10042,15 @@ void RequireNoModuleCallbacks(bool waitForEntries) {
     }
 }
 
+void RequireNoInlineUiTurns() {
+    if (g_moduleEntryCount.load(std::memory_order_acquire) == 0 &&
+        g_uiRegistrationCount.load(std::memory_order_acquire) == 0 &&
+        g_uiOwnerDepth.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    BlockUnload(L"inline unload left a ui turn");
+}
+
 bool DrainUiThread(HWND hwnd) {
     g_uiDrainServed.store(false, std::memory_order_release);
     if (hwnd) {
@@ -10198,6 +10297,10 @@ void RoleUninit() {
         uiWindow = TeardownUiOnUiThread();
     }
 
+    if (inlineUnload) {
+        RequireNoInlineUiTurns();
+    }
+
     if (!inlineUnload && !uiWindow &&
         g_uiTurnEverUsed.load(std::memory_order_acquire)) {
         BlockUnload(L"no window to drain module entries");
@@ -10225,6 +10328,7 @@ void RoleUninit() {
 
     ClearScrollerRetry();
     SwipeIpcClose(&g_ipc);
+    ReleaseExecProcess();
 
     if (g_hidStopEvent) {
         CloseHandle(g_hidStopEvent);
@@ -10929,6 +11033,12 @@ bool ExecutorWorkerReady() {
 }
 
 bool ExecutorCapabilityNow() {
+    // A takeover cancels an intent by setting the channel's intent event. A
+    // bridge without that event can publish a show nothing can cancel, so it
+    // never reports itself capable, whatever else is ready.
+    if (!g_ipc.state || !g_ipc.intentEvent) {
+        return false;
+    }
     if (!ExecutorWorkerReady() ||
         g_execDispatchClosed.load(std::memory_order_acquire) ||
         !g_launcherProven.load(std::memory_order_acquire) ||
@@ -13482,6 +13592,15 @@ void ExecuteShow(const SwipeIpcExecCommand& command) {
                    HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
         return;
     }
+    if (g_pressOutstanding.pending && g_pressOutstanding.external) {
+        TraceLog(L"exec show seq=%lld refused reason=external-barrier "
+                L"barrier=%lld",
+                static_cast<long long>(command.seq),
+                static_cast<long long>(g_pressOutstanding.seq));
+        AnswerExec(command.seq, kSwipeAckRefused,
+                   HRESULT_FROM_WIN32(ERROR_RETRY), kSwipeVisibilityUnknown);
+        return;
+    }
     if (!ExecCommandForCurrentMenu(command, L"show")) {
         AnswerExec(command.seq, kSwipeAckSuperseded,
                    HRESULT_FROM_WIN32(ERROR_TIMEOUT), kSwipeVisibilityUnknown);
@@ -14122,7 +14241,9 @@ bool RemoveExecutorThreadHookLocked() {
     const DWORD error = GetLastError();
     if (error == ERROR_INVALID_HOOK_HANDLE) {
 
-        // The thread that owned the hook is gone, so it cannot enter again.
+        // The error proves the hook handle is invalid; it does not prove the
+        // owning thread exited. The handle can unhook nothing, so it is
+        // dropped: a retry with the same handle cannot succeed.
         g_execThreadHook.store(nullptr, std::memory_order_release);
         g_execThreadHookTarget.store(0, std::memory_order_release);
         TraceLog(L"exec thread hook already gone err=%u", error);
@@ -14750,6 +14871,11 @@ HANDLE g_shellElectStop = nullptr;
 void InitialiseBridge() {
     Wh_Log(L"Swipe for 10Start %s initializing (explorer role)", kModVersion);
 
+    // The election can wait for a shell to appear, and the host delivers a
+    // settings change to a role that is not initialised yet: sample the trace
+    // setting here so a change made while the election waited is honoured.
+    RefreshTraceSetting();
+
     g_pressQueueHead = 0;
     g_pressQueueCount = 0;
     g_pressOutstanding = OutstandingPress{};
@@ -14783,10 +14909,12 @@ void InitialiseBridge() {
     } else {
         TraceLog(L"ipc open created=%d", created ? 1 : 0);
 
-        // The pid is published before the capability word: the Start side
-        // accepts a capable bridge only when that process is still alive.
-        SwipeIpcSetExecPid(&g_ipc, GetCurrentProcessId());
+        // The section outlives an Explorer crash, so the word can still be 1
+        // from the dead bridge. Clear it before the new pid becomes visible:
+        // a reader that paired the old word with the new identity would
+        // publish work before the worker exists. The worker publishes 1.
         PublishExecutorCapability(L"init");
+        SwipeIpcSetExecPid(&g_ipc, GetCurrentProcessId());
     }
 
     g_execOwnerDepth = 0;
