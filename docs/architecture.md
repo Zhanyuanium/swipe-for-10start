@@ -1,6 +1,6 @@
 # Architecture — one controller, one executor
 
-> Mod 0.8.5: one source, two process halves. Channel 240 B, no product version
+> Mod 0.8.6: one source, two process halves. Channel 240 B, no product version
 > word (`SingleMod6` namespace). Measured on the machine in `../AGENTS.md`.
 
 ## What ships

@@ -3,7 +3,7 @@
 
 ## Members
 
-swipe-for-10start.wh.cpp (0.8.5): the shipping mod. One image, installed once, loaded into `StartMenuExperienceHost.exe` (namespace `start`) and `explorer.exe` (namespace `bridge`); `Wh_ModInit` picks one role table from the host executable name, and the other half's hooks, threads and handles never exist there. Settings: `AnimationStyle` (`Windows 11` / `Windows 10` damping), `GestureStartSpeedPercent` (0-300), `CommitDistancePercent` (1-50, default 10, one value on every axis), `DiagnosticTrace` (default false), all read into atomics at init and on change.
+swipe-for-10start.wh.cpp (0.8.6): the shipping mod. One image, installed once, loaded into `StartMenuExperienceHost.exe` (namespace `start`) and `explorer.exe` (namespace `bridge`); `Wh_ModInit` picks one role table from the host executable name, and the other half's hooks, threads and handles never exist there. Settings: `AnimationStyle` (`Windows 11` / `Windows 10` damping), `GestureStartSpeedPercent` (0-300), `CommitDistancePercent` (1-50, default 10, one value on every axis), `DiagnosticTrace` (default false), all read into atomics at init and on change.
 swipe_ipc_shared.h: the channel. One section of 240 bytes and five events, every record a seqlock with its own counter, every offset a `static_assert`, magic `0x53333053`.
 start-menu-touch-gesture-probe.wh.cpp: the early gesture-source experiment; refuses new hooks from `BeforeUninit` and keeps its handles when the scan thread does not join.
 msgprobe.wh.cpp: pointer messages and `GetPointerInfo` ownership; writes `msgprobe.log` under `Wh_GetModStoragePath` and joins its poller.

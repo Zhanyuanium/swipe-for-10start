@@ -7,6 +7,7 @@ pair that shipped before the merge.
 
 | Tag | Start | Bridge | Channel | What it is |
 |---|---:|---:|---:|---|
+| `v0.8.6` | 0.8.6 | — | 240 B | the fifth review answered and an independent audit: the bridge runs only in the shell's Explorer and survives its restart, the heartbeat no longer stalls on pen hover, a click during a close only reverses on Start or the desktop, and a dozen lifetime and ordering defects behind both halves |
 | `v0.8.5` | 0.8.5 | — | 240 B | the fourth review answered: the classic-Start gate reads the value ExplorerPatcher writes, a frozen host's claim expires, the open-time survey is gone, the guides state the real cost of an unsupported build |
 | `v0.8.4` | 0.8.4 | — | 240 B | the collection's second review answered: a proven executor thread, a press never swallowed without a live process, hook frames and teardown that outlive the image, takeovers forwarded |
 | `v0.8.3` | 0.8.3 | — | 232 B | one drag-intent setting for every side, a mod page composed from both guides with localized names and settings, and two full-screen demos |
@@ -26,6 +27,32 @@ pair that shipped before the merge.
 | `v0.1.0` | 0.6.5 | 0.3.0 | — | legacy Start touch gestures: swipe-to-dismiss and edge-swipe-to-open follow the finger |
 
 `—` means the release predates the shared-memory channel.
+
+## v0.8.6 — the fifth review and an independent audit
+
+Windhawk `@version` 0.8.6. The channel moves to `SingleMod6_` with `execPid`
+beside `execCapable` (240 bytes, same size).
+
+- **Only the shell's Explorer runs the bridge.** A second `explorer.exe` (a folder
+  window in its own process, `explorer.exe /select`) no longer overwrites the
+  capability or competes for the channel's events. The bridge elects itself when
+  its process owns `Shell_TrayWnd`, so an Explorer restart re-initialises it
+  without a reinstall.
+- **The heartbeat no longer stalls on pen hover**, so Win and Start presses are
+  never mistaken for a stale peer during an in-range stream.
+- **A click during a close only reverses on the Start menu or the desktop**;
+  clicking another app keeps its close.
+- **A frozen Start host no longer blocks the buttons**: a claimed press expires
+  after 2000 ms without an ack.
+- **Takeovers withdraw what they replace**: a pending show is cancelled when an
+  external takeover arrives, and a dismiss whose timer cannot be armed is refused
+  rather than run early.
+- **The panel never stays off-screen**: an unconfirmed dismiss and a show that
+  never appears both repair to rest, and the touch claim's idle hold is bounded.
+- **A close is bound to its menu**: a close whose menu was replaced before its
+  deadline no longer dismisses the replacement.
+- **A dead executor is dropped at once**: the Start side holds a process handle to
+  the bridge's `execPid`, not just the capability word.
 
 ## v0.8.5 — the fourth review answered
 

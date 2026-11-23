@@ -15,7 +15,7 @@ CHANGELOG.md - release history: one row per tag with the channel size it shipped
 
 Laws: measure before designing · one data source per claim · docs and code move together
 
-## What ships (0.8.5, one mod)
+## What ships (0.8.6, one mod)
 
 One mod, two processes. `mods/swipe-for-10start.wh.cpp` is installed once and
 loaded into `StartMenuExperienceHost.exe` (namespace `start`) and into
