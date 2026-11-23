@@ -1,146 +1,14 @@
-#pragma once
+﻿#pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <windows.h>
 
 
-// Shared-memory contract between the StartMenuExperienceHost-side controller and
-// the explorer-side bridge.
-//
-// Two processes, one session-local section and five auto-reset events. There is
-// no file, no mutex and no polling: every record carries its own sequence
-// number, and a reader accepts a record only when that number did not move
-// while the record was being copied.
-//
-//   Local\SwipeFor10Start_SingleMod5_State      SwipeIpcState
-//   Local\SwipeFor10Start_SingleMod5_Intent     auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod5_IntentAck  auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod5_Exec       auto-reset, Start -> bridge
-//   Local\SwipeFor10Start_SingleMod5_ExecAck    auto-reset, bridge -> Start
-//   Local\SwipeFor10Start_SingleMod5_Capability auto-reset, bridge -> Start
-//
-// The names are session-local because both processes run as the same user in the
-// same session. There is no product version word: the ABI namespace *is* the
-// layout identity. The `5` marks the layout that added `peerUiThread` (it fills
-// the tail padding beside `peerPid`, so the byte count stays 240 while the meaning
-// of that word changed); a
-// future incompatible layout changes the prefix again, so an old
-// pinned development image can never join this channel and a same-size change is
-// never reinterpreted across a staggered update. Only a single shipping mod
-// uses these names.
-//
-// ---------------------------------------------------------------------------
-// Publishing: one seqlock per record
-// ---------------------------------------------------------------------------
-//
-// Every record a reader copies more than one word from has its own counter. The
-// writer bumps the counter to an odd value, writes the fields, and bumps it back
-// to even. The reader reads the counter, copies the fields, reads the counter
-// again, and accepts the copy only when both reads are equal and even. A torn
-// copy is therefore impossible to accept.
-//
-// One counter for the whole section would not work: the records are written by
-// different processes (the Start side the open generation and the executor
-// command, the bridge the intent), and a shared counter would invalidate a
-// record another side is reading.
-//
-// A counter left odd means its writer died between the two bumps. The next
-// writer takes the record at the next odd value, so no reader can accept the
-// fields the dead writer left behind; a reader treats an odd counter as "no
-// stable record" after a bounded number of attempts and falls back.
-//
-// ---------------------------------------------------------------------------
-// Who initialises the section
-// ---------------------------------------------------------------------------
-//
-// The section exists as soon as the first of the two processes calls
-// CreateFileMappingW, and the other can map it before a single byte was written.
-// Creation is therefore not initialisation:
-//
-//   1. A process claims the section by an interlocked exchange of initState from
-//      blank (0) or abandoned (3) to initialising (1). It writes initTick first.
-//   2. The claimer writes magic and layoutBytes, then publishes initState =
-//      ready (2).
-//   3. A process that finds initState = initialising waits and re-checks, in one
-//      millisecond steps, for kSwipeIpcOpenBudgetMs: kSwipeIpcInitAbandonMs plus
-//      one kSwipeIpcInitWaitMs window, so a dead claim becomes abandonable while
-//      this call is still waiting for it.
-//   4. A claim older than kSwipeIpcInitAbandonMs is marked abandoned, and the
-//      next attempt claims it. A process that died inside step 2 therefore does
-//      not brick the channel for the rest of the session.
-//   5. Any other initState value is refused with ERROR_INVALID_DATA at once.
-//
-// SwipeIpcOpen may sleep for its whole budget. Call it from mod init and never
-// from a hook.
-//
-// A reader tells the two failures apart by the error code:
-//   ERROR_NOT_READY    no section was handed over: the section is not ready yet
-//                      or the budget expired. Nothing was changed.
-//   ERROR_INVALID_DATA initState is not one of the four values, or it says ready
-//                      while magic or layoutBytes disagrees.
-//
-// Neither side ever destroys a section the other side may hold: SwipeIpcClose
-// closes this process's handles only.
-//
-// ---------------------------------------------------------------------------
-// The records
-// ---------------------------------------------------------------------------
-//
-// Open generation (Start -> bridge): a counter the Start side publishes when it
-// sees a fresh menu open. The even value is the identity of that menu. A counter
-// of 0 is not a generation; SwipeIpcReadOpen reports ERROR_NOT_READY.
-//
-// Intent (bridge -> Start): the one decision record. kind is open/close/external,
-// trigger names the adapter (win, startbutton, clickaway, touch, override), and
-// method/flags are the shell call's own. `open` is the generation the bridge saw.
-// A close intent's method is evidence about the shell path that produced it; the
-// Start side chooses the executor's execution method separately. The Start side
-// answers with intentAck (state, duration, entry, hr), echoing the intent's
-// sequence.
-//
-// Executor command (Start -> bridge): show, dismiss or cancel. The bridge
-// validates the record before it calls the launcher: a show names a show method
-// (1, 11 or 16) and a flag word from the verified mask; a dismiss names a
-// dismiss method (1 or 6) and no flags; a cancel names the dismiss sequence it
-// supersedes. A dismiss carries the GetTickCount64 deadline at which the bridge
-// must call the launcher; `execTick` is the publish tick and is the deadline of a
-// show and a cancel. A command older than the publisher's budget past its
-// deadline is stale: the publisher has already cleared its sequence and released
-// ownership, so the bridge answers it as expired instead of calling the launcher.
-// The bridge answers with execAck (state, hr, visible), where visible is the
-// IsVisible result and is advisory for a dismiss.
-//
-// Controller state (Start -> bridge): one direction word and one touch flag.
-// controllerDirection is the whole decision: the bridge reads that single word,
-// never a pair of flags, so it cannot see new ownership beside a stale phase.
-// Values: kSwipeDirectionUnowned / Open / Closing.
-//
-// Peer liveness (Start -> bridge): peerEpoch, peerPid, peerUiThread, peerTick
-// and peerState.
-// The bridge creates the section, so a mapped section says nothing about whether
-// the Start side is running; these words are the answer the bridge's gate needs.
-// peerEpoch identifies the activation: it is incremented once per attach,
-// before the tick, so a decision the bridge latched against one activation can
-// tell that a different one now answers. peerPid is the process that owns that
-// epoch, written before the epoch; peerUiThread is the Start side's own XAML UI
-// thread, written when the attach records it. peerState is alive after the consumer
-// is running and gone as soon as that consumer stops; peerTick is the low 32 bits
-// of GetTickCount64, refreshed from the Start side's input thread at most once
-// per kSwipePeerTickIntervalMs. The bridge intercepts only while the state is
-// alive and the tick is younger than kSwipePeerStaleMs: a clean disable is
-// immediate through peerState, and a crashed host is caught by the tick going
-// stale. That window is a detection budget, not a delivery guarantee.
-//
-// Executor capability (bridge -> Start): execCapable is one word. It is 1 only
-// while the bridge has an executor window created on the recorded launcher
-// thread, a started worker, a verified launcher layout and the show/dismiss
-// primitives that window will call. The bridge clears it on any loss - unload,
-// window destruction, worker exit, symbol refusal - and signals capabilityEvent.
-// The Start side publishes peerState=alive only while execCapable is 1 and
-// withdraws it when the word drops, so a mapping is never mistaken for a usable
-// executor. The word is a flag, not a record: the reader takes the steady value
-// and the event only says that it changed.
+// Shared-memory contract between the Start-side controller and the explorer-side
+// bridge: one session-local section and five auto-reset events, every record a
+// seqlock. The names are Local\SwipeFor10Start_SingleMod5_*; that namespace is
+// the ABI identity, and there is no product version word.
 
 constexpr wchar_t kSwipeIpcStateName[] =
     L"Local\\SwipeFor10Start_SingleMod5_State";
@@ -155,9 +23,8 @@ constexpr wchar_t kSwipeIpcExecAckEventName[] =
 constexpr wchar_t kSwipeIpcCapabilityEventName[] =
     L"Local\\SwipeFor10Start_SingleMod5_Capability";
 
-constexpr uint32_t kSwipeIpcMagic = 0x53333053;  // 'S' '3' '0' 'S', LE
+constexpr uint32_t kSwipeIpcMagic = 0x53333053;
 
-// M3 intents, executor commands and acknowledgements.
 constexpr int32_t kSwipeIntentOpen = 0;
 constexpr int32_t kSwipeIntentClose = 1;
 constexpr int32_t kSwipeIntentExternal = 2;
@@ -176,79 +43,45 @@ constexpr int32_t kSwipeAckPending = 0;
 constexpr int32_t kSwipeAckExecuted = 1;
 constexpr int32_t kSwipeAckRefused = 2;
 constexpr int32_t kSwipeAckExpired = 3;
-// The dismiss confirmation, kept apart from the call's own outcome. `Executed`
-// means the primitive returned; `Confirmed` means a later probe read the window
-// hidden; `Unconfirmed` means the probe read it visible; `Unknown` means the
-// probe could not answer (no launcher, no state, a failed call). A dismiss is
-// never reported as a hide on the strength of its return value alone.
+
 constexpr int32_t kSwipeAckConfirmed = 4;
 constexpr int32_t kSwipeAckUnconfirmed = 5;
 constexpr int32_t kSwipeAckUnknown = 6;
-// A record a newer command or a new activation superseded before it could run.
-// Distinct from `Expired`, which means the publisher's budget ran out.
+
 constexpr int32_t kSwipeAckSuperseded = 7;
 
-// The `execAckVisible` word. Negative means the probe could not answer; it is
-// not a hidden window.
 constexpr int32_t kSwipeVisibilityUnknown = -1;
 constexpr int32_t kSwipeVisibilityHidden = 0;
 constexpr int32_t kSwipeVisibilityVisible = 1;
 
-// initState values; see "Who initialises the section" above.
 constexpr LONG kSwipeIpcBlank = 0;
 constexpr LONG kSwipeIpcInitialising = 1;
 constexpr LONG kSwipeIpcReady = 2;
 constexpr LONG kSwipeIpcAbandoned = 3;
 
-// One wait step for a live claim, the age at which a claim is dead, and the
-// whole budget of one SwipeIpcOpen call: the budget must outlast the abandon age,
-// or a caller that arrives while a claim is still young would leave without a
-// channel. See "Who initialises the section" above.
 constexpr ULONGLONG kSwipeIpcInitWaitMs = 50;
 constexpr ULONGLONG kSwipeIpcInitAbandonMs = 500;
 constexpr ULONGLONG kSwipeIpcOpenBudgetMs =
     kSwipeIpcInitAbandonMs + kSwipeIpcInitWaitMs;
 
-// How many times a reader retries a record whose counter moved. A record is a
-// handful of word-sized writes, so a live writer leaves the odd state within
-// nanoseconds; a writer that is preempted mid-record fails these attempts and
-// the caller falls back instead of spinning.
 constexpr int kSwipeIpcReadAttempts = 8;
 
-// Peer liveness. The publisher refreshes peerTick at most once per interval; the
-// reader declares the peer gone after the window without a refresh. The window
-// is six intervals: five consecutive refreshes may be missed without closing the
-// gate, so an ordinary stall of the input thread (a settle, a busy message loop)
-// does not flap it, while a killed Start host stops every interception within
-// 0.6 s.
 constexpr uint32_t kSwipePeerTickIntervalMs = 100;
 constexpr uint32_t kSwipePeerStaleMs = 600;
 
-// peerState values. A fresh section reads 0, so `gone` is also what the bridge
-// finds before the Start side ever attaches.
 constexpr int32_t kSwipePeerGone = 0;
 constexpr int32_t kSwipePeerAlive = 1;
 
-// The layout is written once, here, and both sides include this header.
-// Windhawk compiles each mod from stdin against the repository include path, and
-// a copy in each source would drift. The asserts below pin every field.
 struct SwipeIpcState {
     uint32_t magic;
 
-    // Start -> bridge. openSeq is the record's counter and its even value is
-    // the open generation.
     volatile LONG64 openSeq;
     volatile LONG64 openTick;
 
-    // Initialisation handshake; see "Who initialises the section".
     volatile LONG initState;
     volatile LONG layoutBytes;
     volatile LONG64 initTick;
 
-    // M3: bridge -> Start intent (seqlock). `intentOpen` is the open generation
-    // the bridge saw; `intentKind` is open/close/external and `intentTrigger`
-    // names the adapter. `intentMethod` is the shell method that produced the
-    // trigger (7 for a click-away) and is evidence, not an execution method.
     volatile LONG64 intentSeq;
     volatile LONG64 intentTick;
     volatile LONG intentKind;
@@ -257,82 +90,42 @@ struct SwipeIpcState {
     volatile LONG intentFlags;
     volatile LONG64 intentOpen;
 
-    // M3: Start -> bridge answer to an intent (seqlock). `intentAckFor` echoes
-    // the intent sequence; durationMs is the close settle the Start planned;
-    // entryPercent is the open entry in tenths of a percent.
     volatile LONG64 intentAckSeq;
     volatile LONG64 intentAckFor;
-    volatile LONG intentAckState;     // kSwipeAck*
+    volatile LONG intentAckState;
     volatile LONG intentAckDuration;
     volatile LONG intentAckEntry;
     volatile LONG intentAckHr;
 
-    // M3: Start -> bridge executor command (seqlock). Show and cancel run now;
-    // dismiss is due at execExecuteAt (a GetTickCount64 deadline). `execOpen` is
-    // the open generation from SwipeIpcReadOpen, not the open tick: 0 means the
-    // record names no menu and the menu guard allows it.
     volatile LONG64 execSeq;
     volatile LONG64 execTick;
-    volatile LONG execKind;           // kSwipeExec*
+    volatile LONG execKind;
     volatile LONG execMethod;
     volatile LONG execFlags;
     volatile LONG64 execExecuteAt;
     volatile LONG64 execOpen;
-    volatile LONG64 execTarget;       // the dismiss sequence a cancel names
+    volatile LONG64 execTarget;
 
-    // M3: bridge -> Start executor answer (seqlock). state is the outcome; hr is
-    // the launcher's HRESULT and visible is the visibility probe afterwards
-    // (kSwipeVisibility*). A dismiss is answered twice: once when the primitive
-    // returns (`Executed`) and once when the confirmation probe reads the window
-    // (`Confirmed`/`Unconfirmed`/`Unknown`). The record is one answer, not a
-    // queue: a later answer replaces it before the Start side reads it, so the
-    // reader matches `execAckFor` and never attributes one state to another
-    // sequence.
     volatile LONG64 execAckSeq;
     volatile LONG64 execAckFor;
     volatile LONG execAckState;
     volatile LONG execAckHr;
     volatile LONG execAckVisible;
 
-    // M3/v5: the Start-side session. One authoritative direction word, so the
-    // bridge's toggle rule reads a single atomic value and can never see new
-    // ownership beside the previous phase.
-    volatile LONG controllerDirection;  // kSwipeDirection*
-    // 1 while a touch contact owns the opening panel. The bridge swallows the
-    // shell's click-away from that same opening contact; it is the finger that
-    // pulled the menu out, not a press outside it.
+    volatile LONG controllerDirection;
+
     volatile LONG controllerTouch;
-    // The Start side's liveness and identity. peerTick is the low 32 bits of
-    // GetTickCount64, so the reader compares by unsigned difference and a wrap
-    // after 49.7 days is not a discontinuity. peerState is kSwipePeer*.
-    // peerEpoch counts attachments: it is incremented before the tick and alive,
-    // so an epoch read beside `alive` names the activation that published them.
+
     volatile LONG peerTick;
     volatile LONG peerState;
     volatile LONG peerEpoch;
-    // The process that owns `peerEpoch`, written at attach before the epoch and
-    // before anything is published. The bridge opens a process handle for it and
-    // treats a claim as dead only when that handle is signalled: a heartbeat age
-    // is not proof of death.
+
     volatile LONG peerPid;
 
-    // The Start side's own UI thread, written when the attach records it. It is a
-    // thread of the peer process (`peerPid`), so it can never name a thread of the
-    // bridge's process: the bridge reads it as the peer activation's identity,
-    // never as a launcher candidate. 0 means this activation has not recorded one.
     volatile LONG peerUiThread;
 
-    // Start -> bridge: the sequence of the intent the consumer has taken for
-    // processing. The Start side writes it before it acts, so a publisher whose
-    // ack timed out can tell "the controller has this record" from "the record
-    // is still untaken". One atomic word, not a seqlock: it is a claim, not a
-    // record with fields that must agree.
     volatile LONG64 intentTaken;
 
-    // Bridge -> Start: 1 only while the executor can actually execute. The Start
-    // side requires it before it advertises a controller and before it drives a
-    // touch open or close; a press is never swallowed for a bridge that cannot
-    // perform the command. Written by the bridge, read by the Start side.
     volatile LONG execCapable;
 };
 
@@ -389,16 +182,10 @@ struct SwipeIpcChannel {
     HANDLE capabilityEvent;
 };
 
-// Reads a 64-bit field that the other process may write at any time.
 inline LONG64 SwipeIpcLoad64(volatile LONG64* value) {
     return InterlockedCompareExchange64(value, 0, 0);
 }
 
-// Takes a record for writing: the returned value is odd. A counter left odd by
-// a writer that died is stepped forward to the next odd value, never back to the
-// even one it left behind: that even value would be accepted by a reader
-// together with the dead writer's half-written fields, and only the odd state
-// keeps every reader out until this write is complete.
 inline LONG64 SwipeIpcBeginWrite(volatile LONG64* sequence) {
     const LONG64 current = SwipeIpcLoad64(sequence);
     if ((current & 1) != 0) {
@@ -407,14 +194,10 @@ inline LONG64 SwipeIpcBeginWrite(volatile LONG64* sequence) {
     return InterlockedIncrement64(sequence);
 }
 
-// Releases a record: the returned value is even and is the published sequence.
 inline LONG64 SwipeIpcEndWrite(volatile LONG64* sequence) {
     return InterlockedIncrement64(sequence);
 }
 
-// Copies one record and returns the sequence it was copied under. `copy` writes
-// the fields into the caller's snapshot; it runs at least once and at most
-// kSwipeIpcReadAttempts times. False means no stable record was copied.
 template <typename Copier>
 inline bool SwipeIpcSnapshot(volatile LONG64* sequence, LONG64* outSequence,
                              Copier&& copy) {
@@ -422,12 +205,12 @@ inline bool SwipeIpcSnapshot(volatile LONG64* sequence, LONG64* outSequence,
         const LONG64 before = SwipeIpcLoad64(sequence);
         if ((before & 1) != 0) {
             MemoryBarrier();
-            continue;  // a write is in progress
+            continue;
         }
         copy();
         MemoryBarrier();
         if (SwipeIpcLoad64(sequence) != before) {
-            continue;  // the record moved under the copy
+            continue;
         }
         *outSequence = before;
         return true;
@@ -435,16 +218,6 @@ inline bool SwipeIpcSnapshot(volatile LONG64* sequence, LONG64* outSequence,
     return false;
 }
 
-// Creates the channel when the other side has not, initialises it when neither
-// side has, then validates it. `created` reports that this call performed the
-// initialisation. Every member is optional except the section itself: a missing
-// event disables only the direction it carries. On failure `*error` is
-// ERROR_NOT_READY or ERROR_INVALID_DATA as described above, or the failing Win32
-// code.
-//
-// This call may sleep for kSwipeIpcOpenBudgetMs while another process finishes
-// its claim, so it belongs at mod init. A hook must not call it: a hook that
-// finds no channel takes its own fixed lead.
 inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) {
     *created = false;
     *error = 0;
@@ -467,12 +240,6 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
         return false;
     }
 
-    // Claim, wait, or discover ready. A section that another process created is
-    // initialised by whichever of the two gets here first, never by "the
-    // creator": the creator may still be between its CreateFileMappingW and its
-    // first write. The deadline outlasts the abandon age on purpose, so a claim
-    // that is alive but stuck becomes this caller's instead of ending the wait
-    // with no channel.
     const ULONGLONG deadline = GetTickCount64() + kSwipeIpcOpenBudgetMs;
     const auto fail = [&](DWORD code) -> bool {
         *error = code;
@@ -488,8 +255,7 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
             break;
         }
         if (observed == kSwipeIpcBlank || observed == kSwipeIpcAbandoned) {
-            // initTick goes first: a claim must carry its own age before it can
-            // be judged dead by anyone.
+
             state->initTick = static_cast<LONG64>(GetTickCount64());
             if (InterlockedCompareExchange(&state->initState,
                                            kSwipeIpcInitialising,
@@ -497,25 +263,17 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
                 owner = true;
                 break;
             }
-            // Another process claimed it first. The next pass sees its state;
-            // the budget still bounds this loop.
+
             if (GetTickCount64() >= deadline) {
                 return fail(ERROR_NOT_READY);
             }
             continue;
         }
         if (observed != kSwipeIpcInitialising) {
-            // Not a state this header publishes. Waiting cannot turn it into a
-            // claim, and a loop that waited anyway would outlast the documented
-            // budget. The section belongs to another build or is corrupt; it is
-            // left untouched for its owner.
+
             return fail(ERROR_INVALID_DATA);
         }
 
-        // Initialising. Either a live claim or one whose owner died inside it.
-        // A claim older than the abandon age is taken over, which is what the
-        // caller's whole budget is for; only a claim with no readable age can
-        // outlast the budget.
         const ULONGLONG claimed =
             static_cast<ULONGLONG>(SwipeIpcLoad64(&state->initTick));
         const ULONGLONG now = GetTickCount64();
@@ -523,8 +281,7 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
             now - claimed > kSwipeIpcInitAbandonMs) {
             InterlockedCompareExchange(&state->initState, kSwipeIpcAbandoned,
                                        kSwipeIpcInitialising);
-            // Re-observe whether this process or another one marked it; the
-            // deadline check covers a takeover that another caller won first.
+
             if (GetTickCount64() >= deadline) {
                 return fail(ERROR_NOT_READY);
             }
@@ -547,8 +304,7 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
     if (state->initState != kSwipeIpcReady ||
         state->magic != kSwipeIpcMagic ||
         state->layoutBytes != static_cast<LONG>(sizeof(SwipeIpcState))) {
-        // Broken, or written by another layout. Nothing here is repaired: the
-        // other side may be live on it.
+
         *error = ERROR_INVALID_DATA;
         UnmapViewOfFile(state);
         CloseHandle(mapping);
@@ -577,9 +333,6 @@ inline bool SwipeIpcOpen(SwipeIpcChannel* channel, bool* created, DWORD* error) 
     return true;
 }
 
-// Drops this process's handles. The section and its events stay alive while the
-// other side holds them, so a restarted side reopens the same channel and finds
-// the other side's records where it left them.
 inline void SwipeIpcClose(SwipeIpcChannel* channel) {
     if (channel->state) {
         UnmapViewOfFile(channel->state);
@@ -605,11 +358,6 @@ inline void SwipeIpcClose(SwipeIpcChannel* channel) {
     *channel = SwipeIpcChannel{};
 }
 
-// Publishes a fresh menu open and returns its generation (the even value of the
-// record's counter, unique for every open). Called by the Start side when it
-// sees the window uncloak, which is also where the open settle starts. This is
-// where the Start side must cancel the close stamp it left; the bridge refuses a
-// stamp older than this tick whether or not it does.
 inline LONG64 SwipeIpcPublishOpen(SwipeIpcChannel* channel, uint64_t tickMs) {
     if (!channel->state) {
         return 0;
@@ -621,10 +369,6 @@ inline LONG64 SwipeIpcPublishOpen(SwipeIpcChannel* channel, uint64_t tickMs) {
     return SwipeIpcEndWrite(&channel->state->openSeq);
 }
 
-// Copies the open generation and its tick. A counter of 0 is not a generation:
-// no open has been published yet, so the call fails with ERROR_NOT_READY and
-// leaves the outputs untouched. A record that never settled fails with
-// ERROR_RETRY. `error` may be null. No caller may treat 0 as a generation.
 inline bool SwipeIpcReadOpen(SwipeIpcChannel* channel, uint64_t* generation,
                              uint64_t* tickMs, DWORD* error = nullptr) {
     if (error) {
@@ -659,10 +403,6 @@ inline bool SwipeIpcReadOpen(SwipeIpcChannel* channel, uint64_t* generation,
     *tickMs = tick;
     return true;
 }
-
-// ---------------------------------------------------------------------------
-// M3: intents, executor commands and acks
-// ---------------------------------------------------------------------------
 
 struct SwipeIpcIntent {
     LONG64 seq = 0;
@@ -751,12 +491,6 @@ inline bool SwipeIpcReadIntent(SwipeIpcChannel* channel, SwipeIpcIntent* out) {
     return sequence != 0;
 }
 
-// The consumer's claim: "I have this intent sequence and am about to act on it".
-// Written before the record is copied, so a publisher whose answer is late can
-// prove that a replay would be a second execution. 0 means no claim has been
-// made. A claim is not a lock: the publisher's abort below is what makes an
-// untaken record unreachable, and the consumer re-checks this word after its
-// copy before it acts.
 inline void SwipeIpcTakeIntent(SwipeIpcChannel* channel, LONG64 seq) {
     if (channel->state && seq > 0) {
         InterlockedExchange64(&channel->state->intentTaken, seq);
@@ -767,9 +501,6 @@ inline LONG64 SwipeIpcTakenIntent(SwipeIpcChannel* channel) {
     return channel->state ? SwipeIpcLoad64(&channel->state->intentTaken) : 0;
 }
 
-// The raw sequence of the current intent record, or 0 when there is none. An odd
-// value is a record being written, or one the publisher aborted: it names no
-// intent and must not be claimed.
 inline LONG64 SwipeIpcIntentSequence(SwipeIpcChannel* channel) {
     if (!channel->state) {
         return 0;
@@ -778,11 +509,6 @@ inline LONG64 SwipeIpcIntentSequence(SwipeIpcChannel* channel) {
     return (sequence & 1) != 0 ? 0 : sequence;
 }
 
-// Abandons the published intent `seq` so no consumer can take or copy it
-// afterwards. The counter is stepped to its odd state, which every reader
-// rejects; the next writer steps past it, so an aborted sequence is never
-// reused. True means the record was still `seq` and is now unreachable. False
-// means it had already moved: the caller must not replay.
 inline bool SwipeIpcAbortIntent(SwipeIpcChannel* channel, LONG64 seq) {
     if (!channel->state || seq <= 0 || (seq & 1) != 0) {
         return false;
@@ -928,12 +654,6 @@ inline bool SwipeIpcReadExecAck(SwipeIpcChannel* channel,
     return sequence != 0;
 }
 
-// The controller's published direction, one atomic word. The three values are
-// the whole vocabulary the bridge needs: it is a close when the controller owns
-// an open, a reopen while the controller is closing, and the shell's cloak
-// otherwise. `controllerTouch` stays a separate flag because it answers a
-// different question (which contact owns the opening panel) and no reader
-// combines it with the direction.
 constexpr int32_t kSwipeDirectionUnowned = 0;
 constexpr int32_t kSwipeDirectionOpen = 1;
 constexpr int32_t kSwipeDirectionClosing = 2;
@@ -964,13 +684,6 @@ inline bool SwipeIpcControllerTouch(SwipeIpcChannel* channel) {
                                       0) != 0;
 }
 
-// ---------------------------------------------------------------------------
-// Peer liveness (Start -> bridge)
-// ---------------------------------------------------------------------------
-
-// The Start side's input thread refreshes this from its idle tick and from every
-// positioned report, throttled by kSwipePeerTickIntervalMs. The bridge never
-// writes either word.
 inline void SwipeIpcPublishPeerTick(SwipeIpcChannel* channel, uint64_t tickMs) {
     if (channel->state) {
         InterlockedExchange(
@@ -979,19 +692,12 @@ inline void SwipeIpcPublishPeerTick(SwipeIpcChannel* channel, uint64_t tickMs) {
     }
 }
 
-// `alive` must follow a fresh tick. The reader pairs an alive state with the
-// tick it reads after it, so the previous activation's tick is never accepted as
-// this one's.
 inline void SwipeIpcSetPeerState(SwipeIpcChannel* channel, int32_t state) {
     if (channel->state) {
         InterlockedExchange(&channel->state->peerState, state);
     }
 }
 
-// Claims the next activation identity. Called once per attach, before any tick
-// or alive is published, so an activation's epoch differs from the one that came
-// before it even when both run inside the same session and the same process
-// image. The returned value is what this activation's readers compare.
 inline uint32_t SwipeIpcBeginPeerActivation(SwipeIpcChannel* channel) {
     if (!channel->state) {
         return 0;
@@ -1000,10 +706,6 @@ inline uint32_t SwipeIpcBeginPeerActivation(SwipeIpcChannel* channel) {
         InterlockedIncrement(&channel->state->peerEpoch));
 }
 
-// The process id that owns the current epoch. The writer publishes the pid
-// before the epoch, so a reader that re-reads the epoch around the pid can see
-// the new pid under the old epoch, never the old pid under the new one: the
-// conservative pair can only keep a claim reserved.
 inline void SwipeIpcSetPeerPid(SwipeIpcChannel* channel, uint32_t pid) {
     if (channel->state) {
         InterlockedExchange(&channel->state->peerPid,
@@ -1026,9 +728,6 @@ inline uint32_t SwipeIpcPeerEpoch(SwipeIpcChannel* channel) {
                : 0;
 }
 
-// The peer's own UI thread. Written by the Start side when the attach records
-// it and cleared when that thread is released; the bridge reads it as the peer
-// activation's identity, never as a thread of its own process.
 inline void SwipeIpcSetPeerUiThread(SwipeIpcChannel* channel, uint32_t tid) {
     if (channel->state) {
         InterlockedExchange(&channel->state->peerUiThread,
@@ -1043,9 +742,6 @@ inline uint32_t SwipeIpcPeerUiThread(SwipeIpcChannel* channel) {
                : 0;
 }
 
-// The published liveness words, for a diagnostic that has to say why a timeout
-// was replayed or treated as consumed. The reader that decides liveness is
-// SwipeIpcPeerAlive above; these are reads, not a second gate.
 inline int32_t SwipeIpcPeerState(SwipeIpcChannel* channel) {
     return channel->state
                ? InterlockedCompareExchange(&channel->state->peerState, 0, 0)
@@ -1059,13 +755,6 @@ inline uint32_t SwipeIpcPeerTick(SwipeIpcChannel* channel) {
                : 0;
 }
 
-// True while the Start side is attached and its tick is younger than `staleMs`.
-// The comparison clock is read here, after the tick, never passed in by the
-// caller: a tick published between the caller's own clock read and this call
-// would subtract to a huge age (the unsigned difference of a heartbeat newer than
-// `now`) and close the gate on a peer that had just proved it runs. The state is
-// read on both sides of the tick, so a `gone` that lands during the read is not
-// missed.
 inline bool SwipeIpcPeerAlive(SwipeIpcChannel* channel, uint32_t staleMs) {
     if (!channel->state) {
         return false;
@@ -1084,10 +773,6 @@ inline bool SwipeIpcPeerAlive(SwipeIpcChannel* channel, uint32_t staleMs) {
     return now - tick < staleMs;
 }
 
-// The executor capability word. The bridge writes it only from the lifecycle
-// points that can add or remove a piece of the executor (window, worker,
-// symbols, unload); the Start side only reads it. The event is a wake, not the
-// fact: a reader that missed a signal still sees the steady value.
 inline void SwipeIpcPublishExecCapable(SwipeIpcChannel* channel, bool capable) {
     if (!channel->state) {
         return;
