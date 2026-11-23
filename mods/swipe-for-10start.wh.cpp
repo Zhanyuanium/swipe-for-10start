@@ -11886,7 +11886,7 @@ LONG64 PublishPressIntent(int32_t kind, const QueuedPress& press,
         PublishBridgeIntent(kind, press.trigger, method, press.flags);
     if (sequence <= 0) {
         KillTimer(window, kPressAckTimer);
-        TraceLog(L"own press publish refused trigger=%s reason=no-channel",
+        TraceLog(L"own press publish refused trigger=%s reason=no-delivery",
                 PressTriggerName(press.trigger));
         return 0;
     }
@@ -12268,8 +12268,9 @@ void AdmitPress(const QueuedPress& press, const OwnSnapshot& own) {
             claimed && PeerProcessProbe() == PeerProcess::Dead;
 
         const bool claimStale =
-            claimed && GetTickCount64() - g_pressOutstanding.publishedTick >=
-                           kClaimAbandonMs;
+            GetTickCount64() - g_pressOutstanding.publishedTick >=
+                kClaimAbandonMs &&
+            (claimed || g_pressOutstanding.external);
         if (epochChanged || peerGone || staleUnclaimed || deadClaimed ||
             claimStale) {
             reconciled = ReconcileOutstandingAtAdmission(
@@ -12475,19 +12476,21 @@ void HandlePressAckTimeout() {
 
         const bool deadClaimed =
             claimed && PeerProcessProbe() == PeerProcess::Dead;
-        if (claimed && !deadClaimed && PeerStateAliveNow() &&
-            wait >= kClaimAbandonMs) {
+        if (!deadClaimed && PeerStateAliveNow() && wait >= kClaimAbandonMs) {
 
+            // The deadline is the same whether or not the controller claimed
+            // the intent: an event that never woke it must not pin the queue.
             g_pressOutstanding = OutstandingPress{};
             HWND window = g_execWindow.load(std::memory_order_relaxed);
             if (window) {
                 KillTimer(window, kPressAckTimer);
             }
             TraceLog(L"own external barrier seq=%lld wait=%llu peer=%s age=%u "
-                    L"epoch=%u decision=released reason=claim-deadline bound=%llu",
+                    L"epoch=%u claimed=%d decision=released "
+                    L"reason=claim-deadline bound=%llu",
                     static_cast<long long>(press.seq),
                     static_cast<unsigned long long>(wait), peer, peerAge,
-                    epochNow,
+                    epochNow, claimed ? 1 : 0,
                     static_cast<unsigned long long>(kClaimAbandonMs));
             ResumePressQueueAge();
             ServeNextPress(L"claim-deadline");
@@ -14674,6 +14677,13 @@ void UnregisterExecutorClass() {
 LONG64 PublishBridgeIntent(int32_t kind, int32_t trigger, uint32_t method,
                            uint32_t flags) {
     if (!g_ipc.state) {
+        return 0;
+    }
+    if (!g_ipc.intentEvent) {
+
+        // A record nobody can be woken for is not a publication: the caller
+        // has to pass the press natively.
+        TraceLog(L"intent refused kind=%d reason=no-event", kind);
         return 0;
     }
     if (kind == kSwipeIntentExternal) {
