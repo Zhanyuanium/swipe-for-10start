@@ -14718,9 +14718,9 @@ DWORD g_execThreadId = 0;
 std::atomic<DWORD> g_launcherThread{0};
 thread_local int t_execCall = 0;
 HANDLE g_execStopEvent = nullptr;
-// The deferred-teardown acknowledgement: set by the executor window's
-// outermost module frame after it destroys the window. A nested teardown only
-// marks pending; the unload waits here instead of returning into an outer frame.
+// Set by the depth-0 stop, which cancels the timers and withdraws the
+// capability; the window is destroyed afterwards by a sent message whose
+// return is the unload's proof that the stop dispatch has unwound.
 HANDLE g_execTeardownAck = nullptr;
 int g_execOwnerDepth = 0;          // launcher thread only
 bool g_execTeardownPending = false;  // launcher thread only
@@ -19419,7 +19419,6 @@ void DestroyExecutorWindow() {
             BlockBridgeUnload(L"executor teardown event missing");
         }
         ResetEvent(g_execTeardownAck);
-        g_execTeardownPending = false;
         TraceLog(L"exec window teardown send hwnd=%p tid=%u", window,
                 static_cast<unsigned>(g_execThreadId));
         TraceLog(L"exec window teardown wait hwnd=%p tid=%u", window,
