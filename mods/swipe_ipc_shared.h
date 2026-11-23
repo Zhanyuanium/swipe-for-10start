@@ -7,21 +7,21 @@
 
 // Shared-memory contract between the Start-side controller and the explorer-side
 // bridge: one session-local section and five auto-reset events, every record a
-// seqlock. The names are Local\SwipeFor10Start_SingleMod5_*; that namespace is
+// seqlock. The names are Local\SwipeFor10Start_SingleMod6_*; that namespace is
 // the ABI identity, and there is no product version word.
 
 constexpr wchar_t kSwipeIpcStateName[] =
-    L"Local\\SwipeFor10Start_SingleMod5_State";
+    L"Local\\SwipeFor10Start_SingleMod6_State";
 constexpr wchar_t kSwipeIpcIntentEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod5_Intent";
+    L"Local\\SwipeFor10Start_SingleMod6_Intent";
 constexpr wchar_t kSwipeIpcIntentAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod5_IntentAck";
+    L"Local\\SwipeFor10Start_SingleMod6_IntentAck";
 constexpr wchar_t kSwipeIpcExecEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod5_Exec";
+    L"Local\\SwipeFor10Start_SingleMod6_Exec";
 constexpr wchar_t kSwipeIpcExecAckEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod5_ExecAck";
+    L"Local\\SwipeFor10Start_SingleMod6_ExecAck";
 constexpr wchar_t kSwipeIpcCapabilityEventName[] =
-    L"Local\\SwipeFor10Start_SingleMod5_Capability";
+    L"Local\\SwipeFor10Start_SingleMod6_Capability";
 
 constexpr uint32_t kSwipeIpcMagic = 0x53333053;
 
@@ -127,6 +127,11 @@ struct SwipeIpcState {
     volatile LONG64 intentTaken;
 
     volatile LONG execCapable;
+
+    // The bridge's own process, the word after execCapable at 236. The Start
+    // side holds one synchronisation handle to it: a crash leaves the word at
+    // 1 and the handle signalled, and the controller stops acting.
+    volatile LONG execPid;
 };
 
 static_assert(offsetof(SwipeIpcState, magic) == 0, "layout");
@@ -170,6 +175,7 @@ static_assert(offsetof(SwipeIpcState, peerPid) == 216, "layout");
 static_assert(offsetof(SwipeIpcState, peerUiThread) == 220, "layout");
 static_assert(offsetof(SwipeIpcState, intentTaken) == 224, "layout");
 static_assert(offsetof(SwipeIpcState, execCapable) == 232, "layout");
+static_assert(offsetof(SwipeIpcState, execPid) == 236, "layout");
 static_assert(sizeof(SwipeIpcState) == 240, "layout");
 
 struct SwipeIpcChannel {
@@ -786,4 +792,17 @@ inline void SwipeIpcPublishExecCapable(SwipeIpcChannel* channel, bool capable) {
 inline bool SwipeIpcExecCapable(SwipeIpcChannel* channel) {
     return channel->state != nullptr &&
            InterlockedCompareExchange(&channel->state->execCapable, 0, 0) == 1;
+}
+
+inline void SwipeIpcSetExecPid(SwipeIpcChannel* channel, uint32_t pid) {
+    if (channel->state) {
+        InterlockedExchange(&channel->state->execPid, static_cast<LONG>(pid));
+    }
+}
+
+inline uint32_t SwipeIpcExecPid(SwipeIpcChannel* channel) {
+    return channel->state
+               ? static_cast<uint32_t>(
+                     InterlockedCompareExchange(&channel->state->execPid, 0, 0))
+               : 0;
 }

@@ -111,7 +111,7 @@ and the full [limits and troubleshooting](https://github.com/Zhanyuanium/swipe-f
 // One image, two roles. StartMenuExperienceHost.exe runs the controller: the Raw
 // Input gesture, Progress, settles, the close record and the gates. explorer.exe
 // runs the executor: the launcher call and the Win/Start-button/click-away triggers.
-// The halves talk over mods/swipe_ipc_shared.h (Local\SwipeFor10Start_SingleMod5_*).
+// The halves talk over mods/swipe_ipc_shared.h (Local\SwipeFor10Start_SingleMod6_*).
 // The launcher layout is pinned to twinui.pcshell.dll 10.0.26100.10068.
 
 #include <windhawk_utils.h>
@@ -2116,8 +2116,73 @@ void PublishPeerGone(const wchar_t* why) {
     SetPeerGone(why, true);
 }
 
+// The capability word outlives an Explorer crash: the section stays mapped and
+// the word keeps its 1 until a replacement bridge clears it. The pid the bridge
+// publishes is the second source: a signalled handle turns the word into 0.
+SRWLOCK g_execProcessLock = SRWLOCK_INIT;
+HANDLE g_execProcess = nullptr;
+uint32_t g_execProcessPid = 0;
+uint32_t g_execProcessEpoch = 0;
+
+void CloseExecProcessLocked() {
+    if (g_execProcess) {
+        CloseHandle(g_execProcess);
+        g_execProcess = nullptr;
+    }
+    g_execProcessPid = 0;
+    g_execProcessEpoch = 0;
+}
+
+enum class ExecProcess : int { Unknown = 0, Alive, Dead };
+
+ExecProcess ExecProcessProbe() {
+    if (!g_ipc.state) {
+        return ExecProcess::Unknown;
+    }
+    const uint32_t pid = SwipeIpcExecPid(&g_ipc);
+    const uint32_t epoch = g_peerEpoch;
+    if (pid == 0) {
+
+        // The bridge publishes its pid before it can prove capability, so a
+        // missing pid is a bridge that has not announced itself: unknown.
+        return ExecProcess::Unknown;
+    }
+    ExecProcess answer = ExecProcess::Unknown;
+    AcquireSRWLockExclusive(&g_execProcessLock);
+    if (g_execProcessEpoch != 0 &&
+        (g_execProcessEpoch != epoch || g_execProcessPid != pid)) {
+        CloseExecProcessLocked();
+    }
+    if (!g_execProcess) {
+        HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+        if (!process) {
+            const DWORD error = GetLastError();
+            TraceLog(L"exec process open failed pid=%u epoch=%u err=%u", pid,
+                    epoch, error);
+            ReleaseSRWLockExclusive(&g_execProcessLock);
+            return error == ERROR_INVALID_PARAMETER ? ExecProcess::Dead
+                                                    : ExecProcess::Unknown;
+        }
+        g_execProcess = process;
+        g_execProcessPid = pid;
+        g_execProcessEpoch = epoch;
+    }
+    const DWORD wait = WaitForSingleObject(g_execProcess, 0);
+    answer = wait == WAIT_OBJECT_0
+                 ? ExecProcess::Dead
+                 : (wait == WAIT_TIMEOUT ? ExecProcess::Alive
+                                         : ExecProcess::Unknown);
+    ReleaseSRWLockExclusive(&g_execProcessLock);
+    return answer;
+}
+
+bool ExecutorProcessAlive() {
+    return ExecProcessProbe() == ExecProcess::Alive;
+}
+
 bool BridgeCapabilityNow() {
-    return g_ipc.state != nullptr && SwipeIpcExecCapable(&g_ipc);
+    return g_ipc.state != nullptr && SwipeIpcExecCapable(&g_ipc) &&
+           ExecutorProcessAlive();
 }
 
 bool PublishPeerReady(const wchar_t* why) {
@@ -14679,6 +14744,9 @@ BOOL RoleInit() {
     } else {
         TraceLog(L"ipc open created=%d", created ? 1 : 0);
 
+        // The pid is published before the capability word: the Start side
+        // accepts a capable bridge only when that process is still alive.
+        SwipeIpcSetExecPid(&g_ipc, GetCurrentProcessId());
         PublishExecutorCapability(L"init");
     }
 

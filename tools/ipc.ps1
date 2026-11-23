@@ -5,7 +5,7 @@
 # [OUTPUT]: `pwsh -File tools/ipc.ps1 -State` prints one snapshot of the channel
 #           (each record with the sequence it was copied under, plus the controller
 #           words, the peer tick/state/epoch/pid/uiThread and the bridge's
-#           execCapable word) and
+#           execCapable and execPid words) and
 #           refuses a section whose initState is not ready or whose magic or
 #           layoutBytes is not this header's.
 # [POS]: the read-only view of the merged mod's channel. There is no command
@@ -31,7 +31,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$StateName = 'Local\SwipeFor10Start_SingleMod5_State'
+$StateName = 'Local\SwipeFor10Start_SingleMod6_State'
 
 # Offsets from SwipeIpcState, in bytes. Keep in step with the asserts there.
 $OffsetMagic = 0
@@ -74,6 +74,7 @@ $OffsetPeerPid = 216
 $OffsetPeerUiThread = 220
 $OffsetIntentTaken = 224
 $OffsetExecCapable = 232
+$OffsetExecPid = 236
 $StateBytes = 240
 
 # The ack outcome and visibility words are shared constants (swipe_ipc_shared.h).
@@ -222,6 +223,7 @@ try {
         peerPid             = $view.ReadUInt32($OffsetPeerPid)
         peerUiThread        = $view.ReadUInt32($OffsetPeerUiThread)
         execCapable         = $view.ReadInt32($OffsetExecCapable)
+        execPid             = $view.ReadUInt32($OffsetExecPid)
     } | Format-List
     $view.Dispose()
 } finally {
