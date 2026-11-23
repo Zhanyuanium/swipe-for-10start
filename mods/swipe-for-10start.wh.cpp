@@ -10221,6 +10221,22 @@ void UnregisterHidUsage(USAGE usage) {
 // the symbol load blocks for Windhawk's PDB fetch and must never block the
 // shell's loader thread.
 void ProbeRootSymbolFromInputThread();
+void AttachToRunningStartHost();
+std::atomic<bool> g_attachAttempted{false};
+
+void MaybeAttachToRunningStartHost() {
+    if (g_attachAttempted.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!g_rootHookReady.load(std::memory_order_acquire) &&
+        !g_rootHookRefused.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (g_attachAttempted.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    AttachToRunningStartHost();
+}
 
 // Unregisters the fixed raw-input class under the instance that registered it.
 // The class belongs to this image, so a class left registered would leave a
@@ -10391,6 +10407,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
     // the mod's own. Until the symbol is ready and refused is clear, the peer
     // stays unpublished.
     ProbeRootSymbolFromInputThread();
+    MaybeAttachToRunningStartHost();
     if (g_rootHookReady.load(std::memory_order_acquire) && RendererReady() &&
         capabilitySeen) {
         peerAnnounced = PublishPeerReady(L"consumer");
@@ -10401,6 +10418,7 @@ DWORD WINAPI HidInputThread(LPVOID) {
         // back to look. The probe stops as soon as ready or refused is set, and
         // the one symbol attempt happens on the first pass that finds the module.
         ProbeRootSymbolFromInputThread();
+        MaybeAttachToRunningStartHost();
         // The bridge's capability is a continuing promise. A gain is what lets
         // this side advertise; a loss withdraws the peer before any press can be
         // swallowed for an executor that is gone, and releases the panel it was
@@ -13941,11 +13959,6 @@ bool EnsureUiRendezvousWindow() {
     return true;
 }
 
-// Attaches this activation to a Start host that is already running. The
-// PrepareRootElement hook is not guaranteed to run again once the host has
-// created its root, so Wh_ModAfterInit takes the root from the live XAML window
-// on its own thread and uses the same attach path. A host with no window yet is
-// left to the hook.
 void AttachToRunningStartHost() {
     HWND coreWindow = FindStartCoreWindow();
     if (!coreWindow) {
@@ -14290,11 +14303,6 @@ void RoleAfterInit() {
     // during init; the input thread installs from the record, so no symbol work
     // runs on this host thread.
     RecordLoadedStartUIModule();
-
-    // A host that was already running when this image loaded has created its
-    // root long ago, so the PrepareRootElement hook will not run again. Attach
-    // to that live root now; the hook remains the path for a later root.
-    AttachToRunningStartHost();
 
     TraceLog(L"hid init");
     if (!g_hidStopEvent) {
