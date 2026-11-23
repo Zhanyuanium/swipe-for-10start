@@ -73,9 +73,9 @@ Measured: left docked 2026-11-21 `axis=0`, `rc=0,0,96,1800`,
 
 A vertical dismiss yields to the menu's own scrolling, which happens in more than
 one place (the app list and the tile grid). The mod surveys every vertically
-scrollable `ScrollViewer` under the panel once per open and keeps up to six of
-them (`kMaxScrollRegions`), each with its screen rect, `VerticalOffset`,
-`ScrollableHeight`, depth and label.
+scrollable `ScrollViewer` under the panel once, at the settled pass of an open,
+and keeps up to six of them (`kMaxScrollRegions`), each with its screen rect,
+`VerticalOffset`, `ScrollableHeight`, depth and label.
 
 - At a press the gate picks the innermost containing region (depth first, then
   the smaller rect); no containing region means the drag belongs to the dismiss.

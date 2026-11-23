@@ -48,10 +48,12 @@
 
 ## Configuration and channel
 
-- **The legacy Start mode is a prerequisite, not a runtime gate.** The mod targets
-  ExplorerPatcher's classic Start (`Start_ShowClassicMode=1`) hosting
-  `StartUI_.dll`; no code reads that value, and behaviour on the Windows 11 Start
-  is unmeasured.
+- **The classic Start mode is a load-time gate.** Both halves load only while
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\Start_ShowClassicMode`
+  is 1 (the value ExplorerPatcher's own settings write); the
+  `Software\ExplorerPatcher` value is the fallback when that key is absent. A
+  style change needs both hosts restarted. Behaviour on the Windows 11 Start is
+  unmeasured.
 - **The channel is trusted by name, not authenticated.** Any process in the logon
   session can read and publish every record. `peerState`, `peerTick`, `peerEpoch`,
   `peerPid` and `peerUiThread` prove a Start half is alive and which activation it
@@ -59,10 +61,13 @@
 
 ## Presses and claims
 
-- **A hard kill while a press is claimed holds the slot.** `peerState` stays
-  `alive` without the withdrawal, so the bridge cannot prove the controller gone.
-  The slot is held until the next attach changes `peerEpoch`; presses behind it
-  are dropped at the 2500 ms bound (`reason=stale`), never toggled minutes later.
+- **A claimed press is spent after 2000 ms.** A hard kill leaves `peerState`
+  `alive`; the process handle proves death and releases at once. A frozen host
+  cannot be proven dead, so its claim expires at `kClaimAbandonMs` (2000 ms,
+  below the 2500 ms queue bound so a press queued behind it still runs) without
+  replaying the press (`reason=claim-deadline`). If that host later resumes and
+  applies the copy it validated, one input can produce two transitions; the
+  alternative was a dead Win key until the host answered.
 - **A taken press with no answer is lost, not duplicated.** If the controller dies
   after `intentTaken` and before the ack, the bridge has seen a claim and cannot
   replay. An abort that lands before the copy is the exception: Start's

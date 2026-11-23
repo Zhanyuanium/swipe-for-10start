@@ -60,8 +60,9 @@ published direction: `closing` makes the press an open, `open` makes it a close.
 A close still settling publishes open at once; a hide in flight latches the
 press; presses wait in a four-entry FIFO, one per ack, and an open arms the
 generation gate. A press the bridge already swallowed is dropped, not passed on.
-The bounds: 1000 ms ack, 1500 ms unpublished (shell's original), 2500 ms
-absolute, 900 ms generation gate.
+The bounds: 1000 ms ack, 1500 ms unpublished (shell's original), 2000 ms claim
+deadline, 2500 ms absolute, 900 ms generation gate. A claim past its deadline is
+spent without replay, so a frozen host cannot block the next press.
 
 The open runs from the band contact only after 24 DIP of inward travel; a tap in
 the band stays a native press, and the shell's own edge gesture (from about
@@ -143,7 +144,7 @@ sessions with captured numbers.
 - The trace is a setting. Every decision line calls `Wh_Log`; the file is
   written only while `DiagnosticTrace` is on, one file per role, capped at
   20,000 lines. The smoke requires it and prints the command that enables it.
-- The image is not pinned. Unloading joins the two owned threads, sends the UI
+- The mod image is not pinned. Unloading joins the two owned threads, sends the UI
   teardown to the module's own hidden window on the XAML UI thread, then requires
   the UI-turn count, the registration count and one acknowledged empty turn. A
   frame on the stack defers the teardown until it returns; a proof that cannot be

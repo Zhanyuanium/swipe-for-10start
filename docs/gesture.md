@@ -139,8 +139,9 @@ still-queued dismiss. The transition is never synthesized.
 ## Gates
 
 - **Vertical** — up to six deepest vertically scrollable regions; a press inside
-  one that can still scroll is refused, elsewhere it dismisses. The survey
-  publishes `Unknown` first; retries back off 100/200/400 ms.
+  one that can still scroll is refused, elsewhere it dismisses. Until the settled
+  survey lands, a press inside the panel waits; the gate never fails open inside
+  the panel.
 - **Band tail** — a band contact of an open menu that moves away from the
   taskbar is the opening pull's tail and settles nothing (once per 500 ms).
 - **Layout** — the apply reservation and the admission claim are the two
