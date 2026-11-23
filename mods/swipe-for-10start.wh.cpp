@@ -4596,12 +4596,17 @@ LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam,
         }
     }
     // One exit: CallNextHookEx can pump a sent message, so the frame stays
-    // counted until it has returned.
+    // counted until it has returned. The idle signal goes before the decrement:
+    // there may be no window to drain through, and after the unloader sees zero
+    // this frame must have only the decrement and its return left. An early
+    // signal costs the unloader one extra wake; it re-checks the count after
+    // every wake.
     const LRESULT result = CallNextHookEx(nullptr, code, wParam, lParam);
-    if (g_startAttachFrames.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+    if (g_startAttachFrames.load(std::memory_order_acquire) == 1 &&
         g_startAttachIdle) {
         SetEvent(g_startAttachIdle);
     }
+    g_startAttachFrames.fetch_sub(1, std::memory_order_acq_rel);
     return result;
 }
 
@@ -14937,8 +14942,12 @@ class ExecDepthGuard {
                 // runs after this frame has returned.
                 if (PostMessageW(window, kExecRetireMessage, kExecRetireMagic,
                                  0)) {
+                    g_execRetirePosted.store(window, std::memory_order_release);
                     TraceLog(L"exec retire posted hwnd=%p", window);
                 } else {
+                    // No message remains in the queue, so the marker must not
+                    // claim one: the next entry's retry has to be free to post.
+                    g_execRetirePosted.store(nullptr, std::memory_order_release);
                     TraceLog(L"exec retire post failed hwnd=%p err=%u", window,
                             GetLastError());
                 }
@@ -19631,6 +19640,8 @@ bool RetireSupersededWindow(const wchar_t* source) {
         return true;
     }
     if (!PostMessageW(window, kExecRetireMessage, kExecRetireMagic, 0)) {
+        // No message remains, so a later entry must be free to post one.
+        g_execRetirePosted.store(nullptr, std::memory_order_release);
         TraceLog(L"exec window retire retry failed source=%s hwnd=%p err=%u",
                 source, window, GetLastError());
         return true;
@@ -19767,8 +19778,9 @@ LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
             if (g_launcherThread.compare_exchange_strong(
                     known, tid, std::memory_order_acq_rel)) {
                 // A pump is a proposal: it proves the loop runs, not that it is
-                // the launcher. The launcher entry may correct it.
-                g_launcherProven.store(false, std::memory_order_release);
+                // the launcher. The proof starts false and only a launcher entry
+                // sets it; no store here, which could erase a proof that landed
+                // after this commit.
                 TraceLog(L"exec launcher thread tid=%u source=show-pump "
                         L"provisional=1",
                         tid);
@@ -19788,12 +19800,17 @@ LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
         RemoveExecutorThreadHookIfCurrent(serviced);
     }
     // One exit: CallNextHookEx can pump a sent window message, so the frame stays
-    // counted until it has returned.
+    // counted until it has returned. The idle signal goes before the decrement:
+    // there may be no window to drain through, and after the unloader sees zero
+    // this frame must have only the decrement and its return left. An early
+    // signal costs the unloader one extra wake; it re-checks the count after
+    // every wake.
     const LRESULT result = CallNextHookEx(nullptr, code, wParam, lParam);
-    if (g_execHookFrames.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+    if (g_execHookFrames.load(std::memory_order_acquire) == 1 &&
         g_execHookIdle) {
         SetEvent(g_execHookIdle);
     }
+    g_execHookFrames.fetch_sub(1, std::memory_order_acq_rel);
     return result;
 }
 
