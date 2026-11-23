@@ -1,91 +1,52 @@
 # Store submission
 
-> L3 of `docs/`. How the one mod reaches the official Windhawk mods collection,
-> and what the submission file differs from the repo source.
+> How the one mod reaches `ramensoftware/windhawk-mods`, and what the submitted
+> file differs from the repo source.
 
-The collection (`ramensoftware/windhawk-mods`) accepts exactly one self-contained
-file per pull request, `mods/<id>.wh.cpp`, and its CI rejects a `@compilerOptions`
-that contains a double quote. The shipping source cannot be submitted as it sits
-here: it includes `swipe_ipc_shared.h`.
-
-`tools/make_store_mods.ps1` produces the submittable file. It is generated, never
-hand-edited (`dist/` is ignored), and changes only what the collection requires:
+The collection accepts exactly one self-contained `mods/<id>.wh.cpp` per PR and
+rejects a `@compilerOptions` containing a double quote. The repo source includes
+`swipe_ipc_shared.h`, so `tools/make_store_mods.ps1` generates the submittable
+file (`dist/` is ignored, never hand-edited):
 
 | Change | Why |
 |---|---|
-| Each `#include "<local>.h"` replaced by the header body, inside `#pragma clang diagnostic push/ignored "-Wunused-const-variable"/pop` | One file per PR; the contract's constants are used by one side, so the unused half would warn, and the 2.0 compatibility check fails on any warning |
-| `-I` (if a source ever carries one), `-Wall`, `-Wextra` removed from `@compilerOptions` in the store profile | A machine path must not survive and a quoted option breaks the compile job outright; `-Wall`/`-Wextra` are not among the options the collection accepts, and its CI compiles without them |
-| `==WindhawkModReadme==` body replaced by `README.md` + `---` + `README.zh-CN.md` | The installed mod and the store page show the same full bilingual guides; the condensed block in `mods/` is a placeholder and is never shipped |
-| `@github https://github.com/Zhanyuanium`, `@license MIT`, `@homepage <repo>` added | `@github` is required and must equal the PR author's profile exactly; the collection treats a missing licence as MIT |
+| each `#include "<local>.h"` replaced by the header body, inside a `-Wunused-const-variable` pragma pair | one file per PR; the constants are used by one side, and the 2.0 check fails on a warning |
+| `-I` (and, in `store`, `-Wall`/`-Wextra`) removed from `@compilerOptions` | a machine path must not survive; a quoted option breaks the compile job, and the collection compiles without the warnings |
+| `==WindhawkModReadme==` body replaced by `README.md` + `---` + `README.zh-CN.md` | the store page and the installed mod show the same bilingual guides; the condensed block in `mods/` never ships |
+| `@github`, `@license MIT`, `@homepage` added | `@github` is required and must equal the PR author's login |
 
 Everything else — code, version, `@include`, `@architecture` — is the repo source
 verbatim, so the submitted file and `mods/` cannot drift apart.
 
-Two source constraints come from the collection's scripts, not from Windhawk:
+Two source constraints come from the collection's scripts, not Windhawk:
+`extract_mod_symbols.py` reads a hook name only where the entry carries it as a
+literal (a `constexpr wchar_t` fails with `Symbol name is not a string`), and
+`pr_validation.py` maps a `<base>DllHooks` variable to `<base>.dll` in the Windows
+file-name index, so the Start array is `startuiDllHooks` and the launcher array
+`symbolHooks` with `// twinui.pcshell.dll` above it.
 
-- `.github/extract_mod_symbols.py` reads a hook entry's name only where the entry
-  carries it as a literal. A `constexpr wchar_t` constant fails the job with
-  `Symbol name is not a string`, so both hook arrays spell their names inline as
-  adjacent literals.
-- `pr_validation.py` maps a `<base>DllHooks` variable name to `<base>.dll` and
-  looks that up in the Windows file-name index. `StartUI_.dll` is not in the
-  index, so the Start array is `startuiDllHooks` (the index knows the component
-  as `startui.dll`), while the launcher array keeps the neutral `symbolHooks`
-  with `// twinui.pcshell.dll` directly above it.
+The `local` profile is the same generator without store metadata and with
+`-Wall -Wextra` kept, because an installed mod is also compiled from a single
+file. `tools/install_mods.ps1` builds it and installs `local@swipe-for-10start`.
+The mod is one PR, one file: the controller and the executor live in it, and each
+half is inert in the other's process. The namespace is the ABI identity, so a
+staggered install cannot cross-pair two layouts, but it does not stop two images
+from loading into the same hosts: enable one copy only.
 
-## Local install
+Checks before opening the PR:
 
-The same generator has a `local` profile, because an installed mod is also
-compiled from a single file: Windhawk reads a mod's source from stdin and has no
-repository beside it. `pwsh -File tools/install_mods.ps1` builds that profile into
-`dist/local/` — headers inlined, `-I` removed, `-Wall -Wextra` kept, no store
-metadata — then installs and enables `local@swipe-for-10start` and restarts
-`StartMenuExperienceHost.exe`. `-All` adds the three diagnostic probes from
-`mods/`; `-SkipRestart` leaves the menu host running. The CLI comes from
-`-CliPath`/`-Compiler`, then `windhawk-cli` on `PATH`, then
-`%ProgramFiles%\Windhawk\windhawk-cli.exe`, and the failure message names both
-locations.
+1. `pwsh -File tools/make_store_mods.ps1` — regenerates and runs
+   `windhawk-cli source meta --strict`.
+2. `pwsh -File tools/make_store_mods.ps1 -Profile local`, then compile that file
+   with `-Wall -Wextra -fsyntax-only` and no `-I`; it must be silent.
+3. `get_mod_symbols(...)` from `.github/extract_mod_symbols.py` must print one
+   name under `startui.dll` and thirteen under `twinui.pcshell.dll`.
+4. The collection's validator must report zero errors and zero review items.
+5. The PR body keeps the `## Mod authorship` section, and `@github` matches the PR
+   author's login.
 
-This flow is why `mods/` no longer carries an `-I`: the repository source is built
-with `-I mods` on the compiler command line, and the installed source is always
-the generated one.
-
-## One pull request
-
-The mod is one file that carries both halves; the controller decides and the
-executor performs inside that file, and each half is inert in the other's
-process. Submit `swipe-for-10start` as one PR, one file. The channel has no
-version word: its object namespace is the ABI identity, so a user who installs
-it beside an old development build cannot cross-pair the two: each stays in its
-own namespace and a section of another layout is refused instead of half-read.
-That is all the namespace proves. It does **not** stop both images from loading
-into the same hosts and hooking them; only one copy of the mod should be
-enabled.
-
-## Checks before opening the PR
-
-1. `pwsh -File tools/make_store_mods.ps1` — regenerates the store file and runs
-   `windhawk-cli source meta --strict` on it.
-2. `pwsh -File tools/make_store_mods.ps1 -Profile local`, then compile the
-   generated local file with `-Wall -Wextra -fsyntax-only` and no `-I`; it must
-   be silent (the inlined-header pragma exists for exactly this).
-3. Run the extractor the collection's cache job runs:
-   `get_mod_symbols(Path('mods/<id>.wh.cpp'), [])` from
-   `.github/extract_mod_symbols.py`, with `.github` on `sys.path`. It must print
-   one name under `startui.dll` and thirteen under `twinui.pcshell.dll`. The
-   validator's single-file test mode does not run this step, and its PR mode
-   runs it only after the file checks pass.
-4. Run the collection's own validator against each file, from a clone of
-   `windhawk-mods`:
-   `python .github/pr_validation.py mods/<id>.wh.cpp Zhanyuanium 92024923`
-   It must report zero errors and zero review items.
-5. The PR body must keep the template's `## Mod authorship` section, and the
-   mod's `@github` must match the PR author's login (`Zhanyuanium`).
-
-## After opening
-
-The bot's flow is author-driven: comment `/ai-review`, fix what it reports,
-repeat, then `/ready-for-reviewer` once the head commit's AI review is current.
-The commit message on the branch becomes the mod's changelog entry.
+After opening, comment `/ai-review`, fix what it reports, then
+`/ready-for-reviewer` once the head commit's review is current; the branch's
+commit message becomes the changelog entry.
 
 [PROTOCOL]: Update this header on change, then check AGENTS.md

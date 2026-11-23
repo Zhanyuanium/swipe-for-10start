@@ -1,240 +1,102 @@
-# Input layer — why Raw HID, and how reports are decoded
+# Input layer — Raw HID, decode, identity, release
 
-> 语言：英文；用户指南有中文版：[../README.zh-CN.md](../README.zh-CN.md)。
-> Part of [docs/README.md](README.md). Code member list: [../mods/AGENTS.md](../mods/AGENTS.md).
+> Part of [docs/README.md](README.md). Member list: [../mods/AGENTS.md](../mods/AGENTS.md).
 
-ExplorerPatcher replaces Windows 11's Start UI with the legacy `StartUI_.dll`,
-which has no consumer for the shell's touch gesture. Every in-process source
-for per-frame finger data on that UI was measured on this build and found
-empty — the digitizer itself, through Raw Input, is the only source that works.
+The legacy Start has no consumer for the shell's touch gesture. Every
+in-process source was measured and is empty: XAML pointer events report
+`PointerDeviceType.Mouse` with one move per drag, `GetCursorPos` stays
+`CURSOR_SUPPRESSED`, `GetPointerInfo` returns a frozen down snapshot, the queue
+closes after the down, and `RegisterPointerInputTarget` needs UIAccess. Raw
+Input is the only source that works.
 
-## Data sources that do not work
-
-Each of these was measured on this build, not assumed:
-
-| Source | Result |
-|---|---|
-| XAML pointer events | `PointerDeviceType.Mouse` (0), one `move` per drag, `axisDelta ≈ 0` |
-| `CancelDirectManipulations` | returns false |
-| UDK `ShellViewGestureAnimationPropertySet` | `AnimationProps.Translation` resolves but is constant 0; `Width`/`Height`/`VisibilityProgress` return `0x80070057` |
-| XAML `DManipDataBase` cache (`CUIElement+0x118 → +0x138 → +0x58`) | empty during a drag |
-| `DManipDataBase::SetContentOffsetsHelper` hook | installed, **0 calls** across three real drags |
-| System cursor (`GetCursorPos`) | `CURSOR_SUPPRESSED` for the whole contact, position frozen |
-| Queue (`GetMessageW`/`PeekMessageW`) | `WM_POINTERENTER` + `WM_POINTERDOWN`, then `WM_POINTERCAPTURECHANGED` and silence |
-| `GetPointerInfo(id)` / `GetPointerFrameInfoHistory` | valid id, but a frozen down snapshot |
-| `RegisterPointerInputTarget` | requires UIAccess, unavailable to an injected mod |
-| Composition `IDCompositionVisual` read-back | write-only, no getter |
-
-The short version: the touch never reaches XAML on this UI, and the window queue
-is closed after the down, so the only in-process source is the digitizer itself.
-
-## Capturing reports
-
-A worker thread in the `start` namespace of `mods/swipe-for-10start.wh.cpp`
-registers Raw Input for the digitizer (`usUsagePage 0x0D / usUsage 0x04` for
-touch, `0x0D / 0x02` for pen, `RIDEV_INPUTSINK`) on a hidden top-level window. A message-only window
-would not receive the `WM_SETTINGCHANGE` (`SPI_SETWORKAREA`) and
-`WM_DISPLAYCHANGE` broadcasts that move the taskbar, and those broadcasts are
-the whole event-driven axis refresh (see [geometry.md](geometry.md)).
+A worker in the `start` half registers Raw Input for the digitizer
+(`0x0D/0x04` touch, `0x0D/0x02` pen, `RIDEV_INPUTSINK`) on a hidden **top-level**
+window: a message-only window receives no `WM_SETTINGCHANGE`/`WM_DISPLAYCHANGE`,
+which are the whole event-driven axis refresh.
 
 ## What wakes the thread
 
-The thread has no period. It waits on its events — raw input, stop, the bridge's
-intent and executor-ack events, the renderer event — plus one high-resolution
-**one-shot** timer, and the timer is armed only for the soonest deadline the
-state has:
+No period. One high-resolution one-shot is armed for the soonest deadline only:
 
 | Deadline | Clock | Window |
 |---|---|---|
-| coast start after the last positioned point (a follow: its 50 ms guard too) | QPC | 8 ms, later for a fresh follow |
-| idle release of a dismiss session | QPC | `kIdleReleaseMs`, 18 ms |
-| band candidate's watchdog | QPC | `kCandidateIdleHoldMs`, 120 ms |
-| contact latch and tracked identity expiry | tick | the same 18 ms |
-| the armed close tap | tick | the settle's end (`ScheduleCloseTap`) |
-| the close record's repair bound | tick | `kCloseRepairMs`, 800 ms after acceptance (`RepairExpiredClose`) |
-| a show's executor budget | tick | `kBridgeAckTimeoutMs`, 400 ms |
-| a dismiss's executor budget | tick | `executeAt + 400 ms` |
-| the settled measurement's guaranteed turn | tick | `kSettledMeasureDeadlineMs`, 400 ms |
-| the scroller retry (UI thread; its post re-plans) | tick | `g_scrollerRetryAt` |
-| the slow fallback under a transition | tick | `kVisibilityFallbackMs`, 100 ms |
-| the root-hook bootstrap probe | tick | `kRootProbeMs`, 100 ms |
+| coast start | QPC | 8 ms, later for a fresh follow |
+| idle release of a dismiss session | QPC | 18 ms |
+| band candidate watchdog / contact latch | QPC + tick | 120 ms / 18 ms |
+| close repair bound | tick | 800 ms after acceptance |
+| executor budget (show / dismiss) | tick | 400 ms, or `executeAt + 400` |
+| fallback under a transition / root probe | tick | 100 ms |
 
-`NextInputDeadlineMs` collects them and returns the minimum; nothing due returns
-0 and the timer is disarmed. A deadline that has already passed is armed at 1 ms
-only where serving it clears the condition that produced it (a one-shot turn, a
-release, a watchdog); the coast start is armed only while it is still ahead,
-because `MaybeCoast` runs again on the release wake, and a follow's start is the
-later of its 8 ms report gap and the 50 ms entry guard, so the wake is one the
-coast can actually use. The one deadline published from the UI thread (the
-scroller retry) posts a wake to the input window, so a planner that already read
-the previous value re-reads it. A release that is held —
-a touch show in flight, or the close record owning the panel with a contact
-owning the panel edge — contributes nothing: its hold ends on a cloak event or an
-executor answer, and a deadline that cannot act would spin the thread. The close
-record's own repair bound is the one deadline that ends a close whose landing never
-came; nothing polls for it.
+`NextInputDeadlineMs` returns the minimum or 0 (disarmed). A held release (a
+touch show in flight, a close that owns the panel) contributes no deadline: its
+hold ends on a cloak event or an executor answer.
 
-The open/close state is pushed, not polled: `SetWinEventHook(EVENT_OBJECT_CLOAKED,
-EVENT_OBJECT_UNCLOAKED)` is installed on this thread for its own process and
-filtered to the CoreWindow HWND. The callback takes no lock, reads no XAML,
-queries no DWM and writes no trace; it compares the HWND and sets an auto-reset
-event. The event is a signal to re-read, not the state itself: the callback may
-arrive after the window has moved again, and two transitions can collapse into
-one wake, so the service reads the current `DWMWA_CLOAKED` and runs the same
-open/close transition code the old 20 ms poll ran. That read is tri-state: a
-failed query is **unknown**, never hidden, and the sample is skipped so the last
-state and the watch stand until the next event or poll. The state is therefore
-sampled: seeded when this activation first can serve (a failed seed is retried;
-and again after a
-renderer replacement, where the window may have changed while this side could
-not drive it), kept by each event, and sampled once more when a watch window
-expires. A transition this mod asked
-for (a show or a dismiss), or has just observed, opens a bounded watch in which
-the slow fallback poll runs at 100 ms, so a missed event cannot leave the state
-stuck; a clean run never uses the fallback (see [limits.md](limits.md)).
+The open/close state is pushed: `EVENT_OBJECT_CLOAKED`/`UNCLOAKED` on the
+CoreWindow. The callback sets an auto-reset event and nothing else; the service
+reads `DWMWA_CLOAKED` once, and a failed read is **unknown**, never hidden. A
+requested or just-observed transition opens a bounded watch (1000 ms for a
+request, 500 ms after an observation) with a slow 100 ms fallback poll.
 
-The one wake that exists with nothing to do is the peer heartbeat: while this
-activation advertises a service, the wait times out every
-`kSwipePeerTickIntervalMs` (100 ms) to refresh `peerTick`, because the bridge
-reads a tick younger than `kSwipePeerStaleMs` (600 ms). With the peer withheld
-or gone the wait is `INFINITE` — no timer, no poll, no wake — except for one
-degraded channel: if the bridge's `Capability` event could not be created, a
-100 ms read of `execCapable` runs while the peer is unadvertised so the first 1
-is not missed. Measured with the
-menu closed and nothing touching the screen, on this build: **190 wakes/s and
-32 DWM cloak queries/s before, 9.2 wakes/s and 0 queries/s after**, and the
-Start host's idle CPU fell from 0.625 % to 0.026 % of one core.
+The only idle wake is the 100 ms `peerTick` heartbeat, while the peer is
+advertised. Measured with the menu closed: **190.6 wakes/s and 32 DWM queries/s
+before, 9.2 wakes/s and 0 queries/s after**; Start host idle CPU 0.625 % →
+0.026 % of one core.
 
-## Decoding a report
+## Decode
 
-Each report is decoded with `GetRawInputDeviceInfoW(RIDI_PREPARSEDDATA)` +
-`HidP_GetUsageValue`: contact collections `0x0D/0x22` (Finger) or `0x0D/0x05`
-carry `0x01/0x30` (X) and `0x01/0x31` (Y); the top-level `0x0D/0x54` is the
-Contact Count. A device whose input caps declare report IDs carries the ID in
-the first byte of every raw report (`RAWINPUTHEADER::wParam` is only
-`RIM_INPUT`/`RIM_INPUTSINK`), and that byte selects the caps; a device without
-report IDs takes the previous path. A report whose ID carries no contact field
-at all — no slot field and no contact count — is an unrelated report ID: it is
-ignored whole, which is distinct from a decode failure that logs
-`hid decodefail`. Otherwise every candidate slot's `TipSwitch`, `InRange`,
-Contact Identifier and X/Y are decoded before a contact is chosen.
+`GetRawInputDeviceInfoW(RIDI_PREPARSEDDATA)` + `HidP_GetUsageValue`: contact
+collections `0x0D/0x22` (Finger) or `0x0D/0x05` carry `0x01/0x30` (X) and
+`0x01/0x31` (Y); top-level `0x0D/0x54` is the Contact Count.
 
-`TipSwitch` (`0x0D/0x42`) and `InRange` (`0x0D/0x32`) are button usages, so they
-are read per collection and per report: in range with the tip up is a hover and
-drives nothing, and only the tracked slot's tip going up (or its in-range bit
-clearing) ends the contact while coordinates keep arriving. A count-only lift
-report is not a lift; the idle window ends the contact instead (18 ms for a
-dismiss session, 120 ms for a band candidate). A tracked report
-that carries no coordinates refreshes the liveness clock only when it asserts
-contact (`TipSwitch`/`InRange`, or a slot state of Contact), never on
-identifier presence alone; the liveness clock is separate from the position
-clock, so that report cannot feed a position, and the idle cannot end a contact
-the device is still asserting. When several slots carry the tracked identifier,
-the one that asserts contact wins, and one
-`hid contact id=... declared down in ... slots; using=...` line records the
-ambiguity.
-
-A device with no tip and no in-range usage keeps the count/position path; its
-Contact Count and `(0,0)` rules apply in the tracked branch too, because it
-cannot assert a tip for the tracked slot, and it is the only device family that
-needs those rules.
-
-Raw values are mapped to pixels through the logical range of the collection the
-point was read from (`cap.LinkCollection`) and then to DIP through the window
-DPI. `hid usages dev=... tip=... inrange=... count=... buttons=...
-reportids=... coordpath=... identity=contactid|node` records once per device
-which usages it exposes, whether it is on the count/position path, and which
-name its tracked contact uses.
+- A device whose caps declare report IDs carries the ID in the first raw byte
+  (`RAWINPUTHEADER::wParam` is only `RIM_INPUT`/`RIM_INPUTSINK`); that byte
+  selects the caps. A report ID with no contact field is ignored whole, which is
+  distinct from a decode failure (`hid decodefail`).
+- `TipSwitch` (`0x0D/0x42`) and `InRange` (`0x0D/0x32`) are button usages, read
+  per collection and per report: in range with the tip up is a hover. Only the
+  tracked slot's tip up (or its in-range bit clearing) ends the contact while
+  coordinates keep arriving; a count-only lift report is not a lift.
+- A tracked report with no coordinates refreshes the liveness clock only when it
+  asserts contact. Raw values map to pixels through the collection's logical
+  range then to DIP through the window DPI.
 
 ## Contact identity
 
-The tracked contact is followed by its name: the Contact Identifier
-(`0x0D/0x51`) when both the device and the contact carry one
-(`identity=contactid`), the `(device, node index)` pair otherwise
-(`identity=node`). A slot the device hands to another finger therefore does not
-transfer the drag. When a report names a new contact, its real contacts are the
-candidates and the one nearest the last tracked raw position is chosen; once
-tracked, only that contact can move or end the gesture, and a report from
-another slot or another device is ignored. The identity carries its own
-evidence clock: `lastEvidenceTick` moves only when the report proves the
-contact — the tracked slot's `TipSwitch`/`InRange` asserts it with no point, or
-the report carries a position this path feeds. A name-only report updates the
-slot and the identifier for diagnostics, then returns: no position, no liveness
-and no clock write. The same 18 ms idle deadline, once no session owns the contact,
-forgets an identity whose last evidence is that old — admitted or not — and
-logs `hid identity expired slot=... latch=0` when no contact latch held it, so
-a refused admission cannot strand a name and make every later finger be
-rejected as another contact.
+The tracked contact is named by its Contact Identifier (`0x0D/0x51`) when both
+device and contact carry one, otherwise by `(device, node index)`
+(`identity=contactid|node`). A slot handed to another finger does not transfer
+the drag; a new contact's candidates are its real contacts, nearest the last raw
+position.
 
-A contact a close consumed is the exception, because the digitizer's quiet
-through the hide is not a lift. While a close is in flight neither the latch nor
-the identity expires on silence at all. A consumed contact whose name can answer
-— a Contact Identifier — stays tracked until its lift report or until a report
-names a different asserted identifier; the decoder ends it there, logs
-`hid consumed ended slot=... id=... reason=new-contact`, and follows the new
-contact. Another device's asserted contact is the same evidence
-(`reason=device`), and so is a different asserted node on a device without
-Contact Identifiers. A node index
-can be handed to the next finger and the coordinate-only path has no name, so
-those two keep the idle fallbacks (the 120 ms candidate watchdog, then the
-18 ms latch) once the close has ended; its risk is a consumed finger that
-stays silent past the landing and then resumes, read as a new down. A Contact
-Identifier never expires by
-silence, so its residual is the opposite: a device that reuses an identifier
-after a lost lift makes the next finger a continuation until it lifts.
+- The identity's evidence clock moves only on a report that proves the contact
+  (asserted tip/in-range without a point, or a fed position); a name-only report
+  updates the slot and identifier for diagnostics, then returns.
+- With no session owning the contact, the 18 ms idle forgets an identity whose
+  last evidence is that old (`hid identity expired ... latch=0`).
+- A contact a close consumed is the exception: while a close is in flight neither
+  the latch nor the identity expires on silence. A Contact Identifier ends on its
+  lift or on a report naming another asserted identifier (`hid consumed ended ...
+  reason=new-contact|device`); a node index and the coordinate-only path keep the
+  idle fallbacks (120 ms, then 18 ms) once the close has ended.
 
-## Release detection
+## Release
 
-The digitizer keeps reporting while the finger rests (measured 255 reports in a
-1.5 s hold), so an 18 ms window without a report is a reliable lift for a
-dismiss session. A band candidate is measured against a longer window
-(`kCandidateIdleHoldMs`, 120 ms): a touch panel that samples sparsely, or an
-injected test with 20–30 ms steps, must not lose an admitted 25 DIP flick. A
-report gap alone never begins a new contact — the latch is cleared by a lift
-report or by the candidate's own watchdog — so the admission origin survives the
-gap and the crossing point cannot replace it. On a
-device whose reports carry `TipSwitch`, the tracked slot's lift report ends the
-contact instead: the release line says `src=report`, and the idle window is
-only the fallback for a device that goes silent or a contact that leaves
-without a lift report (`src=idle`). A report that carries only a contact count,
-or no contact field for the tracked slot, says nothing about it, so a
-count-only lift no longer ends a tracked contact; the idle expiry does, with
-`src=idle`. Once no session owns the contact the same 18 ms latch clears the
-contact flag and forgets the tracked identity, except through a close: a close
-in flight suspends both, and a consumed contact with a Contact Identifier is
-never ended by silence (see Contact identity). A report that names the
-tracked contact and asserts it (`TipSwitch` down or `InRange`, or a slot state
-of Contact) but carries no point is not silence: it refreshes the liveness
-clock and the identity's evidence clock, and moves nothing.
+The digitizer keeps reporting while the finger rests (255 reports in a 1.5 s
+hold), so 18 ms without a report is a reliable lift for a dismiss session; a
+band candidate uses 120 ms so a sparse or 20–30 ms injected stream does not lose
+an admitted flick. A report gap alone never begins a new down.
 
-The input layer also keeps the tracked contact's last eight positioned reports
-with their `QueryPerformanceCounter` stamps, duplicates included and in report
-order. The reveal's takeover replays them through its own trail mapping, so the
-settle's release window spans the open instead of starting at the takeover
-([gesture.md](gesture.md)). A duplicate is kept on purpose: the window, not the
-buffer, is what collapses a resting finger to one value. A release that ends
-before its menu opens replays the same buffer at the release, into a record the
-same input thread reads when its visibility service sees the open, so nothing is
-published between them.
+- A tracked lift report ends the contact (`src=report`); the idle is the fallback
+  for a silent device (`src=idle`).
+- The idle check needs a `QueryPerformanceCounter` silence: `GetTickCount64`
+  advances every 15.6 ms, so an 18 ms window would read as 31 ms. The deadline
+  needs a `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` one-shot: `WM_TIMER` stayed on
+  the 15.6 ms quantum even under `timeBeginPeriod(1)`. `SetTimer` is the
+  fallback, at worst 15.6 ms late. Measured release latency: 31 ms with the old
+  periodic tick, **18–19 ms** now.
 
-Measured layouts on this machine: ELAN2513 Col01 touch is five contact
-collections with `Tip` on each, Col05 pen carries tip and in-range, SYNA3580 is
-five with `Tip` each, and the virtual digitizer is four with `Tip` and
-`In Range` plus a contact count, report ID 1. Both halves of the timing matter
-on this build, and each was measured separately:
-
-- the idle check needs a **`QueryPerformanceCounter`** silence: `GetTickCount64`
-  only advances every 15.6 ms, so an 18 ms window read as 31 ms;
-- the deadline timer needs a **`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` one-shot**:
-  `WM_TIMER` stayed on the 15.6 ms quantum even while the process held a 1 ms
-  `timeBeginPeriod(1)` request. The request is still made, paired through
-  `timeEndPeriod`, for the time a contact is down. `SetTimer` remains the
-  fallback when the timer cannot be created, armed at the deadline itself and
-  therefore 15.6 ms late at worst.
-
-Measured release latency (`relms` on the release line, QPC): 31 ms with the old
-periodic tick, **18-19 ms** with the one-shot deadline. The window is still the
-same 18 ms product decision; only the wake that lands it got exact.
-`vel=` on the `hid release`, `open follow` and `settle` lines is always
-DIP/ms toward that settle's target, so a finger held still reads `vel=0.00` on
-all three.
+The input layer keeps the last eight positioned reports with their QPC stamps,
+duplicates included; the reveal takeover replays them so the release window spans
+the open. Measured devices: ELAN2513 Col01 (five contact collections with
+`Tip`), Col05 pen (tip and in-range), SYNA3580 (five with `Tip`), and the virtual
+digitizer (four with `Tip` and `In Range`, report ID 1).
