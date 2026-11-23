@@ -118,11 +118,15 @@ not rely on the asymmetry: every command runs on the launcher thread.
 Shape: a hidden message-only window owned by the mod, created on the launcher
 thread. The manager's `Show` proposes the thread it runs on; a targeted
 `WH_GETMESSAGE` hook fires there, commits it and creates the window on its first
-message. A non-pumping COM or taskbar caller never fires the hook and leaves
-capability 0. A Win or Start-button entry adopts the thread directly and creates
-the window, but only after a live peer and a started worker, so it never
-bootstraps a thread for a service that is not already answering.
-`Dismiss`/`ShowStartView` never adopt. The worker never creates the window. A
+message. That commit is provisional: capability also requires a thread a launcher
+entry proved, so a window the pump created stays capability 0 and no intent is
+consumed until a Win entry, a Start-button entry or the shell's own click-away
+Hide runs on the thread and proves it at the hook entry. A non-pumping COM or
+taskbar caller never fires the hook and leaves capability 0. A Win or
+Start-button entry adopts the thread directly and creates the window, but only
+after a live peer and a started worker, so it never bootstraps a thread for a
+service that is not already answering. `Dismiss`/`ShowStartView` never adopt and
+never prove. The worker never creates the window. A
 worker waits on the channel event
 and posts `WM_APP+0x5A`; the WndProc reads the command and calls the launcher with
 an empty stack. The window class is one fixed name

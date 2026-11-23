@@ -90,15 +90,19 @@ downloads a PDB.
 
 The bridge's gate proves a capability, not just a peer: the recorded launcher
 thread (checked **before** any launcher-local field, including the existing-window
-path), a window this activation created on that thread, a started worker, the
-verified layout, and for
+path), a thread a launcher entry **proved**, a window this activation created on
+that thread, a started worker, the verified layout, and for
 the directional close intent the callable `Dismiss` the command will need. A Hide never adopts an unproven thread
 (`reason=wrong-thread|no-window|no-capability|no-primitive`). The manager's
 `Show` proposes the thread it runs on: a targeted `WH_GETMESSAGE` hook fires
 there, commits the thread and creates the window on its first message, so a COM
-or taskbar caller that never pumps leaves capability 0. A Win/Start-button entry
-adopts the thread directly and creates the window only after a live peer and a
-started worker; `ShowStartView`/`Dismiss` never adopt.
+or taskbar caller that never pumps leaves capability 0. That commit is
+provisional: capability also requires a **proven** thread, and only a Win entry,
+a Start-button entry or the shell's own click-away Hide proves it, at the hook
+entry and before the peer gate. A Win/Start-button entry adopts the thread
+directly and creates the window only after a live peer and a started worker; the
+window a `Show` proposal created stays capability 0 until one of those entries
+runs. `ShowStartView`/`Dismiss` never adopt and never prove.
 A wrong-thread launcher call is not a clean error: never call from a hook frame,
 and the executor window is created only by that hook after a `Show` proposal, or
 by a Win/Start-button entry on the recorded launcher thread.
@@ -518,14 +522,16 @@ checked by hand, and the table lists the sessions with captured numbers.
   own path runs. Availability is published only by the ready consumer, only while
   `execCapable=1`, and withdrawn before it is stopped or when the word drops.
 - A live peer is not a usable executor. The gate also proves the recorded launcher
-  thread, a window this activation created on it, a running worker, the verified
-  layout and the primitive the decision needs; `execCapable` is the shared answer.
+  thread, that a launcher entry proved that thread, a window this activation
+  created on it, a running worker, the verified layout and the primitive the
+  decision needs; `execCapable` is the shared answer.
 - One mechanism, one log shape. A decision line and an executor line per
   trigger; no per-trigger branch in either mod.
 - A wrong-thread launcher call is not a clean error. Never call from a hook
   frame; post to the executor window, and never create that window off the
   recorded launcher thread. A `Show` on an unproven thread only proposes it; the
-  targeted `WH_GETMESSAGE` hook commits it after the loop pumps.
+  targeted `WH_GETMESSAGE` hook creates the window provisionally, and capability
+  stays 0 until a Win, Start-button or click-away entry proves the thread.
 - No cross-process call from a XAML handler. The taskbar's appbar record is
   cached on the input thread at startup and refreshed on
   `WM_SETTINGCHANGE`/`WM_DISPLAYCHANGE`; `ProbeTaskbar` reads the cache.

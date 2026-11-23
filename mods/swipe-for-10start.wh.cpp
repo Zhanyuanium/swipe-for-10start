@@ -15344,10 +15344,14 @@ struct OwnExternalForwardGuard {
 // causes synchronously is part of that open.
 constexpr uint32_t kOwnExternalForwardAny = 0xFFFFFFFFu;
 
+bool OwnExternalForwarded(uint32_t method) {
+    return t_ownExternalMethod != 0 &&
+           (t_ownExternalMethod == kOwnExternalForwardAny ||
+            t_ownExternalMethod == method);
+}
+
 bool OwnTakeExternalForward(uint32_t method) {
-    if (t_ownExternalMethod == 0 ||
-        (t_ownExternalMethod != kOwnExternalForwardAny &&
-         t_ownExternalMethod != method)) {
+    if (!OwnExternalForwarded(method)) {
         return false;
     }
     t_ownExternalMethod = 0;
@@ -15672,13 +15676,14 @@ bool ExecutorWorkerReady() {
 }
 
 // The full capability the Start side is told about. A started worker is not
-// enough: the window must exist on the recorded launcher thread, the layout must
-// be the verified identity, and the primitives that window calls must be
-// resolved. Every one of these is read as a capability, never assumed from a
-// mapped channel.
+// enough: the thread must be proven by a launcher entry (a pump only commits it),
+// the window must exist on that thread, the layout must be the verified
+// identity, and the primitives that window calls must be resolved. Every one of
+// these is read as a capability, never assumed from a mapped channel.
 bool ExecutorCapabilityNow() {
     if (!ExecutorWorkerReady() ||
         g_execDispatchClosed.load(std::memory_order_acquire) ||
+        !g_launcherProven.load(std::memory_order_acquire) ||
         !g_launcherLayoutVerified.load(std::memory_order_acquire)) {
         return false;
     }
@@ -15745,6 +15750,46 @@ bool LauncherTriggerMayAdopt(const wchar_t* trigger) {
 bool OnRecordedLauncherThread() {
     const DWORD known = g_launcherThread.load(std::memory_order_relaxed);
     return known != 0 && known == GetCurrentThreadId();
+}
+
+void ReplaceLauncherThread(const wchar_t* source, DWORD previous);
+
+// A launcher entry the shell itself made: the Windows key, a Start-button press
+// or the shell's own click-away close. It runs on the thread that runs the
+// launcher, and only that thread may run a launcher command — a
+// `ShowStartView` on the taskbar thread was measured as an explorer fail-fast
+// in `twinui.pcshell.dll+0x1BB010`. A pump only proposes a thread: the targeted
+// hook commits it but leaves it unproven, so capability stays 0. Called at the
+// hook entry, before the peer gate, because the first press of a cold session is
+// itself the proof.
+void ProveLauncherEntry(const wchar_t* source) {
+    const DWORD tid = GetCurrentThreadId();
+    DWORD known = g_launcherThread.load(std::memory_order_acquire);
+    if (known == 0 && g_launcherThread.compare_exchange_strong(known, tid)) {
+        known = tid;
+        TraceLog(L"exec launcher thread tid=%u source=%s", tid, source);
+    }
+    if (known != tid) {
+        if (PeerUiThreadNow() != 0 &&
+            !g_launcherProven.load(std::memory_order_acquire)) {
+            // A provisional commitment on another thread is the pump this entry
+            // corrects: the peer's own UI thread is the authorisation, the entry
+            // is the proof.
+            ReplaceLauncherThread(source, known);
+        } else {
+            TraceLog(L"exec launcher thread mismatch known=%u tid=%u source=%s",
+                    known, tid, source);
+        }
+        return;
+    }
+    if (!g_launcherProven.exchange(true, std::memory_order_release)) {
+        TraceLog(L"exec launcher thread proven tid=%u source=%s", tid, source);
+        // The proof is a capability change, so it is published here. The Start
+        // side withholds peer readiness while the bridge reports no capability,
+        // and without this publish the entry that proved the thread would be the
+        // last one the bridge could see a live peer for.
+        PublishExecutorCapability(L"proven");
+    }
 }
 
 // The one gate every decision hook takes before it reads the panel. The peer is
@@ -15960,6 +16005,15 @@ void HideStartAndCortana_Hook(void* self, uint32_t method) {
         g_disabled.load(std::memory_order_relaxed)) {
         callOriginal();
         return;
+    }
+    // The shell's own click-away close is a launcher entry: the z-band
+    // activation runs on the thread that runs the launcher. It proves the thread
+    // before the peer gate, so a touch-only session's first close is the proof a
+    // pump cannot give. A lock, an unattributed caller, Win+Tab and a forwarded
+    // original are not that entry.
+    if (method == kDismissMethodClickAway &&
+        OwnCallerNow() == OwnCaller::ClickAway && !OwnExternalForwarded(method)) {
+        ProveLauncherEntry(L"clickaway");
     }
     if (t_execCall > 0) {
         const uint32_t execState = OwnInternalState(self);
@@ -17886,6 +17940,10 @@ HRESULT OnHotkeyInvoke_Hook(void* self, uint32_t flags) {
         return OnHotkeyInvoke_Original ? OnHotkeyInvoke_Original(self, flags)
                                        : S_OK;
     }
+    // The Win key is the measured launcher entry. It proves the thread before
+    // the peer gate: with no controller this press still passes natively, but it
+    // is the proof the next press is intercepted with.
+    ProveLauncherEntry(L"win");
     EnsureExecutorOnLauncherThread(L"hotkey");
     if (!BridgeCanServeOnLauncherThread(L"win", &admittingEpoch)) {
         // No controller, no worker, or no window on this thread: the shell's own
@@ -17962,6 +18020,9 @@ HRESULT OnStartButtonPressed_Hook(void* self, uint32_t showMethod,
                                                    dismissMethod)
                    : S_OK;
     }
+    // The Start button is the other launcher entry the classification already
+    // treats as adoptable. It proves the thread before the peer gate.
+    ProveLauncherEntry(L"startbutton");
     EnsureExecutorOnLauncherThread(L"startbutton");
     if (!BridgeCanServeOnLauncherThread(L"startbutton", &admittingEpoch)) {
         return OnStartButtonPressed_Original
