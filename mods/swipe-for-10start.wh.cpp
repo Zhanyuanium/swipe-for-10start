@@ -14286,12 +14286,20 @@ void WaitForAttachFramesThenDrainUi(HWND hwnd) {
     WaitForStartAttachFrames();
     if (!hwnd) {
         // No window was ever created, or it is already gone: the counter is the
-        // only barrier this path has.
+        // only barrier this path has. A frame that entered after the wait has
+        // nothing to be drained through, and the image must not be freed under
+        // it.
+        if (g_startAttachFrames.load(std::memory_order_acquire) != 0) {
+            BlockUnload(L"attach hook frames without a window");
+        }
         TraceLog(L"unload ui drain skipped reason=no-window");
         return;
     }
     for (int attempt = 0; attempt < kUiDrainRetries; ++attempt) {
         if (!IsWindow(hwnd)) {
+            if (g_startAttachFrames.load(std::memory_order_acquire) != 0) {
+                BlockUnload(L"attach hook frames without a window");
+            }
             TraceLog(L"unload ui drain skipped reason=window-gone");
             return;
         }
@@ -14656,10 +14664,10 @@ void RoleUninit() {
         CloseHandle(g_moduleEntriesGone);
         g_moduleEntriesGone = nullptr;
     }
-    if (g_startAttachIdle) {
-        CloseHandle(g_startAttachIdle);
-        g_startAttachIdle = nullptr;
-    }
+    // The attach hook's idle event stays with the process. A frame decrements
+    // to zero and only then signals it; a frame descheduled in that tail would
+    // signal a handle closed here, possibly recycled by the shell. The counter
+    // and the drain prove the loop, not the last instruction of a frame.
     TraceLog(L"unload done elapsed=%llums",
             static_cast<unsigned long long>(
                 g_unloadStartTick != 0 && GetTickCount64() >= g_unloadStartTick
@@ -19985,12 +19993,20 @@ void DrainExecutorThread(HWND window) {
     WaitForExecutorHookFrames();
     if (!window) {
         // No window was ever created, or it is already gone: the counter is the
-        // only barrier this path has.
+        // only barrier this path has. A frame that entered after the wait has
+        // nothing to be drained through, and the image must not be freed under
+        // it.
+        if (g_execHookFrames.load(std::memory_order_acquire) != 0) {
+            BlockBridgeUnload(L"executor hook frames without a window");
+        }
         TraceLog(L"unload exec drain skipped reason=no-window");
         return;
     }
     for (int attempt = 0; attempt < kExecDrainRetries; ++attempt) {
         if (!IsWindow(window)) {
+            if (g_execHookFrames.load(std::memory_order_acquire) != 0) {
+                BlockBridgeUnload(L"executor hook frames without a window");
+            }
             TraceLog(L"unload exec drain skipped reason=window-gone");
             return;
         }
@@ -20326,10 +20342,10 @@ void RoleUninit() {
         CloseHandle(g_execTeardownAck);
         g_execTeardownAck = nullptr;
     }
-    if (g_execHookIdle) {
-        CloseHandle(g_execHookIdle);
-        g_execHookIdle = nullptr;
-    }
+    // The hook frame's idle event stays with the process. A frame decrements to
+    // zero and only then signals it; a frame descheduled in that tail would
+    // signal a handle closed here, possibly recycled by the shell. The count
+    // and the drain prove the loop, not the last instruction of a frame.
 
     // The peer's process handle ends with the channel view that named it.
     ReleasePeerProcess();
