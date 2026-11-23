@@ -4669,6 +4669,12 @@ void RemoveStartAttachHook() {
 // the event is its wake; a count that never reaches zero blocks the unload.
 [[noreturn]] void BlockUnload(const wchar_t* reason);
 
+// The frame wait's interval. A frame signals before it decrements, so the signal
+// can be consumed while the count is still non-zero and the decrement then
+// leaves no pending signal; each interval re-reads the count, so a lost wakeup
+// costs one interval, and a genuinely stuck frame still waits forever.
+constexpr DWORD kHookFrameWaitMs = 200;
+
 void WaitForStartAttachFrames() {
     // A disable can run on the host's UI thread with an attach frame below it.
     // The wait would then include this frame, which cannot return while the
@@ -4684,7 +4690,9 @@ void WaitForStartAttachFrames() {
         BlockUnload(L"attach hook frame event missing");
     }
     while (g_startAttachFrames.load(std::memory_order_acquire) != 0) {
-        if (WaitForSingleObject(g_startAttachIdle, INFINITE) != WAIT_OBJECT_0) {
+        const DWORD wait =
+            WaitForSingleObject(g_startAttachIdle, kHookFrameWaitMs);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) {
             BlockUnload(L"attach hook frame wait failed");
         }
     }
@@ -20032,6 +20040,12 @@ void JoinExecutorWorker() {
     __builtin_unreachable();
 }
 
+// The frame wait's interval. A frame signals before it decrements, so the signal
+// can be consumed while the count is still non-zero and the decrement then
+// leaves no pending signal; each interval re-reads the count, so a lost wakeup
+// costs one interval, and a genuinely stuck frame still waits forever.
+constexpr DWORD kHookFrameWaitMs = 200;
+
 // Waits for every targeted-hook frame that was running when the hook was
 // removed. A sent window message can be dispatched from inside CallNextHookEx,
 // so the destroy's return says the frame below it is still holding the image.
@@ -20053,7 +20067,8 @@ void WaitForExecutorHookFrames() {
         BlockBridgeUnload(L"executor hook frame event missing");
     }
     while (g_execHookFrames.load(std::memory_order_acquire) != 0) {
-        if (WaitForSingleObject(g_execHookIdle, INFINITE) != WAIT_OBJECT_0) {
+        const DWORD wait = WaitForSingleObject(g_execHookIdle, kHookFrameWaitMs);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) {
             BlockBridgeUnload(L"executor hook frame wait failed");
         }
     }
