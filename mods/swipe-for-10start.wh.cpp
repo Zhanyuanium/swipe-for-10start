@@ -13792,8 +13792,14 @@ void ExecutePendingCommand() {
                 return;
             }
 
-            TraceLog(L"exec dismiss seq=%lld armed=0 reason=no-timer",
-                    static_cast<long long>(command.seq));
+            // The command must not run before executeAt, and without a timer
+            // it cannot wait. Refuse it; the controller repairs.
+            TraceLog(L"exec dismiss seq=%lld refused reason=no-timer delay=%u",
+                    static_cast<long long>(command.seq), delay);
+            AnswerExec(command.seq, kSwipeAckRefused, E_FAIL,
+                       kSwipeVisibilityUnknown);
+            DropPressLatch(L"dismiss-refused", L"no-timer");
+            return;
         }
         g_pendingDismissEpoch = g_dispatchEpoch;
         ExecuteDismiss(command);
