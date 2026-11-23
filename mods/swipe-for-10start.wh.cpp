@@ -4538,6 +4538,12 @@ struct RunFromWindowThreadParam {
 constexpr WPARAM kRunFromWindowThreadMagic = 0x53575441;  // "SWTA"
 RunFromWindowThreadParam g_attachCall{};
 std::atomic<HHOOK> g_startAttachHook{nullptr};
+// The attach hook's counted frames. A proc that entered before the unload can be
+// preempted and resume after the hook was removed; the image must not be freed
+// under it. The count is incremented at the proc's first line and decremented
+// after CallNextHookEx returns, and the decrement to zero signals the event.
+std::atomic<int> g_startAttachFrames{0};
+HANDLE g_startAttachIdle = nullptr;
 
 UINT RunFromWindowThreadMessage() {
     static const UINT message = RegisterWindowMessageW(
@@ -4547,6 +4553,7 @@ UINT RunFromWindowThreadMessage() {
 
 LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam,
                                          LPARAM lParam) {
+    g_startAttachFrames.fetch_add(1, std::memory_order_acq_rel);
     if (code == HC_ACTION && wParam == PM_REMOVE) {
         auto* message = reinterpret_cast<MSG*>(lParam);
         if (message && message->message == RunFromWindowThreadMessage() &&
@@ -4562,7 +4569,14 @@ LRESULT CALLBACK RunFromWindowThreadHook(int code, WPARAM wParam,
             UnhookWindowsHookEx(hook);
         }
     }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
+    // One exit: CallNextHookEx can pump a sent message, so the frame stays
+    // counted until it has returned.
+    const LRESULT result = CallNextHookEx(nullptr, code, wParam, lParam);
+    if (g_startAttachFrames.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+        g_startAttachIdle) {
+        SetEvent(g_startAttachIdle);
+    }
+    return result;
 }
 
 bool RunFromWindowThread(HWND hwnd, RunFromWindowThreadProc proc,
@@ -4616,6 +4630,27 @@ void RemoveStartAttachHook() {
         TraceLog(L"start attach hook removed before service");
         UnhookWindowsHookEx(hook);
     }
+}
+
+// Waits for every attach-hook frame that was running when the hook was removed.
+// The UI drain proves the dispatch, not an independent hook frame: a proc can be
+// below the sent teardown inside CallNextHookEx. The count is the predicate and
+// the event is its wake; a count that never reaches zero blocks the unload.
+[[noreturn]] void BlockUnload(const wchar_t* reason);
+
+void WaitForStartAttachFrames() {
+    if (g_startAttachFrames.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    if (!g_startAttachIdle) {
+        BlockUnload(L"attach hook frame event missing");
+    }
+    while (g_startAttachFrames.load(std::memory_order_acquire) != 0) {
+        if (WaitForSingleObject(g_startAttachIdle, INFINITE) != WAIT_OBJECT_0) {
+            BlockUnload(L"attach hook frame wait failed");
+        }
+    }
+    TraceLog(L"unload attach hook frames drained");
 }
 
 // Cached answer of StartWindowIsOpen() for the report handler. The cloaked
@@ -14241,6 +14276,13 @@ BOOL RoleInit() {
         TraceLog(L"module entry event failed err=%u",
                 static_cast<unsigned>(GetLastError()));
     }
+    // The attach hook's frame wake. Auto-reset: the decrement to zero sets it,
+    // and the unload's wait is that count, never a sleep loop.
+    g_startAttachIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_startAttachIdle) {
+        TraceLog(L"attach hook frame event failed err=%u",
+                static_cast<unsigned>(GetLastError()));
+    }
     // The deferred-teardown acknowledgement: the UI handler sets it after the
     // outermost module frame on the XAML thread has unwound. Manual reset: the
     // unload clears it before the send and waits once.
@@ -14433,8 +14475,10 @@ void RoleUninit() {
     g_unloading = true;
 
     // Symmetric with BeforeUninit: an uninit that skipped it still removes the
-    // posted attach hook before the root teardown.
+    // posted attach hook before the root teardown, and still waits for a frame
+    // that was already inside it.
     RemoveStartAttachHook();
+    WaitForStartAttachFrames();
 
     // The bridge's interception precondition fails here, before anything below
     // is freed: from this point no intent is consumed, so no trigger may be
@@ -14518,6 +14562,11 @@ void RoleUninit() {
         TraceLog(L"unload teardown without a window; no ui turn");
     }
 
+    // 5b. The attach hook's own frames. The teardown send above proves the
+    //     dispatch reached the UI thread, not that an independent hook frame
+    //     below it has left CallNextHookEx; the counter is what proves that.
+    WaitForStartAttachFrames();
+
     // 6. The window and then its class: the class must not outlive the image,
     //    and the window must be gone before the class is unregistered.
     DestroyUiRendezvousWindow();
@@ -14540,6 +14589,10 @@ void RoleUninit() {
     if (g_moduleEntriesGone) {
         CloseHandle(g_moduleEntriesGone);
         g_moduleEntriesGone = nullptr;
+    }
+    if (g_startAttachIdle) {
+        CloseHandle(g_startAttachIdle);
+        g_startAttachIdle = nullptr;
     }
     TraceLog(L"unload done elapsed=%llums",
             static_cast<unsigned long long>(
@@ -14729,6 +14782,12 @@ bool g_execTeardownPending = false;  // launcher thread only
 // it and creates the window on its first message.
 std::atomic<HHOOK> g_execThreadHook{nullptr};
 std::atomic<DWORD> g_execThreadHookTarget{0};
+// The hook's counted frames. A proc that entered before the unload can be
+// preempted and resume after the hook was removed; the image must not be freed
+// under it. Incremented at the first line, decremented after CallNextHookEx
+// returns, and the decrement to zero signals the event.
+std::atomic<int> g_execHookFrames{0};
+HANDLE g_execHookIdle = nullptr;
 
 void StopExecutorTeardown(HWND window);
 
@@ -19155,6 +19214,7 @@ void EnsureExecutorWindow() {
 }
 
 LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
+    g_execHookFrames.fetch_add(1, std::memory_order_acq_rel);
     HHOOK serviced = nullptr;
     DWORD target = 0;
     AcquireSRWLockShared(&g_execThreadHookLock);
@@ -19181,7 +19241,14 @@ LRESULT CALLBACK ExecutorThreadHook(int code, WPARAM wParam, LPARAM lParam) {
         // Show or trigger, never by a hook that fires on every message.
         RemoveExecutorThreadHookIfCurrent(serviced);
     }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
+    // One exit: CallNextHookEx can pump a sent window message, so the frame stays
+    // counted until it has returned.
+    const LRESULT result = CallNextHookEx(nullptr, code, wParam, lParam);
+    if (g_execHookFrames.fetch_sub(1, std::memory_order_acq_rel) == 1 &&
+        g_execHookIdle) {
+        SetEvent(g_execHookIdle);
+    }
+    return result;
 }
 
 bool CreateExecutorWindowOnUiThread(DWORD timeoutMs) {
@@ -19402,6 +19469,26 @@ void JoinExecutorWorker() {
     __builtin_unreachable();
 }
 
+// Waits for every targeted-hook frame that was running when the hook was
+// removed. A sent window message can be dispatched from inside CallNextHookEx,
+// so the destroy's return says the frame below it is still holding the image.
+// The count is the predicate and the event is its wake; a count that never
+// reaches zero blocks the unload.
+void WaitForExecutorHookFrames() {
+    if (g_execHookFrames.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    if (!g_execHookIdle) {
+        BlockBridgeUnload(L"executor hook frame event missing");
+    }
+    while (g_execHookFrames.load(std::memory_order_acquire) != 0) {
+        if (WaitForSingleObject(g_execHookIdle, INFINITE) != WAIT_OBJECT_0) {
+            BlockBridgeUnload(L"executor hook frame wait failed");
+        }
+    }
+    TraceLog(L"unload executor hook frames drained");
+}
+
 // Stop, wait for the ack, then a sent destroy whose return is the proof.
 void DestroyExecutorWindow() {
     HWND window = g_execWindow.load(std::memory_order_acquire);
@@ -19584,6 +19671,12 @@ BOOL RoleInit() {
     if (!g_execTeardownAck) {
         TraceLog(L"exec teardown event failed err=%u", GetLastError());
     }
+    // The hook frame wake. Created before the worker starts, because the worker
+    // is what installs the hook. Auto-reset: the decrement to zero sets it.
+    g_execHookIdle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_execHookIdle) {
+        TraceLog(L"exec hook frame event failed err=%u", GetLastError());
+    }
     g_execOwnerDepth = 0;
     g_execTeardownPending = false;
 
@@ -19625,6 +19718,20 @@ void RoleBeforeUninit() {
     if (g_execStopEvent) {
         SetEvent(g_execStopEvent);
     }
+
+    // The worker first. It is the one thread that installs the targeted hook, so
+    // joining it here means no new frame can be posted after the removal below;
+    // its install also reads g_disabled, so an install already in flight adds
+    // nothing.
+    JoinExecutorWorker();
+
+    // Then the hook, and then its frames. A proc that entered before this point
+    // keeps its count until CallNextHookEx returns — a sent message can be
+    // dispatched from inside that call, so the removal alone proves nothing. The
+    // wait is the count, not a sleep loop; a count that never reaches zero
+    // blocks the unload.
+    RemoveExecutorThreadHook();
+    WaitForExecutorHookFrames();
 }
 
 void RoleUninit() {
@@ -19647,10 +19754,11 @@ void RoleUninit() {
     }
     JoinExecutorWorker();
 
-    // Then the thread hook, before the exclusive admission. It is a
-    // WH_GETMESSAGE on the window's own thread, so its callback has returned
-    // before the sent teardown can be dispatched; no extra event is needed.
+    // Then the thread hook, and any frame of it that was already running. The
+    // normal path did both in BeforeUninit; this covers an uninit that skipped
+    // it.
     RemoveExecutorThreadHook();
+    WaitForExecutorHookFrames();
 
     // Then the one window, on its owner thread, with the worker already joined:
     // no new post can arrive and no timer can survive the destruction. The
@@ -19690,6 +19798,10 @@ void RoleUninit() {
     if (g_execTeardownAck) {
         CloseHandle(g_execTeardownAck);
         g_execTeardownAck = nullptr;
+    }
+    if (g_execHookIdle) {
+        CloseHandle(g_execHookIdle);
+        g_execHookIdle = nullptr;
     }
 
     // The peer's process handle ends with the channel view that named it.
